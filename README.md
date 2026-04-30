@@ -374,12 +374,59 @@ IBLT max-clients constraint: `N_clients · (2^base_bits − 1) < q`.
 cargo test                              # 25 tests across lib + integration:
                                         #   kahe, sss, codec, cs (9), iblt (11), protocol (6), iblt_e2e (2)
 cargo bench --bench protocol            # criterion micro-benches per stage at small parameters
-cargo bench --bench scaling             # progressive (S, N) grid; 60s default budget
-                                        #   BENCH_BUDGET_SECS=N to extend
+cargo bench --bench scaling             # progressive (S, N) grid with sub-stage breakdowns
+cargo bench --bench iblt_scaling        # IBLT-over-flashnet at varying message_slots
+                                        #   both: BENCH_BUDGET_SECS=N to extend (default 60)
 cargo run --release --example demo      # 6 clients × 128-byte slots over a 1024-byte buffer;
                                         # prints recovered slots
 ```
 
-The scaling bench walks (S, N) cells in increasing cost order: `(4|8|12) × (1|10|100|1000)`. Each row prints per-stage timings (client_round, server_round, verify) plus end-to-end-one-poly time and the corresponding MB/s for a 1 KB payload. Time-to-1MB at any cell = `e2e_ms × 1024 / 1000` seconds.
-
 `tests/end_to_end.rs::end_to_end_recovers_sum` is the canonical executable spec: it runs the full 9-step flow with `|S|=4`, `N_clients=8` and asserts the recovered sum equals `Σ m_i`. `tests/iblt_e2e.rs::iblt_recovers_through_flashnet` is the IBLT-over-flashnet equivalent.
+
+### Scaling bench results
+
+Reported wall times **assume parallel deployment**: clients run in parallel on N machines, servers in parallel on S machines, the verifier is one party. Per-poly wall = `client_total + server_total + verify_total`. Sub-stages within each role are sequential on the same machine. Each `HVCPoly` carries 1024 bytes of broadcast payload.
+
+Sample run on an 8-core machine, `RAYON_NUM_THREADS=8`, release profile:
+
+```
+S= 4 N=   1 | client   1.6 ms (commit 1.6 ms)
+            | server   21 us (pick 5us + sumO 16us + sumS 1us)
+            | verify   3.5 ms (cs_v 3.5 ms)
+            | TOTAL    5.1 ms        (0.20 MB/s,  5.0 s/MB)
+
+S= 4 N= 100 | client   1.5 ms
+            | server   1.5 ms (pick 419us + sumO 1.06ms + sumS 36us)
+            | verify   2.0 ms (cs_v 1.9 ms)
+            | TOTAL    4.9 ms        (0.21 MB/s,  4.8 s/MB)
+
+S=12 N= 100 | client   4.7 ms       server   2.8 ms     verify   7.5 ms     TOTAL  15.0 ms (14.6 s/MB)
+S= 4 N=1000 | client   2.0 ms       server  16.1 ms     verify   3.6 ms     TOTAL  21.3 ms (20.8 s/MB)
+S= 8 N=1000 | client   3.5 ms       server  21.8 ms     verify   7.7 ms     TOTAL  33.0 ms (32.2 s/MB)
+S=12 N=1000 | client   5.6 ms       server  25.3 ms     verify  14.4 ms     TOTAL  45.2 ms (44.2 s/MB)
+```
+
+What the breakdown shows:
+
+- **Client is 99% `commit`** — the lattice commitment build (R generation + matrix-vector products + Merkle tree). `gen + enc + share` is sub-30 µs.
+- **Verify is 99% `cs_v`** — per-server `Cs::verify` runs `S` independent path verifications (parallelizable on the verifier; currently serial).
+- **Server scales linearly in N** — `Cs::sum_openings` sums each opening's `r`, `s`, and `path_nodes` pointwise. Inbox lookup is O(1) per canonical client (HashMap-indexed); openings are passed by reference into `sum_openings` to avoid the multi-hundred-KB clone per canonical client.
+
+### IBLT scaling bench results
+
+Carries an IBLT (`message_slots` slots × 4 levels) end-to-end through flashnet. `base_bits` is auto-chosen to satisfy `N · (2^b − 1) < q`. Per-IBLT-round wall = `pack + n_polys · per_poly + unpack + recover`.
+
+```
+S= 4 N=   4 slots= 16 b=12 polys=  3   per_poly  3.6 ms   IBLT-round  10.9 ms   pack/unpack/recover ≪ 1 ms
+S=12 N=   4 slots= 16 b=12 polys=  3   per_poly 22.1 ms   IBLT-round  66.4 ms
+S= 4 N=  16 slots= 32 b=12 polys=  6   per_poly  3.5 ms   IBLT-round  21.0 ms
+S= 4 N=  64 slots= 64 b=11 polys= 13   per_poly  4.6 ms   IBLT-round  60.5 ms
+S=12 N=  64 slots= 64 b=11 polys= 13   per_poly 14.9 ms   IBLT-round 193.5 ms
+S= 4 N= 100 slots=100 b=10 polys= 22   per_poly  5.4 ms   IBLT-round 119.9 ms
+S=12 N= 100 slots=100 b=10 polys= 22   per_poly 21.3 ms   IBLT-round 467.7 ms
+S= 4 N= 256 slots=256 b= 9 polys= 61   per_poly 10.9 ms   IBLT-round 666.5 ms
+```
+
+Pack/unpack/recover are sub-millisecond at these sizes; the round wall time is `n_polys × per_poly`. `n_polys` grows linearly with `message_slots` and inversely with `base_bits` (`L · M_buckets / 512`). For 1000 clients at 256 slots (`b=7`, `polys≈157`), extrapolated round wall ≈ `157 × 65 ms ≈ 10 s` at S=12.
+
+Both bench harnesses self-terminate when their wall budget would be exceeded, so smaller cells always print regardless of grid size.

@@ -11,8 +11,7 @@
 //! silently (counters stay consistent but bucket limbs wrap mod q).
 
 use chipmunk_code::{HVCPoly, HVC_MODULUS, N};
-// `Polynomial` trait is brought into scope only inside fn bodies that need it.
-use chipmunk_code::Polynomial as _;
+// `Polynomial::lift` is needed in `unpack`; bring trait into scope there.
 use sha2::{Digest, Sha256};
 
 pub const IBLT_N_LEVELS: usize = 4;
@@ -254,6 +253,7 @@ impl IbltVector {
     /// Inverse of `pack`. Reads coefficients from polys (lifted to `[0, q)`).
     /// Caller must supply the same `IbltParams` used at pack time.
     pub fn unpack(params: &IbltParams, polys: &[HVCPoly]) -> Self {
+        use chipmunk_code::Polynomial;
         let l = params.limbs_per_chunk();
 
         let mut coeffs: Vec<i32> = Vec::with_capacity(polys.len() * N);

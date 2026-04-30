@@ -31,7 +31,10 @@ pub trait Cs {
     ) -> (Self::Commitment, Vec<Self::Opening>);
     fn verify(pp: &Self::Params, c: &Self::Commitment, o: &Self::Opening) -> bool;
     fn sum_commitments(cs: &[Self::Commitment]) -> Self::Commitment;
-    fn sum_openings(os: &[Self::Opening]) -> Self::Opening;
+    /// Take borrowed slices to avoid cloning openings (each can be ~100s of KB).
+    /// Callers with owned `Vec<Opening>` should `.iter().collect()` into a
+    /// `Vec<&Opening>` first.
+    fn sum_openings(os: &[&Self::Opening]) -> Self::Opening;
 }
 
 pub struct CsParams {
@@ -213,7 +216,7 @@ impl Cs for HidingMerkleCommitment {
         }
     }
 
-    fn sum_openings(os: &[Opening]) -> Opening {
+    fn sum_openings(os: &[&Opening]) -> Opening {
         assert!(!os.is_empty());
         let idx = os[0].server_index;
         let r_len = os[0].r.len();
@@ -312,8 +315,7 @@ mod tests {
         let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
 
         for i in 0..n_servers {
-            let summed =
-                HidingMerkleCommitment::sum_openings(&[opens_a[i].clone(), opens_b[i].clone()]);
+            let summed = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]);
             assert_eq!(summed.s, shares_a[i] + shares_b[i]);
             assert!(HidingMerkleCommitment::verify(&pp, &comm_sum, &summed));
         }
