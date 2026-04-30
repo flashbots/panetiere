@@ -1,0 +1,25 @@
+[package]
+name = "flashnet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chipmunk_code = { path = "../chipmunk", default-features = false, features = ["parallel"] }
+rand = "0.8"
+rand_chacha = "0.3"
+sha2 = "0.10"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "scaling"
+harness = false
+
+[[bench]]
+name = "iblt_scaling"
+harness = false
