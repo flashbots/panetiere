@@ -28,9 +28,9 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPol
         messages.push(m);
         let round = run_client_round(rng, &pp, cid, m, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op, sh));
+            inboxes[idx].items.push((cid, op));
         }
     }
 
@@ -97,9 +97,9 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
 
         let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op, sh));
+            inboxes[idx].items.push((cid, op));
         }
     }
 
@@ -193,9 +193,9 @@ fn slot_mode_8kb_message_multi_poly() {
             let m = encoded[i][poly_idx];
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
             publics.push((round.client_id, round.public));
-            for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+            for (idx, (sid, op)) in round.private.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, op, sh));
+                inboxes[idx].items.push((cid, op));
             }
         }
         let outputs: Vec<_> = inboxes
@@ -249,9 +249,9 @@ fn tampered_agg_share_rejected() {
         let m = HVCPoly::rand_poly(&mut rng);
         let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op, sh));
+            inboxes[idx].items.push((cid, op));
         }
     }
     let canonical = client_ids;
@@ -292,14 +292,14 @@ fn high_norm_r_rejected_in_protocol() {
         let m = HVCPoly::rand_poly(&mut rng);
         let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op, sh));
+            inboxes[idx].items.push((cid, op));
         }
     }
     // Corrupt one private opening before aggregation: replace one entry of r
     // with a uniform polynomial — ||r||_∞ vastly exceeds r_bound.
-    inboxes[0].items[0].1.r[0] = HVCPoly::rand_poly(&mut rng);
+    inboxes[0].items[0].1.r_mut()[0] = HVCPoly::rand_poly(&mut rng);
 
     let canonical = client_ids;
     let server_outputs: Vec<_> = inboxes

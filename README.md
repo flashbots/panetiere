@@ -140,12 +140,16 @@ pub trait Cs {
     ) -> (Self::Commitment, Vec<Self::Opening>);
     fn verify(pp: &Self::Params, c: &Self::Commitment, o: &Self::Opening) -> bool;
     fn sum_commitments(cs: &[Self::Commitment]) -> Self::Commitment;
-    fn sum_openings(os: &[Self::Opening]) -> Self::Opening;  // same `server_index`
+    /// Borrow the inputs — each `Opening` is multi-hundred-KB, so callers
+    /// holding owned `Vec<Opening>` should `.iter().collect()` into
+    /// `Vec<&Opening>` first to avoid the clone.
+    fn sum_openings(os: &[&Self::Opening]) -> Self::Opening;  // same `server_index`
 }
 
 pub struct CsParams {
-    pub a: Vec<HVCPoly>,
-    pub b: Vec<HVCPoly>,
+    /// `a`, `b` are kept NTT-resident so each `dot(a, R)` only converts `R`.
+    pub a_ntt: Vec<HVCNTTPoly>,
+    pub b_ntt: Vec<HVCNTTPoly>,
     pub r_len: usize,
     pub r_bound: u32,
     pub r_half_weight: usize,
@@ -157,20 +161,29 @@ pub struct CsParams {
 #[derive(Clone)]
 pub struct Commitment { pub root: HVCPoly }
 
+/// Single-allocation opening. `r`, `s`, and the decomposed Merkle path live in
+/// one contiguous `Box<[HVCPoly]>`; access via `r()`, `s()`, `path_node(k)`.
 #[derive(Clone)]
 pub struct Opening {
     pub server_index: usize,
-    pub r: Vec<HVCPoly>,
-    pub s: HVCPoly,
-    pub path_nodes: Vec<(Vec<HVCPoly>, Vec<HVCPoly>)>,   // decomposed pairs, top→bottom
     pub path_index: usize,
+    /* r_len, path_len, data: Box<[HVCPoly]> private */
+}
+
+impl Opening {
+    pub fn r_len(&self) -> usize;
+    pub fn path_len(&self) -> usize;
+    pub fn r(&self) -> &[HVCPoly];
+    pub fn s(&self) -> &HVCPoly;
+    /// `(left, right)` decomposed pair at `level`; index 0 is just below the root.
+    pub fn path_node(&self, level: usize) -> (&[HVCPoly], &[HVCPoly]);
 }
 
 pub struct HidingMerkleCommitment;
 impl Cs for HidingMerkleCommitment { /* ... */ }
 ```
 
-`path_nodes` stores already-decomposed Merkle siblings (each side `HVC_WIDTH` low-norm polys). This is required because chipmunk's `decom_then_hash` is linear over decomposed inputs but non-linear over raw `(left, right)` pairs — so summing openings pointwise must happen in the decomposed representation. Verification recomputes the leaf pair from `(r, s)`, replaces `path_nodes.last()` with it, then walks `hash_separate_inputs` + `projection_r` up to the root.
+The Merkle path is stored in already-decomposed form (each side `HVC_WIDTH` low-norm polys). This is required because chipmunk's `decom_then_hash` is linear over decomposed inputs but non-linear over raw `(left, right)` pairs — so summing openings pointwise must happen in the decomposed representation. Verification recomputes the leaf pair from `(r, s)`, checks it projects to `path_node(path_len-1)`, then walks `hash_separate_inputs` + `projection_r` up to the root.
 
 ### `bulletin` — in-memory broadcast store
 
@@ -230,7 +243,9 @@ pub struct ServerId(pub u32);
 pub struct ClientRound {
     pub client_id: ClientId,
     pub public: ClientPublic,
-    pub private: Vec<(ServerId, Opening, <RingOtp as Kahe>::Key)>,
+    /// Per-server private payload: opening only. The key share is `Opening::s()`,
+    /// so a separate `Key` copy on the wire would be redundant.
+    pub private: Vec<(ServerId, Opening)>,
 }
 
 pub fn run_client_round<R: Rng>(
@@ -243,13 +258,18 @@ pub fn run_client_round<R: Rng>(
 
 pub struct ServerInbox {
     pub server_id: ServerId,
-    pub items: Vec<(ClientId, Opening, <RingOtp as Kahe>::Key)>,
+    pub items: Vec<(ClientId, Opening)>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ServerRoundError {
+    MissingClient(ClientId),
 }
 
 pub fn run_server_round(
     inbox: &ServerInbox,
     canonical: &[ClientId],
-) -> Option<ServerPublic>;
+) -> Result<ServerPublic, ServerRoundError>;
 
 #[derive(Debug, PartialEq)]
 pub enum VerifyError {
@@ -257,6 +277,11 @@ pub enum VerifyError {
     InvalidServerOpening(usize),
     ShareOpeningMismatch(usize),
     NoServers,
+    /// `server_outputs` did not contain exactly one entry per `0..n_servers`
+    /// (wrong count, duplicate `server_id`, or out-of-range `server_id`).
+    BadServerCoverage,
+    /// A `ServerPublic.clients` field disagreed with the canonical set.
+    InconsistentCanonical(ServerId),
 }
 
 pub fn aggregate_and_decrypt(
@@ -267,7 +292,7 @@ pub fn aggregate_and_decrypt(
 ) -> Result<HVCPoly, VerifyError>;
 ```
 
-`aggregate_and_decrypt` is the public verifier of step 9. It cross-checks `agg_share == agg_open.s` (both are the same pointwise sum of per-client shares; mismatch implies tampering) and rejects via `ShareOpeningMismatch`. Tampered Merkle openings reject via `InvalidServerOpening`.
+`aggregate_and_decrypt` is the public verifier of step 9. It enforces `server_outputs.len() == n_servers` with no duplicate / out-of-range `server_id`s (`BadServerCoverage`), checks every server's `ServerPublic.clients` matches the verifier's `canonical` arg (`InconsistentCanonical`), then cross-checks `agg_share == agg_open.s` (both are the same pointwise sum of per-client shares; mismatch implies tampering) and rejects via `ShareOpeningMismatch`. Tampered Merkle openings reject via `InvalidServerOpening`.
 
 ### `codec` — bytes ↔ `HVCPoly`
 
@@ -300,12 +325,13 @@ pub const IBLT_CHUNK_BYTES: usize = 48;          // 384 bits
 pub const IBLT_CHUNK_BITS: usize = 384;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct IbltParams {
-    pub message_slots: u32,
-    pub base_bits: u32,
-}
+pub struct IbltParams { /* fields private; constructed via `new` */ }
 
 impl IbltParams {
+    /// Asserts `message_slots >= 1` and `1 <= base_bits <= 16`.
+    pub fn new(message_slots: u32, base_bits: u32) -> Self;
+    pub fn message_slots(&self) -> u32;
+    pub fn base_bits(&self) -> u32;
     pub fn limbs_per_chunk(&self) -> usize;
     pub fn level_size(&self, level: usize) -> usize;
     pub fn total_buckets(&self) -> usize;
@@ -330,6 +356,8 @@ impl IbltVector {
     pub fn insert_chunk(&mut self, chunk: [u8; IBLT_CHUNK_BYTES]);
     pub fn add_assign(&mut self, other: &Self) -> Result<(), IbltError>;
     pub fn recover(&self) -> Result<Vec<[u8; IBLT_CHUNK_BYTES]>, IbltError>;
+    /// Consuming variant of `recover` — peels in place, no clone.
+    pub fn into_recover(self) -> Result<Vec<[u8; IBLT_CHUNK_BYTES]>, IbltError>;
 
     pub fn n_polys(params: &IbltParams) -> usize;
     pub fn pack(&self) -> Vec<HVCPoly>;
@@ -387,30 +415,37 @@ cargo run --release --example demo      # 6 clients × 128-byte slots over a 102
 
 Reported wall times **assume parallel deployment**: clients run in parallel on N machines, servers in parallel on S machines, the verifier is one party. Per-poly wall = `client_total + server_total + verify_total`. Sub-stages within each role are sequential on the same machine. Each `HVCPoly` carries 1024 bytes of broadcast payload.
 
-Sample run on an 8-core machine, `RAYON_NUM_THREADS=8`, release profile:
+Sample run on an 8-core machine (Intel Core Ultra 7 155H, AVX2), `RAYON_NUM_THREADS=8`, release profile. Both `pointwise_dot` (NTT-domain inner product) and `pointwise_sum` (canonical mod-q sum) are AVX2-vectorized. `Cs::sum_openings` uses opening-major (tiled) traversal so each opening is read from main memory exactly once; `Opening` is a single `Box<[HVCPoly]>` so per-opening data is contiguous.
 
 ```
-S= 4 N=   1 | client   1.6 ms (commit 1.6 ms)
-            | server   21 us (pick 5us + sumO 16us + sumS 1us)
-            | verify   3.5 ms (cs_v 3.5 ms)
-            | TOTAL    5.1 ms        (0.20 MB/s,  5.0 s/MB)
+S= 4 N=   1 | client   0.7 ms (commit 0.7 ms)
+            | server   17 us (pick 1us + sumO 16us + sumS <1us)
+            | verify   2.5 ms (cs_v 2.5 ms)
+            | TOTAL    3.7 ms        (0.28 MB/s,  3.6 s/MB)
 
-S= 4 N= 100 | client   1.5 ms
-            | server   1.5 ms (pick 419us + sumO 1.06ms + sumS 36us)
-            | verify   2.0 ms (cs_v 1.9 ms)
-            | TOTAL    4.9 ms        (0.21 MB/s,  4.8 s/MB)
-
-S=12 N= 100 | client   4.7 ms       server   2.8 ms     verify   7.5 ms     TOTAL  15.0 ms (14.6 s/MB)
-S= 4 N=1000 | client   2.0 ms       server  16.1 ms     verify   3.6 ms     TOTAL  21.3 ms (20.8 s/MB)
-S= 8 N=1000 | client   3.5 ms       server  21.8 ms     verify   7.7 ms     TOTAL  33.0 ms (32.2 s/MB)
-S=12 N=1000 | client   5.6 ms       server  25.3 ms     verify  14.4 ms     TOTAL  45.2 ms (44.2 s/MB)
+S=12 N=  10 | client   2.5 ms       server   84 us       verify   4.0 ms    TOTAL   6.6 ms ( 6.4 s/MB)
+S= 4 N= 100 | client   0.7 ms       server   0.51 ms     verify   0.9 ms    TOTAL   2.1 ms ( 2.1 s/MB)
+S=12 N= 100 | client   2.5 ms       server   0.71 ms     verify   3.7 ms    TOTAL   6.9 ms ( 6.7 s/MB)
+S= 4 N=1000 | client   0.7 ms       server   5.7 ms      verify   1.9 ms    TOTAL   8.3 ms ( 8.1 s/MB)
+S= 8 N=1000 | client   2.0 ms       server   7.0 ms      verify   3.4 ms    TOTAL  12.4 ms (12.1 s/MB)
+S=12 N=1000 | client   3.4 ms       server   7.5 ms      verify   8.3 ms    TOTAL  19.2 ms (18.7 s/MB)
 ```
 
 What the breakdown shows:
 
-- **Client is 99% `commit`** — the lattice commitment build (R generation + matrix-vector products + Merkle tree). `gen + enc + share` is sub-30 µs.
-- **Verify is 99% `cs_v`** — per-server `Cs::verify` runs `S` independent path verifications (parallelizable on the verifier; currently serial).
-- **Server scales linearly in N** — `Cs::sum_openings` sums each opening's `r`, `s`, and `path_nodes` pointwise. Inbox lookup is O(1) per canonical client (HashMap-indexed); openings are passed by reference into `sum_openings` to avoid the multi-hundred-KB clone per canonical client.
+- **Client `commit`** uses SIMD-vectorized `pointwise_dot` over NTT-resident commitment matrices (`a_ntt`, `b_ntt`). Each `(a·R, b·R + s)` leaf computes `R → NTT` once and runs two MAC calls; ~2× faster than the older per-pair `HVCPoly::Mul` shape.
+- **Verify is mostly `cs_v`** — `S` independent path verifications, each calling the same SIMD-vectorized hash. Per-server cost roughly halved vs scalar.
+- **Server `sum_openings`** uses SIMD-vectorized `pointwise_sum` AND opening-major access: the outer loop walks openings (each read once, ~78 KB of opening data streams in sequentially) while the ~78 KB accumulator working set stays L2-resident. At N=1000 this delivers ~3× speedup over slot-major access where each opening was visited 39 times — the kernel was already SIMD but L3 thrashing dominated.
+- **`Opening` is one allocation** — a single `Box<[HVCPoly]>` for `r`, `s`, and the decomposed Merkle path, accessed via `o.r()` / `o.s()` / `o.path_node(k)`. One malloc per opening at commit time (was 13 with the previous Vec-of-Vec shape).
+- **Inbox lookup is O(1)** (HashMap-indexed); openings pass by reference into `sum_openings` to avoid the per-client multi-hundred-KB clone.
+- **`gen + enc + share + dec`** stay sub-30 µs each — the protocol's "scaffolding" is essentially free; the cost lives entirely in lattice ops.
+
+#### Optimizations evaluated and dropped
+
+These were tried and reverted — they didn't move the bench beyond run-to-run noise on this hardware, and the simpler code is preferable until a profile shows otherwise:
+
+- **`#[repr(C, align(64))]` on `HVCPoly` / `HVCNTTPoly`.** Cache-line-aligning every poly's start. Theoretically removes cross-line straddles for AVX2 loads; in practice modern Intel handles unaligned loads with negligible penalty when the data is naturally well-distributed.
+- **`SumScratch` preallocation for `sum_openings`.** Hoists the ~78 KB accumulator buffers out of the call so a long-running server reuses them across rounds. The single-call bench shape doesn't expose the saving (allocator+first-touch cost is microseconds vs the ~7 ms `sumO` at N=1000); a multi-round profile is the place to revisit. The code path that allocates fresh accumulators leaves a comment pointing at the scratch refactor as a viable re-introduction.
 
 ### IBLT scaling bench results
 

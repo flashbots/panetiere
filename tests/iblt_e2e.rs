@@ -27,10 +27,7 @@ fn iblt_recovers_through_flashnet() {
     let n_servers = 3;
     let n_clients = 4;
 
-    let params = IbltParams {
-        message_slots: 16,
-        base_bits: 12,
-    };
+    let params = IbltParams::new(16, 12);
     assert!(params.max_clients() as usize >= n_clients);
 
     // Each client builds their own IBLT with one unique chunk.
@@ -67,9 +64,9 @@ fn iblt_recovers_through_flashnet() {
             let m = client_polys[i][k];
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
             publics.push((round.client_id, round.public));
-            for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+            for (idx, (sid, op)) in round.private.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, op, sh));
+                inboxes[idx].items.push((cid, op));
             }
         }
         let outputs: Vec<_> = inboxes
@@ -94,10 +91,7 @@ fn iblt_protocol_rejects_tampered_share() {
     let mut rng = ChaCha20Rng::from_seed([0xCDu8; 32]);
     let n_servers = 3;
     let n_clients = 3;
-    let params = IbltParams {
-        message_slots: 8,
-        base_bits: 12,
-    };
+    let params = IbltParams::new(8, 12);
 
     let chunks: Vec<[u8; IBLT_CHUNK_BYTES]> =
         (0..n_clients).map(|_| rand_chunk(&mut rng)).collect();
@@ -129,9 +123,9 @@ fn iblt_protocol_rejects_tampered_share() {
         let m = client_polys[i][k];
         let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op, sh));
+            inboxes[idx].items.push((cid, op));
         }
     }
     let mut outputs: Vec<_> = inboxes

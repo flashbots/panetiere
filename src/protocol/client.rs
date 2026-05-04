@@ -11,8 +11,10 @@ use super::message::{ClientId, ServerId};
 pub struct ClientRound {
     pub client_id: ClientId,
     pub public: ClientPublic,
-    /// Per-server private payload: opening and key share.
-    pub private: Vec<(ServerId, Opening, <RingOtp as Kahe>::Key)>,
+    /// Per-server private payload: opening only — the key share `s` lives
+    /// inside `Opening` (`opening.s()`), so sending it again on the wire is
+    /// redundant.
+    pub private: Vec<(ServerId, Opening)>,
 }
 
 pub fn run_client_round<R: Rng>(
@@ -35,8 +37,6 @@ pub fn run_client_round<R: Rng>(
         .iter()
         .copied()
         .zip(openings)
-        .zip(shares)
-        .map(|((sid, op), sh)| (sid, op, sh))
         .collect();
 
     ClientRound {

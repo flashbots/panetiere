@@ -176,15 +176,15 @@ fn time_server_stages(
             .items
             .iter()
             .enumerate()
-            .map(|(i, (cid, _, _))| (*cid, i))
+            .map(|(i, (cid, _))| (*cid, i))
             .collect();
         let mut openings: Vec<&flashnet::cs::Opening> = Vec::with_capacity(canonical.len());
         let mut shares = Vec::with_capacity(canonical.len());
         for cid in canonical {
             let i = *index.get(cid).unwrap();
-            let (_, op, sh) = &inbox.items[i];
+            let (_, op) = &inbox.items[i];
             openings.push(op);
-            shares.push(*sh);
+            shares.push(*op.s());
         }
         (openings, shares)
     });
@@ -234,7 +234,7 @@ fn time_verify_stages(
     });
     let (share_check_us, _) = time_us(|| {
         for sp in outputs {
-            assert_eq!(sp.agg_share, sp.agg_open.s);
+            assert_eq!(sp.agg_share, *sp.agg_open.s());
         }
     });
     let (decrypt_us, _) = time_us(|| {
@@ -253,10 +253,7 @@ fn time_verify_stages(
 
 fn run_cell(s: usize, n: usize, slots: u32) -> Row {
     let base_bits = pick_base_bits(n);
-    let params = IbltParams {
-        message_slots: slots,
-        base_bits,
-    };
+    let params = IbltParams::new(slots, base_bits);
     let n_polys = IbltVector::n_polys(&params);
 
     let mut seed = [0u8; 32];
@@ -303,9 +300,9 @@ fn run_cell(s: usize, n: usize, slots: u32) -> Row {
         let m = client_polys[i][0];
         let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
         publics_fix.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             debug_assert_eq!(sid, server_ids[idx]);
-            inboxes_fix[idx].items.push((cid, op, sh));
+            inboxes_fix[idx].items.push((cid, op));
         }
     }
     let outputs_fix: Vec<_> = inboxes_fix
@@ -332,9 +329,9 @@ fn run_cell(s: usize, n: usize, slots: u32) -> Row {
             let m = client_polys[i][k];
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
             publics.push((round.client_id, round.public));
-            for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+            for (idx, (sid, op)) in round.private.into_iter().enumerate() {
                 debug_assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, op, sh));
+                inboxes[idx].items.push((cid, op));
             }
         }
         let outputs: Vec<_> = inboxes

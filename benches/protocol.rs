@@ -38,9 +38,9 @@ fn bench_server_round(c: &mut Criterion) {
             canonical.push(cid);
             let m = HVCPoly::rand_poly(&mut rng);
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
-            let (sid, op, sh) = round.private.into_iter().next().unwrap();
+            let (sid, op) = round.private.into_iter().next().unwrap();
             assert_eq!(sid, server_ids[0]);
-            inbox.items.push((cid, op, sh));
+            inbox.items.push((cid, op));
         }
         g.bench_with_input(
             BenchmarkId::from_parameter(format!("S{}_C{}", n_servers, n_clients)),
@@ -72,9 +72,9 @@ fn bench_verify(c: &mut Criterion) {
             let m = HVCPoly::rand_poly(&mut rng);
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
             publics.push((round.client_id, round.public));
-            for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+            for (idx, (sid, op)) in round.private.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, op, sh));
+                inboxes[idx].items.push((cid, op));
             }
         }
         let outputs: Vec<_> = inboxes

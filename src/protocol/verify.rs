@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::bulletin::{ClientPublic, ServerPublic};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{Kahe, RingOtp};
 use chipmunk_code::HVCPoly;
 
-use super::message::ClientId;
+use super::message::{ClientId, ServerId};
 
 #[derive(Debug, PartialEq)]
 pub enum VerifyError {
@@ -13,6 +13,12 @@ pub enum VerifyError {
     InvalidServerOpening(usize),
     ShareOpeningMismatch(usize),
     NoServers,
+    /// `server_outputs` did not contain exactly one entry per `0..n_servers`.
+    /// Carries the offending server id for duplicates / out-of-range, or an
+    /// arbitrary missing id for incompleteness.
+    BadServerCoverage,
+    /// A `ServerPublic.clients` field disagreed with the canonical set.
+    InconsistentCanonical(ServerId),
 }
 
 /// Public verifier (README step 9):
@@ -28,6 +34,26 @@ pub fn aggregate_and_decrypt(
 ) -> Result<HVCPoly, VerifyError> {
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
+    }
+
+    // n-of-n additive sharing: every server in 0..n_servers must contribute
+    // exactly once. Otherwise `agg_key` silently sums the wrong set and
+    // decryption produces garbage.
+    if server_outputs.len() != pp.n_servers {
+        return Err(VerifyError::BadServerCoverage);
+    }
+    let mut seen: HashSet<u32> = HashSet::with_capacity(pp.n_servers);
+    for sp in server_outputs {
+        if (sp.server_id.0 as usize) >= pp.n_servers || !seen.insert(sp.server_id.0) {
+            return Err(VerifyError::BadServerCoverage);
+        }
+    }
+
+    // Each server's claimed canonical set must match the one we're verifying.
+    for sp in server_outputs {
+        if sp.clients != canonical {
+            return Err(VerifyError::InconsistentCanonical(sp.server_id));
+        }
     }
 
     // Index the public-bulletin entries by ClientId so the per-canonical lookup
@@ -59,7 +85,7 @@ pub fn aggregate_and_decrypt(
         // The aggregated share and the `s` inside the aggregated opening are
         // both pointwise sums of the same per-client `share_i = opening_i.s`.
         // They must match — otherwise a server has tampered with one of them.
-        if sp.agg_share != sp.agg_open.s {
+        if sp.agg_share != *sp.agg_open.s() {
             return Err(VerifyError::ShareOpeningMismatch(i));
         }
     }

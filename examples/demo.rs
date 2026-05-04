@@ -77,9 +77,9 @@ fn main() {
 
         let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op, sh));
+            inboxes[idx].items.push((cid, op));
         }
     }
 

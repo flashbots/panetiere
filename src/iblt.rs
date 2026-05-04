@@ -23,11 +23,35 @@ const Q: i32 = HVC_MODULUS;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IbltParams {
-    pub message_slots: u32,
-    pub base_bits: u32,
+    message_slots: u32,
+    base_bits: u32,
 }
 
 impl IbltParams {
+    /// Construct params, enforcing `1 <= base_bits <= 16` and
+    /// `message_slots >= 1`. Panics otherwise — callers that need a fallible
+    /// constructor should validate before calling.
+    pub fn new(message_slots: u32, base_bits: u32) -> Self {
+        assert!(message_slots >= 1, "message_slots must be >= 1");
+        assert!(
+            (1..=16).contains(&base_bits),
+            "base_bits must be in 1..=16, got {}",
+            base_bits
+        );
+        Self {
+            message_slots,
+            base_bits,
+        }
+    }
+
+    pub fn message_slots(&self) -> u32 {
+        self.message_slots
+    }
+
+    pub fn base_bits(&self) -> u32 {
+        self.base_bits
+    }
+
     pub fn limbs_per_chunk(&self) -> usize {
         (IBLT_CHUNK_BITS + self.base_bits as usize - 1) / self.base_bits as usize
     }
@@ -149,16 +173,22 @@ pub fn limbs_to_chunk(limbs: &[i32], base_bits: u32) -> [u8; IBLT_CHUNK_BYTES] {
     out
 }
 
+/// Domain-separation tag for the bucket-index hash. Bumping this invalidates
+/// all previously constructed IBLTs.
+const CHUNK_INDEX_TAG: &[u8; 16] = b"flashnet/iblt/v1";
+
 /// Bucket index for a chunk at a given level.
-/// SHA-256(level_decimal_ascii || chunk)[..8] big-endian, mod `items_in_level`.
+/// `SHA-256(tag || level_u8 || chunk)[..8]` big-endian, mod `items_in_level`.
+/// `level` must fit in a `u8` (we only ever have `IBLT_N_LEVELS = 4`).
 pub fn chunk_index(
     chunk: &[u8; IBLT_CHUNK_BYTES],
     level: usize,
     items_in_level: usize,
 ) -> u64 {
-    let level_str = format!("{}", level);
+    debug_assert!(level < 256);
     let mut hasher = Sha256::new();
-    hasher.update(level_str.as_bytes());
+    hasher.update(CHUNK_INDEX_TAG);
+    hasher.update([level as u8]);
     hasher.update(chunk);
     let hash = hasher.finalize();
     let mut prefix = [0u8; 8];
@@ -298,9 +328,16 @@ impl IbltVector {
     }
 
     /// Queue-based peeling: mirrors the structure of `ibf.go::Recover`. Returns
-    /// the multiset of chunks present in the IBLT.
+    /// the multiset of chunks present in the IBLT. Clones internally; use
+    /// `into_recover` when the IBLT is no longer needed afterwards.
     pub fn recover(&self) -> Result<Vec<[u8; IBLT_CHUNK_BYTES]>, IbltError> {
-        let mut working = self.clone();
+        self.clone().into_recover()
+    }
+
+    /// Consuming variant of `recover` — peels in place, no clone. Useful for
+    /// large IBLTs where the per-bucket allocations are non-trivial.
+    pub fn into_recover(self) -> Result<Vec<[u8; IBLT_CHUNK_BYTES]>, IbltError> {
+        let mut working = self;
         let mut recovered: Vec<[u8; IBLT_CHUNK_BYTES]> = Vec::new();
 
         let mut queue: Vec<(usize, usize)> = Vec::new();
@@ -392,10 +429,7 @@ mod tests {
     #[test]
     fn insert_then_recover_single() {
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
-        let params = IbltParams {
-            message_slots: 100,
-            base_bits: 12,
-        };
+        let params = IbltParams::new(100, 12);
         let mut iblt = IbltVector::new(params);
         let chunk = rand_chunk(&mut rng);
         iblt.insert_chunk(chunk);
@@ -406,10 +440,7 @@ mod tests {
     #[test]
     fn recover_twenty_chunks() {
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
-        let params = IbltParams {
-            message_slots: 100,
-            base_bits: 12,
-        };
+        let params = IbltParams::new(100, 12);
         let mut iblt = IbltVector::new(params);
         let chunks: Vec<_> = (0..20).map(|_| rand_chunk(&mut rng)).collect();
         for c in &chunks {
@@ -422,10 +453,7 @@ mod tests {
     #[test]
     fn union_via_add_assign() {
         let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
-        let params = IbltParams {
-            message_slots: 14,
-            base_bits: 12,
-        };
+        let params = IbltParams::new(14, 12);
         let mut a = IbltVector::new(params.clone());
         let mut b = IbltVector::new(params);
         let chunks_a: Vec<_> = (0..IBLT_N_LEVELS).map(|_| rand_chunk(&mut rng)).collect();
@@ -444,14 +472,8 @@ mod tests {
 
     #[test]
     fn add_assign_param_mismatch() {
-        let p1 = IbltParams {
-            message_slots: 10,
-            base_bits: 12,
-        };
-        let p2 = IbltParams {
-            message_slots: 11,
-            base_bits: 12,
-        };
+        let p1 = IbltParams::new(10, 12);
+        let p2 = IbltParams::new(11, 12);
         let mut a = IbltVector::new(p1);
         let b = IbltVector::new(p2);
         assert_eq!(a.add_assign(&b), Err(IbltError::ParamsMismatch));
@@ -461,10 +483,7 @@ mod tests {
     fn pack_unpack_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
         for &b in &[7u32, 10, 12] {
-            let params = IbltParams {
-                message_slots: 32,
-                base_bits: b,
-            };
+            let params = IbltParams::new(32, b);
             let mut iblt = IbltVector::new(params.clone());
             for _ in 0..7 {
                 iblt.insert_chunk(rand_chunk(&mut rng));
@@ -487,10 +506,7 @@ mod tests {
         // Two clients, each builds an IBLT and packs. Pointwise HVCPoly add of
         // their packed polys must equal the pack of `a.add_assign(b)`.
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        let params = IbltParams {
-            message_slots: 16,
-            base_bits: 12,
-        };
+        let params = IbltParams::new(16, 12);
         let mut a = IbltVector::new(params.clone());
         let mut b = IbltVector::new(params.clone());
         for _ in 0..3 {
@@ -529,10 +545,7 @@ mod tests {
     #[test]
     fn max_clients_matches_constraint() {
         for &b in &[7u32, 8, 10, 12] {
-            let p = IbltParams {
-                message_slots: 1,
-                base_bits: b,
-            };
+            let p = IbltParams::new(1, b);
             let n = p.max_clients() as i64;
             let base = 1i64 << b;
             assert!(

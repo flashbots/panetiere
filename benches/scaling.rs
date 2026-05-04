@@ -143,15 +143,15 @@ fn time_server_stages(
             .items
             .iter()
             .enumerate()
-            .map(|(i, (cid, _, _))| (*cid, i))
+            .map(|(i, (cid, _))| (*cid, i))
             .collect();
         let mut openings: Vec<&flashnet::cs::Opening> = Vec::with_capacity(canonical.len());
         let mut shares = Vec::with_capacity(canonical.len());
         for cid in canonical {
             let i = *index.get(cid).unwrap();
-            let (_, op, sh) = &inbox.items[i];
+            let (_, op) = &inbox.items[i];
             openings.push(op);
-            shares.push(*sh);
+            shares.push(*op.s());
         }
         (openings, shares)
     });
@@ -204,7 +204,7 @@ fn time_verify_stages(
     // Step 3: agg_share == agg_open.s checks across S servers.
     let (share_check_us, _) = time_us(|| {
         for sp in outputs {
-            assert_eq!(sp.agg_share, sp.agg_open.s);
+            assert_eq!(sp.agg_share, *sp.agg_open.s());
         }
     });
     // Step 4: aggregate keys, decrypt.
@@ -241,8 +241,8 @@ fn run_cell(s: usize, n: usize) -> Row {
     for (i, &cid) in client_ids.iter().enumerate() {
         let round = run_client_round(&mut rng, &pp, cid, messages[i], &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op, sh)) in round.private.into_iter().enumerate() {
-            inboxes[idx].items.push((cid, op, sh));
+        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+            inboxes[idx].items.push((cid, op));
             let _ = sid;
         }
     }
