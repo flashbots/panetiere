@@ -1,15 +1,15 @@
 use chipmunk_code::{HVCPoly, Polynomial};
 use flashnet::codec;
-use flashnet::cs::{Cs, HidingMerkleCommitment};
 use flashnet::protocol::client::run_client_round;
 use flashnet::protocol::message::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
+use flashnet::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPoly, HVCPoly) {
-    let pp = HidingMerkleCommitment::setup(rng, n_servers);
+    let pp = ProtocolParams::setup(rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
@@ -26,11 +26,11 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPol
     for &cid in &client_ids {
         let m = HVCPoly::rand_poly(rng);
         messages.push(m);
-        let round = run_client_round(rng, &pp, cid, m, &server_ids);
+        let round = run_client_round(rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op));
+            inboxes[idx].items.push((cid, ops));
         }
     }
 
@@ -42,12 +42,13 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPol
 
     let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &server_outputs)
         .expect("verify failed");
+    assert_eq!(recovered.len(), pp.kahe.mu_kahe);
 
     let expected = messages
         .iter()
         .copied()
         .fold(HVCPoly::default(), |a, x| a + x);
-    (expected, recovered)
+    (expected, recovered[0])
 }
 
 /// Several clients write distinct byte payloads into disjoint coefficient slots
@@ -69,10 +70,10 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
     ];
     let n_clients = messages.len();
     const SLOT_SIZE: usize = 128;
-    const TOTAL_BYTES: usize = 1024; // exactly one HVCPoly worth (no length header)
+    const TOTAL_BYTES: usize = 1024;
     assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
 
-    let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
@@ -93,13 +94,12 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
 
         let polys = codec::encode_raw(&buf);
         assert_eq!(polys.len(), 1, "slot buffer sized to one HVCPoly");
-        let m = polys[0];
 
-        let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op));
+            inboxes[idx].items.push((cid, ops));
         }
     }
 
@@ -109,24 +109,22 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered_poly = aggregate_and_decrypt(&pp, &canonical, &publics, &outputs)
+    let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &outputs)
         .expect("verify failed");
-    let recovered = codec::decode_raw(&[recovered_poly]).expect("decode");
-    assert_eq!(recovered.len(), TOTAL_BYTES);
+    let recovered_bytes = codec::decode_raw(&recovered).expect("decode");
+    assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
 
     for slot in 0..n_clients {
         let start = slot * SLOT_SIZE;
         let payload = messages[slot];
         assert_eq!(
-            &recovered[start..start + payload.len()],
+            &recovered_bytes[start..start + payload.len()],
             payload,
             "slot {} should hold its client's payload",
             slot
         );
-        // Bytes outside the payload but inside the slot are zero (no other
-        // client wrote there).
         assert!(
-            recovered[start + payload.len()..start + SLOT_SIZE]
+            recovered_bytes[start + payload.len()..start + SLOT_SIZE]
                 .iter()
                 .all(|&b| b == 0),
             "non-payload bytes in slot {} should be zero",
@@ -145,12 +143,10 @@ fn slot_mode_8kb_message_multi_poly() {
     let n_servers = 3;
     let n_clients = 4;
     const SLOT_SIZE: usize = 2048;
-    const TOTAL_BYTES: usize = 8 * 1024; // 8 polys × 1024 bytes/poly
+    const TOTAL_BYTES: usize = 8 * 1024;
     const N_POLYS: usize = TOTAL_BYTES / 1024;
     assert_eq!(n_clients * SLOT_SIZE, TOTAL_BYTES);
 
-    // Build per-client 8 KB buffers: pseudo-random payload in each client's slot,
-    // zeros elsewhere.
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_clients);
     let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(n_clients);
     for slot in 0..n_clients {
@@ -163,7 +159,6 @@ fn slot_mode_8kb_message_multi_poly() {
         buffers.push(buf);
     }
 
-    // Each buffer encodes to N_POLYS polys.
     let encoded: Vec<Vec<HVCPoly>> = buffers
         .iter()
         .map(|b| {
@@ -173,12 +168,11 @@ fn slot_mode_8kb_message_multi_poly() {
         })
         .collect();
 
-    let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
     let canonical = client_ids.clone();
 
-    // Run the protocol once per poly index. Concatenate recovered polys.
     let mut recovered_polys = Vec::with_capacity(N_POLYS);
     for poly_idx in 0..N_POLYS {
         let mut publics = Vec::new();
@@ -191,11 +185,11 @@ fn slot_mode_8kb_message_multi_poly() {
             .collect();
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = encoded[i][poly_idx];
-            let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+            let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
             publics.push((round.client_id, round.public));
-            for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+            for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, op));
+                inboxes[idx].items.push((cid, ops));
             }
         }
         let outputs: Vec<_> = inboxes
@@ -204,7 +198,8 @@ fn slot_mode_8kb_message_multi_poly() {
             .collect();
         let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", poly_idx, e));
-        recovered_polys.push(recovered);
+        assert_eq!(recovered.len(), 1);
+        recovered_polys.push(recovered[0]);
     }
 
     let recovered_bytes = flashnet::codec::decode_raw(&recovered_polys).expect("decode");
@@ -233,7 +228,7 @@ fn tampered_agg_share_rejected() {
     let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
     let n_servers = 4;
     let n_clients = 4;
-    let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
@@ -247,11 +242,11 @@ fn tampered_agg_share_rejected() {
         .collect();
     for &cid in &client_ids {
         let m = HVCPoly::rand_poly(&mut rng);
-        let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op));
+            inboxes[idx].items.push((cid, ops));
         }
     }
     let canonical = client_ids;
@@ -260,10 +255,8 @@ fn tampered_agg_share_rejected() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    // Tamper: swap the agg_share of two servers (changes individual shares
-    // but not their sum), so decryption silently produces the wrong message
-    // unless the commitment opening check rejects.
-    server_outputs[0].agg_share = server_outputs[0].agg_share + HVCPoly::rand_poly(&mut rng);
+    server_outputs[0].agg_share[0] =
+        server_outputs[0].agg_share[0] + HVCPoly::rand_poly(&mut rng);
     let result = aggregate_and_decrypt(&pp, &canonical, &publics, &server_outputs);
     assert!(matches!(
         result,
@@ -276,7 +269,7 @@ fn high_norm_r_rejected_in_protocol() {
     let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
     let n_servers = 4;
     let n_clients = 4;
-    let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
@@ -290,15 +283,14 @@ fn high_norm_r_rejected_in_protocol() {
         .collect();
     for &cid in &client_ids {
         let m = HVCPoly::rand_poly(&mut rng);
-        let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op));
+            inboxes[idx].items.push((cid, ops));
         }
     }
-    // Corrupt one private opening before aggregation: replace one entry of r
-    // with a uniform polynomial — ||r||_∞ vastly exceeds r_bound.
+    // Corrupt one private opening before aggregation.
     inboxes[0].items[0].1.r_mut()[0] = HVCPoly::rand_poly(&mut rng);
 
     let canonical = client_ids;
@@ -320,5 +312,62 @@ fn end_to_end_small() {
     for (s, c) in [(1usize, 1usize), (2, 1), (2, 3), (3, 5), (4, 1)] {
         let (expected, recovered) = run(&mut rng, s, c);
         assert_eq!(expected, recovered, "s={} c={}", s, c);
+    }
+}
+
+/// Threshold recovery: with t = ⌊γ/2⌋+1, decryption succeeds with any t of γ
+/// server outputs in any order. Verifier picks the first `t` after sorting.
+#[test]
+fn recovers_from_t_of_n_servers() {
+    let mut rng = ChaCha20Rng::from_seed([101u8; 32]);
+    let n_servers = 5;
+    let n_clients = 4;
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
+    assert_eq!(pp.shamir.t, 3);
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
+
+    let mut messages = Vec::with_capacity(n_clients);
+    let mut publics = Vec::new();
+    let mut inboxes: Vec<ServerInbox> = server_ids
+        .iter()
+        .map(|&sid| ServerInbox {
+            server_id: sid,
+            items: vec![],
+        })
+        .collect();
+    for &cid in &client_ids {
+        let m = HVCPoly::rand_poly(&mut rng);
+        messages.push(m);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        publics.push((round.client_id, round.public));
+        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+            assert_eq!(sid, server_ids[idx]);
+            inboxes[idx].items.push((cid, ops));
+        }
+    }
+    let canonical = client_ids.clone();
+    let outputs: Vec<_> = inboxes
+        .iter()
+        .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+        .collect();
+
+    let expected = messages
+        .iter()
+        .copied()
+        .fold(HVCPoly::default(), |a, x| a + x);
+
+    // Pick any t outputs and verify decryption succeeds.
+    for &chosen in &[
+        [0usize, 1, 2].as_slice(),
+        &[0, 2, 4],
+        &[1, 3, 4],
+        &[2, 3, 4],
+    ] {
+        let subset: Vec<_> = chosen.iter().map(|&i| outputs[i].clone()).collect();
+        let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &subset)
+            .expect("verify failed");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0], expected, "subset {:?}", chosen);
     }
 }

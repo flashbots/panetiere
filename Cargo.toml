@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chipmunk_code = { path = "../chipmunk", default-features = false, features = ["parallel"] }
+# `parallel` disabled: profiling at the target (S=8, N=100) showed ~14% of
+# cycles in `crossbeam_epoch` rayon overhead with no measurable speedup at
+# n_leaves ≤ 64. Re-enable when n_leaves ≫ #cores.
+chipmunk_code = { path = "../chipmunk", default-features = false, features = ["fast-ntt"] }
 rand = "0.8"
 rand_chacha = "0.3"
 sha2 = "0.10"
@@ -20,6 +23,13 @@ harness = false
 name = "scaling"
 harness = false
 
-[[bench]]
-name = "iblt_scaling"
-harness = false
+# Release-with-debug-info profile for callgrind / perf. Use via `cargo build
+# --profile profiling --bin <bin>` or `cargo bench --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false
+
+[[example]]
+name = "profile"
+path = "examples/profile.rs"

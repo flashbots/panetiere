@@ -2,8 +2,8 @@ pub mod bulletin;
 pub mod codec;
 pub mod consensus;
 pub mod cs;
-pub mod iblt;
 pub mod kahe;
+pub mod mse;
 pub mod protocol;
 pub mod sss;
 

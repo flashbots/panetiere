@@ -2,42 +2,59 @@ use rand::Rng;
 
 use crate::bulletin::ClientPublic;
 use crate::cs::{Cs, HidingMerkleCommitment, Opening};
-use crate::kahe::{Kahe, RingOtp};
-use crate::sss::{AdditiveSharing, Sss};
+use crate::kahe::{Kahe, KaheScheme};
+use crate::sss::ShamirSharing;
 
 use super::message::{ClientId, ServerId};
+use super::ProtocolParams;
 
-/// Output of a single client round (README steps 1–6 in concrete form).
+/// Output of a single client round (README steps 1–6).
+///
+/// One CS commit per client (with `μ_cs = κ_kahe`), so each per-server
+/// private payload is a single `Opening` — its `s()` is the `κ_kahe`-vector
+/// of Shamir shares for that server.
 pub struct ClientRound {
     pub client_id: ClientId,
     pub public: ClientPublic,
-    /// Per-server private payload: opening only — the key share `s` lives
-    /// inside `Opening` (`opening.s()`), so sending it again on the wire is
-    /// redundant.
     pub private: Vec<(ServerId, Opening)>,
 }
 
 pub fn run_client_round<R: Rng>(
     rng: &mut R,
-    pp: &<HidingMerkleCommitment as Cs>::Params,
+    pp: &ProtocolParams,
     client_id: ClientId,
-    message: <RingOtp as Kahe>::Message,
+    message: <Kahe as KaheScheme>::Message,
     servers: &[ServerId],
 ) -> ClientRound {
-    let key = RingOtp::gen(rng);
-    let ctxt = RingOtp::enc(&key, &message);
+    let key = Kahe::gen(rng, &pp.kahe);
+    let ctxt = Kahe::enc(&pp.kahe, &key, &message);
 
     let n = servers.len();
-    assert_eq!(n, pp.n_servers, "server count must match CS params");
+    assert_eq!(n, pp.cs.n_servers, "server count must match CS params");
+    assert_eq!(n, pp.shamir.n, "server count must match Shamir params");
+    let kappa_kahe = pp.kahe.kappa_kahe;
+    assert_eq!(
+        kappa_kahe, pp.cs.mu_cs,
+        "ProtocolParams must couple μ_cs = κ_kahe"
+    );
 
-    let shares = AdditiveSharing::share(rng, &key, n);
-    let (comm, openings) = HidingMerkleCommitment::commit(rng, pp, &shares);
-
-    let private: Vec<_> = servers
-        .iter()
-        .copied()
-        .zip(openings)
+    // Per-component Shamir shares: shares_per_component[k][i] = f_k(point_{i+1}).
+    let shares_per_component: Vec<Vec<chipmunk_code::HVCPoly>> = (0..kappa_kahe)
+        .map(|k| ShamirSharing::share(rng, &pp.shamir, key.component(k)))
         .collect();
+    // Transpose into per-server share vectors (length κ_kahe each).
+    let shares_per_server: Vec<Vec<chipmunk_code::HVCPoly>> = (0..n)
+        .map(|i| {
+            (0..kappa_kahe)
+                .map(|k| shares_per_component[k][i])
+                .collect()
+        })
+        .collect();
+
+    let (comm, openings) = HidingMerkleCommitment::commit(rng, &pp.cs, &shares_per_server);
+
+    let private: Vec<(ServerId, Opening)> =
+        servers.iter().copied().zip(openings.into_iter()).collect();
 
     ClientRound {
         client_id,

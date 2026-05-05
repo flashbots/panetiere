@@ -1,19 +1,16 @@
 //! Public bulletin (in-memory v1).
-//!
-//! Holds the publicly broadcast values from the protocol: per-client ciphertext
-//! and commitment, per-server aggregated output, and the canonical client set.
-//! Concrete typed storage for v1; abstract over a `Bulletin` trait when we need
-//! a networked impl.
 
 use std::sync::Mutex;
 
-use crate::cs::Commitment;
+use crate::cs::{Commitment, Opening};
 use crate::protocol::message::{ClientId, ServerId};
 use chipmunk_code::HVCPoly;
 
 #[derive(Clone)]
 pub struct ClientPublic {
-    pub ctxt: HVCPoly,
+    /// KAHE ciphertext, one ring element per `μ_kahe` slot.
+    pub ctxt: Vec<HVCPoly>,
+    /// Single CS commitment (μ_cs = κ_kahe packs the share-vector).
     pub comm: Commitment,
 }
 
@@ -21,8 +18,10 @@ pub struct ClientPublic {
 pub struct ServerPublic {
     pub server_id: ServerId,
     pub clients: Vec<ClientId>,
-    pub agg_open: crate::cs::Opening,
-    pub agg_share: HVCPoly,
+    /// Single aggregated `Opening` whose `s()` is the κ_kahe-vector of summed shares.
+    pub agg_open: Opening,
+    /// Mirrors `agg_open.s()` (componentwise sum of per-client shares at this server's point).
+    pub agg_share: Vec<HVCPoly>,
 }
 
 #[derive(Default)]

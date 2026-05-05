@@ -7,20 +7,15 @@
 //! demonstrates how the codec composes with the protocol when the application
 //! picks a slot layout that doesn't overflow.
 
-use chipmunk_code::HVCPoly;
 use flashnet::codec;
-use flashnet::cs::{Cs, HidingMerkleCommitment};
 use flashnet::protocol::client::run_client_round;
 use flashnet::protocol::message::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
+use flashnet::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-/// Place `payload` into a fixed slot inside a single-poly buffer; remaining
-/// bytes are zero. Different `slot` values for different clients ensure the
-/// per-coefficient sum never exceeds the codec's 16-bit budget, so the recovered
-/// sum decodes byte-for-byte to the concatenated multi-client buffer.
 fn pack_slot(payload: &[u8], slot: usize, slot_size: usize, total_bytes: usize) -> Vec<u8> {
     assert!(payload.len() <= slot_size);
     assert!(slot * slot_size + slot_size <= total_bytes);
@@ -44,19 +39,16 @@ fn main() {
     ];
     let n_clients = messages.len();
 
-    // Slot mode: every client writes into a fixed window of a 1024-byte buffer
-    // that fills exactly one HVCPoly via `encode_raw` (no length header — its
-    // coefficients would otherwise overflow when summed).
     const SLOT_SIZE: usize = 128;
     const TOTAL_BYTES: usize = 1024;
     assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
 
     println!(
-        "flashnet demo: {} clients × {}-byte slots, {} servers",
+        "flashnet demo: {} clients × {}-byte slots, {} servers (t = ⌊γ/2⌋+1)",
         n_clients, SLOT_SIZE, n_servers
     );
 
-    let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
@@ -73,13 +65,12 @@ fn main() {
         let buf = pack_slot(messages[slot], slot, SLOT_SIZE, TOTAL_BYTES);
         let polys = codec::encode_raw(&buf);
         assert_eq!(polys.len(), 1, "slot layout sized to fit one HVCPoly");
-        let m: HVCPoly = polys[0];
 
-        let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
         publics.push((round.client_id, round.public));
-        for (idx, (sid, op)) in round.private.into_iter().enumerate() {
+        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, op));
+            inboxes[idx].items.push((cid, ops));
         }
     }
 
@@ -89,10 +80,10 @@ fn main() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered_poly =
+    let recovered =
         aggregate_and_decrypt(&pp, &canonical, &publics, &outputs).expect("verify failed");
     let recovered_bytes =
-        codec::decode_raw(&[recovered_poly]).expect("decode of summed message failed");
+        codec::decode_raw(&recovered).expect("decode of summed message failed");
 
     println!("\nrecovered slots:");
     for slot in 0..n_clients {
