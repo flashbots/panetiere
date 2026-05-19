@@ -2,7 +2,7 @@
 //!
 //! Layout: little-endian `u32` byte-length header, then the bytes themselves,
 //! padded with zeros up to the next even byte count, then packed two bytes per
-//! coefficient (little-endian `u16`). Each `HVCPoly` carries `N = 512`
+//! coefficient (little-endian `u16`). Each `KahePoly` carries `N = 512`
 //! coefficients = `1024` bytes; the final poly is zero-padded to fill `N`
 //! coefficients. Coefficients land in `[0, 65536) ⊂ [0, q)` so a fresh single-
 //! client encode/decode is exact round-trip.
@@ -14,7 +14,7 @@
 //! recovers `Σ m_i` as a polynomial; how to read meaning out of that is the
 //! application's choice.
 
-use chipmunk_code::{HVCPoly, N};
+use chipmunk_code::{KahePoly, Polynomial, N};
 
 const BYTES_PER_COEFF: usize = 2;
 const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
@@ -36,7 +36,7 @@ pub enum CodecError {
 /// on a fixed buffer size — typical for slot-mode aggregation, where one
 /// `decode_raw(sum_of_encoded)` returns the per-slot mixture without the
 /// header coefficients overflowing under summation.
-pub fn encode_raw(bytes: &[u8]) -> Vec<HVCPoly> {
+pub fn encode_raw(bytes: &[u8]) -> Vec<KahePoly> {
     let mut buf = bytes.to_vec();
     if buf.len() % BYTES_PER_COEFF != 0 {
         buf.push(0);
@@ -47,14 +47,14 @@ pub fn encode_raw(bytes: &[u8]) -> Vec<HVCPoly> {
         polys.push(coeffs_from_bytes(chunk));
     }
     while polys.len() < n_polys {
-        polys.push(HVCPoly::from_coeffs([0i32; N]));
+        polys.push(KahePoly::from_coeffs([0i32; N]));
     }
     polys
 }
 
 /// Decode polynomials produced by `encode_raw`. Returns `polys.len() *
 /// BYTES_PER_POLY` bytes (caller trims/parses).
-pub fn decode_raw(polys: &[HVCPoly]) -> Result<Vec<u8>, CodecError> {
+pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     if polys.is_empty() {
         return Err(CodecError::Empty);
     }
@@ -73,18 +73,18 @@ pub fn decode_raw(polys: &[HVCPoly]) -> Result<Vec<u8>, CodecError> {
     Ok(buf)
 }
 
-fn coeffs_from_bytes(chunk: &[u8]) -> HVCPoly {
+fn coeffs_from_bytes(chunk: &[u8]) -> KahePoly {
     let mut coeffs = [0i32; N];
     for (i, pair) in chunk.chunks(BYTES_PER_COEFF).enumerate() {
         let lo = pair[0] as u32;
         let hi = if pair.len() == 2 { pair[1] as u32 } else { 0 };
         coeffs[i] = (lo | (hi << 8)) as i32;
     }
-    HVCPoly::from_coeffs(coeffs)
+    KahePoly::from_coeffs(coeffs)
 }
 
 /// Encode `bytes` into a sequence of polynomials. Always succeeds.
-pub fn encode(bytes: &[u8]) -> Vec<HVCPoly> {
+pub fn encode(bytes: &[u8]) -> Vec<KahePoly> {
     let mut buf = Vec::with_capacity(HEADER_LEN + bytes.len() + 1);
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
@@ -98,14 +98,14 @@ pub fn encode(bytes: &[u8]) -> Vec<HVCPoly> {
         polys.push(coeffs_from_bytes(chunk));
     }
     while polys.len() < n_polys {
-        polys.push(HVCPoly::from_coeffs([0i32; N]));
+        polys.push(KahePoly::from_coeffs([0i32; N]));
     }
     polys
 }
 
 /// Decode a sequence of polynomials produced by `encode`. Each coefficient must
 /// lie in `[0, 65536)` (after `lift`); otherwise `CoeffOutOfRange` is returned.
-pub fn decode(polys: &[HVCPoly]) -> Result<Vec<u8>, CodecError> {
+pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     if polys.is_empty() {
         return Err(CodecError::Empty);
     }
@@ -199,7 +199,7 @@ mod tests {
 
         let pa = encode_raw(&buf_a);
         let pb = encode_raw(&buf_b);
-        let summed: Vec<HVCPoly> = pa
+        let summed: Vec<KahePoly> = pa
             .iter()
             .zip(pb.iter())
             .map(|(x, y)| *x + *y)
@@ -218,7 +218,7 @@ mod tests {
     fn decode_rejects_oob_coeff() {
         let mut coeffs = [0i32; N];
         coeffs[0] = 1 << 17; // > 65535
-        let polys = vec![HVCPoly::from_coeffs(coeffs)];
+        let polys = vec![KahePoly::from_coeffs(coeffs)];
         match decode(&polys) {
             Err(CodecError::CoeffOutOfRange { .. }) => {}
             other => panic!("expected CoeffOutOfRange, got {:?}", other),

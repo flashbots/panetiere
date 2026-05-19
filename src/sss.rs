@@ -32,7 +32,10 @@ impl Sss for AdditiveSharing {
     }
 
     fn recover(shares: &[Self::Share]) -> Self::Secret {
-        shares.iter().copied().fold(HVCPoly::default(), |a, x| a + x)
+        shares
+            .iter()
+            .copied()
+            .fold(HVCPoly::default(), |a, x| a + x)
     }
 }
 
@@ -54,18 +57,17 @@ pub struct ShamirParams {
 impl ShamirParams {
     pub fn new(t: usize, n: usize) -> Self {
         assert!(t >= 1 && t <= n, "require 1 ≤ t ≤ n");
-        assert!(n < HVC_MODULUS as usize, "n must be < q for distinct points");
+        assert!(
+            n < HVC_MODULUS as usize,
+            "n must be < q for distinct points"
+        );
         Self { t, n }
     }
 }
 
 impl ShamirSharing {
     /// Returns `params.n` shares; `out[i]` is the evaluation at point `i+1`.
-    pub fn share<R: Rng>(
-        rng: &mut R,
-        params: &ShamirParams,
-        secret: &HVCPoly,
-    ) -> Vec<HVCPoly> {
+    pub fn share<R: Rng>(rng: &mut R, params: &ShamirParams, secret: &HVCPoly) -> Vec<HVCPoly> {
         let t = params.t;
         let n = params.n;
         let coeffs: Vec<HVCPoly> = (0..t - 1).map(|_| HVCPoly::rand_poly(rng)).collect();
@@ -100,6 +102,7 @@ impl ShamirSharing {
                 debug_assert_ne!(xs[i], xs[j], "duplicate sample index");
             }
         }
+        // Note: can be cached for subsets of xs
         let lagrange: Vec<i32> = (0..t)
             .map(|i| {
                 let xi = xs[i];
@@ -235,9 +238,17 @@ mod tests {
         // sum the shares per index across clients
         let summed: Vec<HVCPoly> = indices
             .iter()
-            .map(|&i| all_shares.iter().fold(HVCPoly::default(), |a, sh| a + sh[i]))
+            .map(|&i| {
+                all_shares
+                    .iter()
+                    .fold(HVCPoly::default(), |a, sh| a + sh[i])
+            })
             .collect();
-        let samples: Vec<_> = indices.iter().copied().zip(summed.iter().copied()).collect();
+        let samples: Vec<_> = indices
+            .iter()
+            .copied()
+            .zip(summed.iter().copied())
+            .collect();
         let recovered = ShamirSharing::recover(&params, &samples);
         let expected = secrets.iter().fold(HVCPoly::default(), |a, s| a + *s);
         assert_eq!(recovered, expected);

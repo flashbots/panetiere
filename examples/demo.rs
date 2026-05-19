@@ -1,6 +1,6 @@
 //! End-to-end demo with byte messages.
 //!
-//! Each client encodes its own short byte string into a single `HVCPoly` slot.
+//! Each client encodes its own short byte string into a single `KahePoly` slot.
 //! Slots are non-overlapping (each client gets a unique window of coefficients
 //! within the 1024-byte poly), so the protocol's recovered sum decodes back to
 //! a buffer where each client's bytes occupy their assigned slot. This
@@ -64,7 +64,7 @@ fn main() {
     for (slot, &cid) in client_ids.iter().enumerate() {
         let buf = pack_slot(messages[slot], slot, SLOT_SIZE, TOTAL_BYTES);
         let polys = codec::encode_raw(&buf);
-        assert_eq!(polys.len(), 1, "slot layout sized to fit one HVCPoly");
+        assert_eq!(polys.len(), 1, "slot layout sized to fit one KahePoly");
 
         let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
         publics.push((round.client_id, round.public));

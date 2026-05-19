@@ -4,12 +4,12 @@ use std::sync::Mutex;
 
 use crate::cs::{Commitment, Opening};
 use crate::protocol::message::{ClientId, ServerId};
-use chipmunk_code::HVCPoly;
+use chipmunk_code::{HVCPoly, KahePoly};
 
 #[derive(Clone)]
 pub struct ClientPublic {
-    /// KAHE ciphertext, one ring element per `μ_kahe` slot.
-    pub ctxt: Vec<HVCPoly>,
+    /// KAHE ciphertext, one KAHE ring element per `μ_kahe` slot.
+    pub ctxt: Vec<KahePoly>,
     /// Single CS commitment (μ_cs = κ_kahe packs the share-vector).
     pub comm: Commitment,
 }

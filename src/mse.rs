@@ -20,16 +20,23 @@
 //! elements (`ξ > 1`) compose by running independent MSE instances at the
 //! application layer.
 //!
-//! `pack` / `unpack` flatten/restore `(C, K, V)` as a sequence of `HVCPoly`
+//! `pack` / `unpack` flatten/restore `(C, K, V)` as a sequence of `KahePoly`
 //! coefficient slots so the encoding rides over the flashnet protocol's
-//! `RingOtp` ciphertext stream. Sum-of-encodings is pointwise add over the
-//! `HVCPoly`s, matching the paper's group-additive structure.
+//! KAHE ciphertext stream. Sum-of-encodings is pointwise add over the
+//! `KahePoly`s, matching the paper's group-additive structure.
+//!
+//! MSE arithmetic runs in `Z_t` where `t = T_MODULUS_DEFAULT` is the KAHE
+//! plaintext modulus, since the protocol returns `Σ m mod t`. The MSE values
+//! must remain consistent under that reduction.
 
-use chipmunk_code::{HVCPoly, Polynomial, HVC_MODULUS, HVC_MODULUS_OVER_TWO, N};
+use chipmunk_code::{KahePoly, Polynomial, N};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-const Q: i32 = HVC_MODULUS;
+use crate::kahe::T_MODULUS_DEFAULT;
+
+const T: i32 = T_MODULUS_DEFAULT as i32;
+const T_OVER_TWO: i32 = T / 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MseParams {
@@ -62,7 +69,7 @@ impl MseParams {
     /// `decode()` returns `Err(PeelStalled)` when recovery fails for any
     /// reason.
     pub fn max_clients(&self) -> u32 {
-        (Q as u32).saturating_sub(1)
+        (T as u32).saturating_sub(1)
     }
 }
 
@@ -87,9 +94,9 @@ pub enum MseError {
 
 #[inline]
 fn reduce(x: i64) -> i32 {
-    let mut r = x.rem_euclid(Q as i64) as i32;
-    if r > HVC_MODULUS_OVER_TWO {
-        r -= Q;
+    let mut r = x.rem_euclid(T as i64) as i32;
+    if r > T_OVER_TWO {
+        r -= T;
     }
     r
 }
@@ -121,7 +128,7 @@ impl MseEncoding {
 
     /// Insert one element `x ∈ Z_q` with fresh randomness `r ← Z_q`.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, x: i32) {
-        let r: i32 = reduce(rng.gen_range(0..Q as i64));
+        let r: i32 = reduce(rng.gen_range(0..T as i64));
         self.insert_with_r(x, r);
     }
 
@@ -200,24 +207,24 @@ impl MseEncoding {
         Ok(emitted)
     }
 
-    /// Number of `HVCPoly`s required to pack this encoding.
+    /// Number of `KahePoly`s required to pack this encoding.
     pub fn n_polys(params: &MseParams) -> usize {
         params.total_scalars().div_ceil(N)
     }
 
-    /// Flatten `(C, K, V)` into HVCPoly coefficient slots (C first, then K,
+    /// Flatten `(C, K, V)` into KahePoly coefficient slots (C first, then K,
     /// then V; each row-major).
-    pub fn pack(&self) -> Vec<HVCPoly> {
+    pub fn pack(&self) -> Vec<KahePoly> {
         let total = self.params.total_scalars();
         let n_polys = total.div_ceil(N);
         let mut polys = Vec::with_capacity(n_polys);
         let mut buf = [0i32; N];
         let mut written = 0usize;
-        let feed = |val: i32, buf: &mut [i32; N], written: &mut usize, polys: &mut Vec<HVCPoly>| {
+        let feed = |val: i32, buf: &mut [i32; N], written: &mut usize, polys: &mut Vec<KahePoly>| {
             buf[*written % N] = val;
             *written += 1;
             if *written % N == 0 {
-                polys.push(HVCPoly::from_coeffs(*buf));
+                polys.push(KahePoly::from_coeffs(*buf));
                 *buf = [0i32; N];
             }
         };
@@ -231,14 +238,14 @@ impl MseEncoding {
             feed(v, &mut buf, &mut written, &mut polys);
         }
         if written % N != 0 {
-            polys.push(HVCPoly::from_coeffs(buf));
+            polys.push(KahePoly::from_coeffs(buf));
         }
         debug_assert_eq!(polys.len(), n_polys);
         polys
     }
 
     /// Inverse of `pack`. `polys.len()` must equal `n_polys(params)`.
-    pub fn unpack(params: &MseParams, polys: &[HVCPoly]) -> Self {
+    pub fn unpack(params: &MseParams, polys: &[KahePoly]) -> Self {
         let total = params.total_scalars();
         assert_eq!(polys.len(), total.div_ceil(N));
         // Lift each poly's coefficients into signed reduced form so summed
@@ -335,7 +342,7 @@ mod tests {
 
     #[test]
     fn pack_sum_unpacks_to_union() {
-        // Pack two encodings, pointwise-sum the packed HVCPoly streams, unpack,
+        // Pack two encodings, pointwise-sum the packed KahePoly streams, unpack,
         // decode → multiset union. Mirrors the protocol's RingOtp aggregation.
         let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
         let pp = params_for(4, 32, 7);
@@ -349,7 +356,7 @@ mod tests {
         }
         let pa = a.pack();
         let pb = b.pack();
-        let summed: Vec<HVCPoly> = pa
+        let summed: Vec<KahePoly> = pa
             .iter()
             .zip(pb.iter())
             .map(|(x, y)| *x + *y)

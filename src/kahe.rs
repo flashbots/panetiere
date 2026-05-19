@@ -1,28 +1,49 @@
-//! Key-additive homomorphic encryption.
+//! Key-additive homomorphic encryption (Willow-style RLWE-based KAHE).
 //!
-//! Two layers:
+//! Lives on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, q ≈ 2^30),
+//! decoupled from the chipmunk Ring-SIS CS ring `R_{q_cs}` (q = 202_753).
+//! The KAHE q is chosen for headroom in the noise budget — chipmunk's q is
+//! tied to its multi-signature size optimization and would be wasteful here.
 //!
-//! 1. [`RingOtp`] — pad-expansion + OTP-style enc/dec primitive. `expand(sk) =
-//!    A·sk ∈ R_q^μ` for a public matrix `A ∈ R_q^{μ × κ}`. `enc(sk, m) = m +
-//!    expand(sk)`, `dec(sk, c) = c − expand(sk)`. `expand` is `R`-linear, so
-//!    the OTP works on both fresh (short) and aggregate (large-norm) seeds —
-//!    callers supply the seed as a raw `&[HVCPoly]`.
+//! Per-poly form (Willow `EncryptPolynomial`):
 //!
-//! 2. [`Kahe`] — the KAHE scheme (impls [`KaheScheme`]). `Gen` samples a
-//!    *short* seed (Lemma 8 hiding regime). `Enc`/`Dec` wrap [`RingOtp`] but
-//!    constrain the key types: [`KaheKey`] (fresh, short) feeds `Enc`,
-//!    [`KaheAggKey`] (aggregate, in `R_q^κ`) feeds `Dec`. The scheme also
-//!    provides `agg_ctxt` and `agg_key`. The Shamir bridge (`Σ sk_j`
-//!    interpolated from per-server share sums) lives in `protocol::verify`,
-//!    where it constructs a `KaheAggKey` via [`KaheAggKey::from_components`].
+//! ```text
+//! Enc(m, sk):  sample e ← D_{σ_e};   c = m + A·sk + t·e   mod q_kahe
+//! Dec(c, sk):  ((c − A·sk) mod q_kahe) reduced mod t   (centered representatives)
+//! ```
 //!
-//! Hiding (BDLOP §4 LHL, Lemma 8) is proven for fresh keys living in the short
-//! ball `B_β^κ`. Aggregate keys live in all of `R_q^κ` and are only valid as
-//! `Dec` input on aggregated ciphertexts; the [`KaheKey`] / [`KaheAggKey`]
-//! newtypes enforce this distinction at the type level.
+//! Parameters:
+//! - `A ∈ R_{q_kahe}^{μ × κ}` — public matrix.
+//! - `sk ← D_{σ_s}^κ` — discrete Gaussian secret key (σ_s = 4.5).
+//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (σ_e = √2·σ_s ≈ 6.36).
+//! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
+//!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
+//!
+//! Correctness budget at ρ aggregations: need `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2`.
+//! With σ_e ≈ 6.36, q_kahe = 1_073_738_753:
+//!   - ρ = 100:  t < q/(2·(8σ_e·√ρ + ρ/2)) ≈ 961k → t = 524_288 = 2^19 (19 bits/coef)
+//!   - ρ = 300:  t < 520k → t = 262_144 = 2^18 (18 bits/coef)
+//!   - ρ = 1000: t < 167k → t = 131_072 = 2^17 (17 bits/coef)
+//!
+//! `KaheKey` (fresh, low-norm) feeds `Enc`; `KaheAggKey` (in `R_{q_kahe}^κ`,
+//! recovered by Shamir interpolation over `R_{q_cs}` and lifted via
+//! [`lift_hvc_to_kahe`] in `protocol::verify`) feeds `Dec`. Hiding-given-
+//! aggregate-key reduces to (Hint-)RLWE rather than to LHL.
+//!
+//! Bridge layer. KAHE secret-key components are *small* (Gaussian σ_s = 4.5,
+//! `‖sk‖_∞ ≤ 8σ_s ≈ 36` w.o.p.). Shamir-recovered sums-of-keys are also small
+//! (`‖Σ sk‖_∞ ≤ N_clients · 8σ_s`). Both fit losslessly in both rings under
+//! centered representation, so we cross between `KahePoly` and `HVCPoly` by
+//! coefficient-wise re-interpretation: see [`kahe_to_hvc_centered`] (client
+//! side, KAHE→CS for Shamir input) and [`lift_hvc_to_kahe`] (verifier side,
+//! CS→KAHE for decryption).
 
-use chipmunk_code::{pointwise_dot, HVCNTTPoly, HVCPoly, Polynomial};
+use chipmunk_code::{
+    pointwise_dot_kahe, HVCPoly, KaheNTTPoly, KahePoly, Polynomial, HVC_MODULUS_OVER_TWO,
+    KAHE_MODULUS_OVER_TWO, N,
+};
 use rand::Rng;
+use rand_distr::{Distribution, Normal};
 
 /// KAHE scheme contract.
 pub trait KaheScheme {
@@ -34,121 +55,192 @@ pub trait KaheScheme {
 
     fn setup<R: Rng>(rng: &mut R) -> Self::Params;
     fn gen<R: Rng>(rng: &mut R, pp: &Self::Params) -> Self::Key;
-    fn enc(pp: &Self::Params, k: &Self::Key, m: &Self::Message) -> Self::Ciphertext;
+    fn enc<R: Rng>(rng: &mut R, pp: &Self::Params, k: &Self::Key, m: &Self::Message) -> Self::Ciphertext;
     fn dec(pp: &Self::Params, c: &Self::Ciphertext, k: &Self::AggKey) -> Self::Message;
     fn agg_ctxt(cs: &[Self::Ciphertext]) -> Self::Ciphertext;
     fn agg_key(ks: &[Self::Key]) -> Self::AggKey;
 }
 
-/// Public matrix-form parameters. `a_matrix_ntt` is `μ × κ`. `sk_bound` is
-/// the KAHE secret-key infinity-norm bound (Lemma 8 `β`).
+/// Public parameters. `a_matrix_ntt` is `μ × κ` (NTT-resident). `t_modulus`
+/// is the plaintext modulus; both `sigma_s` (key) and `sigma_e` (error) are
+/// Gaussian standard deviations.
 pub struct KaheParams {
-    pub a_matrix_ntt: Vec<Vec<HVCNTTPoly>>,
+    pub a_matrix_ntt: Vec<Vec<KaheNTTPoly>>,
     pub mu_kahe: usize,
     pub kappa_kahe: usize,
-    pub sk_bound: u32,
+    pub sigma_s: f64,
+    pub sigma_e: f64,
+    pub t_modulus: u32,
 }
 
-/// Pad-expansion + OTP-style enc/dec primitive. Key-agnostic: callers supply
-/// the seed as a raw `&[HVCPoly]`. Reads only the pad-shape fields of
-/// [`KaheParams`] (`a_matrix_ntt`, dims); ignores `sk_bound`.
-pub struct RingOtp;
-
-impl RingOtp {
-    pub fn expand(pp: &KaheParams, sk: &[HVCPoly]) -> Vec<HVCPoly> {
-        debug_assert_eq!(sk.len(), pp.kappa_kahe);
-        matvec(&pp.a_matrix_ntt, sk)
-    }
-
-    /// `c = m + expand(sk)`.
-    pub fn enc(pp: &KaheParams, sk: &[HVCPoly], m: &[HVCPoly]) -> Vec<HVCPoly> {
-        debug_assert_eq!(m.len(), pp.mu_kahe);
-        let pad = Self::expand(pp, sk);
-        vec_add(m, &pad)
-    }
-
-    /// `m = c − expand(sk)`.
-    pub fn dec(pp: &KaheParams, sk: &[HVCPoly], c: &[HVCPoly]) -> Vec<HVCPoly> {
-        debug_assert_eq!(c.len(), pp.mu_kahe);
-        let pad = Self::expand(pp, sk);
-        vec_sub(c, &pad)
-    }
-}
-
-/// A *fresh* KAHE key — short (`‖·‖∞ ≤ β`), sampled by [`KaheScheme::gen`].
-/// Only valid input to [`KaheScheme::enc`].
+/// A *fresh* KAHE key — discrete Gaussian over `R^κ`. Only valid input to
+/// [`KaheScheme::enc`].
 #[derive(Clone)]
-pub struct KaheKey(Vec<HVCPoly>);
+pub struct KaheKey(Vec<KahePoly>);
 
 impl KaheKey {
-    pub(crate) fn inner(&self) -> &[HVCPoly] {
+    pub(crate) fn inner(&self) -> &[KahePoly] {
         &self.0
     }
-    /// Component-wise access for the SSS bridge in the protocol layer.
-    pub(crate) fn component(&self, k: usize) -> &HVCPoly {
+    pub(crate) fn component(&self, k: usize) -> &KahePoly {
         &self.0[k]
     }
 }
 
-/// An aggregate KAHE key — element of `R_q^κ`, output of
+/// Aggregate KAHE key — element of `R_{q_kahe}^κ`, output of
 /// [`KaheScheme::agg_key`] or constructed by the verifier via
-/// [`KaheAggKey::from_components`] after Shamir interpolation. Only valid input
-/// to [`KaheScheme::dec`] on an aggregated ciphertext.
+/// [`KaheAggKey::from_components`] after Shamir interpolation (and the
+/// HVC→KAHE bridge). Only valid input to [`KaheScheme::dec`].
 #[derive(Clone)]
-pub struct KaheAggKey(Vec<HVCPoly>);
+pub struct KaheAggKey(Vec<KahePoly>);
 
 impl KaheAggKey {
-    pub(crate) fn inner(&self) -> &[HVCPoly] {
+    pub(crate) fn inner(&self) -> &[KahePoly] {
         &self.0
     }
-    /// Construct from per-component polys (one per `κ_kahe` slot). Used by
-    /// `protocol::verify` to wrap the Shamir-interpolated aggregate key.
-    pub fn from_components(components: Vec<HVCPoly>) -> Self {
+    pub fn from_components(components: Vec<KahePoly>) -> Self {
         Self(components)
     }
 }
 
-fn matvec(a_matrix_ntt: &[Vec<HVCNTTPoly>], sk: &[HVCPoly]) -> Vec<HVCPoly> {
-    let sk_ntt: Vec<HVCNTTPoly> = sk.iter().map(HVCNTTPoly::from).collect();
+/// Sample a single discrete-Gaussian-rounded polynomial coefficient.
+/// Round-to-nearest-integer applied to a continuous Gaussian; clamped at the
+/// 8σ tail (Willow's convention).
+fn sample_dg<R: Rng>(rng: &mut R, sigma: f64) -> i32 {
+    let normal = Normal::new(0.0, sigma).expect("σ > 0");
+    let tail = (8.0 * sigma).ceil() as i32;
+    loop {
+        let x = normal.sample(rng).round() as i32;
+        if x.abs() <= tail {
+            return x;
+        }
+    }
+}
+
+fn sample_dg_poly<R: Rng>(rng: &mut R, sigma: f64) -> KahePoly {
+    let mut coeffs = [0i32; N];
+    for c in coeffs.iter_mut() {
+        *c = sample_dg(rng, sigma);
+    }
+    KahePoly::from_coeffs(coeffs)
+}
+
+fn matvec(a_matrix_ntt: &[Vec<KaheNTTPoly>], sk: &[KahePoly]) -> Vec<KahePoly> {
+    let sk_ntt: Vec<KaheNTTPoly> = sk.iter().map(KaheNTTPoly::from).collect();
     a_matrix_ntt
         .iter()
-        .map(|row| HVCPoly::from(&pointwise_dot(row, &sk_ntt)))
+        .map(|row| KahePoly::from(&pointwise_dot_kahe(row, &sk_ntt)))
         .collect()
 }
 
-fn vec_add(a: &[HVCPoly], b: &[HVCPoly]) -> Vec<HVCPoly> {
+fn vec_add(a: &[KahePoly], b: &[KahePoly]) -> Vec<KahePoly> {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(x, y)| *x + *y).collect()
 }
 
-fn vec_sub(a: &[HVCPoly], b: &[HVCPoly]) -> Vec<HVCPoly> {
+fn vec_sub(a: &[KahePoly], b: &[KahePoly]) -> Vec<KahePoly> {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(x, y)| *x - *y).collect()
 }
 
-fn vec_zero(len: usize) -> Vec<HVCPoly> {
-    vec![HVCPoly::default(); len]
+fn vec_zero(len: usize) -> Vec<KahePoly> {
+    vec![KahePoly::default(); len]
 }
 
-/// The KAHE scheme used by flashnet. Built on [`RingOtp`] with short-key
-/// `Gen`, type-separated fresh / aggregate keys, and a Shamir `recover_key`.
+/// In-place: each coefficient of `poly` becomes `poly[i] · t` (mod q via
+/// KahePoly's add semantics — caller's responsibility to keep within range).
+/// Widened to i64 to support t up to ~2^19 at q ≈ 2^30.
+fn scale_poly(poly: &KahePoly, scale: i32) -> KahePoly {
+    let mut coeffs = [0i32; N];
+    let q = chipmunk_code::KAHE_MODULUS as i64;
+    for (out, &c) in coeffs.iter_mut().zip(poly.coeffs().iter()) {
+        let prod = (c as i64) * (scale as i64) % q;
+        *out = prod as i32;
+    }
+    let mut p = KahePoly::from_coeffs(coeffs);
+    p.normalize();
+    p
+}
+
+/// Reduce one (centered) integer coefficient mod `t` to centered range
+/// `[-t/2, t/2)`.
+fn reduce_centered(x: i32, t: i32) -> i32 {
+    let r = x.rem_euclid(t);
+    let half = t / 2;
+    if r >= half { r - t } else { r }
+}
+
+/// Reduce a polynomial coefficient-wise mod `t` (centered).
+///
+/// Crucially uses `normalize()` (centered `[-q/2, q/2]`) and not `lift()`
+/// (which puts coefficients in `[0, q)` and would skew the mod-t residue
+/// whenever `q ≢ 0 (mod t)`).
+fn poly_mod_t(poly: &KahePoly, t: u32) -> KahePoly {
+    let mut p = *poly;
+    p.normalize();
+    let t_i = t as i32;
+    let mut coeffs = [0i32; N];
+    for (out, &c) in coeffs.iter_mut().zip(p.coeffs().iter()) {
+        *out = reduce_centered(c, t_i);
+    }
+    KahePoly::from_coeffs(coeffs)
+}
+
+// ---------------------------------------------------------------
+// Bridge: HVC ↔ KAHE via centered-representative re-interpretation
+// ---------------------------------------------------------------
+
+/// Lift an `HVCPoly` (centered repr in `[-q_cs/2, q_cs/2]`) into a `KahePoly`
+/// at q_kahe by reinterpreting coefficients as signed integers. Lossless iff
+/// `‖input‖_∞ ≤ q_cs/2`, which holds for Shamir-recovered sums of small
+/// Gaussian keys (`‖Σ sk‖_∞ ≪ q_cs/2` at any realistic n_clients).
+pub fn lift_hvc_to_kahe(p: &HVCPoly) -> KahePoly {
+    let mut q = *p;
+    q.normalize();
+    debug_assert!(
+        q.coeffs().iter().all(|&c| c.abs() <= HVC_MODULUS_OVER_TWO),
+        "lift_hvc_to_kahe: input not centered after normalize()"
+    );
+    KahePoly::from_signed_coeffs(q.coeffs())
+}
+
+/// Reduce a small `KahePoly` (intended for a fresh KAHE secret key — Gaussian
+/// σ_s ≈ 4.5, `‖·‖_∞ ≤ 8σ_s ≈ 36`) into an `HVCPoly` by centered-rep
+/// re-interpretation. Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client
+/// side to feed Shamir sharing, which operates over `R_{q_cs}`.
+pub fn kahe_to_hvc_centered(p: &KahePoly) -> HVCPoly {
+    let mut q = *p;
+    q.normalize();
+    debug_assert!(
+        q.coeffs().iter().all(|&c| c.abs() <= HVC_MODULUS_OVER_TWO),
+        "kahe_to_hvc_centered: coefficient magnitude exceeds q_cs/2 = {} \
+         (callers must only bridge small Gaussian-bounded values)",
+        HVC_MODULUS_OVER_TWO
+    );
+    HVCPoly::from_coeffs(*q.coeffs())
+}
+
 pub struct Kahe;
 
 impl Kahe {
-    /// Setup with explicit dimensions. `(μ, κ, β)` must jointly satisfy
-    /// Lemma 8 for the target ρ and λ; this constructor does not check.
+    /// Setup with explicit dimensions and Willow-style Gaussian widths.
+    /// `sigma_s` = key std, `sigma_e` = error std. Defaults match Willow:
+    /// `sigma_s = 4.5`, `sigma_e = √2 · sigma_s ≈ 6.36`.
     pub fn setup_with_dims<R: Rng>(
         rng: &mut R,
         mu_kahe: usize,
         kappa_kahe: usize,
-        sk_bound: u32,
+        sigma_s: f64,
+        sigma_e: f64,
+        t_modulus: u32,
     ) -> KaheParams {
         assert!(mu_kahe >= 1, "μ_kahe must be ≥ 1");
         assert!(kappa_kahe >= 1, "κ_kahe must be ≥ 1");
-        let a_matrix_ntt: Vec<Vec<HVCNTTPoly>> = (0..mu_kahe)
+        assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
+        let a_matrix_ntt: Vec<Vec<KaheNTTPoly>> = (0..mu_kahe)
             .map(|_| {
                 (0..kappa_kahe)
-                    .map(|_| HVCNTTPoly::from(&HVCPoly::rand_poly(rng)))
+                    .map(|_| KaheNTTPoly::from(&KahePoly::rand_poly(rng)))
                     .collect()
             })
             .collect();
@@ -156,43 +248,66 @@ impl Kahe {
             a_matrix_ntt,
             mu_kahe,
             kappa_kahe,
-            sk_bound,
+            sigma_s,
+            sigma_e,
+            t_modulus,
         }
     }
 }
+
+/// Willow defaults at q_kahe = 1_073_738_753.
+pub const SIGMA_S_DEFAULT: f64 = 4.5;
+pub const SIGMA_E_DEFAULT: f64 = 6.363_961_030_678_928; // √2 · 4.5
+/// 2^18 — gives 18 bits of plaintext per coefficient at ρ ≤ 300, with margin.
+pub const T_MODULUS_DEFAULT: u32 = 262_144;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
     type Key = KaheKey;
     type AggKey = KaheAggKey;
-    type Message = Vec<HVCPoly>;
-    type Ciphertext = Vec<HVCPoly>;
+    type Message = Vec<KahePoly>;
+    type Ciphertext = Vec<KahePoly>;
 
-    /// Default-dimension setup: `(μ, κ, β) = (1, 6, 64)` — satisfies Lemma 8
-    /// at λ=128 for ρ ≤ 2²⁰ with the chipmunk HVC modulus.
+    /// `(μ, κ) = (1, 5)`, Willow Gaussian widths, `t = 2^18` —
+    /// budget covers ρ ≤ ~300 at q_kahe = 1_073_738_753.
+    /// κ_kahe=5 spans the Shamir share-vector across 5 components per CS opening.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
-        Self::setup_with_dims(rng, 1, 6, 64)
+        Self::setup_with_dims(rng, 1, 5, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }
 
     fn gen<R: Rng>(rng: &mut R, pp: &KaheParams) -> KaheKey {
-        // Short low-norm secret: each component has coefficients in [-sk_bound, sk_bound].
         let polys = (0..pp.kappa_kahe)
-            .map(|_| HVCPoly::rand_mod_p(rng, pp.sk_bound))
+            .map(|_| sample_dg_poly(rng, pp.sigma_s))
             .collect();
         KaheKey(polys)
     }
 
-    fn enc(pp: &KaheParams, k: &KaheKey, m: &Vec<HVCPoly>) -> Vec<HVCPoly> {
+    /// `c = m + A·sk + t·e`, with `e ← D_{σ_e}^μ`.
+    fn enc<R: Rng>(rng: &mut R, pp: &KaheParams, k: &KaheKey, m: &Vec<KahePoly>) -> Vec<KahePoly> {
         debug_assert_eq!(k.inner().len(), pp.kappa_kahe);
-        RingOtp::enc(pp, k.inner(), m)
+        debug_assert_eq!(m.len(), pp.mu_kahe);
+        let pad = matvec(&pp.a_matrix_ntt, k.inner());
+        let t = pp.t_modulus as i32;
+        let mut out = Vec::with_capacity(pp.mu_kahe);
+        for i in 0..pp.mu_kahe {
+            let e = sample_dg_poly(rng, pp.sigma_e);
+            let te = scale_poly(&e, t);
+            // m + A·sk + t·e
+            out.push(m[i] + pad[i] + te);
+        }
+        out
     }
 
-    fn dec(pp: &KaheParams, c: &Vec<HVCPoly>, k: &KaheAggKey) -> Vec<HVCPoly> {
+    /// `((c − A·sk) mod q_kahe) reduced mod t`, coefficient-wise centered.
+    fn dec(pp: &KaheParams, c: &Vec<KahePoly>, k: &KaheAggKey) -> Vec<KahePoly> {
         debug_assert_eq!(k.inner().len(), pp.kappa_kahe);
-        RingOtp::dec(pp, k.inner(), c)
+        debug_assert_eq!(c.len(), pp.mu_kahe);
+        let pad = matvec(&pp.a_matrix_ntt, k.inner());
+        let raw = vec_sub(c, &pad);
+        raw.iter().map(|p| poly_mod_t(p, pp.t_modulus)).collect()
     }
 
-    fn agg_ctxt(cs: &[Vec<HVCPoly>]) -> Vec<HVCPoly> {
+    fn agg_ctxt(cs: &[Vec<KahePoly>]) -> Vec<KahePoly> {
         if cs.is_empty() {
             return Vec::new();
         }
@@ -212,20 +327,35 @@ impl KaheScheme for Kahe {
     }
 }
 
+// Suppress unused warning for re-exported KAHE_MODULUS_OVER_TWO consumers
+// (used by bridge debug assertions transitively).
+const _: i32 = KAHE_MODULUS_OVER_TWO;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
+    /// Random message with coefficients centered in `[-t/2, t/2)`.
+    fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {
+        let half = t / 2;
+        let mut coeffs = [0i32; N];
+        for c in coeffs.iter_mut() {
+            *c = (rng.gen_range(0..t) as i32) - half as i32;
+        }
+        KahePoly::from_coeffs(coeffs)
+    }
+
     #[test]
     fn round_trip() {
         let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
         let pp = Kahe::setup(&mut rng);
         let k = Kahe::gen(&mut rng, &pp);
-        let m: Vec<HVCPoly> = (0..pp.mu_kahe).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
-        let c = Kahe::enc(&pp, &k, &m);
-        // Dec takes an AggKey; a single fresh key lifts via agg_key([k]).
+        let m: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+            .collect();
+        let c = Kahe::enc(&mut rng, &pp, &k, &m);
         let agg = Kahe::agg_key(std::slice::from_ref(&k));
         assert_eq!(Kahe::dec(&pp, &c, &agg), m);
     }
@@ -236,26 +366,31 @@ mod tests {
         let pp = Kahe::setup(&mut rng);
         let n = 5;
         let keys: Vec<KaheKey> = (0..n).map(|_| Kahe::gen(&mut rng, &pp)).collect();
-        let msgs: Vec<Vec<HVCPoly>> = (0..n)
-            .map(|_| (0..pp.mu_kahe).map(|_| HVCPoly::rand_poly(&mut rng)).collect())
+        let msgs: Vec<Vec<KahePoly>> = (0..n)
+            .map(|_| {
+                (0..pp.mu_kahe)
+                    .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+                    .collect()
+            })
             .collect();
-        let ctxts: Vec<Vec<HVCPoly>> = keys
+        let ctxts: Vec<Vec<KahePoly>> = keys
             .iter()
             .zip(&msgs)
-            .map(|(k, m)| Kahe::enc(&pp, k, m))
+            .map(|(k, m)| Kahe::enc(&mut rng, &pp, k, m))
             .collect();
 
         let agg_c = Kahe::agg_ctxt(&ctxts);
         let agg_k = Kahe::agg_key(&keys);
-        let agg_m_expected: Vec<HVCPoly> = (0..pp.mu_kahe)
-            .map(|i| msgs.iter().fold(HVCPoly::default(), |a, x| a + x[i]))
+        let agg_m_expected: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|i| {
+                let summed = msgs.iter().fold(KahePoly::default(), |a, x| a + x[i]);
+                poly_mod_t(&summed, pp.t_modulus)
+            })
             .collect();
 
         assert_eq!(Kahe::dec(&pp, &agg_c, &agg_k), agg_m_expected);
     }
 
-    /// Shamir-interpolated aggregate key (the `verify.rs` path) decrypts the
-    /// single-client ciphertext correctly.
     #[test]
     fn shamir_recovered_agg_key_round_trip() {
         use crate::sss::{ShamirParams, ShamirSharing};
@@ -267,33 +402,78 @@ mod tests {
         let shamir = ShamirParams::new(t, n_servers);
         let k = Kahe::gen(&mut rng, &pp);
 
-        // Shamir-share each component, then interpolate from the first t
-        // servers — exactly what verify.rs does.
-        let recovered_components: Vec<HVCPoly> = (0..pp.kappa_kahe)
+        // Shamir runs over HVCPoly (R_{q_cs}). Bridge KAHE → HVC for shares,
+        // recover at q_cs, bridge HVC → KAHE for decryption.
+        let recovered_components: Vec<KahePoly> = (0..pp.kappa_kahe)
             .map(|c| {
-                let shares = ShamirSharing::share(&mut rng, &shamir, k.component(c));
-                let samples: Vec<(usize, HVCPoly)> =
-                    (0..t).map(|i| (i, shares[i])).collect();
-                ShamirSharing::recover(&shamir, &samples)
+                let secret_hvc = kahe_to_hvc_centered(k.component(c));
+                let shares = ShamirSharing::share(&mut rng, &shamir, &secret_hvc);
+                let samples: Vec<(usize, HVCPoly)> = (0..t).map(|i| (i, shares[i])).collect();
+                let recovered_hvc = ShamirSharing::recover(&shamir, &samples);
+                lift_hvc_to_kahe(&recovered_hvc)
             })
             .collect();
         let agg = KaheAggKey::from_components(recovered_components);
 
-        let m: Vec<HVCPoly> = (0..pp.mu_kahe).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
-        let c = Kahe::enc(&pp, &k, &m);
+        let m: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+            .collect();
+        let c = Kahe::enc(&mut rng, &pp, &k, &m);
         assert_eq!(Kahe::dec(&pp, &c, &agg), m);
     }
 
-    /// `RingOtp::enc` / `dec` directly (no Key newtypes) round-trips on a raw seed.
+    /// Aggregating ρ=200 ciphertexts decrypts to `Σm mod t` at the default
+    /// parameters (sanity check for the noise budget at the bench operating point).
     #[test]
-    fn ring_otp_raw_round_trip() {
-        let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
-        let pp = Kahe::setup_with_dims(&mut rng, 1, 6, 64);
-        let sk: Vec<HVCPoly> = (0..pp.kappa_kahe)
-            .map(|_| HVCPoly::rand_mod_p(&mut rng, pp.sk_bound))
+    fn aggregate_200_decrypts() {
+        let mut rng = ChaCha20Rng::from_seed([29u8; 32]);
+        let pp = Kahe::setup(&mut rng);
+        let n = 200;
+        let keys: Vec<KaheKey> = (0..n).map(|_| Kahe::gen(&mut rng, &pp)).collect();
+        let msgs: Vec<Vec<KahePoly>> = (0..n)
+            .map(|_| {
+                (0..pp.mu_kahe)
+                    .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+                    .collect()
+            })
             .collect();
-        let m: Vec<HVCPoly> = (0..pp.mu_kahe).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
-        let c = RingOtp::enc(&pp, &sk, &m);
-        assert_eq!(RingOtp::dec(&pp, &sk, &c), m);
+        let ctxts: Vec<Vec<KahePoly>> = keys
+            .iter()
+            .zip(&msgs)
+            .map(|(k, m)| Kahe::enc(&mut rng, &pp, k, m))
+            .collect();
+
+        let agg_c = Kahe::agg_ctxt(&ctxts);
+        let agg_k = Kahe::agg_key(&keys);
+        let agg_m_expected: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|i| {
+                let summed = msgs.iter().fold(KahePoly::default(), |a, x| a + x[i]);
+                poly_mod_t(&summed, pp.t_modulus)
+            })
+            .collect();
+        assert_eq!(Kahe::dec(&pp, &agg_c, &agg_k), agg_m_expected);
+    }
+
+    #[test]
+    fn bridge_round_trip_small_values() {
+        // Realistic Shamir-recovered range: |coef| ≤ N_clients · 8σ_s ≈ 3600.
+        let mut rng = ChaCha20Rng::from_seed([41u8; 32]);
+        for _ in 0..50 {
+            let mut coeffs = [0i32; N];
+            for c in coeffs.iter_mut() {
+                *c = rng.gen_range(-3600i32..=3600);
+            }
+            let hvc = HVCPoly::from_coeffs(coeffs);
+            let kahe = lift_hvc_to_kahe(&hvc);
+            // The lift preserves centered representatives for small inputs.
+            for (a, b) in hvc.coeffs().iter().zip(kahe.coeffs().iter()) {
+                assert_eq!(*a, *b);
+            }
+            // Round trip via kahe_to_hvc_centered.
+            let back = kahe_to_hvc_centered(&kahe);
+            for (a, b) in hvc.coeffs().iter().zip(back.coeffs().iter()) {
+                assert_eq!(*a, *b);
+            }
+        }
     }
 }

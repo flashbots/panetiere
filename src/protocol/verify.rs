@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
-use chipmunk_code::HVCPoly;
+use chipmunk_code::{HVCPoly, KahePoly};
 
 use crate::bulletin::{ClientPublic, ServerPublic};
 use crate::cs::{Cs, HidingMerkleCommitment};
-use crate::kahe::{Kahe, KaheAggKey, KaheScheme};
+use crate::kahe::{lift_hvc_to_kahe, Kahe, KaheAggKey, KaheScheme};
 use crate::sss::ShamirSharing;
 
 use super::message::{ClientId, ServerId};
@@ -32,7 +32,7 @@ pub fn aggregate_and_decrypt(
     canonical: &[ClientId],
     publics: &[(ClientId, ClientPublic)],
     server_outputs: &[ServerPublic],
-) -> Result<Vec<HVCPoly>, VerifyError> {
+) -> Result<Vec<KahePoly>, VerifyError> {
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
@@ -65,7 +65,7 @@ pub fn aggregate_and_decrypt(
         .map(|(i, (cid, _))| (*cid, i))
         .collect();
 
-    let mut ctxts: Vec<Vec<HVCPoly>> = Vec::with_capacity(canonical.len());
+    let mut ctxts: Vec<Vec<KahePoly>> = Vec::with_capacity(canonical.len());
     let mut comms = Vec::with_capacity(canonical.len());
     for cid in canonical {
         let i = *pub_index
@@ -93,15 +93,17 @@ pub fn aggregate_and_decrypt(
     }
 
     // Lagrange-interpolate each KAHE key component from the first `t`
-    // servers' summed Shamir shares, then wrap into a `KaheAggKey`.
-    let recovered_components: Vec<HVCPoly> = (0..kappa_kahe)
+    // servers' summed Shamir shares (R_{q_cs}), then bridge each into
+    // R_{q_kahe} via centered-rep lift before wrapping as `KaheAggKey`.
+    let recovered_components: Vec<KahePoly> = (0..kappa_kahe)
         .map(|k| {
             let samples: Vec<(usize, HVCPoly)> = server_outputs
                 .iter()
                 .take(t)
                 .map(|sp| (sp.server_id.0 as usize, sp.agg_share[k]))
                 .collect();
-            ShamirSharing::recover(&pp.shamir, &samples)
+            let recovered_hvc = ShamirSharing::recover(&pp.shamir, &samples);
+            lift_hvc_to_kahe(&recovered_hvc)
         })
         .collect();
     let agg_key = KaheAggKey::from_components(recovered_components);

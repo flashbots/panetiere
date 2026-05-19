@@ -6,7 +6,7 @@ pub mod verify;
 use rand::Rng;
 
 use crate::cs::{Cs, HidingMerkleCommitment};
-use crate::kahe::{Kahe, KaheParams, KaheScheme};
+use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::sss::ShamirParams;
 
 /// Bundle of public parameters carried through one protocol session.
@@ -35,28 +35,38 @@ impl ProtocolParams {
         Self { kahe, cs, shamir }
     }
 
-    /// Setup with explicit KAHE dimensions `(μ, κ)` (β=64) and threshold
-    /// `t = max(⌊n/2⌋ + 1, n − 2)`. CS μ_cs is coupled to κ_kahe.
+    /// Explicit KAHE dimensions `(μ, κ)` with Willow defaults
+    /// (`σ_s = 4.5`, `σ_e = √2·σ_s`, `t_modulus = 64`).
     pub fn setup_with_kahe_dims<R: Rng>(
         rng: &mut R,
         n_servers: usize,
         mu_kahe: usize,
         kappa_kahe: usize,
     ) -> Self {
-        Self::setup_with_kahe_dims_beta(rng, n_servers, mu_kahe, kappa_kahe, 64)
+        Self::setup_with_kahe_dims_full(
+            rng,
+            n_servers,
+            mu_kahe,
+            kappa_kahe,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        )
     }
 
-    /// Setup with explicit KAHE dimensions `(μ, κ, β)` and threshold
-    /// `t = max(⌊n/2⌋ + 1, n − 2)`. CS μ_cs is coupled to κ_kahe.
-    pub fn setup_with_kahe_dims_beta<R: Rng>(
+    /// Explicit KAHE dimensions and Gaussian / plaintext-modulus parameters.
+    /// Threshold `t = max(⌊n/2⌋ + 1, n − 2)`. CS μ_cs is coupled to κ_kahe.
+    pub fn setup_with_kahe_dims_full<R: Rng>(
         rng: &mut R,
         n_servers: usize,
         mu_kahe: usize,
         kappa_kahe: usize,
-        sk_bound: u32,
+        sigma_s: f64,
+        sigma_e: f64,
+        t_modulus: u32,
     ) -> Self {
         let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
-        let kahe = Kahe::setup_with_dims(rng, mu_kahe, kappa_kahe, sk_bound);
+        let kahe = Kahe::setup_with_dims(rng, mu_kahe, kappa_kahe, sigma_s, sigma_e, t_modulus);
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 8);
         let shamir = ShamirParams::new(t, n_servers);
         Self { kahe, cs, shamir }

@@ -1,14 +1,41 @@
-use chipmunk_code::{HVCPoly, Polynomial};
+use chipmunk_code::{HVCPoly, KahePoly, Polynomial, N};
 use flashnet::codec;
 use flashnet::protocol::client::run_client_round;
 use flashnet::protocol::message::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPoly, HVCPoly) {
+/// Sample a polynomial with coefficients centered in `[-t/2, t/2)` —
+/// matches the KAHE plaintext space `R_t`.
+fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {
+    let half = t as i32 / 2;
+    let mut coeffs = [0i32; N];
+    for c in coeffs.iter_mut() {
+        *c = (rng.gen_range(0..t) as i32) - half;
+    }
+    KahePoly::from_coeffs(coeffs)
+}
+
+/// Reduce each coefficient of `poly` mod `t` into centered range — used to
+/// compute the expected aggregate decryption (`Σm mod t`). Uses `normalize`
+/// (centered `[-q/2, q/2]`) so the mod-t residue isn't skewed by `q mod t`.
+fn reduce_centered_mod_t(poly: KahePoly, t: u32) -> KahePoly {
+    let mut p = poly;
+    p.normalize();
+    let t_i = t as i32;
+    let half = t_i / 2;
+    let mut coeffs = [0i32; N];
+    for (out, &c) in coeffs.iter_mut().zip(p.coeffs().iter()) {
+        let r = c.rem_euclid(t_i);
+        *out = if r >= half { r - t_i } else { r };
+    }
+    KahePoly::from_coeffs(coeffs)
+}
+
+fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePoly, KahePoly) {
     let pp = ProtocolParams::setup(rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
@@ -24,7 +51,7 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPol
         .collect();
 
     for &cid in &client_ids {
-        let m = HVCPoly::rand_poly(rng);
+        let m = rand_message_poly(rng, pp.kahe.t_modulus);
         messages.push(m);
         let round = run_client_round(rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
@@ -44,10 +71,13 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPol
         .expect("verify failed");
     assert_eq!(recovered.len(), pp.kahe.mu_kahe);
 
-    let expected = messages
-        .iter()
-        .copied()
-        .fold(HVCPoly::default(), |a, x| a + x);
+    let expected = reduce_centered_mod_t(
+        messages
+            .iter()
+            .copied()
+            .fold(KahePoly::default(), |a, x| a + x),
+        pp.kahe.t_modulus,
+    );
     (expected, recovered[0])
 }
 
@@ -55,6 +85,10 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (HVCPol
 /// of a single `HVCPoly`. The protocol's recovered sum decodes back to a
 /// 1024-byte buffer with each client's bytes intact in its own slot — i.e.
 /// anonymous broadcast in slot mode.
+///
+/// After the q_kahe decoupling, `t = T_MODULUS_DEFAULT = 262_144` (≥ 2^16),
+/// so the codec's 16-bit-per-coefficient layout fits inside the plaintext
+/// modulus without further reworking.
 #[test]
 fn slot_mode_disjoint_clients_recover_each_payload() {
     let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
@@ -93,7 +127,7 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         buf[start..start + payload.len()].copy_from_slice(payload);
 
         let polys = codec::encode_raw(&buf);
-        assert_eq!(polys.len(), 1, "slot buffer sized to one HVCPoly");
+        assert_eq!(polys.len(), 1, "slot buffer sized to one KahePoly");
 
         let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
         publics.push((round.client_id, round.public));
@@ -137,6 +171,7 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
 /// writes a 2 KB payload into its own slot; we run the full protocol once per
 /// poly index of the encoded buffer (8 sub-rounds), recover the per-poly sums,
 /// concatenate, and assert each client's slot decodes byte-for-byte.
+///
 #[test]
 fn slot_mode_8kb_message_multi_poly() {
     let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
@@ -159,7 +194,7 @@ fn slot_mode_8kb_message_multi_poly() {
         buffers.push(buf);
     }
 
-    let encoded: Vec<Vec<HVCPoly>> = buffers
+    let encoded: Vec<Vec<KahePoly>> = buffers
         .iter()
         .map(|b| {
             let polys = flashnet::codec::encode_raw(b);
@@ -241,7 +276,7 @@ fn tampered_agg_share_rejected() {
         })
         .collect();
     for &cid in &client_ids {
-        let m = HVCPoly::rand_poly(&mut rng);
+        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
         for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
@@ -282,7 +317,7 @@ fn high_norm_r_rejected_in_protocol() {
         })
         .collect();
     for &cid in &client_ids {
-        let m = HVCPoly::rand_poly(&mut rng);
+        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
         for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
@@ -337,7 +372,7 @@ fn recovers_from_t_of_n_servers() {
         })
         .collect();
     for &cid in &client_ids {
-        let m = HVCPoly::rand_poly(&mut rng);
+        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         messages.push(m);
         let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
         publics.push((round.client_id, round.public));
@@ -352,10 +387,13 @@ fn recovers_from_t_of_n_servers() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let expected = messages
-        .iter()
-        .copied()
-        .fold(HVCPoly::default(), |a, x| a + x);
+    let expected = reduce_centered_mod_t(
+        messages
+            .iter()
+            .copied()
+            .fold(KahePoly::default(), |a, x| a + x),
+        pp.kahe.t_modulus,
+    );
 
     // Pick any t outputs and verify decryption succeeds.
     for &chosen in &[

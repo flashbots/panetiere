@@ -18,7 +18,8 @@
 //! Tip: keep ITERS low under callgrind (it adds ~50× overhead). For perf
 //! sampling, push ITERS to 100+ to dilute startup noise.
 
-use chipmunk_code::{HVCPoly, Polynomial};
+use chipmunk_code::KahePoly;
+use rand::Rng;
 use flashnet::protocol::client::run_client_round;
 use flashnet::protocol::message::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
@@ -26,6 +27,15 @@ use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+
+fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {
+    let half = t as i32 / 2;
+    let mut coeffs = [0i32; chipmunk_code::N];
+    for c in coeffs.iter_mut() {
+        *c = (rng.gen_range(0..t) as i32) - half;
+    }
+    KahePoly::from_coeffs(coeffs)
+}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -40,19 +50,27 @@ fn main() {
     let iters = env_usize("PROFILE_ITERS", 10);
     let mu = env_usize("PROFILE_MU", 0);
     let kappa = env_usize("PROFILE_KAPPA", 0);
-    let beta = env_usize("PROFILE_BETA", 0) as u32;
+    let t_modulus = env_usize("PROFILE_T", 0) as u32;
 
     let mut rng = ChaCha20Rng::from_seed([(s as u8).wrapping_mul(7) ^ n as u8; 32]);
-    let pp = if mu > 0 && kappa > 0 && beta > 0 {
-        ProtocolParams::setup_with_kahe_dims_beta(&mut rng, s, mu, kappa, beta)
+    let pp = if mu > 0 && kappa > 0 && t_modulus > 0 {
+        ProtocolParams::setup_with_kahe_dims_full(
+            &mut rng, s, mu, kappa,
+            flashnet::kahe::SIGMA_S_DEFAULT,
+            flashnet::kahe::SIGMA_E_DEFAULT,
+            t_modulus,
+        )
+    } else if mu > 0 && kappa > 0 {
+        ProtocolParams::setup_with_kahe_dims(&mut rng, s, mu, kappa)
     } else {
         ProtocolParams::setup(&mut rng, s)
     };
 
     eprintln!(
-        "profile: S={} N={} iters={} (μ_kahe={}, κ_kahe={}, μ_cs={}, β={}, t={})",
+        "profile: S={} N={} iters={} (μ_kahe={}, κ_kahe={}, μ_cs={}, σ_s={:.3}, σ_e={:.3}, t={}, threshold={})",
         s, n, iters,
-        pp.kahe.mu_kahe, pp.kahe.kappa_kahe, pp.cs.mu_cs, pp.kahe.sk_bound, pp.shamir.t
+        pp.kahe.mu_kahe, pp.kahe.kappa_kahe, pp.cs.mu_cs,
+        pp.kahe.sigma_s, pp.kahe.sigma_e, pp.kahe.t_modulus, pp.shamir.t
     );
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
@@ -68,8 +86,8 @@ fn main() {
             })
             .collect();
         for &cid in &client_ids {
-            let m: Vec<HVCPoly> = (0..pp.kahe.mu_kahe)
-                .map(|_| HVCPoly::rand_poly(&mut rng))
+            let m: Vec<KahePoly> = (0..pp.kahe.mu_kahe)
+                .map(|_| rand_message_poly(&mut rng, pp.kahe.t_modulus))
                 .collect();
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
             publics.push((round.client_id, round.public));

@@ -33,19 +33,11 @@
 //! freshly computed parent. Finally it walks the stored chipmunk path above
 //! the block.
 
-use std::cell::RefCell;
-
 use chipmunk_code::{
     pointwise_dot, pointwise_sum_polys, HVCHash, HVCNTTPoly, HVCPoly, Polynomial, Tree,
     HVC_MODULUS, HVC_WIDTH, N as POLY_N,
 };
 use rand::Rng;
-
-thread_local! {
-    /// Reusable accumulator for [`HidingMerkleCommitment::sum_openings`]. Avoids
-    /// re-allocating ~600 KB per call (the dominant memmove source before).
-    static SUM_OPENING_ACC: RefCell<Vec<[i32; POLY_N]>> = const { RefCell::new(Vec::new()) };
-}
 
 pub trait Cs {
     type Params;
@@ -224,7 +216,9 @@ impl HidingMerkleCommitment {
     ) -> CsParams {
         assert!(mu_cs >= 1, "μ_cs must be ≥ 1");
         assert!(kappa_cs >= 1, "κ_cs must be ≥ 1");
-        let r_bound = 64;
+        // β_agg bound on aggregated CS randomness ∞-norm. Sized so
+        // 2·r_bound ≪ q_cs and supports N_clients ≤ 512 worst-case.
+        let r_bound = 512;
         let r_half_weight = 1;
         let a_ntt: Vec<HVCNTTPoly> = (0..kappa_cs)
             .map(|_| HVCNTTPoly::from(&HVCPoly::rand_poly(rng)))
@@ -463,64 +457,351 @@ impl Cs for HidingMerkleCommitment {
             debug_assert_eq!(o.data.len(), total);
         }
 
-        // One contiguous accumulator. Layout matches `Opening::data` exactly,
-        // so we can stream each opening's coefficients straight in. Opening-
-        // major loop keeps reads sequential per opening. The i32 accumulator
-        // suffices: each input coeff is in (-q/2, q/2] and we sum at most ρ
-        // of them; ρ·q/2 fits in i32 for ρ up to ~21000.
+        // Allocate the output Box up front and accumulate directly into its
+        // coefficients. This avoids the previous acc → output transcription
+        // (~1.2 MB of memcpy per call) and the thread-local accumulator.
         //
-        // Backing storage is thread-local; we resize/zero in place so a hot
-        // server only pays the ~600 KB malloc once per thread.
-        SUM_OPENING_ACC.with(|cell| {
-            let mut acc = cell.borrow_mut();
-            if acc.len() < total {
-                acc.resize(total, [0i32; POLY_N]);
+        // Opening-major loop preserves the HW prefetcher's stream over each
+        // opening's contiguous data. SIMD wrapping-add (i32x8 via AVX2 when
+        // available) speeds the per-slot inner loop. Final mod-q centering
+        // pass runs in place on the output.
+        //
+        // i32 accumulator suffices: each input coeff ∈ (-q/2, q/2]; summing
+        // ρ of them stays within i32 for ρ up to ~280k (>> any deployment).
+        // Allocate the output Box pre-zeroed in a single system call.
+        // `vec![HVCPoly::default(); total]` would issue `total` 2-KB memcpys
+        // from the prototype; `alloc_zeroed` is a single memset (or a kernel-
+        // zeroed page on first touch). HVCPoly's bit pattern of all zeros is
+        // a valid default value ([i32; N] of zeros).
+        let mut data: Vec<HVCPoly> = unsafe {
+            let layout = std::alloc::Layout::array::<HVCPoly>(total).unwrap();
+            let ptr = std::alloc::alloc_zeroed(layout) as *mut HVCPoly;
+            if ptr.is_null() {
+                std::alloc::handle_alloc_error(layout);
             }
-            let acc = &mut acc[..total];
-            // Zero only the slice we'll use this call; rest of the cached
-            // capacity is left untouched.
-            for slot in acc.iter_mut() {
-                *slot = [0i32; POLY_N];
-            }
-            for o in os.iter() {
-                for (slot, poly) in o.data.iter().enumerate() {
-                    let v = poly.coeffs();
-                    let a = &mut acc[slot];
-                    // Plain wrapping add; final centering pass below.
-                    for k in 0..POLY_N {
-                        a[k] = a[k].wrapping_add(v[k]);
-                    }
+            Vec::from_raw_parts(ptr, total, total)
+        };
+        for i in 0..os.len() {
+            // Software prefetch: bring opening i+1's leading cachelines into
+            // L2 while we're processing opening i. Each opening is ~600 KB
+            // contiguous but its base address is unrelated to the previous
+            // opening, so the HW stream prefetcher can't bridge the gap.
+            #[cfg(target_arch = "x86_64")]
+            if i + 1 < os.len() {
+                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T1};
+                unsafe {
+                    let next = os[i + 1].data.as_ptr() as *const i8;
+                    // Prefetch the first few cachelines of the next opening
+                    // into L2. The HW stream prefetcher will continue from
+                    // there once we start touching it.
+                    _mm_prefetch(next, _MM_HINT_T1);
+                    _mm_prefetch(next.add(64), _MM_HINT_T1);
+                    _mm_prefetch(next.add(128), _MM_HINT_T1);
+                    _mm_prefetch(next.add(192), _MM_HINT_T1);
                 }
             }
 
-            // Single mod-q + centering pass. Replaces ρ·total per-call
-            // centerings in the previous code.
-            let q = HVC_MODULUS;
-            let half = q / 2;
-            let mut data: Vec<HVCPoly> = Vec::with_capacity(total);
-            for slot in acc.iter_mut() {
-                for k in 0..POLY_N {
-                    let mut x = slot[k] % q;
-                    if x > half {
-                        x -= q;
-                    } else if x < -half {
-                        x += q;
-                    }
-                    slot[k] = x;
-                }
-                data.push(HVCPoly::from_coeffs(*slot));
+            let o = os[i];
+            for (slot, poly) in o.data.iter().enumerate() {
+                let v = poly.coeffs();
+                let a = data[slot].coeffs_mut();
+                wrapping_add_avx2(a, v);
             }
+        }
 
-            Opening {
-                server_index: idx,
-                path_index,
-                kappa_cs,
-                mu_cs,
-                block_size,
-                stored_path_len,
-                data: data.into_boxed_slice(),
+        // In-place mod-q centering pass on the output buffer.
+        let q = HVC_MODULUS;
+        let half = q / 2;
+        for poly in data.iter_mut() {
+            let coeffs = poly.coeffs_mut();
+            for k in 0..POLY_N {
+                let mut x = coeffs[k] % q;
+                if x > half {
+                    x -= q;
+                } else if x < -half {
+                    x += q;
+                }
+                coeffs[k] = x;
             }
-        })
+        }
+
+        Opening {
+            server_index: idx,
+            path_index,
+            kappa_cs,
+            mu_cs,
+            block_size,
+            stored_path_len,
+            data: data.into_boxed_slice(),
+        }
+    }
+}
+
+/// SIMD wrapping i32 add: `acc[i] = acc[i].wrapping_add(v[i])`. Dispatches to
+/// AVX2 when available (8 i32 lanes/iter); falls back to scalar otherwise.
+#[inline(always)]
+fn wrapping_add_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { wrapping_add_avx2_impl(acc, v) };
+            return;
+        }
+    }
+    for k in 0..POLY_N {
+        acc[k] = acc[k].wrapping_add(v[k]);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let mut k = 0;
+    while k < POLY_N {
+        let a_ptr = acc.as_mut_ptr().add(k) as *mut __m256i;
+        let av = _mm256_loadu_si256(a_ptr as *const __m256i);
+        let bv = _mm256_loadu_si256(v.as_ptr().add(k) as *const __m256i);
+        let s = _mm256_add_epi32(av, bv);
+        _mm256_storeu_si256(a_ptr, s);
+        k += 8;
+    }
+}
+
+// ============================================================
+// Tight bit-packing for Openings (wire-format compaction).
+// ============================================================
+//
+// Each opening's `data: Box<[HVCPoly]>` holds 4 regions with different
+// coefficient bounds:
+//   r              (κ_cs polys, bounded by r_bound)
+//   s              (μ_cs polys, bounded by q_cs/2)
+//   block subtree  ((2·block_size − 2) · HVC_WIDTH polys, decomposed at ZETA)
+//   path           (stored_path_len · 2 · HVC_WIDTH polys, decomposed at ZETA)
+//
+// In-memory, every coefficient takes 4 bytes (i32). Tight pack uses just
+// enough bits per coefficient for each region's actual norm bound:
+//   r:    ⌈log₂(2·r_bound + 1)⌉ bits (e.g. 11 at r_bound = 512)
+//   s:    ⌈log₂(2·(q_cs/2) + 1)⌉ = ⌈log₂(q_cs)⌉ bits (15 at q_cs = 25601)
+//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(59)⌉ = 6 bits
+//
+// The pack is a pure post-processing step on a complete `Opening`; the
+// in-memory layout is unchanged. Callers serialise to bytes for transport
+// and call `from_packed` on the receiving side. No SIMD/cache-perf impact.
+
+
+/// Number of bits to encode signed values in [-bound, bound].
+#[inline]
+fn bits_for_signed(bound: u32) -> u32 {
+    // 2·bound + 1 distinct values
+    let n = 2u64 * bound as u64 + 1;
+    (64 - n.leading_zeros()).max(1)
+}
+
+/// Pack signed values in [-bound, bound] into `out` at `bits` bits each
+/// (LSB-first within each byte). Values get offset by `bound` to become
+/// unsigned. Caller-tracked: count, bound, bits.
+fn pack_bits(out: &mut Vec<u8>, values: &[i32], bound: u32, bits: u32) {
+    debug_assert!(bits <= 32);
+    let offset = bound as i64;
+    let max_u: u64 = (1u64 << bits) - 1;
+    let mut acc: u64 = 0;
+    let mut acc_bits: u32 = 0;
+    for &v in values {
+        debug_assert!(
+            v >= -(bound as i32) && v <= bound as i32,
+            "pack_bits: value {} outside [{}, {}]",
+            v,
+            -(bound as i32),
+            bound as i32
+        );
+        let u = ((v as i64) + offset) as u64;
+        debug_assert!(u <= max_u);
+        acc |= u << acc_bits;
+        acc_bits += bits;
+        while acc_bits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            acc_bits -= 8;
+        }
+    }
+    if acc_bits > 0 {
+        out.push(acc as u8);
+    }
+}
+
+/// Inverse of `pack_bits`. Reads `values.len()` signed integers each `bits`
+/// wide from `input` starting at `start_byte`; returns the next byte index.
+fn unpack_bits(
+    input: &[u8],
+    start_byte: usize,
+    values: &mut [i32],
+    bound: u32,
+    bits: u32,
+) -> usize {
+    let offset = bound as i64;
+    let mask: u64 = (1u64 << bits) - 1;
+    let mut acc: u64 = 0;
+    let mut acc_bits: u32 = 0;
+    let mut byte_idx = start_byte;
+    for v in values.iter_mut() {
+        while acc_bits < bits {
+            acc |= (input[byte_idx] as u64) << acc_bits;
+            byte_idx += 1;
+            acc_bits += 8;
+        }
+        let u = (acc & mask) as i64;
+        *v = (u - offset) as i32;
+        acc >>= bits;
+        acc_bits -= bits;
+    }
+    byte_idx
+}
+
+/// Tightly bit-packed Opening for wire transport. Stores per-region bit
+/// widths so unpacking is self-describing. Format:
+///
+/// ```text
+/// PackedOpening {
+///     header:  server_index u32, path_index u32, kappa_cs u32, mu_cs u32,
+///              block_size u32, stored_path_len u32,
+///              r_bound u32, s_bound u32, tree_bound u32,
+///     bytes:   pack(r)  ‖ pack(s)  ‖ pack(block_subtree)  ‖ pack(path)
+/// }
+/// ```
+///
+/// The `_bound` fields drive the bits-per-coef computation on unpack; they
+/// also let the encoder use different bounds for fresh vs aggregated
+/// openings (fresh r has ‖·‖∞ = 1; aggregated up to `r_bound = 512`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackedOpening {
+    pub server_index: u32,
+    pub path_index: u32,
+    pub kappa_cs: u32,
+    pub mu_cs: u32,
+    pub block_size: u32,
+    pub stored_path_len: u32,
+    pub r_bound: u32,
+    pub s_bound: u32,
+    pub tree_bound: u32,
+    pub bytes: Vec<u8>,
+}
+
+impl PackedOpening {
+    /// Total byte length of the packed payload (header excluded).
+    pub fn body_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl Opening {
+    /// Pack this opening at the tightest bit width for each region.
+    ///
+    /// - `r_bound`: ∞-norm bound on `r` (1 for fresh ternary openings,
+    ///   `CsParams::r_bound` for aggregated).
+    /// - `s_bound`: ∞-norm bound on `s` (q_cs/2 for arbitrary share values).
+    /// - `tree_bound`: ∞-norm bound on decomposed nodes (block subtree + path).
+    ///   `ZETA` for fresh openings, `ρ·ZETA` after summing ρ openings.
+    ///   Use `chipmunk_code::ZETA` for the fresh value.
+    pub fn pack(&self, r_bound: u32, s_bound: u32, tree_bound: u32) -> PackedOpening {
+        let r_bits = bits_for_signed(r_bound);
+        let s_bits = bits_for_signed(s_bound);
+        let tree_bits = bits_for_signed(tree_bound);
+        let total_polys = opening_total_polys(
+            self.kappa_cs,
+            self.mu_cs,
+            self.block_size,
+            self.stored_path_len,
+        );
+        let est_bytes = ((self.kappa_cs * POLY_N) * r_bits as usize
+            + (self.mu_cs * POLY_N) * s_bits as usize
+            + ((total_polys - self.kappa_cs - self.mu_cs) * POLY_N) * tree_bits as usize
+            + 7)
+            / 8;
+        let mut bytes = Vec::with_capacity(est_bytes);
+
+        // Pack r
+        for poly in self.r() {
+            pack_bits(&mut bytes, poly.coeffs(), r_bound, r_bits);
+        }
+        // Pack s
+        for poly in self.s() {
+            pack_bits(&mut bytes, poly.coeffs(), s_bound, s_bits);
+        }
+        // Pack block subtree + path (both decomposed at tree_bound).
+        let tail_start = self.kappa_cs + self.mu_cs;
+        for poly in &self.data[tail_start..] {
+            pack_bits(&mut bytes, poly.coeffs(), tree_bound, tree_bits);
+        }
+        PackedOpening {
+            server_index: self.server_index as u32,
+            path_index: self.path_index as u32,
+            kappa_cs: self.kappa_cs as u32,
+            mu_cs: self.mu_cs as u32,
+            block_size: self.block_size as u32,
+            stored_path_len: self.stored_path_len as u32,
+            r_bound,
+            s_bound,
+            tree_bound,
+            bytes,
+        }
+    }
+
+    /// Inverse of `pack`. Reconstructs the in-memory `Opening`.
+    pub fn from_packed(p: &PackedOpening) -> Opening {
+        let kappa_cs = p.kappa_cs as usize;
+        let mu_cs = p.mu_cs as usize;
+        let block_size = p.block_size as usize;
+        let stored_path_len = p.stored_path_len as usize;
+        let total_polys = opening_total_polys(kappa_cs, mu_cs, block_size, stored_path_len);
+        let r_bits = bits_for_signed(p.r_bound);
+        let s_bits = bits_for_signed(p.s_bound);
+        let tree_bits = bits_for_signed(p.tree_bound);
+
+        let mut data: Vec<HVCPoly> = vec![HVCPoly::default(); total_polys];
+        let mut byte_idx = 0usize;
+        // Unpack r
+        for poly in data[..kappa_cs].iter_mut() {
+            byte_idx = unpack_bits(
+                &p.bytes,
+                byte_idx,
+                poly.coeffs_mut(),
+                p.r_bound,
+                r_bits,
+            );
+        }
+        // Unpack s
+        for poly in data[kappa_cs..kappa_cs + mu_cs].iter_mut() {
+            byte_idx = unpack_bits(
+                &p.bytes,
+                byte_idx,
+                poly.coeffs_mut(),
+                p.s_bound,
+                s_bits,
+            );
+        }
+        // Unpack block subtree + path
+        for poly in data[kappa_cs + mu_cs..].iter_mut() {
+            byte_idx = unpack_bits(
+                &p.bytes,
+                byte_idx,
+                poly.coeffs_mut(),
+                p.tree_bound,
+                tree_bits,
+            );
+        }
+        debug_assert!(byte_idx == p.bytes.len() || byte_idx + 1 == p.bytes.len());
+
+        Opening {
+            server_index: p.server_index as usize,
+            path_index: p.path_index as usize,
+            kappa_cs,
+            mu_cs,
+            block_size,
+            stored_path_len,
+            data: data.into_boxed_slice(),
+        }
     }
 }
 
@@ -640,5 +921,95 @@ mod tests {
             }
             assert!(HidingMerkleCommitment::verify(&pp, &comm_sum, &summed));
         }
+    }
+
+    #[test]
+    fn pack_round_trip_fresh_opening() {
+        // Fresh openings have ternary r (‖r‖∞ = 1). s comes from the protocol
+        // share-vector. Block subtree + path are decomposed (bounded by ZETA).
+        let mut rng = ChaCha20Rng::from_seed([100u8; 32]);
+        let n_servers = 4;
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, 5, 8);
+        let shares = rand_shares(&mut rng, n_servers, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        for o in &openings {
+            // Fresh r is ternary weight-2 (‖r‖∞ = 1); s ∈ R_q so bound = q/2;
+            // decomposed tree nodes bounded by ZETA for fresh openings.
+            let packed = o.pack(
+                1,
+                chipmunk_code::HVC_MODULUS as u32 / 2,
+                chipmunk_code::ZETA,
+            );
+            let unpacked = Opening::from_packed(&packed);
+            assert_eq!(o.r(), unpacked.r());
+            assert_eq!(o.s(), unpacked.s());
+            assert_eq!(o.server_index, unpacked.server_index);
+            assert_eq!(o.path_index, unpacked.path_index);
+            // Spot-check a block subtree node and a path node.
+            assert_eq!(o.block_node(0, 0), unpacked.block_node(0, 0));
+            if o.stored_path_len() > 0 {
+                let (l0, r0) = o.path_node(0);
+                let (l1, r1) = unpacked.path_node(0);
+                assert_eq!(l0, l1);
+                assert_eq!(r0, r1);
+            }
+        }
+    }
+
+    #[test]
+    fn pack_round_trip_aggregated_opening() {
+        // Aggregated openings have larger r (up to r_bound after sum).
+        let mut rng = ChaCha20Rng::from_seed([101u8; 32]);
+        let n_servers = 4;
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, 5, 8);
+        let shares_a = rand_shares(&mut rng, n_servers, pp.mu_cs);
+        let shares_b = rand_shares(&mut rng, n_servers, pp.mu_cs);
+        let (_, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
+        let (_, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
+        for i in 0..n_servers {
+            let agg = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]);
+            // ρ = 2 (we summed two openings); tree nodes bounded by ρ·ZETA.
+            let packed = agg.pack(
+                pp.r_bound,
+                chipmunk_code::HVC_MODULUS as u32 / 2,
+                2 * chipmunk_code::ZETA,
+            );
+            let unpacked = Opening::from_packed(&packed);
+            assert_eq!(agg.r(), unpacked.r());
+            assert_eq!(agg.s(), unpacked.s());
+            assert_eq!(agg.block_node(0, 0), unpacked.block_node(0, 0));
+        }
+    }
+
+    #[test]
+    fn pack_size_reduction() {
+        // Sanity check: tight pack is meaningfully smaller than in-memory.
+        let mut rng = ChaCha20Rng::from_seed([102u8; 32]);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 5, 8);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let o = &openings[0];
+        let total_polys = opening_total_polys(
+            o.kappa_cs(),
+            o.mu_cs(),
+            o.block_size(),
+            o.stored_path_len(),
+        );
+        let in_mem_bytes = total_polys * std::mem::size_of::<HVCPoly>();
+        let packed = o.pack(1, chipmunk_code::HVC_MODULUS as u32 / 2, chipmunk_code::ZETA);
+        let packed_bytes = packed.body_len();
+        // Expect at least 5× compression on fresh openings.
+        assert!(
+            packed_bytes * 5 <= in_mem_bytes,
+            "packed {} not ≤ in_mem {} / 5",
+            packed_bytes,
+            in_mem_bytes
+        );
+        eprintln!(
+            "pack_size_reduction: in_mem={} packed={} ratio={:.2}x",
+            in_mem_bytes,
+            packed_bytes,
+            in_mem_bytes as f64 / packed_bytes as f64
+        );
     }
 }

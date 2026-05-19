@@ -2,7 +2,7 @@ use rand::Rng;
 
 use crate::bulletin::ClientPublic;
 use crate::cs::{Cs, HidingMerkleCommitment, Opening};
-use crate::kahe::{Kahe, KaheScheme};
+use crate::kahe::{kahe_to_hvc_centered, Kahe, KaheScheme};
 use crate::sss::ShamirSharing;
 
 use super::message::{ClientId, ServerId};
@@ -27,7 +27,7 @@ pub fn run_client_round<R: Rng>(
     servers: &[ServerId],
 ) -> ClientRound {
     let key = Kahe::gen(rng, &pp.kahe);
-    let ctxt = Kahe::enc(&pp.kahe, &key, &message);
+    let ctxt = Kahe::enc(rng, &pp.kahe, &key, &message);
 
     let n = servers.len();
     assert_eq!(n, pp.cs.n_servers, "server count must match CS params");
@@ -39,8 +39,13 @@ pub fn run_client_round<R: Rng>(
     );
 
     // Per-component Shamir shares: shares_per_component[k][i] = f_k(point_{i+1}).
+    // Shamir lives in R_{q_cs}; KAHE keys live in R_{q_kahe}. Bridge each
+    // component (small Gaussian) into HVC via centered-rep re-interpretation.
     let shares_per_component: Vec<Vec<chipmunk_code::HVCPoly>> = (0..kappa_kahe)
-        .map(|k| ShamirSharing::share(rng, &pp.shamir, key.component(k)))
+        .map(|k| {
+            let secret_hvc = kahe_to_hvc_centered(key.component(k));
+            ShamirSharing::share(rng, &pp.shamir, &secret_hvc)
+        })
         .collect();
     // Transpose into per-server share vectors (length κ_kahe each).
     let shares_per_server: Vec<Vec<chipmunk_code::HVCPoly>> = (0..n)

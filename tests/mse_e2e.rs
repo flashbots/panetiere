@@ -1,10 +1,10 @@
 //! Paper-aligned MSE (`src/mse.rs`) carried through the flashnet protocol.
 //!
-//! Each client builds a 1-element MSE encoding, packs it into HVCPolys, and
+//! Each client builds a 1-element MSE encoding, packs it into KahePolys, and
 //! contributes them to the protocol. The verifier's recovered per-poly sums
 //! unpack into the multiset union, which decodes to all clients' elements.
 
-use chipmunk_code::HVCPoly;
+use chipmunk_code::KahePoly;
 use flashnet::mse::{MseEncoding, MseParams};
 use flashnet::protocol::client::run_client_round;
 use flashnet::protocol::message::{ClientId, ServerId};
@@ -14,6 +14,10 @@ use flashnet::protocol::ProtocolParams;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
+/// MSE arithmetic now lives in `Z_t` (KAHE plaintext modulus, default
+/// `t = 262_144`), large enough to carry random `r` values and small element
+/// values without wrap. The protocol's recovered sum decodes back to the
+/// multiset union.
 #[test]
 fn mse_recovers_through_flashnet() {
     let mut rng = ChaCha20Rng::from_seed([0xFEu8; 32]);
@@ -25,12 +29,13 @@ fn mse_recovers_through_flashnet() {
 
     // Each client picks a unique element x ∈ Z_q with small magnitude.
     let elements: Vec<i32> = (0..n_clients).map(|i| 1000 + i as i32).collect();
-    let client_polys: Vec<Vec<HVCPoly>> = elements
+    let client_polys: Vec<Vec<KahePoly>> = elements
         .iter()
         .map(|&x| {
             let mut enc = MseEncoding::new(mse_params.clone());
             // Use a per-client random `r` drawn from the protocol RNG so each
-            // client's encoding has independent randomness.
+            // client's encoding has independent randomness. Keep `r` well
+            // inside `[-t/2, t/2)` (t = 262_144 by default).
             let r: i32 = rng.gen_range(-100_000..100_000);
             enc.insert_with_r(x, r);
             enc.pack()
