@@ -39,8 +39,10 @@
 //! `KahePoly`s.
 //!
 //! MSE cell arithmetic runs in `Z_t` where `t = T_MODULUS_DEFAULT` is
-//! the KAHE plaintext modulus. With `t = 2^18`, `L · 18 ≤ 126` (capped
-//! at `L = 7`) so r-arithmetic fits in a `u128`.
+//! the KAHE plaintext modulus. With `t = 2^18` and `L = K_LIMBS = 2`,
+//! `r ∈ Z_{t^2} = Z_{2^36}`, so r-arithmetic fits in a `u64`. If a wider
+//! r-space is ever needed, bump `K_LIMBS` (and the `u64` arithmetic with
+//! it) — `L = 2` is plenty for the protocol's current operating point.
 
 use chipmunk_code::{KahePoly, Polynomial, N};
 use rand::Rng;
@@ -50,10 +52,8 @@ use crate::kahe::T_MODULUS_DEFAULT;
 
 const T: i32 = T_MODULUS_DEFAULT as i32;
 const T_OVER_TWO: i32 = T / 2;
-const T_U128: u128 = T_MODULUS_DEFAULT as u128;
-/// Max limbs such that `r ∈ Z_{t^L}` still fits in a `u128`.
-/// With `t = 2^18`, `7 · 18 = 126 < 128`.
-pub const MAX_K_LIMBS: usize = 7;
+/// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
+pub const K_LIMBS: usize = 2;
 /// Bits of payload carried per symbol.
 pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
 
@@ -73,8 +73,6 @@ pub struct MseParams {
     pub gamma: usize,
     /// Number of buckets in row 0. Subsequent rows follow `row_layout`.
     pub delta: usize,
-    /// Number of base-`t` limbs for `r`. `r ∈ Z_{t^k_limbs}`.
-    pub k_limbs: usize,
     /// Symbols per element. Each symbol is one `Z_t` value, so total
     /// payload per element is `payload_symbols · BITS_PER_SYMBOL` bits.
     pub payload_symbols: usize,
@@ -87,33 +85,25 @@ impl MseParams {
     pub fn new(
         gamma: usize,
         delta: usize,
-        k_limbs: usize,
         payload_symbols: usize,
         prf_key: [u8; 32],
     ) -> Self {
-        Self::with_layout(gamma, delta, k_limbs, payload_symbols, RowLayout::Uniform, prf_key)
+        Self::with_layout(gamma, delta, payload_symbols, RowLayout::Uniform, prf_key)
     }
 
     pub fn with_layout(
         gamma: usize,
         delta: usize,
-        k_limbs: usize,
         payload_symbols: usize,
         row_layout: RowLayout,
         prf_key: [u8; 32],
     ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
-        assert!(k_limbs >= 1, "k_limbs must be ≥ 1");
-        assert!(
-            k_limbs <= MAX_K_LIMBS,
-            "k_limbs must be ≤ {MAX_K_LIMBS} so t^k_limbs fits in u128",
-        );
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
         Self {
             gamma,
             delta,
-            k_limbs,
             payload_symbols,
             row_layout,
             prf_key,
@@ -145,27 +135,21 @@ impl MseParams {
         (0..self.gamma).map(|i| self.row_delta(i)).sum()
     }
 
-    /// `(1 + k_limbs + payload_symbols)` scalars per cell: C, K_0…K_{L-1},
+    /// `(1 + K_LIMBS + payload_symbols)` scalars per cell: C, K_0…K_{L-1},
     /// V_0…V_{ξ-1}.
     pub fn total_scalars(&self) -> usize {
-        (1 + self.k_limbs + self.payload_symbols) * self.total_cells()
+        (1 + K_LIMBS + self.payload_symbols) * self.total_cells()
     }
 
-    /// `t^k_limbs`, the size of the randomness space.
-    pub fn r_space(&self) -> u128 {
-        let mut p: u128 = 1;
-        for _ in 0..self.k_limbs {
-            p *= T_U128;
+    /// `t^K_LIMBS`, the size of the randomness space. Fits in `u64`
+    /// since `T_MODULUS_DEFAULT^2 = 2^36 < 2^64`.
+    pub fn r_space(&self) -> u64 {
+        let t = T_MODULUS_DEFAULT as u64;
+        let mut p: u64 = 1;
+        for _ in 0..K_LIMBS {
+            p *= t;
         }
         p
-    }
-
-    /// Advisory: largest `N_clients` for which the C matrix stays
-    /// representable without mod-t wrap. Peeling is probabilistic
-    /// regardless; `decode()` returns `Err(PeelStalled)` when recovery
-    /// fails for any reason.
-    pub fn max_clients(&self) -> u32 {
-        (T as u32).saturating_sub(1)
     }
 }
 
@@ -201,11 +185,11 @@ fn reduce(x: i64) -> i32 {
 
 /// Canonical unsigned rep `[0, t)` from centered `[-t/2, t/2]`.
 #[inline]
-fn to_canonical(x: i32) -> u128 {
-    (x as i64).rem_euclid(T as i64) as u128
+fn to_canonical(x: i32) -> u64 {
+    (x as i64).rem_euclid(T as i64) as u64
 }
 
-fn prf_bucket(key: &[u8; 32], row: usize, r: u128, delta: usize) -> usize {
+fn prf_bucket(key: &[u8; 32], row: usize, r: u64, delta: usize) -> usize {
     let mut h = Sha256::new();
     h.update(key);
     h.update((row as u32).to_le_bytes());
@@ -218,7 +202,7 @@ fn prf_bucket(key: &[u8; 32], row: usize, r: u128, delta: usize) -> usize {
 impl MseEncoding {
     pub fn new(params: MseParams) -> Self {
         let n = params.total_cells();
-        let k = (0..params.k_limbs).map(|_| vec![0i32; n]).collect();
+        let k = (0..K_LIMBS).map(|_| vec![0i32; n]).collect();
         let v = (0..params.payload_symbols).map(|_| vec![0i32; n]).collect();
         Self {
             c: vec![0; n],
@@ -237,31 +221,32 @@ impl MseEncoding {
     /// randomness `r ← Z_{t^L}` is drawn from `rng`.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i32]) {
         let r_space = self.params.r_space();
-        let r: u128 = rng.gen::<u128>() % r_space;
+        let r: u64 = rng.gen::<u64>() % r_space;
         self.insert_with_r(payload, r);
     }
 
     /// Insert with caller-supplied randomness — useful for deterministic
-    /// tests. `r` must be in `[0, t^L)`.
-    pub fn insert_with_r(&mut self, payload: &[i32], r: u128) {
+    /// tests. `r` must be in `[0, t^K_LIMBS)`.
+    pub fn insert_with_r(&mut self, payload: &[i32], r: u64) {
         assert_eq!(
             payload.len(),
             self.params.payload_symbols,
             "payload arity must match params.payload_symbols",
         );
-        debug_assert!(r < self.params.r_space(), "r must be in [0, t^L)");
-        let mut limbs = [0i32; MAX_K_LIMBS];
+        debug_assert!(r < self.params.r_space(), "r must be in [0, t^K_LIMBS)");
+        let t = T_MODULUS_DEFAULT as u64;
+        let mut limbs = [0i32; K_LIMBS];
         let mut acc = r;
-        for limb in limbs.iter_mut().take(self.params.k_limbs) {
-            *limb = reduce((acc % T_U128) as i64);
-            acc /= T_U128;
+        for limb in limbs.iter_mut() {
+            *limb = reduce((acc % t) as i64);
+            acc /= t;
         }
         let payload_reduced: Vec<i32> = payload.iter().map(|&x| reduce(x as i64)).collect();
         for row in 0..self.params.gamma {
             let col = prf_bucket(&self.params.prf_key, row, r, self.params.row_delta(row));
             let idx = self.idx(row, col);
             self.c[idx] = reduce(self.c[idx] as i64 + 1);
-            for ell in 0..self.params.k_limbs {
+            for ell in 0..K_LIMBS {
                 self.k[ell][idx] = reduce(self.k[ell][idx] as i64 + limbs[ell] as i64);
             }
             for s in 0..self.params.payload_symbols {
@@ -277,7 +262,7 @@ impl MseEncoding {
         }
         for i in 0..self.c.len() {
             self.c[i] = reduce(self.c[i] as i64 + other.c[i] as i64);
-            for ell in 0..self.params.k_limbs {
+            for ell in 0..K_LIMBS {
                 self.k[ell][i] = reduce(self.k[ell][i] as i64 + other.k[ell][i] as i64);
             }
             for s in 0..self.params.payload_symbols {
@@ -309,20 +294,30 @@ impl MseEncoding {
         }
 
         let mut emitted: Vec<Vec<i32>> = Vec::new();
-        let mut limb_signed = [0i32; MAX_K_LIMBS];
+        let mut limb_signed = [0i32; K_LIMBS];
         let mut x_star_buf = vec![0i32; self.params.payload_symbols];
+        let t_u64 = T_MODULUS_DEFAULT as u64;
+        // Outer loop terminates because every iteration that hits the
+        // `c[idx] == 1` branch strictly reduces the multiset still
+        // encoded in the matrices: one element is emitted and subtracted
+        // from its γ rows. The queue can only grow with cells that just
+        // became pure as a side effect of that subtraction (`c[cell] ==
+        // 1` post-decrement), so it never re-enqueues the cell we just
+        // peeled. Stale `(row, col)` entries from earlier peels are
+        // discarded by the `c[idx] != 1` guard. Total pure-peel
+        // iterations ≤ initial multiset size, so progress is bounded.
         while let Some((row, col)) = queue.pop() {
             let idx = self.params.row_offset(row) + col;
             if c[idx] != 1 {
                 continue;
             }
-            let mut r_star: u128 = 0;
-            let mut place: u128 = 1;
-            for ell in 0..self.params.k_limbs {
+            let mut r_star: u64 = 0;
+            let mut place: u64 = 1;
+            for ell in 0..K_LIMBS {
                 let signed = k[ell][idx];
                 limb_signed[ell] = signed;
                 r_star += to_canonical(signed) * place;
-                place *= T_U128;
+                place *= t_u64;
             }
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
@@ -333,7 +328,7 @@ impl MseEncoding {
                 let j = prf_bucket(&self.params.prf_key, i, r_star, row_d);
                 let cell = self.params.row_offset(i) + j;
                 c[cell] = reduce(c[cell] as i64 - 1);
-                for ell in 0..self.params.k_limbs {
+                for ell in 0..K_LIMBS {
                     k[ell][cell] = reduce(k[ell][cell] as i64 - limb_signed[ell] as i64);
                 }
                 for s in 0..self.params.payload_symbols {
@@ -409,10 +404,10 @@ impl MseEncoding {
 
         let cells = params.total_cells();
         let c = flat[..cells].to_vec();
-        let k: Vec<Vec<i32>> = (0..params.k_limbs)
+        let k: Vec<Vec<i32>> = (0..K_LIMBS)
             .map(|ell| flat[(1 + ell) * cells..(2 + ell) * cells].to_vec())
             .collect();
-        let v_base = (1 + params.k_limbs) * cells;
+        let v_base = (1 + K_LIMBS) * cells;
         let v: Vec<Vec<i32>> = (0..params.payload_symbols)
             .map(|s| flat[v_base + s * cells..v_base + (s + 1) * cells].to_vec())
             .collect();
@@ -434,17 +429,16 @@ mod tests {
     fn params_for(
         gamma: usize,
         delta: usize,
-        k_limbs: usize,
         payload_symbols: usize,
         seed: u8,
     ) -> MseParams {
-        MseParams::new(gamma, delta, k_limbs, payload_symbols, [seed; 32])
+        MseParams::new(gamma, delta, payload_symbols, [seed; 32])
     }
 
     #[test]
     fn single_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-        let pp = params_for(4, 16, 2, 1, 1);
+        let pp = params_for(4, 16, 1, 1);
         let mut enc = MseEncoding::new(pp.clone());
         enc.insert(&mut rng, &[42]);
         let recovered = enc.decode().expect("decode");
@@ -454,7 +448,7 @@ mod tests {
     #[test]
     fn multi_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
-        let pp = params_for(4, 64, 2, 1, 2);
+        let pp = params_for(4, 64, 1, 2);
         let mut enc = MseEncoding::new(pp);
         let mut elements = vec![1, 7, 13, 19, 100, 200, 300, 400];
         for &x in &elements {
@@ -474,7 +468,7 @@ mod tests {
     #[test]
     fn union_via_pointwise_add() {
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
-        let pp = params_for(4, 32, 2, 1, 3);
+        let pp = params_for(4, 32, 1, 3);
         let mut a = MseEncoding::new(pp.clone());
         let mut b = MseEncoding::new(pp.clone());
         for x in [1, 5, 9, 17] {
@@ -497,7 +491,7 @@ mod tests {
     #[test]
     fn pack_unpack_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
-        let pp = params_for(4, 32, 2, 1, 5);
+        let pp = params_for(4, 32, 1, 5);
         let mut enc = MseEncoding::new(pp.clone());
         for x in [11, 22, 33, 44, 55] {
             enc.insert(&mut rng, &[x]);
@@ -519,7 +513,7 @@ mod tests {
     #[test]
     fn pack_sum_unpacks_to_union() {
         let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
-        let pp = params_for(4, 32, 2, 1, 7);
+        let pp = params_for(4, 32, 1, 7);
         let mut a = MseEncoding::new(pp.clone());
         let mut b = MseEncoding::new(pp.clone());
         for x in [100, 200, 300] {
@@ -546,33 +540,13 @@ mod tests {
         assert_eq!(got, vec![100, 200, 300, 400, 500, 600]);
     }
 
-    #[test]
-    fn three_limbs_round_trip() {
-        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-        let pp = params_for(4, 128, 3, 1, 11);
-        let mut enc = MseEncoding::new(pp);
-        let mut elements: Vec<i32> = (0..50).map(|i| i * 17).collect();
-        for &x in &elements {
-            enc.insert(&mut rng, &[x]);
-        }
-        let mut recovered: Vec<i32> = enc
-            .decode()
-            .expect("decode")
-            .into_iter()
-            .map(|t| t[0])
-            .collect();
-        elements.sort();
-        recovered.sort();
-        assert_eq!(recovered, elements);
-    }
-
     /// 4 symbols × 18 bits ≈ 72 bits of payload per element. Verifies
     /// multi-symbol insert/decode and confirms C/K are correctly shared
     /// across the V matrices.
     #[test]
     fn multi_symbol_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-        let pp = params_for(4, 64, 2, 4, 17);
+        let pp = params_for(4, 64, 4, 17);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i32>> = (0..10)
             .map(|i| vec![i * 11, i * 13 + 1, i * 17 + 2, i * 19 + 3])
@@ -593,7 +567,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = MseParams::payload_symbols_for_bits(512);
         assert_eq!(xi, 29);
-        let pp = params_for(4, 32, 2, xi, 31);
+        let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i32>> = (0..5)
             .map(|i| (0..xi).map(|s| (i * 7 + s * 13) as i32).collect())
@@ -613,7 +587,6 @@ mod tests {
         let pp = MseParams::with_layout(
             5,
             128,
-            2,
             1,
             RowLayout::Geometric { shrink: 0.5 },
             [43u8; 32],
@@ -644,7 +617,7 @@ mod tests {
     #[should_panic(expected = "payload arity must match")]
     fn payload_arity_mismatch_panics() {
         let mut rng = ChaCha20Rng::from_seed([29u8; 32]);
-        let pp = params_for(4, 32, 2, 3, 41);
+        let pp = params_for(4, 32, 3, 41);
         let mut enc = MseEncoding::new(pp);
         enc.insert(&mut rng, &[1, 2]);
     }

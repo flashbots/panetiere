@@ -2,12 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use chipmunk_code::{HVCPoly, KahePoly};
 
-use crate::bulletin::{ClientPublic, ServerPublic};
+use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_hvc_to_kahe, Kahe, KaheAggKey, KaheScheme};
 use crate::sss::ShamirSharing;
 
-use super::message::{ClientId, ServerId};
+use super::{ClientId, ServerId};
 use super::ProtocolParams;
 
 #[derive(Debug, PartialEq)]
@@ -30,8 +30,8 @@ pub enum VerifyError {
 pub fn aggregate_and_decrypt(
     pp: &ProtocolParams,
     canonical: &[ClientId],
-    publics: &[(ClientId, ClientPublic)],
-    server_outputs: &[ServerPublic],
+    client_entries: &[(ClientId, ClientBulletinEntry)],
+    server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
@@ -59,7 +59,7 @@ pub fn aggregate_and_decrypt(
         }
     }
 
-    let pub_index: HashMap<ClientId, usize> = publics
+    let pub_index: HashMap<ClientId, usize> = client_entries
         .iter()
         .enumerate()
         .map(|(i, (cid, _))| (*cid, i))
@@ -71,7 +71,7 @@ pub fn aggregate_and_decrypt(
         let i = *pub_index
             .get(cid)
             .ok_or(VerifyError::MissingClient(*cid))?;
-        let (_, p) = &publics[i];
+        let (_, p) = &client_entries[i];
         if p.ctxt.len() != mu_kahe {
             return Err(VerifyError::InconsistentKappa(server_outputs[0].server_id));
         }

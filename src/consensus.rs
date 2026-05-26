@@ -4,7 +4,7 @@
 //! README §5 (servers must refuse to decrypt anything other than the canonical
 //! set) is the responsibility of the server logic.
 
-use crate::protocol::message::ClientId;
+use crate::protocol::ClientId;
 
 pub trait ClientSetSelector {
     fn canonical_set(&self) -> Vec<ClientId>;

@@ -9,7 +9,7 @@
 
 use flashnet::codec;
 use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::message::{ClientId, ServerId};
+use flashnet::protocol::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
@@ -52,7 +52,7 @@ fn main() {
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
-    let mut publics = vec![];
+    let mut client_entries: Vec<_> = vec![];
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
         .map(|&sid| ServerInbox {
@@ -67,8 +67,8 @@ fn main() {
         assert_eq!(polys.len(), 1, "slot layout sized to fit one KahePoly");
 
         let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
-        publics.push((round.client_id, round.public));
-        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
             inboxes[idx].items.push((cid, ops));
         }
@@ -81,7 +81,7 @@ fn main() {
         .collect();
 
     let recovered =
-        aggregate_and_decrypt(&pp, &canonical, &publics, &outputs).expect("verify failed");
+        aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).expect("verify failed");
     let recovered_bytes =
         codec::decode_raw(&recovered).expect("decode of summed message failed");
 

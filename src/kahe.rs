@@ -1,7 +1,7 @@
 //! Key-additive homomorphic encryption (Willow-style RLWE-based KAHE).
 //!
 //! Lives on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, q ≈ 2^30),
-//! decoupled from the chipmunk Ring-SIS CS ring `R_{q_cs}` (q = 202_753).
+//! decoupled from the chipmunk Ring-SIS CS ring.
 //! The KAHE q is chosen for headroom in the noise budget — chipmunk's q is
 //! tied to its multi-signature size optimization and would be wasteful here.
 //!
@@ -55,7 +55,12 @@ pub trait KaheScheme {
 
     fn setup<R: Rng>(rng: &mut R) -> Self::Params;
     fn gen<R: Rng>(rng: &mut R, pp: &Self::Params) -> Self::Key;
-    fn enc<R: Rng>(rng: &mut R, pp: &Self::Params, k: &Self::Key, m: &Self::Message) -> Self::Ciphertext;
+    fn enc<R: Rng>(
+        rng: &mut R,
+        pp: &Self::Params,
+        k: &Self::Key,
+        m: &Self::Message,
+    ) -> Self::Ciphertext;
     fn dec(pp: &Self::Params, c: &Self::Ciphertext, k: &Self::AggKey) -> Self::Message;
     fn agg_ctxt(cs: &[Self::Ciphertext]) -> Self::Ciphertext;
     fn agg_key(ks: &[Self::Key]) -> Self::AggKey;
@@ -167,7 +172,11 @@ fn scale_poly(poly: &KahePoly, scale: i32) -> KahePoly {
 fn reduce_centered(x: i32, t: i32) -> i32 {
     let r = x.rem_euclid(t);
     let half = t / 2;
-    if r >= half { r - t } else { r }
+    if r >= half {
+        r - t
+    } else {
+        r
+    }
 }
 
 /// Reduce a polynomial coefficient-wise mod `t` (centered).
@@ -272,7 +281,14 @@ impl KaheScheme for Kahe {
     /// budget covers ρ ≤ ~300 at q_kahe = 1_073_738_753.
     /// κ_kahe=5 spans the Shamir share-vector across 5 components per CS opening.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
-        Self::setup_with_dims(rng, 1, 5, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
+        Self::setup_with_dims(
+            rng,
+            1,
+            5,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        )
     }
 
     fn gen<R: Rng>(rng: &mut R, pp: &KaheParams) -> KaheKey {

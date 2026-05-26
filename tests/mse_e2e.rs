@@ -7,7 +7,7 @@
 use chipmunk_code::KahePoly;
 use flashnet::mse::{MseEncoding, MseParams};
 use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::message::{ClientId, ServerId};
+use flashnet::protocol::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
@@ -24,8 +24,8 @@ fn mse_recovers_through_flashnet() {
     let n_servers = 3;
     let n_clients = 6;
 
-    // Pick γ = 4 (paper Theorem 3 sweet spot), δ = 2·ρ.
-    let mse_params = MseParams::new(4, 2 * n_clients, [0xAA; 32]);
+    // Pick γ = 4 (paper Theorem 3 sweet spot), δ = 2·ρ, ξ = 1.
+    let mse_params = MseParams::new(4, 2 * n_clients, 1, [0xAA; 32]);
 
     // Each client picks a unique element x ∈ Z_q with small magnitude.
     let elements: Vec<i32> = (0..n_clients).map(|i| 1000 + i as i32).collect();
@@ -33,11 +33,9 @@ fn mse_recovers_through_flashnet() {
         .iter()
         .map(|&x| {
             let mut enc = MseEncoding::new(mse_params.clone());
-            // Use a per-client random `r` drawn from the protocol RNG so each
-            // client's encoding has independent randomness. Keep `r` well
-            // inside `[-t/2, t/2)` (t = 262_144 by default).
-            let r: i32 = rng.gen_range(-100_000..100_000);
-            enc.insert_with_r(x, r);
+            // Per-client random `r ∈ [0, t^K_LIMBS)` drawn from the protocol RNG.
+            let r: u64 = rng.gen_range(0..mse_params.r_space());
+            enc.insert_with_r(&[x], r);
             enc.pack()
         })
         .collect();
@@ -51,7 +49,7 @@ fn mse_recovers_through_flashnet() {
 
     let mut recovered_polys = Vec::with_capacity(n_polys);
     for k in 0..n_polys {
-        let mut publics = Vec::new();
+        let mut client_entries = Vec::new();
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
             .map(|&sid| ServerInbox {
@@ -62,8 +60,8 @@ fn mse_recovers_through_flashnet() {
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = vec![client_polys[i][k]];
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
-            publics.push((round.client_id, round.public));
-            for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+            client_entries.push((round.client_id, round.encrypted_message));
+            for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
                 let _ = sid;
                 inboxes[idx].items.push((cid, ops));
             }
@@ -72,14 +70,19 @@ fn mse_recovers_through_flashnet() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &outputs)
+        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         assert_eq!(recovered.len(), 1);
         recovered_polys.push(recovered[0]);
     }
 
     let union = MseEncoding::unpack(&mse_params, &recovered_polys);
-    let mut got = union.decode().expect("MSE decode");
+    let mut got: Vec<i32> = union
+        .decode()
+        .expect("MSE decode")
+        .into_iter()
+        .map(|t| t[0])
+        .collect();
     let mut expected = elements.clone();
     got.sort();
     expected.sort();

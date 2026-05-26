@@ -1,7 +1,7 @@
 use chipmunk_code::{HVCPoly, KahePoly, Polynomial, N};
 use flashnet::codec;
 use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::message::{ClientId, ServerId};
+use flashnet::protocol::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
@@ -41,7 +41,7 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePo
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut messages = Vec::with_capacity(n_clients);
-    let mut publics = Vec::with_capacity(n_clients);
+    let mut client_entries = Vec::with_capacity(n_clients);
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
         .map(|&sid| ServerInbox {
@@ -54,8 +54,8 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePo
         let m = rand_message_poly(rng, pp.kahe.t_modulus);
         messages.push(m);
         let round = run_client_round(rng, &pp, cid, vec![m], &server_ids);
-        publics.push((round.client_id, round.public));
-        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
             inboxes[idx].items.push((cid, ops));
         }
@@ -67,7 +67,7 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePo
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &server_outputs)
+    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
         .expect("verify failed");
     assert_eq!(recovered.len(), pp.kahe.mu_kahe);
 
@@ -111,7 +111,7 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
-    let mut publics = Vec::new();
+    let mut client_entries = Vec::new();
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
         .map(|&sid| ServerInbox {
@@ -130,8 +130,8 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         assert_eq!(polys.len(), 1, "slot buffer sized to one KahePoly");
 
         let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
-        publics.push((round.client_id, round.public));
-        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
             inboxes[idx].items.push((cid, ops));
         }
@@ -143,7 +143,7 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &outputs)
+    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
         .expect("verify failed");
     let recovered_bytes = codec::decode_raw(&recovered).expect("decode");
     assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
@@ -210,7 +210,7 @@ fn slot_mode_8kb_message_multi_poly() {
 
     let mut recovered_polys = Vec::with_capacity(N_POLYS);
     for poly_idx in 0..N_POLYS {
-        let mut publics = Vec::new();
+        let mut client_entries = Vec::new();
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
             .map(|&sid| ServerInbox {
@@ -221,8 +221,8 @@ fn slot_mode_8kb_message_multi_poly() {
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = encoded[i][poly_idx];
             let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
-            publics.push((round.client_id, round.public));
-            for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+            client_entries.push((round.client_id, round.encrypted_message));
+            for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
                 inboxes[idx].items.push((cid, ops));
             }
@@ -231,7 +231,7 @@ fn slot_mode_8kb_message_multi_poly() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &outputs)
+        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", poly_idx, e));
         assert_eq!(recovered.len(), 1);
         recovered_polys.push(recovered[0]);
@@ -267,7 +267,7 @@ fn tampered_agg_share_rejected() {
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
-    let mut publics = Vec::new();
+    let mut client_entries = Vec::new();
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
         .map(|&sid| ServerInbox {
@@ -278,8 +278,8 @@ fn tampered_agg_share_rejected() {
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
-        publics.push((round.client_id, round.public));
-        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
             inboxes[idx].items.push((cid, ops));
         }
@@ -292,7 +292,7 @@ fn tampered_agg_share_rejected() {
 
     server_outputs[0].agg_share[0] =
         server_outputs[0].agg_share[0] + HVCPoly::rand_poly(&mut rng);
-    let result = aggregate_and_decrypt(&pp, &canonical, &publics, &server_outputs);
+    let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
         Err(flashnet::protocol::verify::VerifyError::ShareOpeningMismatch(_))
@@ -308,7 +308,7 @@ fn high_norm_r_rejected_in_protocol() {
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
-    let mut publics = Vec::new();
+    let mut client_entries = Vec::new();
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
         .map(|&sid| ServerInbox {
@@ -319,8 +319,8 @@ fn high_norm_r_rejected_in_protocol() {
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
-        publics.push((round.client_id, round.public));
-        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
             inboxes[idx].items.push((cid, ops));
         }
@@ -334,7 +334,7 @@ fn high_norm_r_rejected_in_protocol() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let result = aggregate_and_decrypt(&pp, &canonical, &publics, &server_outputs);
+    let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
         Err(flashnet::protocol::verify::VerifyError::InvalidServerOpening(_))
@@ -363,7 +363,7 @@ fn recovers_from_t_of_n_servers() {
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut messages = Vec::with_capacity(n_clients);
-    let mut publics = Vec::new();
+    let mut client_entries = Vec::new();
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
         .map(|&sid| ServerInbox {
@@ -375,8 +375,8 @@ fn recovers_from_t_of_n_servers() {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         messages.push(m);
         let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
-        publics.push((round.client_id, round.public));
-        for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
             inboxes[idx].items.push((cid, ops));
         }
@@ -403,7 +403,7 @@ fn recovers_from_t_of_n_servers() {
         &[2, 3, 4],
     ] {
         let subset: Vec<_> = chosen.iter().map(|&i| outputs[i].clone()).collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &publics, &subset)
+        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &subset)
             .expect("verify failed");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0], expected, "subset {:?}", chosen);

@@ -1,7 +1,7 @@
 use chipmunk_code::{KahePoly, Polynomial};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::message::{ClientId, ServerId};
+use flashnet::protocol::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
@@ -38,7 +38,7 @@ fn bench_server_round(c: &mut Criterion) {
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
-            let (sid, ops) = round.private.into_iter().next().unwrap();
+            let (sid, ops) = round.encrypted_openings.into_iter().next().unwrap();
             assert_eq!(sid, server_ids[0]);
             inbox.items.push((cid, ops));
         }
@@ -64,15 +64,15 @@ fn bench_verify(c: &mut Criterion) {
                 items: vec![],
             })
             .collect();
-        let mut publics = vec![];
+        let mut client_entries: Vec<_> = vec![];
         let mut canonical = vec![];
         for ci in 0..n_clients {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
-            publics.push((round.client_id, round.public));
-            for (idx, (sid, ops)) in round.private.into_iter().enumerate() {
+            client_entries.push((round.client_id, round.encrypted_message));
+            for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
                 inboxes[idx].items.push((cid, ops));
             }
@@ -84,7 +84,7 @@ fn bench_verify(c: &mut Criterion) {
         g.bench_with_input(
             BenchmarkId::from_parameter(format!("S{}_C{}", n_servers, n_clients)),
             &(n_servers, n_clients),
-            |b, _| b.iter(|| aggregate_and_decrypt(&pp, &canonical, &publics, &outputs).unwrap()),
+            |b, _| b.iter(|| aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).unwrap()),
         );
     }
     g.finish();

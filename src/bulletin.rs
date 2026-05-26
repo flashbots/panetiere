@@ -3,11 +3,11 @@
 use std::sync::Mutex;
 
 use crate::cs::{Commitment, Opening};
-use crate::protocol::message::{ClientId, ServerId};
+use crate::protocol::{ClientId, ServerId};
 use chipmunk_code::{HVCPoly, KahePoly};
 
 #[derive(Clone)]
-pub struct ClientPublic {
+pub struct ClientBulletinEntry {
     /// KAHE ciphertext, one KAHE ring element per `μ_kahe` slot.
     pub ctxt: Vec<KahePoly>,
     /// Single CS commitment (μ_cs = κ_kahe packs the share-vector).
@@ -15,7 +15,7 @@ pub struct ClientPublic {
 }
 
 #[derive(Clone)]
-pub struct ServerPublic {
+pub struct ServerBulletinEntry {
     pub server_id: ServerId,
     pub clients: Vec<ClientId>,
     /// Single aggregated `Opening` whose `s()` is the κ_kahe-vector of summed shares.
@@ -31,8 +31,8 @@ pub struct InMemoryBulletin {
 
 #[derive(Default)]
 struct Inner {
-    clients: Vec<(ClientId, ClientPublic)>,
-    servers: Vec<ServerPublic>,
+    clients: Vec<(ClientId, ClientBulletinEntry)>,
+    servers: Vec<ServerBulletinEntry>,
     canonical: Option<Vec<ClientId>>,
 }
 
@@ -41,11 +41,11 @@ impl InMemoryBulletin {
         Self::default()
     }
 
-    pub fn publish_client(&self, id: ClientId, p: ClientPublic) {
+    pub fn publish_client(&self, id: ClientId, p: ClientBulletinEntry) {
         self.inner.lock().unwrap().clients.push((id, p));
     }
 
-    pub fn publish_server(&self, p: ServerPublic) {
+    pub fn publish_server(&self, p: ServerBulletinEntry) {
         self.inner.lock().unwrap().servers.push(p);
     }
 
@@ -53,11 +53,11 @@ impl InMemoryBulletin {
         self.inner.lock().unwrap().canonical = Some(set);
     }
 
-    pub fn clients(&self) -> Vec<(ClientId, ClientPublic)> {
+    pub fn clients(&self) -> Vec<(ClientId, ClientBulletinEntry)> {
         self.inner.lock().unwrap().clients.clone()
     }
 
-    pub fn servers(&self) -> Vec<ServerPublic> {
+    pub fn servers(&self) -> Vec<ServerBulletinEntry> {
         self.inner.lock().unwrap().servers.clone()
     }
 

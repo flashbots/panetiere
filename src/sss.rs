@@ -102,7 +102,8 @@ impl ShamirSharing {
                 debug_assert_ne!(xs[i], xs[j], "duplicate sample index");
             }
         }
-        // Note: can be cached for subsets of xs
+        // Note: can be cached for subsets of xs (right now doesnt seem to be relevant to
+        // performance)
         let lagrange: Vec<i32> = (0..t)
             .map(|i| {
                 let xi = xs[i];

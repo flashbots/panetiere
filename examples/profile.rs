@@ -21,7 +21,7 @@
 use chipmunk_code::KahePoly;
 use rand::Rng;
 use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::message::{ClientId, ServerId};
+use flashnet::protocol::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::aggregate_and_decrypt;
 use flashnet::protocol::ProtocolParams;
@@ -77,7 +77,7 @@ fn main() {
     let canonical = client_ids.clone();
 
     for iter in 0..iters {
-        let mut publics = Vec::with_capacity(n);
+        let mut client_entries = Vec::with_capacity(n);
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
             .map(|&sid| ServerInbox {
@@ -90,8 +90,8 @@ fn main() {
                 .map(|_| rand_message_poly(&mut rng, pp.kahe.t_modulus))
                 .collect();
             let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
-            publics.push((round.client_id, round.public));
-            for (idx, (_, op)) in round.private.into_iter().enumerate() {
+            client_entries.push((round.client_id, round.encrypted_message));
+            for (idx, (_, op)) in round.encrypted_openings.into_iter().enumerate() {
                 inboxes[idx].items.push((cid, op));
             }
         }
@@ -100,7 +100,7 @@ fn main() {
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
         let _recovered =
-            aggregate_and_decrypt(&pp, &canonical, &publics, &outputs).expect("verify");
+            aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).expect("verify");
         if iter == 0 {
             eprintln!("profile: first iteration completed");
         }

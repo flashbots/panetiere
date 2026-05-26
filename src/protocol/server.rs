@@ -2,10 +2,10 @@ use std::collections::HashMap;
 
 use chipmunk_code::HVCPoly;
 
-use crate::bulletin::ServerPublic;
+use crate::bulletin::ServerBulletinEntry;
 use crate::cs::{Cs, HidingMerkleCommitment, Opening};
 
-use super::message::{ClientId, ServerId};
+use super::{ClientId, ServerId};
 
 /// Per-server inbox: one `Opening` per client (its `s()` is the κ_kahe-vector
 /// of that client's Shamir shares for this server).
@@ -24,7 +24,7 @@ pub enum ServerRoundError {
 pub fn run_server_round(
     inbox: &ServerInbox,
     canonical: &[ClientId],
-) -> Result<ServerPublic, ServerRoundError> {
+) -> Result<ServerBulletinEntry, ServerRoundError> {
     let index: HashMap<ClientId, usize> = inbox
         .items
         .iter()
@@ -46,7 +46,7 @@ pub fn run_server_round(
     // point. `agg_share` mirrors `agg_open.s()` componentwise.
     let agg_share: Vec<HVCPoly> = agg_open.s().to_vec();
 
-    Ok(ServerPublic {
+    Ok(ServerBulletinEntry {
         server_id: inbox.server_id,
         clients: canonical.to_vec(),
         agg_open,

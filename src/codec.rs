@@ -41,15 +41,9 @@ pub fn encode_raw(bytes: &[u8]) -> Vec<KahePoly> {
     if buf.len() % BYTES_PER_COEFF != 0 {
         buf.push(0);
     }
-    let n_polys = buf.len().div_ceil(BYTES_PER_POLY).max(1);
-    let mut polys = Vec::with_capacity(n_polys);
-    for chunk in buf.chunks(BYTES_PER_POLY) {
-        polys.push(coeffs_from_bytes(chunk));
-    }
-    while polys.len() < n_polys {
-        polys.push(KahePoly::from_coeffs([0i32; N]));
-    }
-    polys
+    // `coeffs_from_bytes` zero-pads short chunks internally, so the
+    // final under-filled chunk produces a correctly padded poly.
+    buf.chunks(BYTES_PER_POLY).map(coeffs_from_bytes).collect()
 }
 
 /// Decode polynomials produced by `encode_raw`. Returns `polys.len() *

@@ -2,35 +2,38 @@ use rand::Rng;
 
 use chipmunk_code::HVCPoly;
 
-use crate::bulletin::ClientPublic;
+use crate::bulletin::ClientBulletinEntry;
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment, Opening};
 use crate::kahe::{kahe_to_hvc_centered, Kahe, KaheKey, KaheScheme};
 use crate::sss::ShamirSharing;
 
-use super::message::{ClientId, ServerId};
+use super::{ClientId, ServerId};
 use super::ProtocolParams;
 
 /// Output of a single client round (README steps 1–6).
 ///
-/// One CS commit per client (with `μ_cs = κ_kahe`), so each per-server
-/// private payload is a single `Opening` — its `s()` is the `κ_kahe`-vector
-/// of Shamir shares for that server.
+/// One CS commit per client (with `μ_cs = κ_kahe`), so each server's
+/// encrypted opening is a single `Opening` — its `s()` is the
+/// `κ_kahe`-vector of Shamir shares for that server.
 pub struct ClientRound {
     pub client_id: ClientId,
-    pub public: ClientPublic,
-    pub private: Vec<(ServerId, Opening)>,
+    pub encrypted_message: ClientBulletinEntry,
+    pub encrypted_openings: Vec<(ServerId, Opening)>,
 }
 
-/// Phase 1 — KAHE keygen + encrypt of the client's message.
-/// Returns the ciphertext (public) and the secret key (consumed by phase 2).
+/// Sample a fresh KAHE secret key.
+pub fn kahe_keygen<R: Rng>(rng: &mut R, pp: &ProtocolParams) -> KaheKey {
+    Kahe::gen(rng, &pp.kahe)
+}
+
+/// Encrypt `message` under `key`.
 pub fn kahe_encrypt<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
+    key: &KaheKey,
     message: &<Kahe as KaheScheme>::Message,
-) -> (<Kahe as KaheScheme>::Ciphertext, KaheKey) {
-    let key = Kahe::gen(rng, &pp.kahe);
-    let ctxt = Kahe::enc(rng, &pp.kahe, &key, message);
-    (ctxt, key)
+) -> <Kahe as KaheScheme>::Ciphertext {
+    Kahe::enc(rng, &pp.kahe, key, message)
 }
 
 /// Phase 2 — bridge each KAHE-key component into R_{q_cs} via centered-rep
@@ -83,16 +86,17 @@ pub fn run_client_round<R: Rng>(
     message: <Kahe as KaheScheme>::Message,
     servers: &[ServerId],
 ) -> ClientRound {
-    let (ctxt, key) = kahe_encrypt(rng, pp, &message);
+    let key = kahe_keygen(rng, pp);
+    let ctxt = kahe_encrypt(rng, pp, &key, &message);
     let shares_per_server = shamir_share(rng, pp, &key, servers.len());
     let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
 
-    let private: Vec<(ServerId, Opening)> =
+    let encrypted_openings: Vec<(ServerId, Opening)> =
         servers.iter().copied().zip(openings.into_iter()).collect();
 
     ClientRound {
         client_id,
-        public: ClientPublic { ctxt, comm },
-        private,
+        encrypted_message: ClientBulletinEntry { ctxt, comm },
+        encrypted_openings,
     }
 }

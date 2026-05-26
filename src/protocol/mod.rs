@@ -1,9 +1,14 @@
 pub mod client;
-pub mod message;
 pub mod server;
 pub mod verify;
 
 use rand::Rng;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct ClientId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct ServerId(pub u32);
 
 use crate::cs::{Cs, HidingMerkleCommitment};
 use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};

@@ -259,6 +259,36 @@ impl Cs for HidingMerkleCommitment {
         Self::setup_with_dims(rng, num_servers, 1, 8)
     }
 
+    /// Commit per-server share vectors and emit one opening per server.
+    ///
+    /// Walkthrough:
+    /// 1. **Per-server BDLOP leaves.** For each server `i` draw a fresh
+    ///    ternary randomness vector `r_i ∈ B^{κ_cs}_{β,q}` of Hamming
+    ///    half-weight `r_half_weight`, then compute the `1 + μ_cs` raw
+    ///    leaf polys `(a^T r_i, B r_i + s_i)` via `leaf_block`. Zero-pad
+    ///    to `block_size = next_power_of_two(1 + μ_cs)`.
+    /// 2. **Per-server block subtree.** Hash the padded leaves upward
+    ///    pairwise with `decom_then_hash` (chipmunk's `hash_separate_in
+    ///    puts ∘ decompose_r`). The full subtree is retained in raw
+    ///    (non-decomposed) form because we re-decompose it just below
+    ///    when filling the opening.
+    /// 3. **Chipmunk Merkle tree over block roots.** Splat each server's
+    ///    `block_size` leaves into a global leaf array at offsets
+    ///    `[block_size·i .. block_size·(i+1))` and build a standard
+    ///    chipmunk `Tree` over `n_leaves = next_pow2(block_size·
+    ///    n_servers)`. Its `root` is the commitment.
+    /// 4. **Opening layout.** Each opening packs, in order:
+    ///    - `r_i` (`κ_cs` polys) and `s_i` (`μ_cs` polys), raw;
+    ///    - every node of the server's block subtree, level 0 (leaves)
+    ///      up to but excluding the block-root, decomposed (`HVC_WIDTH`
+    ///      polys per node);
+    ///    - the chipmunk Merkle path above the block — `stored_path_len`
+    ///      `(left, right)` sibling pairs, decomposed.
+    ///   The block subtree is stored decomposed (not raw) because
+    ///   `decompose_r` is non-linear; aggregation (`sum_openings`)
+    ///   pointwise-adds the stored decomps, and `hash_separate_inputs`
+    ///   is linear over decomposed inputs, so summed openings still hash
+    ///   to summed roots.
     fn commit<R: Rng>(
         rng: &mut R,
         pp: &CsParams,
@@ -274,6 +304,10 @@ impl Cs for HidingMerkleCommitment {
         let stored_path_len = pp.stored_path_len();
         let total = opening_total_polys(pp.kappa_cs, pp.mu_cs, block_size, stored_path_len);
 
+        // Step 1+2: build each server's BDLOP leaf-block and its raw
+        // block subtree. `levels[0]` = padded leaves, `levels[h]` =
+        // level h of the subtree; the last level is a single node (the
+        // block root) that becomes a leaf of the chipmunk tree below.
         let mut leaves_full = vec![HVCPoly::default(); pp.n_leaves];
         let mut server_raw_blocks: Vec<Vec<Vec<HVCPoly>>> = Vec::with_capacity(pp.n_servers);
         let mut server_rs: Vec<Vec<HVCPoly>> = Vec::with_capacity(pp.n_servers);
@@ -301,6 +335,11 @@ impl Cs for HidingMerkleCommitment {
                 levels.push(next.clone());
                 level_polys = next;
             }
+            // Splat the server's block leaves into the global tree-leaf
+            // array (Step 3 prep). Note we splat the *raw leaves*, not
+            // the block root, because chipmunk's `Tree` re-decomposes
+            // and re-hashes from these positions; the block root falls
+            // out of that tree's construction naturally.
             for (k, leaf) in levels[0].iter().enumerate() {
                 leaves_full[block_size * i + k] = *leaf;
             }
@@ -308,19 +347,31 @@ impl Cs for HidingMerkleCommitment {
             server_rs.push(r);
         }
 
+        // Step 3: chipmunk tree over the full leaf array.
         let tree = Tree::<HVCHash>::new_with_leaf_nodes(&leaves_full, &pp.hasher);
         let root = tree.root();
 
+        // Step 4: pack each server's opening. Order matters — `Opening`
+        // accessors read by fixed offset (`r()`, `s()`, `block_node()`,
+        // `path_node()`).
         let openings: Vec<Opening> = (0..pp.n_servers)
             .map(|i| {
                 let mut data: Vec<HVCPoly> = Vec::with_capacity(total);
                 data.extend_from_slice(&server_rs[i]);
                 data.extend_from_slice(&shares[i]);
+                // Block subtree, level 0 → block_height-1, decomposed.
+                // The block root itself is omitted: verify recomputes it
+                // from the stored top level and matches it against the
+                // chipmunk-path sibling that links into the global root.
                 for h in 0..block_height {
                     for node in &server_raw_blocks[i][h] {
                         data.extend_from_slice(&node.decompose_r());
                     }
                 }
+                // Chipmunk path from this server's first leaf upward;
+                // we keep only the `stored_path_len` levels strictly
+                // above the block (the lower levels are already covered
+                // by the block subtree we just wrote).
                 let raw_path = tree.gen_proof(block_size * i);
                 debug_assert_eq!(raw_path.nodes.len(), total_path_len);
                 for (l, r) in raw_path.nodes.iter().take(stored_path_len) {
@@ -343,7 +394,41 @@ impl Cs for HidingMerkleCommitment {
         (Commitment { root }, openings)
     }
 
+    /// Verify reverses `commit` step-by-step:
+    ///
+    /// 1. **Shape + norm checks.** Reject openings whose dimensions
+    ///    disagree with `pp`, or whose `r` exceeds `r_bound` (∞-norm).
+    ///    The norm check is what makes hiding statistical: a malicious
+    ///    aggregator can't escape the BDLOP `r`-ball by summing more
+    ///    than ρ openings.
+    /// 2. **Recompute BDLOP leaves.** From the opening's raw `(r, s)`
+    ///    and `pp`'s `(a, B)`, recompute the `1 + μ_cs` raw leaf polys.
+    ///    Pad to `block_size`.
+    /// 3. **Walk the block subtree.** For each level `h ∈ [0,
+    ///    block_height)`: project every stored decomp at level `h` back
+    ///    to its raw value (`projection_r` is the left-inverse of
+    ///    `decompose_r`) and check it equals `expected_level[k]`; then
+    ///    hash stored-decomp sibling pairs with `hash_separate_inputs`
+    ///    to produce the next expected level. After the loop,
+    ///    `expected_level[0]` is the block root.
+    /// 4. **Walk the chipmunk path above the block.** If
+    ///    `stored_path_len == 0` (single server fits in the tree), the
+    ///    block root *is* the commitment root — direct compare. Else:
+    ///    a. Top sibling pair must hash to the commitment root.
+    ///    b. For each level `i ∈ [1, stored_path_len)`, hash the
+    ///       current `(l, r)` pair and check it matches the projection
+    ///       of the previous level's `l` or `r` depending on the bit of
+    ///       `above_block_index`.
+    ///    c. At the bottom (level `stored_path_len - 1`), the same
+    ///       position-bit selects which projection must equal the block
+    ///       root computed in step 3.
+    ///
+    /// The asymmetry (block subtree decomposed, BDLOP leaves raw) is
+    /// what makes `sum_openings` linear: the only non-linear step
+    /// (`decompose_r`) is pre-applied at commit time and never
+    /// re-applied at sum/verify.
     fn verify(pp: &CsParams, c: &Commitment, o: &Opening) -> bool {
+        // Step 1
         if o.kappa_cs() != pp.kappa_cs {
             return false;
         }
@@ -363,6 +448,7 @@ impl Cs for HidingMerkleCommitment {
         let block_size = pp.block_size();
         let block_height = pp.block_height();
 
+        // Step 2
         let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, o.r(), o.s());
         let mut expected_level: Vec<HVCPoly> = raw
             .iter()
@@ -370,6 +456,7 @@ impl Cs for HidingMerkleCommitment {
             .chain(std::iter::repeat(HVCPoly::default()).take(block_size - raw.len()))
             .collect();
 
+        // Step 3
         for h in 0..block_height {
             let level_size = block_level_size(block_size, h);
             for k in 0..level_size {
@@ -390,6 +477,7 @@ impl Cs for HidingMerkleCommitment {
         debug_assert_eq!(expected_level.len(), 1);
         let leaf_block_root = expected_level[0];
 
+        // Step 4
         let stored_path_len = o.stored_path_len();
         if stored_path_len == 0 {
             return c.root == leaf_block_root;
