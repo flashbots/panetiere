@@ -75,29 +75,31 @@ use flashnet::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
 use flashnet::protocol::client::{cs_commit, kahe_encrypt, kahe_keygen, run_client_round, shamir_share};
 use flashnet::protocol::{ClientId, ServerId};
 use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::aggregate_and_decrypt;
+use flashnet::protocol::verify::{aggregate_and_decrypt_timed, VerifyTimings};
 use flashnet::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-const CELLS: &[(usize, usize)] = &[(4, 100)];
+const CELLS: &[(usize, usize)] = &[(4, 100), (8, 100), (16, 100)];
 
 struct Config {
     label: &'static str,
     gamma: usize,
-    delta_factor: usize, // δ = delta_factor · N
+    delta_factor: usize, // δ = delta_factor · N · l
     payload_symbols: usize,
     kappa_kahe: usize,
+    /// Number of MSE elements packed per client, per round. Equivalently the
+    /// number of KAHE ciphertext chunks per round — one Shamir+CS commit
+    /// amortizes over all `l` chunks. `l = 1` is the original (no-amortize)
+    /// regime; `l > 1` widens MSE's `δ` so per-row load stays the same.
+    l: usize,
 }
 
-// ξ = 29 ⇒ 29·18 = 522 useful bits per client (≥ 512-bit target).
-const CONFIGS: &[Config] = &[Config {
-    label: "std",
-    gamma: 4,
-    delta_factor: 2,
-    payload_symbols: 29,
-    kappa_kahe: 31,
-}];
+// ξ = 29 ⇒ 29·18 = 522 useful bits per element (≥ 512-bit target).
+const CONFIGS: &[Config] = &[
+    Config { label: " L=1",  gamma: 4, delta_factor: 2, payload_symbols: 29, kappa_kahe: 31, l: 1 },
+    Config { label: " L=20", gamma: 4, delta_factor: 2, payload_symbols: 29, kappa_kahe: 31, l: 20 },
+];
 
 /// ⌈log₂ q⌉, tight-pack bit-width per ring coefficient.
 const fn bits_per_coef(q: i32) -> usize {
@@ -141,13 +143,20 @@ struct Row {
     gamma: usize,
     delta: usize,
     xi: usize,
-    // CPU (one round, no averaging). client.proto is split into KAHE / Shamir-bridge / CS phases.
-    mse_c_us: f64,
+    l: usize,
+    // CPU (one round, no averaging). Fixed-per-round vs per-chunk split:
+    //   fixed:    client_share + client_cs + server + verify_opening + verify_interp + verify_sum_comm
+    //   per-chunk (×l): mse_c + client_kahe + verify_agg_ctxt + verify_kahe_dec + mse_v
+    mse_c_us: f64,           // total over l inserts
     client_kahe_us: f64,
     client_share_us: f64,
     client_cs_us: f64,
     server_us: f64,
-    verify_us: f64,
+    verify_agg_ctxt_us: f64,
+    verify_sum_comm_us: f64,
+    verify_opening_us: f64,
+    verify_interp_us: f64,
+    verify_kahe_us: f64,
     mse_v_us: f64,
     // Bandwidth (bytes per round, totalled across all parties)
     useful_b: f64,
@@ -159,7 +168,7 @@ struct Row {
 
 fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     let mut seed = [0u8; 32];
-    seed[..7].copy_from_slice(&[
+    seed[..8].copy_from_slice(&[
         s as u8,
         n as u8,
         (n >> 8) as u8,
@@ -167,22 +176,28 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         cfg.gamma as u8,
         cfg.payload_symbols as u8,
         cfg.delta_factor as u8,
+        cfg.l as u8,
     ]);
     let mut rng = ChaCha20Rng::from_seed(seed);
 
-    let mse_params = MseParams::new(
-        cfg.gamma,
-        cfg.delta_factor * n,
-        cfg.payload_symbols,
-        [0xAA; 32],
+    // Widen MSE so total elements scale with l while per-row peeling load
+    // (ρ_total / δ) stays the same as the l=1 baseline.
+    let delta = cfg.delta_factor * n * cfg.l;
+    let mse_params = MseParams::new(cfg.gamma, delta, cfg.payload_symbols, [0xAA; 32]);
+    let n_polys = MseEncoding::n_polys(&mse_params);
+    assert!(
+        n_polys % cfg.l == 0,
+        "n_polys={n_polys} must divide evenly by l={}",
+        cfg.l
     );
-    let mu_kahe = MseEncoding::n_polys(&mse_params);
+    let mu_kahe = n_polys / cfg.l;
 
     let pp = ProtocolParams::setup_with_kahe_dims_full(
         &mut rng,
         s,
         mu_kahe,
         cfg.kappa_kahe,
+        cfg.l,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
         T_MODULUS_DEFAULT,
@@ -190,21 +205,28 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
 
-    // Small distinct values; max magnitude ≈ N + ξ ≪ t/2 = 2^17, so no wrap
-    // when summed across N clients.
-    let payloads: Vec<Vec<i32>> = client_ids
+    // Each client inserts l distinct elements. Small distinct values; max
+    // magnitude ≈ (n·l + ξ) ≪ t/2 = 2^17, so no wrap when summed across n.
+    let payloads: Vec<Vec<Vec<i32>>> = client_ids
         .iter()
         .map(|cid| {
-            (0..cfg.payload_symbols)
-                .map(|j| cid.0 as i32 + j as i32 + 1)
+            (0..cfg.l)
+                .map(|elt_idx| {
+                    let base = cid.0 as i32 * cfg.l as i32 + elt_idx as i32;
+                    (0..cfg.payload_symbols)
+                        .map(|j| base + j as i32 + 1)
+                        .collect()
+                })
                 .collect()
         })
         .collect();
     let client_polys: Vec<Vec<KahePoly>> = payloads
         .iter()
-        .map(|p| {
+        .map(|elts| {
             let mut enc = MseEncoding::new(mse_params.clone());
-            enc.insert(&mut rng, p);
+            for e in elts {
+                enc.insert(&mut rng, e);
+            }
             enc.pack()
         })
         .collect();
@@ -231,11 +253,16 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         .collect();
 
     // Recovery must succeed before timing — otherwise we're benching broken params.
-    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).unwrap();
+    let (recovered, _t0) =
+        aggregate_and_decrypt_timed(&pp, &canonical, &client_entries, &outputs).unwrap();
     let decoded = MseEncoding::unpack(&mse_params, &recovered)
         .decode()
         .expect("MSE decode");
-    assert_eq!(decoded.len(), n, "MSE recovered wrong multiset size");
+    assert_eq!(
+        decoded.len(),
+        n * cfg.l,
+        "MSE recovered wrong multiset size"
+    );
 
     // Wire ledger (structural — tight ⌈log₂ q⌉ packing).
     let o = &inboxes[0].items[0].1;
@@ -247,7 +274,9 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     // Per-phase timings (one round each).
     let (mse_c_us, _) = time_us(|| {
         let mut enc = MseEncoding::new(mse_params.clone());
-        enc.insert(&mut rng, &payloads[0]);
+        for e in &payloads[0] {
+            enc.insert(&mut rng, e);
+        }
         enc.pack()
     });
     let key0 = kahe_keygen(&mut rng, &pp);
@@ -256,8 +285,17 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     let (client_share_us, shares0) = time_us(|| shamir_share(&mut rng, &pp, &key0, s));
     let (client_cs_us, _) = time_us(|| cs_commit(&mut rng, &pp, &shares0));
     let (server_us, _) = time_us(|| run_server_round(&inboxes[0], &canonical).unwrap());
-    let (verify_us, recovered2) =
-        time_us(|| aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).unwrap());
+    let (verify_us_total, (recovered2, vt)) = time_us(|| {
+        aggregate_and_decrypt_timed(&pp, &canonical, &client_entries, &outputs).unwrap()
+    });
+    let _ = verify_us_total;
+    let VerifyTimings {
+        agg_ctxt_us,
+        sum_comm_us,
+        opening_verify_us,
+        interpolation_us,
+        kahe_dec_us,
+    } = vt;
     let (mse_v_us, _) = time_us(|| {
         MseEncoding::unpack(&mse_params, &recovered2)
             .decode()
@@ -271,17 +309,22 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         mu_kahe,
         kappa: cfg.kappa_kahe,
         gamma: cfg.gamma,
-        delta: cfg.delta_factor * n,
+        delta,
         xi: cfg.payload_symbols,
+        l: cfg.l,
         mse_c_us,
         client_kahe_us,
         client_share_us,
         client_cs_us,
         server_us,
-        verify_us,
+        verify_agg_ctxt_us: agg_ctxt_us,
+        verify_sum_comm_us: sum_comm_us,
+        verify_opening_us: opening_verify_us,
+        verify_interp_us: interpolation_us,
+        verify_kahe_us: kahe_dec_us,
         mse_v_us,
-        useful_b: (n * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
-        wire_ctxt_b: n as f64 * mu_kahe as f64 * KAHE_POLY_BYTES,
+        useful_b: (n * cfg.l * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
+        wire_ctxt_b: n as f64 * (mu_kahe * cfg.l) as f64 * KAHE_POLY_BYTES,
         wire_comm_b: n as f64 * HVC_POLY_BYTES,
         wire_opening_b: (n * s) as f64 * opening_polys as f64 * HVC_POLY_BYTES,
         wire_server_b: s as f64 * (opening_polys + cfg.kappa_kahe) as f64 * HVC_POLY_BYTES,
@@ -289,17 +332,54 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
 }
 
 fn print_row(r: &Row) {
-    let client_us = r.client_kahe_us + r.client_share_us + r.client_cs_us;
-    let per_round_us = r.mse_c_us + client_us + r.server_us + r.verify_us + r.mse_v_us;
+    // Fixed-per-round = Shamir share + CS commit + server + opening verify
+    //                 + Shamir interpolation + commitment summation.
+    // Per-chunk (×l)   = MSE encode + KAHE enc + KAHE agg_ctxt + KAHE dec + MSE decode.
+    let fixed_us = r.client_share_us
+        + r.client_cs_us
+        + r.server_us
+        + r.verify_opening_us
+        + r.verify_interp_us
+        + r.verify_sum_comm_us;
+    let per_chunk_total_us =
+        r.mse_c_us + r.client_kahe_us + r.verify_agg_ctxt_us + r.verify_kahe_us + r.mse_v_us;
+    let per_chunk_us = per_chunk_total_us / r.l as f64;
+    let per_round_us = fixed_us + per_chunk_total_us;
     let wire_total = r.wire_ctxt_b + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
     let useful_mb_s = r.useful_b / (per_round_us / 1e6) / 1e6;
     let wire_mb_s = wire_total / (per_round_us / 1e6) / 1e6;
     let efficiency = r.useful_b / wire_total;
-    let pct = |us: f64| 100.0 * us / per_round_us;
 
     println!(
-        "S={:>2} N={:>4} {:>5} (μ_kahe={}, κ_kahe={}, γ={}, δ={}, L={}, ξ={})",
-        r.s, r.n, r.label, r.mu_kahe, r.kappa, r.gamma, r.delta, K_LIMBS, r.xi,
+        "S={:>2} N={:>4} {:>5} (μ_kahe={}, κ_kahe={}, γ={}, δ={}, K={}, ξ={}, l={})",
+        r.s, r.n, r.label, r.mu_kahe, r.kappa, r.gamma, r.delta, K_LIMBS, r.xi, r.l,
+    );
+    println!(
+        "  fixed/round: {:>10}   [share {} + cs {} + server {} + verify_open {} + verify_interp {} + sum_comm {}]",
+        fmt_us(fixed_us),
+        fmt_us(r.client_share_us),
+        fmt_us(r.client_cs_us),
+        fmt_us(r.server_us),
+        fmt_us(r.verify_opening_us),
+        fmt_us(r.verify_interp_us),
+        fmt_us(r.verify_sum_comm_us),
+    );
+    println!(
+        "  per-chunk:   {:>10}   [mse_c {} + kahe_enc {} + verify_agg_ctxt {} + verify_kahe_dec {} + mse_v {}]   (×l={})",
+        fmt_us(per_chunk_us),
+        fmt_us(r.mse_c_us / r.l as f64),
+        fmt_us(r.client_kahe_us / r.l as f64),
+        fmt_us(r.verify_agg_ctxt_us / r.l as f64),
+        fmt_us(r.verify_kahe_us / r.l as f64),
+        fmt_us(r.mse_v_us / r.l as f64),
+        r.l,
+    );
+    println!(
+        "  total wall:  {:>10}  = {} + {} · {}",
+        fmt_us(per_round_us),
+        fmt_us(fixed_us),
+        r.l,
+        fmt_us(per_chunk_us),
     );
     println!(
         "  useful: {} / round  ⇒  {:.3} MB/s  (wall per 1 MiB useful: {})",
@@ -314,23 +394,11 @@ fn print_row(r: &Row) {
         efficiency,
     );
     println!(
-        "          ctxt={} comm={} opening={} server_pub={}",
+        "          ctxt={} (l·μ) comm={} opening={} (fixed) server_pub={}",
         fmt_bytes(r.wire_ctxt_b),
         fmt_bytes(r.wire_comm_b),
         fmt_bytes(r.wire_opening_b),
         fmt_bytes(r.wire_server_b),
-    );
-    println!(
-        "  cpu:    mse_c {} ({:.1}%) | client [kahe {} ({:.1}%) + share {} ({:.1}%) + cs {} ({:.1}%) = {} ({:.1}%)] | server {} ({:.1}%) | verify {} ({:.1}%) | mse_v {} ({:.1}%)  ⇒ per-round {}",
-        fmt_us(r.mse_c_us),         pct(r.mse_c_us),
-        fmt_us(r.client_kahe_us),   pct(r.client_kahe_us),
-        fmt_us(r.client_share_us),  pct(r.client_share_us),
-        fmt_us(r.client_cs_us),     pct(r.client_cs_us),
-        fmt_us(client_us),          pct(client_us),
-        fmt_us(r.server_us),        pct(r.server_us),
-        fmt_us(r.verify_us),        pct(r.verify_us),
-        fmt_us(r.mse_v_us),         pct(r.mse_v_us),
-        fmt_us(per_round_us),
     );
 }
 
@@ -352,8 +420,10 @@ fn main() {
         KAHE_POLY_BYTES as usize,
         BITS_PER_SYMBOL,
     );
-    println!("per-round wall = mse_c + client + server + verify + mse_v");
-    println!("useful = N · ξ · log₂(t) bits per round");
+    println!("per-round wall = fixed + l · per-chunk");
+    println!("  fixed   = shamir_share + cs_commit + server + verify_open + verify_interp + sum_comm");
+    println!("  chunk   = mse_c + kahe_enc + kahe_agg_ctxt + kahe_dec + mse_v");
+    println!("useful = l · N · ξ · log₂(t) bits per round  (N clients × l elements each)");
     println!();
 
     'outer: for &(s, n) in CELLS {

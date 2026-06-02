@@ -66,13 +66,20 @@ pub trait KaheScheme {
     fn agg_key(ks: &[Self::Key]) -> Self::AggKey;
 }
 
-/// Public parameters. `a_matrix_ntt` is `μ × κ` (NTT-resident). `t_modulus`
-/// is the plaintext modulus; both `sigma_s` (key) and `sigma_e` (error) are
-/// Gaussian standard deviations.
+/// Public parameters. `a_matrices_ntt[i]` is a `μ × κ` (NTT-resident) public
+/// matrix for chunk `i ∈ [0, l)`. One Shamir+CS round amortizes its commit
+/// overhead across `l` ciphertexts that share the same `sk` but each use a
+/// different `A_i` — security reduces to standard multi-sample Module-LWE
+/// with the same secret. `t_modulus` is the plaintext modulus; both `sigma_s`
+/// (key) and `sigma_e` (error) are Gaussian standard deviations.
 pub struct KaheParams {
-    pub a_matrix_ntt: Vec<Vec<KaheNTTPoly>>,
+    pub a_matrices_ntt: Vec<Vec<Vec<KaheNTTPoly>>>,
     pub mu_kahe: usize,
     pub kappa_kahe: usize,
+    /// Number of ciphertext chunks emitted per `enc` call (and consumed per
+    /// `dec`). Messages and ciphertexts are flat `Vec<KahePoly>` of length
+    /// `mu_kahe · l`.
+    pub l: usize,
     pub sigma_s: f64,
     pub sigma_e: f64,
     pub t_modulus: u32,
@@ -130,22 +137,18 @@ fn sample_dg_poly<R: Rng>(rng: &mut R, sigma: f64) -> KahePoly {
     KahePoly::from_coeffs(coeffs)
 }
 
-fn matvec(a_matrix_ntt: &[Vec<KaheNTTPoly>], sk: &[KahePoly]) -> Vec<KahePoly> {
-    let sk_ntt: Vec<KaheNTTPoly> = sk.iter().map(KaheNTTPoly::from).collect();
+/// `A · sk` where `sk` is already in NTT representation. Used by `enc`/`dec`
+/// to amortize the κ-NTT of the secret across all `l` chunks.
+fn matvec_ntt_sk(a_matrix_ntt: &[Vec<KaheNTTPoly>], sk_ntt: &[KaheNTTPoly]) -> Vec<KahePoly> {
     a_matrix_ntt
         .iter()
-        .map(|row| KahePoly::from(&pointwise_dot_kahe(row, &sk_ntt)))
+        .map(|row| KahePoly::from(&pointwise_dot_kahe(row, sk_ntt)))
         .collect()
 }
 
 fn vec_add(a: &[KahePoly], b: &[KahePoly]) -> Vec<KahePoly> {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(x, y)| *x + *y).collect()
-}
-
-fn vec_sub(a: &[KahePoly], b: &[KahePoly]) -> Vec<KahePoly> {
-    debug_assert_eq!(a.len(), b.len());
-    a.iter().zip(b.iter()).map(|(x, y)| *x - *y).collect()
 }
 
 fn vec_zero(len: usize) -> Vec<KahePoly> {
@@ -239,24 +242,33 @@ impl Kahe {
         rng: &mut R,
         mu_kahe: usize,
         kappa_kahe: usize,
+        l: usize,
         sigma_s: f64,
         sigma_e: f64,
         t_modulus: u32,
     ) -> KaheParams {
         assert!(mu_kahe >= 1, "μ_kahe must be ≥ 1");
         assert!(kappa_kahe >= 1, "κ_kahe must be ≥ 1");
+        assert!(l >= 1, "l must be ≥ 1");
         assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
-        let a_matrix_ntt: Vec<Vec<KaheNTTPoly>> = (0..mu_kahe)
+        // Sample directly NTT-resident — uniform-in-NTT slot is statistically
+        // equivalent to NTT(uniform coeff poly) and saves `l·μ·κ` forward NTTs.
+        let a_matrices_ntt: Vec<Vec<Vec<KaheNTTPoly>>> = (0..l)
             .map(|_| {
-                (0..kappa_kahe)
-                    .map(|_| KaheNTTPoly::from(&KahePoly::rand_poly(rng)))
+                (0..mu_kahe)
+                    .map(|_| {
+                        (0..kappa_kahe)
+                            .map(|_| KaheNTTPoly::rand_ntt_poly(rng))
+                            .collect()
+                    })
                     .collect()
             })
             .collect();
         KaheParams {
-            a_matrix_ntt,
+            a_matrices_ntt,
             mu_kahe,
             kappa_kahe,
+            l,
             sigma_s,
             sigma_e,
             t_modulus,
@@ -285,6 +297,7 @@ impl KaheScheme for Kahe {
             rng,
             1,
             5,
+            1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
             T_MODULUS_DEFAULT,
@@ -298,29 +311,44 @@ impl KaheScheme for Kahe {
         KaheKey(polys)
     }
 
-    /// `c = m + A·sk + t·e`, with `e ← D_{σ_e}^μ`.
+    /// Batch-encrypt `l` chunks of `μ` plaintext polys under one key `sk`.
+    /// For chunk `i ∈ [0, l)`: `c_i = m_i + A_i·sk + t·e_i`, with a fresh
+    /// `e_i ← D_{σ_e}^μ`. The κ-NTT of `sk` is computed once and reused
+    /// across all `l` chunks.
     fn enc<R: Rng>(rng: &mut R, pp: &KaheParams, k: &KaheKey, m: &Vec<KahePoly>) -> Vec<KahePoly> {
         debug_assert_eq!(k.inner().len(), pp.kappa_kahe);
-        debug_assert_eq!(m.len(), pp.mu_kahe);
-        let pad = matvec(&pp.a_matrix_ntt, k.inner());
+        debug_assert_eq!(m.len(), pp.mu_kahe * pp.l);
         let t = pp.t_modulus as i32;
-        let mut out = Vec::with_capacity(pp.mu_kahe);
-        for i in 0..pp.mu_kahe {
-            let e = sample_dg_poly(rng, pp.sigma_e);
-            let te = scale_poly(&e, t);
-            // m + A·sk + t·e
-            out.push(m[i] + pad[i] + te);
+        let sk_ntt: Vec<KaheNTTPoly> = k.inner().iter().map(KaheNTTPoly::from).collect();
+        let mut out = Vec::with_capacity(pp.mu_kahe * pp.l);
+        for chunk in 0..pp.l {
+            let pad = matvec_ntt_sk(&pp.a_matrices_ntt[chunk], &sk_ntt);
+            let base = chunk * pp.mu_kahe;
+            for i in 0..pp.mu_kahe {
+                let e = sample_dg_poly(rng, pp.sigma_e);
+                let te = scale_poly(&e, t);
+                out.push(m[base + i] + pad[i] + te);
+            }
         }
         out
     }
 
-    /// `((c − A·sk) mod q_kahe) reduced mod t`, coefficient-wise centered.
+    /// `((c_i − A_i·sk_agg) mod q_kahe) reduced mod t`, per chunk. `sk_agg`'s
+    /// κ-NTT is computed once and shared across all `l` chunks.
     fn dec(pp: &KaheParams, c: &Vec<KahePoly>, k: &KaheAggKey) -> Vec<KahePoly> {
         debug_assert_eq!(k.inner().len(), pp.kappa_kahe);
-        debug_assert_eq!(c.len(), pp.mu_kahe);
-        let pad = matvec(&pp.a_matrix_ntt, k.inner());
-        let raw = vec_sub(c, &pad);
-        raw.iter().map(|p| poly_mod_t(p, pp.t_modulus)).collect()
+        debug_assert_eq!(c.len(), pp.mu_kahe * pp.l);
+        let sk_ntt: Vec<KaheNTTPoly> = k.inner().iter().map(KaheNTTPoly::from).collect();
+        let mut out = Vec::with_capacity(pp.mu_kahe * pp.l);
+        for chunk in 0..pp.l {
+            let pad = matvec_ntt_sk(&pp.a_matrices_ntt[chunk], &sk_ntt);
+            let base = chunk * pp.mu_kahe;
+            for i in 0..pp.mu_kahe {
+                let raw = c[base + i] - pad[i];
+                out.push(poly_mod_t(&raw, pp.t_modulus));
+            }
+        }
+        out
     }
 
     fn agg_ctxt(cs: &[Vec<KahePoly>]) -> Vec<KahePoly> {
@@ -462,6 +490,65 @@ mod tests {
         let agg_c = Kahe::agg_ctxt(&ctxts);
         let agg_k = Kahe::agg_key(&keys);
         let agg_m_expected: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|i| {
+                let summed = msgs.iter().fold(KahePoly::default(), |a, x| a + x[i]);
+                poly_mod_t(&summed, pp.t_modulus)
+            })
+            .collect();
+        assert_eq!(Kahe::dec(&pp, &agg_c, &agg_k), agg_m_expected);
+    }
+
+    #[test]
+    fn round_trip_l4() {
+        let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
+        let pp = Kahe::setup_with_dims(
+            &mut rng,
+            5,
+            5,
+            4,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
+        let k = Kahe::gen(&mut rng, &pp);
+        let m: Vec<KahePoly> = (0..pp.mu_kahe * pp.l)
+            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+            .collect();
+        let c = Kahe::enc(&mut rng, &pp, &k, &m);
+        assert_eq!(c.len(), pp.mu_kahe * pp.l);
+        let agg = Kahe::agg_key(std::slice::from_ref(&k));
+        assert_eq!(Kahe::dec(&pp, &c, &agg), m);
+    }
+
+    #[test]
+    fn additive_homomorphism_l4() {
+        let mut rng = ChaCha20Rng::from_seed([17u8; 32]);
+        let pp = Kahe::setup_with_dims(
+            &mut rng,
+            3,
+            5,
+            4,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
+        let n = 5;
+        let keys: Vec<KaheKey> = (0..n).map(|_| Kahe::gen(&mut rng, &pp)).collect();
+        let msgs: Vec<Vec<KahePoly>> = (0..n)
+            .map(|_| {
+                (0..pp.mu_kahe * pp.l)
+                    .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+                    .collect()
+            })
+            .collect();
+        let ctxts: Vec<Vec<KahePoly>> = keys
+            .iter()
+            .zip(&msgs)
+            .map(|(k, m)| Kahe::enc(&mut rng, &pp, k, m))
+            .collect();
+        let agg_c = Kahe::agg_ctxt(&ctxts);
+        let agg_k = Kahe::agg_key(&keys);
+        let agg_m_expected: Vec<KahePoly> = (0..pp.mu_kahe * pp.l)
             .map(|i| {
                 let summed = msgs.iter().fold(KahePoly::default(), |a, x| a + x[i]);
                 poly_mod_t(&summed, pp.t_modulus)

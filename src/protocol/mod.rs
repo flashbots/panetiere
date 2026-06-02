@@ -53,6 +53,7 @@ impl ProtocolParams {
             n_servers,
             mu_kahe,
             kappa_kahe,
+            1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
             T_MODULUS_DEFAULT,
@@ -60,18 +61,22 @@ impl ProtocolParams {
     }
 
     /// Explicit KAHE dimensions and Gaussian / plaintext-modulus parameters.
+    /// `l` is the per-round chunk multiplier: one Shamir+CS pass covers `l`
+    /// ciphertext chunks (each `μ`-wide) under independent matrices `A_i`.
     /// Threshold `t = max(⌊n/2⌋ + 1, n − 2)`. CS μ_cs is coupled to κ_kahe.
     pub fn setup_with_kahe_dims_full<R: Rng>(
         rng: &mut R,
         n_servers: usize,
         mu_kahe: usize,
         kappa_kahe: usize,
+        l: usize,
         sigma_s: f64,
         sigma_e: f64,
         t_modulus: u32,
     ) -> Self {
         let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
-        let kahe = Kahe::setup_with_dims(rng, mu_kahe, kappa_kahe, sigma_s, sigma_e, t_modulus);
+        let kahe =
+            Kahe::setup_with_dims(rng, mu_kahe, kappa_kahe, l, sigma_s, sigma_e, t_modulus);
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 8);
         let shamir = ShamirParams::new(t, n_servers);
         Self { kahe, cs, shamir }
