@@ -1,10 +1,10 @@
 use rand::Rng;
 
-use chipmunk_code::HVCPoly;
+use chipmunk_code::CsPoly;
 
 use crate::bulletin::ClientBulletinEntry;
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment, Opening};
-use crate::kahe::{kahe_to_hvc_centered, Kahe, KaheKey, KaheScheme};
+use crate::kahe::{kahe_to_cs_centered, Kahe, KaheKey, KaheScheme};
 use crate::sss::ShamirSharing;
 
 use super::{ClientId, ServerId};
@@ -48,7 +48,7 @@ pub fn shamir_share<R: Rng>(
     pp: &ProtocolParams,
     key: &KaheKey,
     n_servers: usize,
-) -> Vec<Vec<HVCPoly>> {
+) -> Vec<Vec<CsPoly>> {
     assert_eq!(n_servers, pp.cs.n_servers, "server count must match CS params");
     assert_eq!(n_servers, pp.shamir.n, "server count must match Shamir params");
     let kappa_kahe = pp.kahe.kappa_kahe;
@@ -58,10 +58,10 @@ pub fn shamir_share<R: Rng>(
     );
 
     // shares_per_component[k][i] = f_k(point_{i+1}).
-    let shares_per_component: Vec<Vec<HVCPoly>> = (0..kappa_kahe)
+    let shares_per_component: Vec<Vec<CsPoly>> = (0..kappa_kahe)
         .map(|k| {
-            let secret_hvc = kahe_to_hvc_centered(key.component(k));
-            ShamirSharing::share(rng, &pp.shamir, &secret_hvc)
+            let secret_cs = kahe_to_cs_centered(key.component(k));
+            ShamirSharing::share(rng, &pp.shamir, &secret_cs)
         })
         .collect();
     (0..n_servers)
@@ -74,7 +74,7 @@ pub fn shamir_share<R: Rng>(
 pub fn cs_commit<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
-    shares_per_server: &[Vec<HVCPoly>],
+    shares_per_server: &[Vec<CsPoly>],
 ) -> (Commitment, Vec<Opening>) {
     HidingMerkleCommitment::commit(rng, &pp.cs, shares_per_server)
 }

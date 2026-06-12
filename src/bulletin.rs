@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use crate::cs::{Commitment, Opening};
 use crate::protocol::{ClientId, ServerId};
-use chipmunk_code::{HVCPoly, KahePoly};
+use chipmunk_code::{CsPoly, KahePoly};
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
@@ -21,7 +21,7 @@ pub struct ServerBulletinEntry {
     /// Single aggregated `Opening` whose `s()` is the κ_kahe-vector of summed shares.
     pub agg_open: Opening,
     /// Mirrors `agg_open.s()` (componentwise sum of per-client shares at this server's point).
-    pub agg_share: Vec<HVCPoly>,
+    pub agg_share: Vec<CsPoly>,
 }
 
 #[derive(Default)]

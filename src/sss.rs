@@ -1,6 +1,6 @@
 //! Secret sharing.
 
-use chipmunk_code::{HVCPoly, Polynomial, HVC_MODULUS, HVC_MODULUS_OVER_TWO, N};
+use chipmunk_code::{CsPoly, Polynomial, CS_MODULUS, CS_MODULUS_OVER_TWO, N};
 use rand::Rng;
 
 pub trait Sss {
@@ -11,19 +11,19 @@ pub trait Sss {
     fn recover(shares: &[Self::Share]) -> Self::Secret;
 }
 
-/// Additive n-of-n sharing over `HVCPoly`. `s_1..s_{n-1}` random; `s_n = secret − Σ s_i`.
+/// Additive n-of-n sharing over `CsPoly`. `s_1..s_{n-1}` random; `s_n = secret − Σ s_i`.
 pub struct AdditiveSharing;
 
 impl Sss for AdditiveSharing {
-    type Secret = HVCPoly;
-    type Share = HVCPoly;
+    type Secret = CsPoly;
+    type Share = CsPoly;
 
     fn share<R: Rng>(rng: &mut R, secret: &Self::Secret, n: usize) -> Vec<Self::Share> {
         assert!(n >= 1);
         let mut shares = Vec::with_capacity(n);
-        let mut acc = HVCPoly::default();
+        let mut acc = CsPoly::default();
         for _ in 0..n - 1 {
-            let s = HVCPoly::rand_poly(rng);
+            let s = CsPoly::rand_poly(rng);
             acc = acc + s;
             shares.push(s);
         }
@@ -35,7 +35,7 @@ impl Sss for AdditiveSharing {
         shares
             .iter()
             .copied()
-            .fold(HVCPoly::default(), |a, x| a + x)
+            .fold(CsPoly::default(), |a, x| a + x)
     }
 }
 
@@ -58,7 +58,7 @@ impl ShamirParams {
     pub fn new(t: usize, n: usize) -> Self {
         assert!(t >= 1 && t <= n, "require 1 ≤ t ≤ n");
         assert!(
-            n < HVC_MODULUS as usize,
+            n < CS_MODULUS as usize,
             "n must be < q for distinct points"
         );
         Self { t, n }
@@ -67,10 +67,10 @@ impl ShamirParams {
 
 impl ShamirSharing {
     /// Returns `params.n` shares; `out[i]` is the evaluation at point `i+1`.
-    pub fn share<R: Rng>(rng: &mut R, params: &ShamirParams, secret: &HVCPoly) -> Vec<HVCPoly> {
+    pub fn share<R: Rng>(rng: &mut R, params: &ShamirParams, secret: &CsPoly) -> Vec<CsPoly> {
         let t = params.t;
         let n = params.n;
-        let coeffs: Vec<HVCPoly> = (0..t - 1).map(|_| HVCPoly::rand_poly(rng)).collect();
+        let coeffs: Vec<CsPoly> = (0..t - 1).map(|_| CsPoly::rand_poly(rng)).collect();
         (0..n)
             .map(|i| {
                 let x = (i + 1) as i32;
@@ -88,7 +88,7 @@ impl ShamirSharing {
     /// Recover the secret from any `t` `(index, share)` samples (0-based
     /// indices into the original `share()` output). Extra samples beyond `t`
     /// are ignored.
-    pub fn recover(params: &ShamirParams, samples: &[(usize, HVCPoly)]) -> HVCPoly {
+    pub fn recover(params: &ShamirParams, samples: &[(usize, CsPoly)]) -> CsPoly {
         let t = params.t;
         assert!(samples.len() >= t, "need at least t samples");
         let xs: Vec<i32> = samples
@@ -120,7 +120,7 @@ impl ShamirSharing {
                 mul_q(num, inv_q(den))
             })
             .collect();
-        let mut acc = HVCPoly::default();
+        let mut acc = CsPoly::default();
         for (slot, (_, share)) in samples.iter().take(t).enumerate() {
             acc = acc + scalar_mul(share, lagrange[slot]);
         }
@@ -130,9 +130,9 @@ impl ShamirSharing {
 
 #[inline]
 fn reduce(x: i64) -> i32 {
-    let mut r = x.rem_euclid(HVC_MODULUS as i64) as i32;
-    if r > HVC_MODULUS_OVER_TWO {
-        r -= HVC_MODULUS;
+    let mut r = x.rem_euclid(CS_MODULUS as i64) as i32;
+    if r > CS_MODULUS_OVER_TWO {
+        r -= CS_MODULUS;
     }
     r
 }
@@ -163,16 +163,16 @@ fn pow_q(base: i32, mut exp: i32) -> i32 {
 #[inline]
 fn inv_q(x: i32) -> i32 {
     debug_assert!(reduce(x as i64) != 0, "inv of zero");
-    pow_q(x, HVC_MODULUS - 2)
+    pow_q(x, CS_MODULUS - 2)
 }
 
-fn scalar_mul(p: &HVCPoly, c: i32) -> HVCPoly {
+fn scalar_mul(p: &CsPoly, c: i32) -> CsPoly {
     let mut out = [0i32; N];
     let src = p.coeffs();
     for i in 0..N {
         out[i] = mul_q(src[i], c);
     }
-    HVCPoly::from_coeffs(out)
+    CsPoly::from_coeffs(out)
 }
 
 #[cfg(test)]
@@ -185,7 +185,7 @@ mod tests {
     fn round_trip() {
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
         for n in [1usize, 2, 4, 7] {
-            let secret = HVCPoly::rand_poly(&mut rng);
+            let secret = CsPoly::rand_poly(&mut rng);
             let shares = AdditiveSharing::share(&mut rng, &secret, n);
             assert_eq!(shares.len(), n);
             assert_eq!(AdditiveSharing::recover(&shares), secret);
@@ -197,7 +197,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
         for &(t, n) in &[(1usize, 1), (1, 4), (2, 3), (3, 5), (4, 7), (5, 7)] {
             let params = ShamirParams::new(t, n);
-            let secret = HVCPoly::rand_poly(&mut rng);
+            let secret = CsPoly::rand_poly(&mut rng);
             let shares = ShamirSharing::share(&mut rng, &params, &secret);
             assert_eq!(shares.len(), n);
             // Recover from the first t shares.
@@ -211,7 +211,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
         let (t, n) = (3, 5);
         let params = ShamirParams::new(t, n);
-        let secret = HVCPoly::rand_poly(&mut rng);
+        let secret = CsPoly::rand_poly(&mut rng);
         let shares = ShamirSharing::share(&mut rng, &params, &secret);
         // Try every t-subset of {0..n}.
         for a in 0..n {
@@ -230,19 +230,19 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
         let (t, n) = (3, 5);
         let params = ShamirParams::new(t, n);
-        let secrets: Vec<HVCPoly> = (0..4).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
-        let all_shares: Vec<Vec<HVCPoly>> = secrets
+        let secrets: Vec<CsPoly> = (0..4).map(|_| CsPoly::rand_poly(&mut rng)).collect();
+        let all_shares: Vec<Vec<CsPoly>> = secrets
             .iter()
             .map(|s| ShamirSharing::share(&mut rng, &params, s))
             .collect();
         let indices = [0usize, 2, 4];
         // sum the shares per index across clients
-        let summed: Vec<HVCPoly> = indices
+        let summed: Vec<CsPoly> = indices
             .iter()
             .map(|&i| {
                 all_shares
                     .iter()
-                    .fold(HVCPoly::default(), |a, sh| a + sh[i])
+                    .fold(CsPoly::default(), |a, sh| a + sh[i])
             })
             .collect();
         let samples: Vec<_> = indices
@@ -251,7 +251,7 @@ mod tests {
             .zip(summed.iter().copied())
             .collect();
         let recovered = ShamirSharing::recover(&params, &samples);
-        let expected = secrets.iter().fold(HVCPoly::default(), |a, s| a + *s);
+        let expected = secrets.iter().fold(CsPoly::default(), |a, s| a + *s);
         assert_eq!(recovered, expected);
     }
 }

@@ -560,13 +560,13 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → 29 symbols. Smaller multiset but exercises the
-    /// fat-payload code path end-to-end.
+    /// 512-bit message → 32 symbols at BITS_PER_SYMBOL=16 (t=2^16). Smaller
+    /// multiset but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = MseParams::payload_symbols_for_bits(512);
-        assert_eq!(xi, 29);
+        assert_eq!(xi, 32);
         let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i32>> = (0..5)

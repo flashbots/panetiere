@@ -35,7 +35,8 @@ impl ProtocolParams {
 
     pub fn setup_with_threshold<R: Rng>(rng: &mut R, n_servers: usize, t: usize) -> Self {
         let kahe = Kahe::setup(rng);
-        let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 8);
+        // μ_cs = κ_kahe (coupling); κ_cs = 5 (BDLOP hiding bound, spec).
+        let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 5);
         let shamir = ShamirParams::new(t, n_servers);
         Self { kahe, cs, shamir }
     }
@@ -77,7 +78,8 @@ impl ProtocolParams {
         let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
         let kahe =
             Kahe::setup_with_dims(rng, mu_kahe, kappa_kahe, l, sigma_s, sigma_e, t_modulus);
-        let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 8);
+        // μ_cs = κ_kahe (coupling); κ_cs = 5 (BDLOP hiding bound, spec).
+        let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 5);
         let shamir = ShamirParams::new(t, n_servers);
         Self { kahe, cs, shamir }
     }

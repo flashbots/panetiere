@@ -55,13 +55,18 @@ pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     let mut buf = Vec::with_capacity(polys.len() * BYTES_PER_POLY);
     for poly in polys {
         let mut p = *poly;
-        p.lift();
+        p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
-            if !(0..(1 << 16)).contains(&c) {
+            // A symbol is defined mod t = 2^16. It arrives either raw-unsigned
+            // `[0, 2^16)` (direct encode) or centered `[-2^15, 2^15)` (KAHE dec,
+            // `poly_mod_t`). Accept that union; reject genuine overflow (e.g. a
+            // summed-message coefficient ≥ 2^16 in magnitude).
+            if !(-(1 << 15)..(1 << 16)).contains(&c) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }
-            buf.push((c & 0xFF) as u8);
-            buf.push(((c >> 8) & 0xFF) as u8);
+            let u = c.rem_euclid(1 << 16);
+            buf.push((u & 0xFF) as u8);
+            buf.push(((u >> 8) & 0xFF) as u8);
         }
     }
     Ok(buf)
@@ -107,13 +112,16 @@ pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     let mut buf = Vec::with_capacity(total_bytes);
     for poly in polys {
         let mut p = *poly;
-        p.lift();
+        p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
-            if !(0..(1 << 16)).contains(&c) {
+            // See `decode_raw`: symbols are mod-t = 2^16, raw-unsigned or
+            // centered. Accept the union, reject genuine overflow.
+            if !(-(1 << 15)..(1 << 16)).contains(&c) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }
-            buf.push((c & 0xFF) as u8);
-            buf.push(((c >> 8) & 0xFF) as u8);
+            let u = c.rem_euclid(1 << 16);
+            buf.push((u & 0xFF) as u8);
+            buf.push(((u >> 8) & 0xFF) as u8);
         }
     }
     if buf.len() < HEADER_LEN {
@@ -159,7 +167,8 @@ mod tests {
 
     #[test]
     fn round_trip_multi_poly() {
-        let msg: Vec<u8> = (0..3500).map(|i| (i * 37) as u8).collect();
+        // Span ≥4 polys regardless of BYTES_PER_POLY (4096 at N=2048).
+        let msg: Vec<u8> = (0..BYTES_PER_POLY * 3 + 500).map(|i| (i * 37) as u8).collect();
         let polys = encode(&msg);
         assert!(polys.len() >= 4);
         assert_eq!(decode(&polys).unwrap(), msg);

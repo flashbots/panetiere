@@ -39,7 +39,7 @@
 //! CS→KAHE for decryption).
 
 use chipmunk_code::{
-    pointwise_dot_kahe, HVCPoly, KaheNTTPoly, KahePoly, Polynomial, HVC_MODULUS_OVER_TWO,
+    pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, Polynomial, CS_MODULUS_OVER_TWO,
     KAHE_MODULUS_OVER_TWO, N,
 };
 use rand::Rng;
@@ -155,6 +155,47 @@ fn vec_zero(len: usize) -> Vec<KahePoly> {
     vec![KahePoly::default(); len]
 }
 
+/// Accumulate `Σ_client cs[client][pos]` into an `i64[N]` accumulator. Summing
+/// ρ ciphertext coefficients (each `< q/2 ≈ 2^27`) reaches ~`ρ·2^27`, which
+/// overflows i32 for ρ ≳ 15 — so we widen to i64 and reduce once at the end,
+/// instead of the per-step mod-q the old fold-of-adds required.
+fn accumulate_pos(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { accumulate_pos_avx2(acc, cs, pos) };
+            return;
+        }
+    }
+    for client in cs {
+        let src = client[pos].coeffs();
+        for i in 0..N {
+            acc[i] += src[i] as i64;
+        }
+    }
+}
+
+/// AVX2: widen 4 i32 coefficients to i64 (`cvtepi32_epi64`) and accumulate into
+/// 4-wide i64 lanes. `N` is a multiple of 4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(N % 4, 0);
+    for client in cs {
+        let src = client[pos].coeffs().as_ptr();
+        let mut i = 0usize;
+        while i < N {
+            let v = _mm_loadu_si128(src.add(i) as *const __m128i);
+            let v64 = _mm256_cvtepi32_epi64(v);
+            let a = _mm256_loadu_si256(acc.as_ptr().add(i) as *const __m256i);
+            let s = _mm256_add_epi64(a, v64);
+            _mm256_storeu_si256(acc.as_mut_ptr().add(i) as *mut __m256i, s);
+            i += 4;
+        }
+    }
+}
+
 /// In-place: each coefficient of `poly` becomes `poly[i] · t` (mod q via
 /// KahePoly's add semantics — caller's responsibility to keep within range).
 /// Widened to i64 to support t up to ~2^19 at q ≈ 2^30.
@@ -202,34 +243,34 @@ fn poly_mod_t(poly: &KahePoly, t: u32) -> KahePoly {
 // Bridge: HVC ↔ KAHE via centered-representative re-interpretation
 // ---------------------------------------------------------------
 
-/// Lift an `HVCPoly` (centered repr in `[-q_cs/2, q_cs/2]`) into a `KahePoly`
+/// Lift a `CsPoly` (centered repr in `[-q_cs/2, q_cs/2]`) into a `KahePoly`
 /// at q_kahe by reinterpreting coefficients as signed integers. Lossless iff
 /// `‖input‖_∞ ≤ q_cs/2`, which holds for Shamir-recovered sums of small
 /// Gaussian keys (`‖Σ sk‖_∞ ≪ q_cs/2` at any realistic n_clients).
-pub fn lift_hvc_to_kahe(p: &HVCPoly) -> KahePoly {
+pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
     let mut q = *p;
     q.normalize();
     debug_assert!(
-        q.coeffs().iter().all(|&c| c.abs() <= HVC_MODULUS_OVER_TWO),
-        "lift_hvc_to_kahe: input not centered after normalize()"
+        q.coeffs().iter().all(|&c| c.abs() <= CS_MODULUS_OVER_TWO),
+        "lift_cs_to_kahe: input not centered after normalize()"
     );
     KahePoly::from_signed_coeffs(q.coeffs())
 }
 
-/// Reduce a small `KahePoly` (intended for a fresh KAHE secret key — Gaussian
-/// σ_s ≈ 4.5, `‖·‖_∞ ≤ 8σ_s ≈ 36`) into an `HVCPoly` by centered-rep
-/// re-interpretation. Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client
-/// side to feed Shamir sharing, which operates over `R_{q_cs}`.
-pub fn kahe_to_hvc_centered(p: &KahePoly) -> HVCPoly {
+/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 15.72,
+/// `‖·‖_∞ ≤ 8σ_s ≈ 126`) into a `CsPoly` by centered-rep re-interpretation.
+/// Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client side to feed Shamir
+/// sharing, which operates over `R_{q_cs}`.
+pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
     let mut q = *p;
     q.normalize();
     debug_assert!(
-        q.coeffs().iter().all(|&c| c.abs() <= HVC_MODULUS_OVER_TWO),
-        "kahe_to_hvc_centered: coefficient magnitude exceeds q_cs/2 = {} \
+        q.coeffs().iter().all(|&c| c.abs() <= CS_MODULUS_OVER_TWO),
+        "kahe_to_cs_centered: coefficient magnitude exceeds q_cs/2 = {} \
          (callers must only bridge small Gaussian-bounded values)",
-        HVC_MODULUS_OVER_TWO
+        CS_MODULUS_OVER_TWO
     );
-    HVCPoly::from_coeffs(*q.coeffs())
+    CsPoly::from_coeffs(*q.coeffs())
 }
 
 pub struct Kahe;
@@ -276,11 +317,14 @@ impl Kahe {
     }
 }
 
-/// Willow defaults at q_kahe = 1_073_738_753.
-pub const SIGMA_S_DEFAULT: f64 = 4.5;
-pub const SIGMA_E_DEFAULT: f64 = 6.363_961_030_678_928; // √2 · 4.5
-/// 2^18 — gives 18 bits of plaintext per coefficient at ρ ≤ 300, with margin.
-pub const T_MODULUS_DEFAULT: u32 = 262_144;
+/// q_kahe = 271_163_393 (≈2^28) at N=2048. Single `D_σ` for key and error
+/// (Nils's spec), σ_s = σ_e = 15.72 — sized for ~128-bit RLWE at N=2048.
+pub const SIGMA_S_DEFAULT: f64 = 15.72;
+pub const SIGMA_E_DEFAULT: f64 = 15.72;
+/// 2^16. Per-coefficient noise budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` holds for
+/// ρ ≲ 240 at (t, σ, q) = (2^16, 15.72, 271_163_393); comfortably covers the
+/// S=8, N=100 operating point.
+pub const T_MODULUS_DEFAULT: u32 = 65536;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -289,14 +333,14 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `(μ, κ) = (1, 5)`, Willow Gaussian widths, `t = 2^18` —
-    /// budget covers ρ ≤ ~300 at q_kahe = 1_073_738_753.
-    /// κ_kahe=5 spans the Shamir share-vector across 5 components per CS opening.
+    /// `(μ, κ) = (1, 1)`, σ_s=σ_e=15.6, `t = 2^8` at q_kahe = 59_393.
+    /// κ_kahe=1 → plain RLWE secret (single ring element); one Shamir-share
+    /// component per CS opening.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(
             rng,
             1,
-            5,
+            1,
             1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
@@ -356,7 +400,27 @@ impl KaheScheme for Kahe {
             return Vec::new();
         }
         let len = cs[0].len();
-        cs.iter().fold(vec_zero(len), |acc, x| vec_add(&acc, x))
+        let q = chipmunk_code::KAHE_MODULUS as i64;
+        let half = q / 2;
+        // Per ciphertext-poly position, sum across all clients in i64 (no
+        // overflow), then reduce mod q to a centered representative once. The
+        // result is ≡ Σ cᵢ (mod q), which is all `dec` (which subtracts the
+        // aggregate pad then reduces mod t) requires.
+        (0..len)
+            .map(|pos| {
+                let mut acc = [0i64; N];
+                accumulate_pos(&mut acc, cs, pos);
+                let mut coeffs = [0i32; N];
+                for (out, &a) in coeffs.iter_mut().zip(acc.iter()) {
+                    let mut r = a.rem_euclid(q);
+                    if r > half {
+                        r -= q;
+                    }
+                    *out = r as i32;
+                }
+                KahePoly::from_coeffs(coeffs)
+            })
+            .collect()
     }
 
     fn agg_key(ks: &[KaheKey]) -> KaheAggKey {
@@ -446,15 +510,15 @@ mod tests {
         let shamir = ShamirParams::new(t, n_servers);
         let k = Kahe::gen(&mut rng, &pp);
 
-        // Shamir runs over HVCPoly (R_{q_cs}). Bridge KAHE → HVC for shares,
-        // recover at q_cs, bridge HVC → KAHE for decryption.
+        // Shamir runs over CsPoly (R_{q_cs}). Bridge KAHE → CS for shares,
+        // recover at q_cs, bridge CS → KAHE for decryption.
         let recovered_components: Vec<KahePoly> = (0..pp.kappa_kahe)
             .map(|c| {
-                let secret_hvc = kahe_to_hvc_centered(k.component(c));
-                let shares = ShamirSharing::share(&mut rng, &shamir, &secret_hvc);
-                let samples: Vec<(usize, HVCPoly)> = (0..t).map(|i| (i, shares[i])).collect();
-                let recovered_hvc = ShamirSharing::recover(&shamir, &samples);
-                lift_hvc_to_kahe(&recovered_hvc)
+                let secret_cs = kahe_to_cs_centered(k.component(c));
+                let shares = ShamirSharing::share(&mut rng, &shamir, &secret_cs);
+                let samples: Vec<(usize, CsPoly)> = (0..t).map(|i| (i, shares[i])).collect();
+                let recovered_cs = ShamirSharing::recover(&shamir, &samples);
+                lift_cs_to_kahe(&recovered_cs)
             })
             .collect();
         let agg = KaheAggKey::from_components(recovered_components);
@@ -566,15 +630,15 @@ mod tests {
             for c in coeffs.iter_mut() {
                 *c = rng.gen_range(-3600i32..=3600);
             }
-            let hvc = HVCPoly::from_coeffs(coeffs);
-            let kahe = lift_hvc_to_kahe(&hvc);
+            let cs = CsPoly::from_coeffs(coeffs);
+            let kahe = lift_cs_to_kahe(&cs);
             // The lift preserves centered representatives for small inputs.
-            for (a, b) in hvc.coeffs().iter().zip(kahe.coeffs().iter()) {
+            for (a, b) in cs.coeffs().iter().zip(kahe.coeffs().iter()) {
                 assert_eq!(*a, *b);
             }
-            // Round trip via kahe_to_hvc_centered.
-            let back = kahe_to_hvc_centered(&kahe);
-            for (a, b) in hvc.coeffs().iter().zip(back.coeffs().iter()) {
+            // Round trip via kahe_to_cs_centered.
+            let back = kahe_to_cs_centered(&kahe);
+            for (a, b) in cs.coeffs().iter().zip(back.coeffs().iter()) {
                 assert_eq!(*a, *b);
             }
         }

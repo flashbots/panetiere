@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chipmunk_code::HVCPoly;
+use chipmunk_code::CsPoly;
 
 use crate::bulletin::ServerBulletinEntry;
 use crate::cs::{Cs, HidingMerkleCommitment, Opening};
@@ -44,7 +44,7 @@ pub fn run_server_round(
     // For Shamir t-of-n with linear interpolation, summing per-server shares
     // across canonical clients gives the share of `Σ sk_j` at this server's
     // point. `agg_share` mirrors `agg_open.s()` componentwise.
-    let agg_share: Vec<HVCPoly> = agg_open.s().to_vec();
+    let agg_share: Vec<CsPoly> = agg_open.s().to_vec();
 
     Ok(ServerBulletinEntry {
         server_id: inbox.server_id,

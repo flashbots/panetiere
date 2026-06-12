@@ -1,4 +1,4 @@
-use chipmunk_code::{HVCPoly, KahePoly, Polynomial, N};
+use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
 use flashnet::codec;
 use flashnet::protocol::client::run_client_round;
 use flashnet::protocol::{ClientId, ServerId};
@@ -104,7 +104,8 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
     ];
     let n_clients = messages.len();
     const SLOT_SIZE: usize = 128;
-    const TOTAL_BYTES: usize = 1024;
+    // One KahePoly = N·2 bytes = 4096 at N=2048.
+    const TOTAL_BYTES: usize = 4096;
     assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
@@ -179,7 +180,8 @@ fn slot_mode_8kb_message_multi_poly() {
     let n_clients = 4;
     const SLOT_SIZE: usize = 2048;
     const TOTAL_BYTES: usize = 8 * 1024;
-    const N_POLYS: usize = TOTAL_BYTES / 1024;
+    // One KahePoly = N·2 bytes = 4096 at N=2048 → 8 KiB spans 2 polys.
+    const N_POLYS: usize = TOTAL_BYTES / 4096;
     assert_eq!(n_clients * SLOT_SIZE, TOTAL_BYTES);
 
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_clients);
@@ -291,7 +293,7 @@ fn tampered_agg_share_rejected() {
         .collect();
 
     server_outputs[0].agg_share[0] =
-        server_outputs[0].agg_share[0] + HVCPoly::rand_poly(&mut rng);
+        server_outputs[0].agg_share[0] + CsPoly::rand_poly(&mut rng);
     let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
@@ -326,7 +328,7 @@ fn high_norm_r_rejected_in_protocol() {
         }
     }
     // Corrupt one private opening before aggregation.
-    inboxes[0].items[0].1.r_mut()[0] = HVCPoly::rand_poly(&mut rng);
+    inboxes[0].items[0].1.r_mut()[0] = CsPoly::rand_poly(&mut rng);
 
     let canonical = client_ids;
     let server_outputs: Vec<_> = inboxes

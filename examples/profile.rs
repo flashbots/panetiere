@@ -56,6 +56,7 @@ fn main() {
     let pp = if mu > 0 && kappa > 0 && t_modulus > 0 {
         ProtocolParams::setup_with_kahe_dims_full(
             &mut rng, s, mu, kappa,
+            1,
             flashnet::kahe::SIGMA_S_DEFAULT,
             flashnet::kahe::SIGMA_E_DEFAULT,
             t_modulus,
