@@ -1,10 +1,10 @@
 use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
-use flashnet::codec;
-use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::{ClientId, ServerId};
-use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::aggregate_and_decrypt;
-use flashnet::protocol::ProtocolParams;
+use panetiere::codec;
+use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::ProtocolParams;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -199,7 +199,7 @@ fn slot_mode_8kb_message_multi_poly() {
     let encoded: Vec<Vec<KahePoly>> = buffers
         .iter()
         .map(|b| {
-            let polys = flashnet::codec::encode_raw(b);
+            let polys = panetiere::codec::encode_raw(b);
             assert_eq!(polys.len(), N_POLYS);
             polys
         })
@@ -239,7 +239,7 @@ fn slot_mode_8kb_message_multi_poly() {
         recovered_polys.push(recovered[0]);
     }
 
-    let recovered_bytes = flashnet::codec::decode_raw(&recovered_polys).expect("decode");
+    let recovered_bytes = panetiere::codec::decode_raw(&recovered_polys).expect("decode");
     assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
 
     for slot in 0..n_clients {
@@ -297,7 +297,7 @@ fn tampered_agg_share_rejected() {
     let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
-        Err(flashnet::protocol::verify::VerifyError::ShareOpeningMismatch(_))
+        Err(panetiere::protocol::verify::VerifyError::ShareOpeningMismatch(_))
     ));
 }
 
@@ -339,7 +339,7 @@ fn high_norm_r_rejected_in_protocol() {
     let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
-        Err(flashnet::protocol::verify::VerifyError::InvalidServerOpening(_))
+        Err(panetiere::protocol::verify::VerifyError::InvalidServerOpening(_))
     ));
 }
 

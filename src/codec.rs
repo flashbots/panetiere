@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn round_trip_short() {
-        let msg = b"hello flashnet";
+        let msg = b"hello panetiere";
         let polys = encode(msg);
         assert_eq!(polys.len(), 1);
         assert_eq!(decode(&polys).unwrap(), msg);

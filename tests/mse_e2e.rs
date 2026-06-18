@@ -1,16 +1,16 @@
-//! Paper-aligned MSE (`src/mse.rs`) carried through the flashnet protocol.
+//! Paper-aligned MSE (`src/mse.rs`) carried through the Panetière protocol.
 //!
 //! Each client builds a 1-element MSE encoding, packs it into KahePolys, and
 //! contributes them to the protocol. The verifier's recovered per-poly sums
 //! unpack into the multiset union, which decodes to all clients' elements.
 
 use chipmunk_code::KahePoly;
-use flashnet::mse::{MseEncoding, MseParams};
-use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::{ClientId, ServerId};
-use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::aggregate_and_decrypt;
-use flashnet::protocol::ProtocolParams;
+use panetiere::mse::{MseEncoding, MseParams};
+use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::ProtocolParams;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -19,7 +19,7 @@ use rand_chacha::ChaCha20Rng;
 /// values without wrap. The protocol's recovered sum decodes back to the
 /// multiset union.
 #[test]
-fn mse_recovers_through_flashnet() {
+fn mse_recovers_through_panetiere() {
     let mut rng = ChaCha20Rng::from_seed([0xFEu8; 32]);
     let n_servers = 3;
     let n_clients = 6;

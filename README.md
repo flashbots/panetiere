@@ -1,6 +1,6 @@
-# Flashnet
+# Panetière
 
-Flashnet is an anonymous broadcast protocol intended to allow (TEE) clients to send messages through `t`-of-`n` (non-TEE) servers in a way that preserves anonymity of clients.
+Panetière is an anonymous broadcast protocol intended to allow (TEE) clients to send messages through `t`-of-`n` (non-TEE) servers in a way that preserves anonymity of clients.
 This repository is an early proof of concept built using lattice-based key-additive homomorphic encryption (RLWE-based KAHE) and the §5.3 hiding-vector commitment over the chipmunk Ring-SIS Merkle hash.
 Everything apart from this section is AI-generated. Do not use anywhere near production data.
 
@@ -416,7 +416,7 @@ impl MseEncoding {
 }
 ```
 
-`pack` flattens `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_flashnet` is the executable spec.
+`pack` flattens `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_panetiere` is the executable spec.
 
 ## Security properties
 
@@ -452,7 +452,7 @@ cargo bench --bench scaling             # (S, N) cell × (μ_kahe, κ_kahe) vari
 cargo run --release --example demo      # 6 clients × 128-byte slots over a 1024-byte buffer
 ```
 
-`tests/end_to_end.rs::end_to_end_recovers_sum` is the canonical executable spec. Other coverage in that file: `slot_mode_disjoint_clients_recover_each_payload`, `slot_mode_8kb_message_multi_poly`, `tampered_agg_share_rejected`, `high_norm_r_rejected_in_protocol`, `recovers_from_t_of_n_servers`. `tests/mse_e2e.rs::mse_recovers_through_flashnet` carries an MSE multiset end-to-end.
+`tests/end_to_end.rs::end_to_end_recovers_sum` is the canonical executable spec. Other coverage in that file: `slot_mode_disjoint_clients_recover_each_payload`, `slot_mode_8kb_message_multi_poly`, `tampered_agg_share_rejected`, `high_norm_r_rejected_in_protocol`, `recovers_from_t_of_n_servers`. `tests/mse_e2e.rs::mse_recovers_through_panetiere` carries an MSE multiset end-to-end.
 
 ### Scaling bench
 
@@ -482,7 +482,7 @@ CPU profile at `(S=8, N=300, μ=16, κ=31, β=1024)`, fast-ntt on, after the cac
 29.6%  ntt_stages_scalar              forward NTT, scalar tail (ht ∈ {4,2,1})
 14.5%  ntt_avx2_dispatch              forward NTT, AVX2 (ht ≥ 8)
 11.0%  pointwise_mac_avx2_dispatch    NTT-domain inner product
- 7.9%  flashnet::sss::scalar_mul      Shamir Lagrange interp scalar mult
+ 7.9%  panetiere::sss::scalar_mul      Shamir Lagrange interp scalar mult
  7.4%  HVCPoly::decompose_r           non-linear decomposition for Merkle leaves
  6.9%  inv_ntt_stages_scalar          inverse NTT, scalar head
  6.1%  inv_ntt_avx2_dispatch          inverse NTT, AVX2

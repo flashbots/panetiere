@@ -27,7 +27,7 @@
 //!
 //! The CSV columns are documented at the top of the output.
 
-use flashnet::mse::{MseEncoding, MseParams, RowLayout};
+use panetiere::mse::{MseEncoding, MseParams, RowLayout};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;

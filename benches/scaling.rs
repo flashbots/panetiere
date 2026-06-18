@@ -74,15 +74,15 @@ use std::time::{Duration, Instant};
 use chipmunk_code::{
     KaheNTTPoly, KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA,
 };
-use flashnet::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
-use flashnet::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
-use flashnet::protocol::client::{
+use panetiere::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
+use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
+use panetiere::protocol::client::{
     cs_commit, kahe_encrypt, kahe_keygen, run_client_round, shamir_share,
 };
-use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::{aggregate_and_decrypt_timed, VerifyTimings};
-use flashnet::protocol::ProtocolParams;
-use flashnet::protocol::{ClientId, ServerId};
+use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::verify::{aggregate_and_decrypt_timed, VerifyTimings};
+use panetiere::protocol::ProtocolParams;
+use panetiere::protocol::{ClientId, ServerId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -653,7 +653,7 @@ fn main() {
     );
     let start = Instant::now();
 
-    println!("flashnet scaling bench  (budget: {}s)", budget.as_secs());
+    println!("Panetière scaling bench  (budget: {}s)", budget.as_secs());
     println!(
         "ring: HVC {} bits/coef ({} B/poly) | KAHE {} bits/coef ({} B/poly) | t bits/symbol {}",
         bits_per_coef(HVC_MODULUS),

@@ -20,11 +20,11 @@
 
 use chipmunk_code::KahePoly;
 use rand::Rng;
-use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::{ClientId, ServerId};
-use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::aggregate_and_decrypt;
-use flashnet::protocol::ProtocolParams;
+use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -57,8 +57,8 @@ fn main() {
         ProtocolParams::setup_with_kahe_dims_full(
             &mut rng, s, mu, kappa,
             1,
-            flashnet::kahe::SIGMA_S_DEFAULT,
-            flashnet::kahe::SIGMA_E_DEFAULT,
+            panetiere::kahe::SIGMA_S_DEFAULT,
+            panetiere::kahe::SIGMA_E_DEFAULT,
             t_modulus,
         )
     } else if mu > 0 && kappa > 0 {

@@ -34,7 +34,7 @@
 //!
 //! `pack` / `unpack` flatten/restore the matrices as a sequence of
 //! `KahePoly` coefficient slots (`C, K_0…K_{L-1}, V_0…V_{ξ-1}`, each
-//! row-major) so the encoding rides over the flashnet protocol's KAHE
+//! row-major) so the encoding rides over the Panetière protocol's KAHE
 //! ciphertext stream. Sum-of-encodings is pointwise add over the
 //! `KahePoly`s.
 //!

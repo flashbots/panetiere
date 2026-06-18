@@ -1,10 +1,10 @@
 use chipmunk_code::{KahePoly, Polynomial};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::{ClientId, ServerId};
-use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::aggregate_and_decrypt;
-use flashnet::protocol::ProtocolParams;
+use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 

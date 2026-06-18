@@ -7,12 +7,12 @@
 //! demonstrates how the codec composes with the protocol when the application
 //! picks a slot layout that doesn't overflow.
 
-use flashnet::codec;
-use flashnet::protocol::client::run_client_round;
-use flashnet::protocol::{ClientId, ServerId};
-use flashnet::protocol::server::{run_server_round, ServerInbox};
-use flashnet::protocol::verify::aggregate_and_decrypt;
-use flashnet::protocol::ProtocolParams;
+use panetiere::codec;
+use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -44,7 +44,7 @@ fn main() {
     assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
 
     println!(
-        "flashnet demo: {} clients × {}-byte slots, {} servers (t = ⌊γ/2⌋+1)",
+        "Panetière demo: {} clients × {}-byte slots, {} servers (t = ⌊γ/2⌋+1)",
         n_clients, SLOT_SIZE, n_servers
     );
 
