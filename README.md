@@ -1,7 +1,7 @@
 # Flashnet
 
 Flashnet is an anonymous broadcast protocol intended to allow (TEE) clients to send messages through `t`-of-`n` (non-TEE) servers in a way that preserves anonymity of clients.
-This repository is an early proof of concept built using lattice-based key-additive homomorphic encryption (BDLOP-style §4 KAHE) and the §5.3 hiding-vector commitment over the chipmunk Ring-SIS Merkle hash.
+This repository is an early proof of concept built using lattice-based key-additive homomorphic encryption (RLWE-based KAHE) and the §5.3 hiding-vector commitment over the chipmunk Ring-SIS Merkle hash.
 Everything apart from this section is AI-generated. Do not use anywhere near production data.
 
 
@@ -13,50 +13,50 @@ RAYON_NUM_THREADS=8 cargo bench -j 8 --bench scaling                   # progres
 RAYON_NUM_THREADS=8 cargo run -j 8 --release --example demo            # slot-mode broadcast demo
 ```
 
-`bench.sh` and `scripts/run_demo.sh` are thin wrappers around the above. The crate path-deps a sister crate `chipmunk_code` for the lattice primitives (Ring-SIS hash, dynamic-height Merkle tree, NTT polynomial multiplication; the `fast-ntt` feature enables Barrett + AVX2).
+`bench.sh` and `scripts/run_demo.sh` are thin wrappers around the above. The crate depends on `chipmunk_code` (a pinned git dependency, `github.com/Ruteri/Chipmunk`) for the lattice primitives (Ring-SIS hash, dynamic-height Merkle tree, NTT polynomial multiplication; the `fast-ntt` feature enables Barrett + AVX2 NTT across all three rings — HVC, CS, KAHE).
 
 ## Repository layout
 
 ```
 src/
   lib.rs                    re-exports
-  kahe.rs                   matrix-form KAHE (RingOtp pad-expansion + Kahe scheme with short keys / agg keys)
-  sss.rs                    AdditiveSharing (n-of-n) + ShamirSharing (t-of-n) over R_q
+  kahe.rs                   matrix-form RLWE KAHE (Gaussian short keys / agg keys + CS↔KAHE ring bridge)
+  sss.rs                    AdditiveSharing (n-of-n) + ShamirSharing (t-of-n) over the CS ring R_{q_cs}
   cs.rs                     BDLOP §5.3 hiding vector commitment over a chipmunk Merkle tree
   bulletin.rs               in-memory typed broadcast store
-  consensus.rs              canonical-client-set selector + FixedSet stub
-  codec.rs                  bytes <-> HVCPoly (header-prefixed and fixed-buffer flavors)
-  mse.rs                    additive multi-set encoding (paper §3 Fig. 1) + pack/unpack to HVCPoly
-  protocol/{mod,client,server,verify,message}.rs   ProtocolParams + round drivers + public verifier
+  codec.rs                  bytes <-> KahePoly (header-prefixed and fixed-buffer flavors)
+  mse.rs                    additive multi-set encoding (paper §3 Fig. 1) + pack/unpack to KahePoly
+  protocol/{mod,client,server,verify}.rs   ProtocolParams + round drivers + public verifier
 tests/
   end_to_end.rs             core protocol integration tests (slot-mode, t-of-n, tamper rejection)
   mse_e2e.rs                MSE carried through the protocol end-to-end
 benches/
   protocol.rs               criterion micro-benches per stage at small parameters
-  scaling.rs                (S, N) × (μ_kahe, κ_kahe, β) bench, payload extrapolated to 1 MB
+  scaling.rs                (S, N) × (μ_kahe, κ_kahe) bench, payload extrapolated to 1 MB
 examples/
   demo.rs                   slot-mode broadcast over byte messages
   profile.rs                fixed-(S,N) loop driver for flamegraph / callgrind
 ```
 
-Module file layout matches the conceptual layering: lattice primitives at the bottom (chipmunk dep), then KAHE + SSS + CS, then bulletin + consensus, then protocol drivers, with codec and mse as application-side encodings on top.
+Module file layout matches the conceptual layering: lattice primitives at the bottom (chipmunk dep), then KAHE + SSS + CS, then bulletin, then protocol drivers, with codec and mse as application-side encodings on top.
 
 ## Protocol overview
 
-Symbols. `sk_j ∈ B_β^{κ_kahe}` = client `j`'s short KAHE secret key. `m_j ∈ R_q^{μ_kahe}` = plaintext, `c_j` = ciphertext. `(s_{j,1}, ..., s_{j,n})` = per-server Shamir shares of `sk_j` (componentwise across `κ_kahe` components). `comm_j` = single CS commitment to the per-server share-vector matrix; `d_{j,i}` = opening for server `i` carrying its `κ_kahe`-component share-vector. `t` = Shamir threshold.
+Symbols. `sk_j ∈ D_{σ_s}^{κ_kahe}` = client `j`'s short (discrete-Gaussian) KAHE secret key on the KAHE ring `R_{q_kahe}`. `m_j ∈ R_{q_kahe}^{μ_kahe}`, `c_j` = ciphertext (both on the KAHE ring). `(s_{j,1}, ..., s_{j,n})` = per-server Shamir shares of `sk_j` on the CS ring `R_{q_cs}` (each KAHE-key component is bridged into `R_{q_cs}` and shared componentwise across `κ_kahe` components). `comm_j` = single CS commitment to the per-server share-vector matrix; `d_{j,i}` = opening for server `i` carrying its `κ_kahe`-component share-vector. `t` = Shamir threshold.
 
 ```
 Client j  (run_client_round):
-  1. sk_j     := KAHE.gen()                                           # short, ‖·‖∞ ≤ β
-  2. c_j      := KAHE.enc(sk_j, m_j)                                  # m + A·sk
+  1. sk_j     := KAHE.gen()                                           # short, sk ← D_{σ_s}^{κ_kahe}
+  2. c_j      := KAHE.enc(rng, sk_j, m_j)                             # m + A·sk + t·e
   3. for k ∈ [κ_kahe]:
-       (s_{j,1}^{(k)}, ..., s_{j,n}^{(k)}) := Shamir.share(sk_j[k], t, n)
+       bridge sk_j[k] (KAHE ring) into the CS ring, then
+       (s_{j,1}^{(k)}, ..., s_{j,n}^{(k)}) := Shamir.share(sk_j[k], t, n)   # over R_{q_cs}
      transpose into per-server κ_kahe-vectors share_vec_{j,i} = (s_{j,i}^{(0)}, ..., s_{j,i}^{(κ-1)})
   4. (comm_j, (d_{j,1}, ..., d_{j,n}))         := CS.commit(share_vec_{j,1..n})
   5. publish (c_j, comm_j) to the public bulletin
   6. privately send d_{j,i} to server i  (its s() is the κ_kahe share-vector)
 
-Server i  (run_server_round, for canonical client set chosen by consensus):
+Server i  (run_server_round, over a canonical client set agreed out of band):
   7. agg_open_i  := CS.sum_openings([d_{j,i} for j in canonical])
      agg_share_i := agg_open_i.s()                                    # κ_kahe-vector
   8. publish (agg_open_i, agg_share_i)
@@ -67,20 +67,21 @@ Verifier  (aggregate_and_decrypt):
   9b. for each server i: assert CS.verify(summed_comm, agg_open_i)
                           assert agg_share_i == agg_open_i.s()
   9c. for each k ∈ [κ_kahe]:
-        sk_sum[k] := ShamirSharing.recover([(server_id_i, agg_share_i[k]) for any t servers])
+        sk_sum[k] := ShamirSharing.recover([(server_id_i, agg_share_i[k]) for any t servers])   # over R_{q_cs}
+                     then lift each recovered component from R_{q_cs} into R_{q_kahe}
       agg_key := KaheAggKey::from_components(sk_sum)
   9d. return KAHE.dec(summed_ctxt, agg_key)             # = Σ m_j over canonical
 ```
 
-The verifier output is a `μ_kahe`-vector of polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `tests/end_to_end.rs::end_to_end_recovers_sum` is the executable spec.
+The verifier output is a `μ_kahe·l`-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `tests/end_to_end.rs::end_to_end_recovers_sum` is the executable spec.
 
 ## Modules
 
 ### `kahe` — key-additive homomorphic encryption
 
-Two layers. `RingOtp` is the pad-expansion + OTP primitive: for a public `μ × κ` matrix `A` (NTT-resident), `expand(sk) = A·sk ∈ R_q^μ`, `enc(sk, m) = m + expand(sk)`, `dec(sk, c) = c − expand(sk)`. `expand` is `R`-linear, so it works on both fresh (short) and aggregate (large-norm) seeds.
+RLWE-based KAHE on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, q_kahe ≈ 2^28), decoupled from the CS ring. Per-poly form: with a public `μ × κ` matrix `A` (NTT-resident), `Enc(m, sk) = m + A·sk + t·e mod q_kahe` (fresh error `e ← D_{σ_e}`); `Dec(c, sk) = ((c − A·sk) mod q_kahe) reduced mod t` in centered representatives. `enc` batches `l` ciphertext chunks under one key, each chunk using its own matrix `A_i`; messages and ciphertexts are flat `Vec<KahePoly>` of length `μ_kahe · l`.
 
-`Kahe` is the scheme. `Gen` samples a *short* key (Lemma 8 hiding regime, `‖sk‖∞ ≤ β`). The `KaheKey` / `KaheAggKey` newtypes separate fresh keys (sole valid `Enc` input) from aggregate keys in `R_q^κ` (sole valid `Dec` input). The Shamir bridge (`Σ sk_j` interpolated from per-server share sums) lives in `protocol::verify`, which builds a `KaheAggKey` via `KaheAggKey::from_components` after running `ShamirSharing::recover` componentwise.
+`Gen` samples a *short* key (discrete Gaussian `D_{σ_s}^κ`). The `KaheKey` / `KaheAggKey` newtypes separate fresh keys (sole valid `Enc` input) from aggregate keys in `R_{q_kahe}^κ` (sole valid `Dec` input). The Shamir bridge (`Σ sk_j` interpolated from per-server share sums on the CS ring, then lifted into the KAHE ring) lives in `protocol::verify`, which builds a `KaheAggKey` via `KaheAggKey::from_components` after running `ShamirSharing::recover` componentwise and `lift_cs_to_kahe`.
 
 ```rust
 pub trait KaheScheme {
@@ -92,44 +93,47 @@ pub trait KaheScheme {
 
     fn setup<R: Rng>(rng: &mut R) -> Self::Params;
     fn gen<R: Rng>(rng: &mut R, pp: &Self::Params) -> Self::Key;
-    fn enc(pp: &Self::Params, k: &Self::Key, m: &Self::Message) -> Self::Ciphertext;
+    fn enc<R: Rng>(rng: &mut R, pp: &Self::Params, k: &Self::Key, m: &Self::Message) -> Self::Ciphertext;
     fn dec(pp: &Self::Params, c: &Self::Ciphertext, k: &Self::AggKey) -> Self::Message;
     fn agg_ctxt(cs: &[Self::Ciphertext]) -> Self::Ciphertext;
     fn agg_key(ks: &[Self::Key]) -> Self::AggKey;
 }
 
 pub struct KaheParams {
-    pub a_matrix_ntt: Vec<Vec<HVCNTTPoly>>,   // μ_kahe × κ_kahe
+    pub a_matrices_ntt: Vec<Vec<Vec<KaheNTTPoly>>>,   // l × (μ_kahe × κ_kahe)
     pub mu_kahe: usize,
     pub kappa_kahe: usize,
-    pub sk_bound: u32,                        // β
-}
-
-pub struct RingOtp;
-impl RingOtp {
-    pub fn expand(pp: &KaheParams, sk: &[HVCPoly]) -> Vec<HVCPoly>;
-    pub fn enc(pp: &KaheParams, sk: &[HVCPoly], m: &[HVCPoly]) -> Vec<HVCPoly>;
-    pub fn dec(pp: &KaheParams, sk: &[HVCPoly], c: &[HVCPoly]) -> Vec<HVCPoly>;
+    pub l: usize,                             // ciphertext chunks per enc/dec
+    pub sigma_s: f64,                         // key std dev
+    pub sigma_e: f64,                         // error std dev
+    pub t_modulus: u32,                       // plaintext modulus t
 }
 
 pub struct KaheKey(/* short, len = κ_kahe */);
-pub struct KaheAggKey(/* in R_q^κ */);
+pub struct KaheAggKey(/* in R_{q_kahe}^κ */);
 impl KaheAggKey {
-    pub fn from_components(components: Vec<HVCPoly>) -> Self;
+    pub fn from_components(components: Vec<KahePoly>) -> Self;
 }
+
+// CS ↔ KAHE bridge (centered-rep re-interpretation; lossless for ‖·‖∞ ≤ q_cs/2):
+pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly;       // verifier side, CS → KAHE for decryption
+pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly;   // client side, KAHE → CS for Shamir input
 
 pub struct Kahe;
 impl Kahe {
-    pub fn setup_with_dims<R: Rng>(rng: &mut R, mu: usize, kappa: usize, sk_bound: u32) -> KaheParams;
+    pub fn setup_with_dims<R: Rng>(
+        rng: &mut R, mu_kahe: usize, kappa_kahe: usize, l: usize,
+        sigma_s: f64, sigma_e: f64, t_modulus: u32,
+    ) -> KaheParams;
 }
-impl KaheScheme for Kahe { /* default setup: (μ, κ, β) = (1, 6, 64) */ }
+impl KaheScheme for Kahe { /* default setup: (μ, κ, l) = (1, 1, 1), σ_s=σ_e=15.72, t=2^16 */ }
 ```
 
-Each round must use a fresh key (standard OTP requirement, met by `gen` once per `run_client_round`).
+Each round must use a fresh key (standard requirement, met by `gen` once per `run_client_round`).
 
 ### `sss` — secret sharing
 
-Two implementations. `AdditiveSharing` is n-of-n over `HVCPoly` (kept for parity / additive-only uses). `ShamirSharing` is t-of-n over `R_q` with evaluation points `1..=n`; pairwise differences are units in `Z_q*`, so Lagrange at `X = 0` is well-defined despite `R_q` not being a field. The protocol uses Shamir; KAHE's `recover_key` is the bridge.
+Two implementations, both over the CS ring `R_{q_cs}` (chipmunk's `CsPoly`). `AdditiveSharing` is n-of-n (kept for parity / additive-only uses). `ShamirSharing` is t-of-n over `R_{q_cs}` with evaluation points `1..=n`; pairwise differences are units in `Z_{q_cs}*`, so Lagrange at `X = 0` is well-defined despite `R_{q_cs}` not being a field. The protocol uses Shamir; the CS↔KAHE bridge (`kahe_to_cs_centered` / `lift_cs_to_kahe`) crosses to the KAHE ring.
 
 ```rust
 pub trait Sss {
@@ -140,30 +144,32 @@ pub trait Sss {
 }
 
 pub struct AdditiveSharing;
-impl Sss for AdditiveSharing { type Secret = HVCPoly; type Share = HVCPoly; /* ... */ }
+impl Sss for AdditiveSharing { type Secret = CsPoly; type Share = CsPoly; /* ... */ }
 
 pub struct ShamirParams { pub t: usize, pub n: usize }
-impl ShamirParams { pub fn new(t: usize, n: usize) -> Self; }   // asserts 1 ≤ t ≤ n < q
+impl ShamirParams { pub fn new(t: usize, n: usize) -> Self; }   // asserts 1 ≤ t ≤ n and n < q_cs = 147457
 
 pub struct ShamirSharing;
 impl ShamirSharing {
     /// Returns n shares; out[i] = f(i+1) where f(0) = secret and f has degree t-1.
-    pub fn share<R: Rng>(rng: &mut R, params: &ShamirParams, secret: &HVCPoly) -> Vec<HVCPoly>;
+    pub fn share<R: Rng>(rng: &mut R, params: &ShamirParams, secret: &CsPoly) -> Vec<CsPoly>;
     /// Recover from any t (0-based-index, share) samples; extras ignored.
-    pub fn recover(params: &ShamirParams, samples: &[(usize, HVCPoly)]) -> HVCPoly;
+    pub fn recover(params: &ShamirParams, samples: &[(usize, CsPoly)]) -> CsPoly;
 }
 ```
 
 ### `cs` — BDLOP-style hiding vector commitment over a homomorphic Merkle tree
 
-`Commit` packs a per-server `μ_cs`-component share vector `s ∈ R_q^{μ_cs}` into a single BDLOP leaf: with `r ← B_β^{κ_cs}` random, `c¹ = a^T r`, `c²_k = B_k r + s_k`, leaf-block `= (c¹, c²_0, ..., c²_{μ-1})` zero-padded to `block_size = (1 + μ_cs).next_power_of_two()`. The `n_servers` leaf-blocks occupy contiguous tree positions `[block_size·i .. block_size·(i+1))` of a chipmunk `Tree<HVCHash>`. The opening stores `(r, s)`, the **entire decomposed leaf-block subtree** (`2·block_size − 2` decomposed nodes), and the chipmunk Merkle path *above* the leaf-block in decomposed `(left, right)` pairs.
+All BDLOP arithmetic lives on the **CS ring** `R_{q_cs}` (chipmunk's `CsPoly`, q_cs = 147457); the chipmunk Merkle-tree hash lives on the **HVC ring** `R_{q_hvc}` (q_hvc = 40961). `Commit` packs a per-server `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` into a single BDLOP leaf: with `r ← B_{β_cs}^{κ_cs}` random, `c¹ = a^T r`, `c²_k = B_k r + s_k`, leaf-block `= (c¹, c²_0, ..., c²_{μ-1})` (all `CsPoly`) zero-padded to `block_size = (1 + μ_cs).next_power_of_two()`. The `n_servers` block roots occupy positions of a chipmunk `Tree<HVCHash>`. The opening stores `(r, s)` on the CS ring, the **entire decomposed leaf-block subtree** (`2·block_size − 2` decomposed nodes), and the chipmunk Merkle path *above* the block root in decomposed `(left, right)` pairs — all on the HVC ring.
+
+**CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span `[-q_cs/2, q_cs/2]`, larger than `q_hvc`. To feed it into the HVC tree hash, each leaf element is base-69 (`2ζ+1`) decomposed into `HVC_WIDTH = 3` `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); digits are tiny (`|·| ≤ ζ = 34 ≪ q_hvc`) so they embed losslessly. The left-inverse `CsPoly::project_r_from_hvc` is linear in the digits.
 
 Why store the whole block subtree decomposed? `decompose_r` is non-linear in raw values; `hash_separate_inputs` is linear over decomposed inputs. Summing openings pointwise is correct only in the decomposed representation — recomputing decompositions after summation would not be linear.
 
 ```rust
 pub trait Cs {
     type Params;
-    type Secret;                                   // = Vec<HVCPoly> of length μ_cs
+    type Secret;                                   // = Vec<CsPoly> of length μ_cs
     type Commitment: Clone;
     type Opening: Clone;
 
@@ -177,12 +183,13 @@ pub trait Cs {
 }
 
 pub struct CsParams {
-    pub a_ntt: Vec<HVCNTTPoly>,                    // length κ_cs
-    pub b_matrix_ntt: Vec<Vec<HVCNTTPoly>>,        // μ_cs × κ_cs
+    pub a_ntt: Vec<CsNTTPoly>,                     // length κ_cs
+    pub b_matrix_ntt: Vec<Vec<CsNTTPoly>>,         // μ_cs × κ_cs
     pub mu_cs: usize,
     pub kappa_cs: usize,
-    pub r_bound: u32,
-    pub r_half_weight: usize,
+    pub beta_cs: u32,                              // fresh randomness sampling radius
+    pub r_bound: u32,                              // aggregated-opening verify bound on r
+    pub beta_agg_hvc: u32,                         // aggregated HVC digit bound (ρ_max·ζ)
     pub hasher: HVCHash,
     pub n_servers: usize,
     pub n_leaves: usize,
@@ -191,69 +198,65 @@ impl CsParams {
     pub fn block_size(&self) -> usize;             // (1 + μ_cs).next_power_of_two()
     pub fn block_height(&self) -> usize;
     pub fn total_path_len(&self) -> usize;
-    pub fn stored_path_len(&self) -> usize;        // total − block_height
+    pub fn stored_path_len(&self) -> usize;
 }
 
 #[derive(Clone)] pub struct Commitment { pub root: HVCPoly }
 
 #[derive(Clone)]
-pub struct Opening { /* server_index, path_index, kappa_cs, mu_cs, block_size, stored_path_len, data: Box<[HVCPoly]> */ }
+pub struct Opening { /* server_index, path_index, kappa_cs, mu_cs, block_size, stored_path_len,
+                        rs: Box<[CsPoly]>, data: Box<[HVCPoly]> */ }
 impl Opening {
-    pub fn r(&self) -> &[HVCPoly];                 // length κ_cs
-    pub fn s(&self) -> &[HVCPoly];                 // length μ_cs (the share-vector)
+    pub fn r(&self) -> &[CsPoly];                  // length κ_cs (CS ring)
+    pub fn s(&self) -> &[CsPoly];                  // length μ_cs, the share-vector (CS ring)
     pub fn block_node(&self, level: usize, idx: usize) -> &[HVCPoly];   // decomposed (HVC_WIDTH polys)
     pub fn path_node(&self, level: usize) -> (&[HVCPoly], &[HVCPoly]);  // decomposed (left, right)
+    pub fn pack(&self, r_bound: u32, s_bound: u32, tree_bound: u32) -> PackedOpening;
+    pub fn from_packed(p: &PackedOpening) -> Result<Opening, OpeningDecodeError>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpeningDecodeError {
+    BadHeader,    // header shape fields inconsistent or implausibly large
+    Truncated,    // `bytes` shorter than the declared regions require
 }
 
 pub struct HidingMerkleCommitment;
 impl HidingMerkleCommitment {
     pub fn setup_with_dims<R: Rng>(rng: &mut R, n_servers: usize, mu_cs: usize, kappa_cs: usize) -> CsParams;
 }
-impl Cs for HidingMerkleCommitment { /* default setup_with_dims(.., 1, 8) */ }
+impl Cs for HidingMerkleCommitment { /* default setup_with_dims(.., 1, 5) */ }
 ```
 
-`Verify` reconstructs the raw leaf-block from `(r, s, A, B)`, walks up the block subtree using `hash_separate_inputs` (each level's stored decomp must `projection_r` to the freshly hashed parent), then walks the stored decomposed path above the block.
+`Verify` reconstructs the raw CS leaf-block from `(r, s, a, B)`, walks up the block subtree (level 0 via `project_r_from_hvc` on the CS ring, higher levels via `projection_r` on the HVC ring, each stored decomp hashed to the freshly computed parent), then walks the stored decomposed path above the block root. It also bounds `‖r‖∞ ≤ r_bound` (CS ring) and every decomposed digit by `beta_agg_hvc`.
 
 ### `bulletin` — in-memory broadcast store
 
 ```rust
 #[derive(Clone)]
-pub struct ClientPublic {
-    pub ctxt: Vec<HVCPoly>,     // μ_kahe ring elements
+pub struct ClientBulletinEntry {
+    pub ctxt: Vec<KahePoly>,     // KAHE ciphertext, μ_kahe·l ring elements
     pub comm: Commitment,        // single CS commitment (μ_cs = κ_kahe packs the share-vector)
 }
 
 #[derive(Clone)]
-pub struct ServerPublic {
+pub struct ServerBulletinEntry {
     pub server_id: ServerId,
     pub clients: Vec<ClientId>,  // canonical set
-    pub agg_open: Opening,       // s() is the κ_kahe-vector of summed shares
-    pub agg_share: Vec<HVCPoly>, // mirrors agg_open.s()
+    pub agg_open: Opening,       // s() is the κ_kahe-vector of summed shares (CS ring)
+    pub agg_share: Vec<CsPoly>,  // mirrors agg_open.s()
 }
 
 pub struct InMemoryBulletin { /* Mutex<{clients, servers, canonical}> */ }
 impl InMemoryBulletin {
     pub fn new() -> Self;
-    pub fn publish_client(&self, id: ClientId, p: ClientPublic);
-    pub fn publish_server(&self, p: ServerPublic);
+    pub fn publish_client(&self, id: ClientId, p: ClientBulletinEntry);
+    pub fn publish_server(&self, p: ServerBulletinEntry);
     pub fn publish_canonical(&self, set: Vec<ClientId>);
-    pub fn clients(&self)   -> Vec<(ClientId, ClientPublic)>;
-    pub fn servers(&self)   -> Vec<ServerPublic>;
+    pub fn clients(&self)   -> Vec<(ClientId, ClientBulletinEntry)>;
+    pub fn servers(&self)   -> Vec<ServerBulletinEntry>;
     pub fn canonical(&self) -> Option<Vec<ClientId>>;
 }
-```
-
-### `consensus` — canonical-client-set selector
-
-Defines which clients servers will jointly decrypt. Honest servers must refuse to decrypt anything other than the canonical set; anonymity holds as long as one honest server enforces this.
-
-```rust
-pub trait ClientSetSelector {
-    fn canonical_set(&self) -> Vec<ClientId>;
-}
-
-pub struct FixedSet(pub Vec<ClientId>);
-impl ClientSetSelector for FixedSet { /* returns self.0.clone() */ }
 ```
 
 ### `protocol` — params + round drivers + verifier
@@ -270,8 +273,11 @@ impl ProtocolParams {
     /// Threshold `t = max(⌊n/2⌋ + 1, n − 2)`.
     pub fn setup<R: Rng>(rng: &mut R, n_servers: usize) -> Self;
     pub fn setup_with_threshold<R: Rng>(rng: &mut R, n_servers: usize, t: usize) -> Self;
-    pub fn setup_with_kahe_dims<R: Rng>(rng: &mut R, n_servers: usize, mu: usize, kappa: usize) -> Self;
-    pub fn setup_with_kahe_dims_beta<R: Rng>(rng: &mut R, n_servers: usize, mu: usize, kappa: usize, beta: u32) -> Self;
+    pub fn setup_with_kahe_dims<R: Rng>(rng: &mut R, n_servers: usize, mu_kahe: usize, kappa_kahe: usize) -> Self;
+    pub fn setup_with_kahe_dims_full<R: Rng>(
+        rng: &mut R, n_servers: usize, mu_kahe: usize, kappa_kahe: usize, l: usize,
+        sigma_s: f64, sigma_e: f64, t_modulus: u32,
+    ) -> Self;
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)] pub struct ClientId(pub u32);
@@ -279,16 +285,16 @@ impl ProtocolParams {
 
 pub struct ClientRound {
     pub client_id: ClientId,
-    pub public: ClientPublic,
+    pub encrypted_message: ClientBulletinEntry,
     /// One Opening per server. Its s() is the κ_kahe-vector of Shamir shares for this server.
-    pub private: Vec<(ServerId, Opening)>,
+    pub encrypted_openings: Vec<(ServerId, Opening)>,
 }
 
 pub fn run_client_round<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     client_id: ClientId,
-    message: <Kahe as KaheScheme>::Message,        // Vec<HVCPoly> of length μ_kahe
+    message: <Kahe as KaheScheme>::Message,        // Vec<KahePoly> of length μ_kahe·l
     servers: &[ServerId],
 ) -> ClientRound;
 
@@ -303,7 +309,7 @@ pub enum ServerRoundError { MissingClient(ClientId) }
 pub fn run_server_round(
     inbox: &ServerInbox,
     canonical: &[ClientId],
-) -> Result<ServerPublic, ServerRoundError>;
+) -> Result<ServerBulletinEntry, ServerRoundError>;
 
 #[derive(Debug, PartialEq)]
 pub enum VerifyError {
@@ -313,25 +319,25 @@ pub enum VerifyError {
     NoServers,
     /// `server_outputs.len() < t`, or duplicate / out-of-range `server_id`.
     BadServerCoverage,
-    /// A `ServerPublic.clients` field disagreed with the canonical set.
+    /// A `ServerBulletinEntry.clients` field disagreed with the canonical set.
     InconsistentCanonical(ServerId),
-    /// `agg_share.len() != κ_kahe`, or ciphertext length != μ_kahe.
+    /// `agg_share.len() != κ_kahe`, or ciphertext length != μ_kahe·l.
     InconsistentKappa(ServerId),
 }
 
 pub fn aggregate_and_decrypt(
     pp: &ProtocolParams,
     canonical: &[ClientId],
-    publics: &[(ClientId, ClientPublic)],
-    server_outputs: &[ServerPublic],
-) -> Result<Vec<HVCPoly>, VerifyError>;
+    client_entries: &[(ClientId, ClientBulletinEntry)],
+    server_outputs: &[ServerBulletinEntry],
+) -> Result<Vec<KahePoly>, VerifyError>;
 ```
 
-`aggregate_and_decrypt` requires at least `t` distinct, in-range server outputs (`BadServerCoverage`), enforces every `ServerPublic.clients` matches `canonical` (`InconsistentCanonical`), and checks `agg_share == agg_open.s()` per server (`ShareOpeningMismatch`). It runs **one** CS verification per server (the `μ_cs = κ_kahe` packing) and recovers the aggregate KAHE key by Lagrange interpolation across the first `t` servers, componentwise over the `κ_kahe` components. Tampered Merkle openings reject via `InvalidServerOpening`.
+`aggregate_and_decrypt` requires at least `t` distinct, in-range server outputs (`BadServerCoverage`), enforces every `ServerBulletinEntry.clients` matches `canonical` (`InconsistentCanonical`), and checks `agg_share == agg_open.s()` per server (`ShareOpeningMismatch`). It runs **one** CS verification per server (the `μ_cs = κ_kahe` packing) and recovers the aggregate KAHE key by Lagrange interpolation across the first `t` servers, componentwise over the `κ_kahe` components (then lifting each from the CS ring to the KAHE ring). Tampered Merkle openings reject via `InvalidServerOpening`.
 
-### `codec` — bytes ↔ `HVCPoly`
+### `codec` — bytes ↔ `KahePoly`
 
-Two flavors. `encode`/`decode` carry a 4-byte little-endian length header so the decoded length is exact for a single message; safe for round-trips, **not** safe to sum across clients (the per-coefficient header sums multiply by N and overflow). `encode_raw`/`decode_raw` skip the header and return a fixed-size buffer (`polys.len() * 1024` bytes) — use this when multiple clients write into disjoint slots of a fixed buffer and the recovered sum is decoded as a single layout.
+Two flavors. `encode`/`decode` carry a 4-byte little-endian length header so the decoded length is exact for a single message; safe for round-trips, **not** safe to sum across clients (the per-coefficient header sums multiply by N and overflow). `encode_raw`/`decode_raw` skip the header and return a fixed-size buffer (`polys.len() * 4096` bytes) — use this when multiple clients write into disjoint slots of a fixed buffer and the recovered sum is decoded as a single layout.
 
 ```rust
 #[derive(Debug, PartialEq)]
@@ -341,84 +347,107 @@ pub enum CodecError {
     CoeffOutOfRange { index: usize, value: i32 },
 }
 
-pub fn encode    (bytes: &[u8])      -> Vec<HVCPoly>;
-pub fn decode    (polys: &[HVCPoly]) -> Result<Vec<u8>, CodecError>;
-pub fn encode_raw(bytes: &[u8])      -> Vec<HVCPoly>;
-pub fn decode_raw(polys: &[HVCPoly]) -> Result<Vec<u8>, CodecError>;
+pub fn encode    (bytes: &[u8])       -> Vec<KahePoly>;
+pub fn decode    (polys: &[KahePoly]) -> Result<Vec<u8>, CodecError>;
+pub fn encode_raw(bytes: &[u8])       -> Vec<KahePoly>;
+pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError>;
 ```
 
-Layout for both: 2 bytes per coefficient (little-endian `u16`), 512 coefficients per `HVCPoly`, 1024 bytes per poly. Coefficients land in `[0, 65536) ⊂ [0, q)` so a fresh single-message encode/decode is exact. Decoding a sum is meaningful only when the application controls the encoding so per-coefficient sums stay below `q = 202_753`.
+Layout for both: 2 bytes per coefficient (little-endian `u16`), `N = 2048` coefficients per `KahePoly`, 4096 bytes per poly. Coefficients land in `[0, 65536) ⊂ [0, q_kahe)` so a fresh single-message encode/decode is exact. Decoding a sum is meaningful only when the application controls the encoding so per-coefficient sums stay below `t = 65536` (symbols are mod-`t`).
 
 ### `mse` — additive multi-set encoding (paper §3 Fig. 1)
 
-The application payload. Three matrices `(C, K, V)` of shape `γ × δ` over `Z_q`. Insert one element `x ∈ Z_q` with fresh randomness `r ← Z_q`: for each row `i ∈ [γ]`, compute `j := PRF(prf_key, (i, r)) mod δ` and `(C[i,j] += 1, K[i,j] += r, V[i,j] += x)`. `Decode` peels cells with `C[i, j] = 1`, reads `(r, x)` from `(K, V)`, emits `x`, and subtracts that element's contribution from every row by re-running the PRF. Theorem 3 correctness: `2^{-(γ-2) log ρ} + negl(λ)`. v1 PRF is SHA-256 keyed by `prf_key`.
+The application payload. Matrices `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` of shape `γ × δ` over `Z_t` (`t = T_MODULUS_DEFAULT = 2^16`, the KAHE plaintext modulus). `L = K_LIMBS = 2` base-`t` randomness limbs, so per-element randomness `r ∈ Z_{t^2} = Z_{2^32}`; `ξ = payload_symbols` symbols per element, each in `Z_t`, so one insert rides a `ξ · 16`-bit message. C and K are shared across the V symbols. Insert one element with fresh `r ← Z_{t^L}`: split `r` into limbs `r_ℓ`, and for each row `i ∈ [γ]` compute `j := PRF(prf_key, (i, r)) mod row_delta(i)` and `C[i,j] += 1`, `K_ℓ[i,j] += r_ℓ`, `V_s[i,j] += x_s`. `Decode` peels cells with `C = 1`, reconstructs `r = Σ r_ℓ·t^ℓ`, reads the `ξ`-symbol payload, emits it, and subtracts the element's contribution from every row via the PRF. Theorem 3 correctness: `2^{-(γ-2) log ρ} + negl(λ)`. PRF is SHA-256 keyed by `prf_key`. `RowLayout` lets later rows shrink geometrically for a smaller structure.
 
 ```rust
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub enum RowLayout {
+    Uniform,
+    Geometric { shrink: f64 },   // row i bucket count *= shrink^i (floored at 1)
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
     pub gamma: usize,
-    pub delta: usize,
+    pub delta: usize,             // buckets in row 0
+    pub payload_symbols: usize,   // ξ
+    pub row_layout: RowLayout,
     pub prf_key: [u8; 32],
 }
 impl MseParams {
-    pub fn new(gamma: usize, delta: usize, prf_key: [u8; 32]) -> Self;   // asserts γ ≥ 2, δ ≥ 1
-    pub fn total_cells(&self) -> usize;                                  // γ · δ
-    pub fn total_scalars(&self) -> usize;                                // 3 · γ · δ
-    pub fn max_clients(&self) -> u32;                                    // q − 1 (advisory)
+    pub fn new(gamma: usize, delta: usize, payload_symbols: usize, prf_key: [u8; 32]) -> Self;  // Uniform; asserts γ≥2, δ≥1, ξ≥1
+    pub fn with_layout(gamma: usize, delta: usize, payload_symbols: usize, row_layout: RowLayout, prf_key: [u8; 32]) -> Self;
+    pub fn payload_symbols_for_bits(bits: usize) -> usize;   // ⌈bits / BITS_PER_SYMBOL⌉
+    pub fn row_delta(&self, row: usize) -> usize;
+    pub fn row_offset(&self, row: usize) -> usize;
+    pub fn total_cells(&self) -> usize;
+    pub fn total_scalars(&self) -> usize;                    // (1 + K_LIMBS + ξ) · total_cells
+    pub fn r_space(&self) -> u64;                            // t^K_LIMBS
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+pub const K_LIMBS: usize = 2;
+pub const BITS_PER_SYMBOL: usize = 16;   // log2(t)
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct MseEncoding {
     pub params: MseParams,
-    pub c: Vec<i32>, pub k: Vec<i32>, pub v: Vec<i32>,
+    pub c: Vec<i32>,            // γ × δ counters
+    pub k: Vec<Vec<i32>>,       // K_LIMBS limbs, each total_cells entries
+    pub v: Vec<Vec<i32>>,       // ξ symbols, each total_cells entries
 }
 
 #[derive(Debug, PartialEq)]
 pub enum MseError {
     PeelStalled,
     ParamsMismatch,
+    PayloadArity,               // payload.len() != params.payload_symbols
 }
 
 impl MseEncoding {
     pub fn new(params: MseParams) -> Self;
-    pub fn insert<R: Rng>(&mut self, rng: &mut R, x: i32);
-    pub fn insert_with_r(&mut self, x: i32, r: i32);
+    pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i32]);   // payload.len() == ξ
+    pub fn insert_with_r(&mut self, payload: &[i32], r: u64);
     pub fn add_assign(&mut self, other: &Self) -> Result<(), MseError>;
-    pub fn decode(&self) -> Result<Vec<i32>, MseError>;
+    pub fn decode(&self) -> Result<Vec<Vec<i32>>, MseError>;          // recovered payload tuples, sorted
 
     pub fn n_polys(params: &MseParams) -> usize;
-    pub fn pack(&self) -> Vec<HVCPoly>;
-    pub fn unpack(params: &MseParams, polys: &[HVCPoly]) -> Self;
+    pub fn pack(&self) -> Vec<KahePoly>;
+    pub fn unpack(params: &MseParams, polys: &[KahePoly]) -> Self;
 }
 ```
 
-`pack` flattens `(C, K, V)` row-major into a coefficient stream (C first, then K, then V). `unpack` is the inverse, lifting each `HVCPoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_flashnet` is the executable spec.
+`pack` flattens `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_flashnet` is the executable spec.
 
 ## Security properties
 
-- **Binding** (commitment): given `comm`, an adversary cannot produce a different `(r', s', path')` that verifies — Module-SIS hardness on the BDLOP leaf and Ring-SIS hardness on every internal Merkle node.
-- **Hiding** (commitment, single opening): the BDLOP leaf `(a^T r, B r + s)` is statistically uniform over `R_q^{1+μ_cs}` by the leftover hash lemma when `r` is short and the matrix `(a | B)` has enough min-entropy.
+- **Binding** (commitment): given `comm`, an adversary cannot produce a different `(r', s', path')` that verifies — Module-SIS hardness on the BDLOP leaf (CS ring) and Ring-SIS hardness on every internal Merkle node (HVC ring).
+- **Hiding** (commitment, single opening): the BDLOP leaf `(a^T r, B r + s)` is statistically uniform over `R_{q_cs}^{1+μ_cs}` by the leftover hash lemma when `r` is short and the matrix `(a | B)` has enough min-entropy.
 - **Strong hiding** (sum of openings): pointwise sums of low-norm `r`s stay low-norm with margin; the linear hash + decomposed-path representation makes summed openings verify against the summed root; per-client `s_j` remains hidden under any subset of summands.
 - **Threshold liveness**: any `t` honest servers' `agg_share`s suffice to recover `Σ sk_j` via Lagrange; up to `n − t` servers can be offline or corrupted.
 - **Integrity**: `aggregate_and_decrypt` rejects tampered Merkle openings (`InvalidServerOpening`), tampered key shares (`ShareOpeningMismatch`), inconsistent canonical sets (`InconsistentCanonical`), and shape mismatches (`InconsistentKappa`); honest output is `Σ m_j` over canonical clients, nothing else.
-- **Anonymity**: holds as long as at least one honest server refuses to decrypt sets smaller than the canonical set (`consensus` invariant).
+- **Anonymity**: assumes at least one honest server refuses to decrypt any set other than the canonical one. **This is NOT enforced by this PoC** — there is no consensus / canonical-set-enforcement module; a `canonical` slice is passed in by the caller and `aggregate_and_decrypt` only checks that every server agrees on it, not that it is the "right" set. Enforcing canonicality is out of scope here.
 
 ## Parameters and limits
 
-Lattice ring (from chipmunk): `Z_q[x]/(x^N+1)` with `q = 202_753`, `N = 512`. `HVC_WIDTH = 3` decomposed polys per node, `ZETA = 29` decomposition base bound. Tree height = `⌈log2(block_size · n_servers)⌉`, where `block_size = (1 + μ_cs).next_power_of_two()`.
+Three rings, all `Z_q[x]/(x^N+1)` with `N = 2048` and `q ≡ 1 mod 2N` (from chipmunk):
+- **HVC** (`HVCPoly`, Merkle internal hash nodes): `q_hvc = 40_961` (~15.3 bits), `HVC_WIDTH = 3` decomposed polys per node, `ZETA = 34` decomposition base bound.
+- **CS** (`CsPoly`, BDLOP commitment leaf + Shamir sharing + CS-side aggregation): `q_cs = 147_457` (~17.2 bits), `q_cs/2 = 73_728`.
+- **KAHE** (`KahePoly`, KAHE encryption + codec + MSE): `q_kahe = 271_163_393` (~28 bits).
 
-KAHE defaults (`Kahe::setup`): `(μ, κ, β) = (1, 6, 64)` — chosen so Lemma 8 hides at λ = 128 for `ρ ≤ 2²⁰` with the chipmunk HVC modulus. The scaling bench compares two operating points: **(μ=16, κ=31, β=1024)** with `block_size = 32` (best 1 MB throughput) and **(μ=8, κ=15, β=2048)** with `block_size = 16` (best per-round latency — `1+κ` exactly hits the lower power-of-two).
+Tree height = `⌈log2(block_size · n_servers)⌉`, where `block_size = (1 + μ_cs).next_power_of_two()`.
 
-CS defaults (`HidingMerkleCommitment::setup`): `μ_cs = 1, κ_cs = 8, r_bound = 64, r_half_weight = 1` (balanced ternary). The protocol's `setup_with_dims` overrides `μ_cs := κ_kahe` so a single CS pipeline carries the entire share-vector.
+KAHE defaults (`Kahe::setup`): `(μ, κ, l) = (1, 1, 1)`, `σ_s = σ_e = 15.72`, `t = 2^16` — sized for ~128-bit RLWE at N=2048 with noise budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` holding for ρ ≲ 240. The scaling bench compares two operating points: **(μ=16, κ=31)** with `block_size = 32` (best 1 MB throughput) and **(μ=8, κ=15)** with `block_size = 16` (best per-round latency — `1+κ` exactly hits the lower power-of-two).
 
-Threshold: `t = max(⌊n/2⌋ + 1, n − 2)` by default. Per-opening size grows as `(2·block_size − 2)·HVC_WIDTH + 2·stored_path_len·HVC_WIDTH + κ_cs + μ_cs` ring elements; for `μ_cs = κ_kahe = 6` (`block_size = 8`) and `n_servers = 8`, that is roughly 50 KB of decomposed nodes plus per-opening `r` and `s`.
+CS defaults (`HidingMerkleCommitment::setup`): `μ_cs = 1, κ_cs = 5, β_cs = 122, r_bound = 36600, β_agg_hvc = 300·ζ = 10200`. The protocol couples `μ_cs := κ_kahe` so a single CS pipeline carries the entire share-vector.
+
+Threshold: `t = max(⌊n/2⌋ + 1, n − 2)` by default. Per-opening data size grows as `(2·block_size − 2)·HVC_WIDTH + 2·stored_path_len·HVC_WIDTH` HVC ring elements, plus `κ_cs + μ_cs` CS ring elements (`r ‖ s`).
 
 ## Tests, benches, demos
 
 ```
 cargo test                              # all unit + integration tests
 cargo bench --bench protocol            # criterion micro-benches per stage at small parameters
-cargo bench --bench scaling             # (S, N) cell × (μ, κ, β) variants
+cargo bench --bench scaling             # (S, N) cell × (μ_kahe, κ_kahe) variants
                                         #   BENCH_BUDGET_SECS=N to extend (default 300)
 cargo run --release --example demo      # 6 clients × 128-byte slots over a 1024-byte buffer
 ```
@@ -427,7 +456,9 @@ cargo run --release --example demo      # 6 clients × 128-byte slots over a 102
 
 ### Scaling bench
 
-Reported wall times **assume parallel deployment**: clients run in parallel on N machines, servers in parallel on S machines, the verifier is one party. Per-round wall = `client_round + server_round + verify_round`. Sub-stages within each role are sequential on the same machine. Each round ships `μ_kahe · 1024` bytes of broadcast payload; the bench extrapolates a 1 MB total as `⌈1024 / μ⌉ · per_round`. Default cell: `(S, N) = (8, 300)` × the two `(μ, κ, β)` points above.
+> **Caveat:** the measured millisecond/percentage values in this section predate the move to three rings at `N = 2048`; treat them as historical and re-run the bench for current numbers. The `β` column in the sample table below is a stale KAHE secret-key bound that no longer exists (the key is now discrete-Gaussian, σ_s = 15.72).
+
+Reported wall times **assume parallel deployment**: clients run in parallel on N machines, servers in parallel on S machines, the verifier is one party. Per-round wall = `client_round + server_round + verify_round`. Sub-stages within each role are sequential on the same machine. Each round ships `μ_kahe · (bytes-per-poly)` bytes of broadcast payload; the bench extrapolates a 1 MB total over the corresponding round count. Default cell: `(S, N) = (8, 300)` × the two `(μ_kahe, κ_kahe)` points above.
 
 Sample on an 8-core machine (Intel Core Ultra 7 155H, AVX2), `RAYON_NUM_THREADS=8`, `chipmunk_code` built with `--features fast-ntt` (Barrett + AVX2), default `parallel` feature off:
 

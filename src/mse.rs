@@ -39,8 +39,8 @@
 //! `KahePoly`s.
 //!
 //! MSE cell arithmetic runs in `Z_t` where `t = T_MODULUS_DEFAULT` is
-//! the KAHE plaintext modulus. With `t = 2^18` and `L = K_LIMBS = 2`,
-//! `r ∈ Z_{t^2} = Z_{2^36}`, so r-arithmetic fits in a `u64`. If a wider
+//! the KAHE plaintext modulus. With `t = 2^16` and `L = K_LIMBS = 2`,
+//! `r ∈ Z_{t^2} = Z_{2^32}`, so r-arithmetic fits in a `u64`. If a wider
 //! r-space is ever needed, bump `K_LIMBS` (and the `u64` arithmetic with
 //! it) — `L = 2` is plenty for the protocol's current operating point.
 

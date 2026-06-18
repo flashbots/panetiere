@@ -2,8 +2,8 @@
 //!
 //! Layout: little-endian `u32` byte-length header, then the bytes themselves,
 //! padded with zeros up to the next even byte count, then packed two bytes per
-//! coefficient (little-endian `u16`). Each `KahePoly` carries `N = 512`
-//! coefficients = `1024` bytes; the final poly is zero-padded to fill `N`
+//! coefficient (little-endian `u16`). Each `KahePoly` carries `N = 2048`
+//! coefficients = `4096` bytes; the final poly is zero-padded to fill `N`
 //! coefficients. Coefficients land in `[0, 65536) ⊂ [0, q)` so a fresh single-
 //! client encode/decode is exact round-trip.
 //!

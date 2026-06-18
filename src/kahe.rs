@@ -1,6 +1,6 @@
 //! Key-additive homomorphic encryption (Willow-style RLWE-based KAHE).
 //!
-//! Lives on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, q ≈ 2^30),
+//! Lives on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, q ≈ 2^28),
 //! decoupled from the chipmunk Ring-SIS CS ring.
 //! The KAHE q is chosen for headroom in the noise budget — chipmunk's q is
 //! tied to its multi-signature size optimization and would be wasteful here.
@@ -14,28 +14,26 @@
 //!
 //! Parameters:
 //! - `A ∈ R_{q_kahe}^{μ × κ}` — public matrix.
-//! - `sk ← D_{σ_s}^κ` — discrete Gaussian secret key (σ_s = 4.5).
-//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (σ_e = √2·σ_s ≈ 6.36).
+//! - `sk ← D_{σ_s}^κ` — discrete Gaussian secret key (σ_s = 15.72).
+//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 15.72).
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 //!
 //! Correctness budget at ρ aggregations: need `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2`.
-//! With σ_e ≈ 6.36, q_kahe = 1_073_738_753:
-//!   - ρ = 100:  t < q/(2·(8σ_e·√ρ + ρ/2)) ≈ 961k → t = 524_288 = 2^19 (19 bits/coef)
-//!   - ρ = 300:  t < 520k → t = 262_144 = 2^18 (18 bits/coef)
-//!   - ρ = 1000: t < 167k → t = 131_072 = 2^17 (17 bits/coef)
+//! At σ_e = 15.72, q_kahe = 271_163_393, t = 2^16: holds for ρ ≲ 240,
+//! covering the S=8, N=100 operating point.
 //!
 //! `KaheKey` (fresh, low-norm) feeds `Enc`; `KaheAggKey` (in `R_{q_kahe}^κ`,
 //! recovered by Shamir interpolation over `R_{q_cs}` and lifted via
-//! [`lift_hvc_to_kahe`] in `protocol::verify`) feeds `Dec`. Hiding-given-
+//! [`lift_cs_to_kahe`] in `protocol::verify`) feeds `Dec`. Hiding-given-
 //! aggregate-key reduces to (Hint-)RLWE rather than to LHL.
 //!
-//! Bridge layer. KAHE secret-key components are *small* (Gaussian σ_s = 4.5,
-//! `‖sk‖_∞ ≤ 8σ_s ≈ 36` w.o.p.). Shamir-recovered sums-of-keys are also small
+//! Bridge layer. KAHE secret-key components are *small* (Gaussian σ_s = 15.72,
+//! `‖sk‖_∞ ≤ 8σ_s ≈ 126` w.o.p.). Shamir-recovered sums-of-keys are also small
 //! (`‖Σ sk‖_∞ ≤ N_clients · 8σ_s`). Both fit losslessly in both rings under
-//! centered representation, so we cross between `KahePoly` and `HVCPoly` by
-//! coefficient-wise re-interpretation: see [`kahe_to_hvc_centered`] (client
-//! side, KAHE→CS for Shamir input) and [`lift_hvc_to_kahe`] (verifier side,
+//! centered representation, so we cross between `KahePoly` and `CsPoly` by
+//! coefficient-wise re-interpretation: see [`kahe_to_cs_centered`] (client
+//! side, KAHE→CS for Shamir input) and [`lift_cs_to_kahe`] (verifier side,
 //! CS→KAHE for decryption).
 
 use chipmunk_code::{
@@ -276,9 +274,9 @@ pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
 pub struct Kahe;
 
 impl Kahe {
-    /// Setup with explicit dimensions and Willow-style Gaussian widths.
-    /// `sigma_s` = key std, `sigma_e` = error std. Defaults match Willow:
-    /// `sigma_s = 4.5`, `sigma_e = √2 · sigma_s ≈ 6.36`.
+    /// Setup with explicit dimensions and Gaussian widths. `sigma_s` = key std,
+    /// `sigma_e` = error std. Defaults `SIGMA_S_DEFAULT = SIGMA_E_DEFAULT =
+    /// 15.72` (single `D_σ`) target ~128-bit RLWE at N=2048.
     pub fn setup_with_dims<R: Rng>(
         rng: &mut R,
         mu_kahe: usize,
@@ -333,7 +331,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `(μ, κ) = (1, 1)`, σ_s=σ_e=15.6, `t = 2^8` at q_kahe = 59_393.
+    /// `(μ, κ, l) = (1, 1, 1)`, σ_s=σ_e=15.72, `t = 2^16` at q_kahe = 271_163_393.
     /// κ_kahe=1 → plain RLWE secret (single ring element); one Shamir-share
     /// component per CS opening.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {

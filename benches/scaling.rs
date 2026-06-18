@@ -18,6 +18,8 @@
 //!           δ_factor      δ = δ_factor · N (paper sweet spot = 2, δ ≈ 2ρ)
 //!           ξ             payload symbols/client (useful bits = ξ·log₂ t)
 //!           κ_kahe        KAHE key components (coupled to μ_cs in ProtocolParams)
+//!  NETWORKS: per-profile one-way latency + uniform jitter, link Mbit/s
+//!           (wire-time sim; reported separately from CPU, then combined)
 //!  env:     BENCH_BUDGET_SECS  default 300
 //!           RAYON_NUM_THREADS  recommend 8
 //!
@@ -70,7 +72,7 @@
 use std::time::{Duration, Instant};
 
 use chipmunk_code::{
-    KahePoly, CS_MODULUS, HVC_MODULUS, HVC_WIDTH, KAHE_MODULUS, N as POLY_N, ZETA,
+    KaheNTTPoly, KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA,
 };
 use flashnet::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use flashnet::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
@@ -81,7 +83,7 @@ use flashnet::protocol::server::{run_server_round, ServerInbox};
 use flashnet::protocol::verify::{aggregate_and_decrypt_timed, VerifyTimings};
 use flashnet::protocol::ProtocolParams;
 use flashnet::protocol::{ClientId, ServerId};
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 const CELLS: &[(usize, usize)] = &[(8, 100)];
@@ -112,6 +114,25 @@ const CONFIGS: &[Config] = &[Config {
     payload_symbols: 8192,
     kappa_kahe: 1,
 }];
+
+/// Network sim profile: per-message one-way latency = `lat_ms + U[0, jitter_ms)`
+/// (parallel arrivals take the max draw). Two link classes: client links
+/// (residential, the slow side) and server-side links (servers, bulletin,
+/// verifier — cloud, ~Gbit). Each endpoint serializes its own bytes at its
+/// class rate, both directions.
+struct NetProfile {
+    label: &'static str,
+    lat_ms: f64,
+    jitter_ms: f64,
+    client_mbps: f64,
+    server_mbps: f64,
+}
+
+const NETWORKS: &[NetProfile] = &[
+    NetProfile { label: "LAN  ", lat_ms: 0.5, jitter_ms: 0.2, client_mbps: 1000.0, server_mbps: 1000.0 },
+    NetProfile { label: "fiber", lat_ms: 25.0, jitter_ms: 10.0, client_mbps: 100.0, server_mbps: 1000.0 },
+    NetProfile { label: "dsl  ", lat_ms: 35.0, jitter_ms: 15.0, client_mbps: 20.0, server_mbps: 1000.0 },
+];
 
 /// ⌈log₂ q⌉, tight-pack bit-width per ring coefficient.
 const fn bits_per_coef(q: i32) -> usize {
@@ -171,6 +192,10 @@ struct Row {
     verify_interp_us: f64,
     verify_kahe_us: f64,
     mse_v_us: f64,
+    // sqrt-compression sim: per-client extra CPU (m ring mults) and the
+    // compressed wire width (2·⌈√m⌉ polys, m = μ·l).
+    compress_us: f64,
+    sqrt_polys: usize,
     // Bandwidth (bytes per round, totalled across all parties)
     useful_b: f64,
     wire_ctxt_b: f64,
@@ -278,10 +303,6 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     // ⌈log₂ q⌉. Openings are decomposed digits + small r/s, so we measure the
     // REAL packed size via `Opening::pack` (per-region bit widths).
     let o = &inboxes[0].items[0].1;
-    let opening_polys = o.kappa_cs()
-        + o.mu_cs()
-        + (2 * o.block_size() - 2) * HVC_WIDTH
-        + o.stored_path_len() * 2 * HVC_WIDTH;
     // Client→server opening is FRESH: r ≤ β_cs, tree digits ≤ ζ, s ≤ q_cs/2.
     let cs_half = (CS_MODULUS as u32) / 2;
     let fresh_open_b = o.pack(pp.cs.beta_cs, cs_half, ZETA).body_len();
@@ -301,7 +322,25 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         enc.pack()
     });
     let key0 = kahe_keygen(&mut rng, &pp);
-    let (client_kahe_us, _ctxt0) = time_us(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
+    let (client_kahe_us, ctxt0) = time_us(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
+
+    // ── sqrt-compression sim ─────────────────────────────────────────────
+    // Hypothetical client-side step: one ring multiplication per ciphertext
+    // element against a public NTT-resident poly, accumulated into 2·⌈√m⌉
+    // outputs which are all the client posts. CPU = m forward NTTs +
+    // m pointwise mult-accs + 2⌈√m⌉ inverse NTTs (the compression operand is
+    // public, so its NTT is precomputed). Recovery from the compressed form
+    // is NOT modelled — the real pipeline below still runs on full ctxts.
+    let m = ctxt0.len(); // = μ·l
+    let sqrt_polys = 2 * (m as f64).sqrt().ceil() as usize;
+    let comp_ntt = KaheNTTPoly::rand_ntt_poly(&mut rng);
+    let (compress_us, _compressed) = time_us(|| {
+        let mut acc = vec![KaheNTTPoly::default(); sqrt_polys];
+        for (j, p) in ctxt0.iter().enumerate() {
+            acc[j % sqrt_polys] += KaheNTTPoly::from(p) * comp_ntt;
+        }
+        acc.iter().map(KahePoly::from).collect::<Vec<KahePoly>>()
+    });
     let (client_share_us, shares0) = time_us(|| shamir_share(&mut rng, &pp, &key0, s));
     let (client_cs_us, _) = time_us(|| cs_commit(&mut rng, &pp, &shares0));
     let (server_us, _) = time_us(|| run_server_round(&inboxes[0], &canonical).unwrap());
@@ -343,6 +382,8 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         verify_interp_us: interpolation_us,
         verify_kahe_us: kahe_dec_us,
         mse_v_us,
+        compress_us,
+        sqrt_polys,
         useful_b: (n * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
         wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * KAHE_POLY_BYTES,
         wire_comm_b: n as f64 * HVC_POLY_BYTES,
@@ -497,6 +538,110 @@ fn print_row(r: &Row) {
         r.l,
         fmt_bytes(r.wire_ctxt_b / l),
     );
+
+    // ── sqrt-compression sim ────────────────────────────────────────────
+    // CPU: +compress_us per client (scales with l, like the other per-chunk
+    // phases). Wire: client ctxt shrinks from μ·l to 2·⌈√(μ·l)⌉ polys;
+    // comm/openings/server entries unchanged.
+    let m = r.mu_kahe * r.l;
+    let client_ctxt_sqrt = r.sqrt_polys as f64 * KAHE_POLY_BYTES;
+    let wire_ctxt_sqrt = r.n as f64 * client_ctxt_sqrt;
+    let wall_sim_us = per_round_us + r.compress_us;
+    let wire_sim_total = wire_ctxt_sqrt + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
+    println!(
+        "  ── sqrt-compression sim: m={} → 2·⌈√m⌉={} polys/client ──",
+        m, r.sqrt_polys,
+    );
+    println!(
+        "    extra client CPU: {} (m ring mults; {} per mult)  →  wall {} (was {}, {:+.1}%)",
+        fmt_us(r.compress_us),
+        fmt_us(r.compress_us / m as f64),
+        fmt_us(wall_sim_us),
+        fmt_us(per_round_us),
+        (wall_sim_us / per_round_us - 1.0) * 100.0,
+    );
+    println!(
+        "    1 client out = {}  [comm {} + openings {} + ctxt {} (was {})]",
+        fmt_bytes(client_fixed + client_ctxt_sqrt),
+        fmt_bytes(client_comm),
+        fmt_bytes(client_open),
+        fmt_bytes(client_ctxt_sqrt),
+        fmt_bytes(client_ctxt),
+    );
+    println!(
+        "    bulletin = {} (was {}, {:.1}× smaller)   1 server out = {} (unchanged)",
+        fmt_bytes(bulletin_fixed + wire_ctxt_sqrt),
+        fmt_bytes(bulletin_fixed + r.wire_ctxt_b),
+        (bulletin_fixed + r.wire_ctxt_b) / (bulletin_fixed + wire_ctxt_sqrt),
+        fmt_bytes(server_fixed),
+    );
+    println!(
+        "    wire total = {} (was {})   efficiency {:.3e} (was {:.3e})   useful {:.3} MB/s (was {:.3})",
+        fmt_bytes(wire_sim_total),
+        fmt_bytes(wire_total),
+        r.useful_b / wire_sim_total,
+        efficiency,
+        r.useful_b / (wall_sim_us / 1e6) / 1e6,
+        useful_mb_s,
+    );
+
+    // ── network sim ─────────────────────────────────────────────────────
+    // Three sequential wire phases per round, kept separate from CPU wall:
+    //   A  client upload — N parallel uplinks; each client streams its
+    //      bulletin post and its S openings as parallel flows (each at the
+    //      full client rate). Gated by the slowest of: a client→bulletin
+    //      flow, a client→servers flow, a server downlink (ingesting N
+    //      openings), the bulletin ingest (N posts).
+    //      Every phase is gated by both ends of each flow — sender uplink
+    //      and receiver downlink each serialize their own total bytes.
+    //   B  server post — S entries onto the bulletin (receiver ingest of
+    //      all S entries dominates each server's single-entry uplink).
+    //   C  verifier read — the full bulletin over the verifier's downlink
+    //      (bulletin egress is the same bytes at the same class rate).
+    // No compute/transfer overlap is modelled, so e2e = CPU wall + net is
+    // the conservative end of pipelined reality. Deterministic jitter seed.
+    let mut nrng = ChaCha20Rng::from_seed([0x5E; 32]);
+    println!("  network sim (net = A client upload + B server post + C verifier read; e2e = cpu + net):");
+    for p in NETWORKS {
+        // Mbit/s → bytes/µs. Client links vs cloud (server/bulletin/verifier).
+        let xfer_cl = |b: f64| b / (p.client_mbps / 8.0);
+        let xfer_srv = |b: f64| b / (p.server_mbps / 8.0);
+        let mut maxlat = |k: usize| -> f64 {
+            (0..k)
+                .map(|_| p.lat_ms + nrng.gen::<f64>() * p.jitter_ms)
+                .fold(0.0, f64::max)
+                * 1e3
+        };
+        println!(
+            "    {} ({}+U[0,{})ms, client {} / cloud {} Mbps):",
+            p.label, p.lat_ms, p.jitter_ms, p.client_mbps, p.server_mbps,
+        );
+        for (tag, ctxt_per_client, cpu_us) in [
+            ("base", client_ctxt, per_round_us),
+            ("sqrt", client_ctxt_sqrt, wall_sim_us),
+        ] {
+            let post_b = client_comm + ctxt_per_client; // one client's bulletin post
+            let a = (maxlat(r.n) + xfer_cl(post_b)) // client→bulletin flow
+                .max(maxlat(r.n) + xfer_cl(client_open)) // client→servers flow
+                .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
+                .max(maxlat(r.n) + xfer_srv(r.n as f64 * post_b)); // bulletin ingest
+            let b = maxlat(r.s) + xfer_srv(r.wire_server_b);
+            let c = maxlat(1) + xfer_srv(bulletin_fixed + r.n as f64 * ctxt_per_client);
+            let net = a + b + c;
+            let e2e = cpu_us + net;
+            println!(
+                "      {}: net {:>10} [A {} + B {} + C {}]   e2e {:>10}  →  {:.3} MB/s (cpu-only {:.3})",
+                tag,
+                fmt_us(net),
+                fmt_us(a),
+                fmt_us(b),
+                fmt_us(c),
+                fmt_us(e2e),
+                r.useful_b / (e2e / 1e6) / 1e6,
+                r.useful_b / (cpu_us / 1e6) / 1e6,
+            );
+        }
+    }
 }
 
 fn main() {

@@ -120,6 +120,10 @@ pub fn aggregate_and_decrypt_timed(
         if !HidingMerkleCommitment::verify(&pp.cs, &summed_comm, &sp.agg_open) {
             return Err(VerifyError::InvalidServerOpening(i));
         }
+        // Shamir point (server_id) must match the slot `verify` bound `s()` to.
+        if sp.agg_open.path_index != sp.server_id.0 as usize {
+            return Err(VerifyError::InvalidServerOpening(i));
+        }
         if sp.agg_share.as_slice() != sp.agg_open.s() {
             return Err(VerifyError::ShareOpeningMismatch(i));
         }

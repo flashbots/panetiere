@@ -41,8 +41,8 @@ impl ProtocolParams {
         Self { kahe, cs, shamir }
     }
 
-    /// Explicit KAHE dimensions `(μ, κ)` with Willow defaults
-    /// (`σ_s = 4.5`, `σ_e = √2·σ_s`, `t_modulus = 64`).
+    /// Explicit KAHE dimensions `(μ, κ)`; `l = 1`, `σ_s = σ_e = 15.72`,
+    /// `t_modulus = 2^16` (the `*_DEFAULT` constants).
     pub fn setup_with_kahe_dims<R: Rng>(
         rng: &mut R,
         n_servers: usize,

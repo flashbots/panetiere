@@ -403,6 +403,12 @@ impl Cs for HidingMerkleCommitment {
         {
             return false;
         }
+        // Guard backing buffers before the accessors slice into them.
+        if o.rs.len() != pp.kappa_cs + pp.mu_cs
+            || o.data.len() != opening_data_polys(pp.block_size(), pp.stored_path_len())
+        {
+            return false;
+        }
         if !o.r().iter().all(|p| p.infinity_norm() <= pp.r_bound) {
             return false;
         }
@@ -754,6 +760,18 @@ impl PackedOpening {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpeningDecodeError {
+    /// Header shape fields are inconsistent or implausibly large.
+    BadHeader,
+    /// `bytes` is shorter than the declared regions require.
+    Truncated,
+}
+
+/// Upper bound on any single opening dimension; rejects adversarial headers
+/// whose derived buffer sizes would overflow or trigger huge allocations.
+const MAX_OPENING_DIM: usize = 1 << 20;
+
 impl Opening {
     /// Pack this opening at the tightest bit width for each region.
     ///
@@ -797,16 +815,35 @@ impl Opening {
         }
     }
 
-    /// Inverse of `pack`. Reconstructs the in-memory `Opening`.
-    pub fn from_packed(p: &PackedOpening) -> Opening {
+    /// Inverse of `pack`. Validates the (untrusted) header before allocating.
+    pub fn from_packed(p: &PackedOpening) -> Result<Opening, OpeningDecodeError> {
         let kappa_cs = p.kappa_cs as usize;
         let mu_cs = p.mu_cs as usize;
         let block_size = p.block_size as usize;
         let stored_path_len = p.stored_path_len as usize;
+
+        if kappa_cs == 0
+            || block_size < 2
+            || !block_size.is_power_of_two()
+            || kappa_cs > MAX_OPENING_DIM
+            || mu_cs > MAX_OPENING_DIM
+            || block_size > MAX_OPENING_DIM
+            || stored_path_len > MAX_OPENING_DIM
+        {
+            return Err(OpeningDecodeError::BadHeader);
+        }
+
         let data_polys = opening_data_polys(block_size, stored_path_len);
         let r_bits = bits_for_signed(p.r_bound);
         let s_bits = bits_for_signed(p.s_bound);
         let tree_bits = bits_for_signed(p.tree_bound);
+
+        let total_bits = (kappa_cs * POLY_N) * r_bits as usize
+            + (mu_cs * POLY_N) * s_bits as usize
+            + (data_polys * POLY_N) * tree_bits as usize;
+        if p.bytes.len() < total_bits.div_ceil(8) {
+            return Err(OpeningDecodeError::Truncated);
+        }
 
         let mut rs: Vec<CsPoly> = vec![CsPoly::default(); kappa_cs + mu_cs];
         let mut data: Vec<HVCPoly> = vec![HVCPoly::default(); data_polys];
@@ -826,9 +863,7 @@ impl Opening {
         for poly in data.iter_mut() {
             byte_idx = unpack_bits(&p.bytes, byte_idx, poly.coeffs_mut(), p.tree_bound, tree_bits);
         }
-        debug_assert!(byte_idx == p.bytes.len() || byte_idx + 1 == p.bytes.len());
-
-        Opening {
+        Ok(Opening {
             server_index: p.server_index as usize,
             path_index: p.path_index as usize,
             kappa_cs,
@@ -837,7 +872,7 @@ impl Opening {
             stored_path_len,
             rs: rs.into_boxed_slice(),
             data: data.into_boxed_slice(),
-        }
+        })
     }
 }
 
@@ -984,7 +1019,7 @@ mod tests {
             // Fresh r ∈ [-β_cs, β_cs]; s ∈ R_{q_cs} so bound = q_cs/2;
             // decomposed tree nodes bounded by ZETA for fresh openings.
             let packed = o.pack(pp.beta_cs, CS_MODULUS as u32 / 2, chipmunk_code::ZETA);
-            let unpacked = Opening::from_packed(&packed);
+            let unpacked = Opening::from_packed(&packed).unwrap();
             assert_eq!(o.r(), unpacked.r());
             assert_eq!(o.s(), unpacked.s());
             assert_eq!(o.server_index, unpacked.server_index);
@@ -1016,7 +1051,7 @@ mod tests {
                 CS_MODULUS as u32 / 2,
                 2 * chipmunk_code::ZETA,
             );
-            let unpacked = Opening::from_packed(&packed);
+            let unpacked = Opening::from_packed(&packed).unwrap();
             assert_eq!(agg.r(), unpacked.r());
             assert_eq!(agg.s(), unpacked.s());
             assert_eq!(agg.block_node(0, 0), unpacked.block_node(0, 0));
@@ -1041,12 +1076,6 @@ mod tests {
             "packed {} not ≤ in_mem {} / 4",
             packed_bytes,
             in_mem_bytes
-        );
-        eprintln!(
-            "pack_size_reduction: in_mem={} packed={} ratio={:.2}x",
-            in_mem_bytes,
-            packed_bytes,
-            in_mem_bytes as f64 / packed_bytes as f64
         );
     }
 }
