@@ -13,9 +13,11 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! INPUTS (knobs — sweep by editing CELLS / CONFIGS, or via env)
 //! ──────────────────────────────────────────────────────────────────────
-//!  CELLS:   (S, N)        servers, clients (= ρ)
+//!  CELLS:   (S, ρ)        servers, anonymity-set size (= total clients)
+//!  ACTIVE_CLIENTS:        clients carrying real msgs; ρ−active send cover.
+//!                         IBLT is sized to active, not ρ.
 //!  CONFIGS: γ             MSE rows (practical sweet spot = 4)
-//!           δ_factor      δ = δ_factor · N (paper sweet spot = 2, δ ≈ 2ρ)
+//!           δ_factor      δ = δ_factor · active (paper sweet spot = 2)
 //!           ξ             payload symbols/client (useful bits = ξ·log₂ t)
 //!           κ_kahe        KAHE key components (coupled to μ_cs in ProtocolParams)
 //!  NETWORKS: per-profile one-way latency + uniform jitter, link Mbit/s
@@ -87,7 +89,12 @@ use panetiere::protocol::{ClientId, ServerId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
-const CELLS: &[(usize, usize)] = &[(8, 100)];
+// (S, ρ): servers, anonymity-set size (= total clients, noise-budget-bounded).
+const CELLS: &[(usize, usize)] = &[(8, 200)];
+
+// Active clients per cell; the remaining ρ−active send cover traffic. IBLT is
+// sized to active, so this is the "smaller IBLT, same anonymity set" axis.
+const ACTIVE_CLIENTS: &[usize] = &[200, 150, 100, 50, 20];
 
 struct Config {
     label: &'static str,
@@ -108,11 +115,11 @@ const MU_KAHE: usize = 76;
 // Each row extrapolates throughput to this full-utilization point.
 const MU_FULL: f64 = 14401.0;
 
-// Per-client element size: 16 KB ⇒ n_polys ≈ 1201 ⇒ l = ⌈1201/MU_KAHE⌉ = 16 chunks.
+// Per-client element size: 4 KiB = 2048 symbols · 16 bits.
 const CONFIGS: &[Config] = &[Config {
-    label: "16KB",
+    label: "4KB",
     gamma: 4,
-    payload_symbols: 8192,
+    payload_symbols: 2048,
     kappa_kahe: 1,
 }];
 
@@ -163,7 +170,10 @@ fn fmt_bytes(b: f64) -> String {
 
 struct Row {
     s: usize,
-    n: usize,
+    n: usize, // ρ — total clients = anonymity set
+    active: usize,
+    cover: usize,
+    iblt_cells: usize,
     label: &'static str,
     mu_kahe: usize,
     kappa: usize,
@@ -198,24 +208,24 @@ struct Row {
     wire_server_b: f64,
 }
 
-fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
+fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
+    let cover = n - active;
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&[
         s as u8,
         n as u8,
         (n >> 8) as u8,
+        active as u8,
         cfg.kappa_kahe as u8,
         cfg.gamma as u8,
         cfg.payload_symbols as u8,
         (cfg.payload_symbols >> 8) as u8,
-        0,
     ]);
     let mut rng = ChaCha20Rng::from_seed(seed);
 
-    // One IBLT for the n insertions, sized at ~3 buckets per insertion (the
-    // 300-buckets-for-100-clients ratio) so peeling recovers all n messages.
-    // Total cells γ·δ ≈ 3·n; bigger n ⇒ bigger encoding ⇒ more chunks l.
-    let delta = (3 * n).div_ceil(cfg.gamma);
+    // IBLT sized to the active count only (cover clients add nothing): ~3
+    // buckets per insertion so peeling recovers all `active` messages.
+    let delta = (3 * active).div_ceil(cfg.gamma);
     let mse_params = MseParams::new(cfg.gamma, delta, cfg.payload_symbols, [0xAA; 32]);
     let n_polys = MseEncoding::n_polys(&mse_params);
     // KAHE encrypts the encoding in l chunks of the fixed size MU_KAHE.
@@ -235,25 +245,22 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
 
-    // One ξ-symbol element per client (its broadcast message). Small distinct
-    // values, ≪ t/2 = 2^15, so summing across clients doesn't wrap.
-    let payloads: Vec<Vec<i32>> = client_ids
-        .iter()
-        .map(|cid| {
-            let base = cid.0 as i32;
-            (0..cfg.payload_symbols)
-                .map(|j| base + j as i32 + 1)
-                .collect()
-        })
+    // One ξ-symbol element per active client. Small distinct values, ≪ t/2,
+    // so summing across clients doesn't wrap.
+    let payloads: Vec<Vec<i32>> = (0..active)
+        .map(|i| (0..cfg.payload_symbols).map(|j| i as i32 + j as i32 + 1).collect())
         .collect();
-    // Each client encodes its element into the IBLT and zero-pads the encoding to
-    // a whole number of MU_KAHE chunks (mu_kahe·l polys) for KAHE encryption.
-    let client_polys: Vec<Vec<KahePoly>> = payloads
-        .iter()
-        .map(|elt| {
-            let mut enc = MseEncoding::new(mse_params.clone());
-            enc.insert(&mut rng, elt);
-            let mut polys = enc.pack();
+    // Active clients encode their element; the rest send cover traffic. Both
+    // zero-pad to mu_kahe·l polys for KAHE encryption.
+    let client_polys: Vec<Vec<KahePoly>> = (0..n)
+        .map(|i| {
+            let mut polys = if i < active {
+                let mut enc = MseEncoding::new(mse_params.clone());
+                enc.insert(&mut rng, &payloads[i]);
+                enc.pack()
+            } else {
+                MseEncoding::cover(&mse_params)
+            };
             polys.resize(mu_kahe * l, KahePoly::default());
             polys
         })
@@ -288,7 +295,7 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     {
         Ok((recovered, _t0)) => MseEncoding::unpack(&mse_params, &recovered[..n_polys])
             .decode()
-            .map(|d| d.len() == n)
+            .map(|d| d.len() == active)
             .unwrap_or(false),
         Err(_) => false,
     };
@@ -357,6 +364,9 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
     Row {
         s,
         n,
+        active,
+        cover,
+        iblt_cells: mse_params.total_cells(),
         label: cfg.label,
         mu_kahe,
         kappa: cfg.kappa_kahe,
@@ -378,7 +388,7 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         mse_v_us,
         compress_us,
         sqrt_polys,
-        useful_b: (n * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
+        useful_b: (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
         wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * poly_packed_len(KAHE_MODULUS) as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * fresh_open_b as f64,
@@ -406,10 +416,13 @@ fn print_row(r: &Row) {
     let efficiency = r.useful_b / wire_total;
 
     println!(
-        "S={:>2} N={:>4} {:>5} (μ_kahe={}, κ_kahe={}, γ={}, δ={}, K={}, ξ={}, l={})  recovered: {}",
+        "S={:>2} ρ={:>4} active={:>4} cover={:>4} {:>5} (cells={}, μ_kahe={}, κ_kahe={}, γ={}, δ={}, K={}, ξ={}, l={})  recovered: {}",
         r.s,
         r.n,
+        r.active,
+        r.cover,
         r.label,
+        r.iblt_cells,
         r.mu_kahe,
         r.kappa,
         r.gamma,
@@ -661,18 +674,23 @@ fn main() {
         "  fixed   = shamir_share + cs_commit + server + verify_open + verify_interp + sum_comm"
     );
     println!("  chunk   = mse_c + kahe_enc + kahe_agg_ctxt + kahe_dec + mse_v");
-    println!("useful = l · N · ξ · log₂(t) bits per round  (N clients × l elements each)");
+    println!("useful = l · active · ξ · log₂(t) bits per round  (only active clients carry payload)");
     println!();
 
     'outer: for &(s, n) in CELLS {
-        for cfg in CONFIGS {
-            if start.elapsed() >= budget {
-                println!("(budget exhausted; remaining cells skipped)");
-                break 'outer;
+        for &active in ACTIVE_CLIENTS {
+            if active > n {
+                continue;
             }
-            print_row(&run_cell(s, n, cfg));
+            for cfg in CONFIGS {
+                if start.elapsed() >= budget {
+                    println!("(budget exhausted; remaining cells skipped)");
+                    break 'outer;
+                }
+                print_row(&run_cell(s, n, active, cfg));
+            }
+            println!();
         }
-        println!();
     }
     println!("done in {:.1}s", start.elapsed().as_secs_f64());
 }

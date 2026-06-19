@@ -355,6 +355,13 @@ impl MseEncoding {
         params.total_scalars().div_ceil(N)
     }
 
+    /// Cover-traffic message: zero polys, same count as `pack()`. Adds nothing
+    /// to the homomorphic sum, so it occupies no IBLT cell. NOT `insert(&[0,…])`
+    /// (that draws fresh `r` and peels back out as a real element).
+    pub fn cover(params: &MseParams) -> Vec<KahePoly> {
+        Self::new(params.clone()).pack()
+    }
+
     /// Flatten `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` into KahePoly coefficient
     /// slots in that order, each row-major.
     pub fn pack(&self) -> Vec<KahePoly> {
