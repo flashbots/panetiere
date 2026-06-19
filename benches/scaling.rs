@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 use chipmunk_code::{
     KaheNTTPoly, KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA,
 };
+use panetiere::cs::poly_packed_len;
 use panetiere::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
 use panetiere::protocol::client::{
@@ -133,13 +134,6 @@ const NETWORKS: &[NetProfile] = &[
     NetProfile { label: "fiber", lat_ms: 25.0, jitter_ms: 10.0, client_mbps: 100.0, server_mbps: 1000.0 },
     NetProfile { label: "dsl  ", lat_ms: 35.0, jitter_ms: 15.0, client_mbps: 20.0, server_mbps: 1000.0 },
 ];
-
-/// ⌈log₂ q⌉, tight-pack bit-width per ring coefficient.
-const fn bits_per_coef(q: i32) -> usize {
-    (32 - ((q as u32) - 1).leading_zeros()) as usize
-}
-const HVC_POLY_BYTES: f64 = (POLY_N * bits_per_coef(HVC_MODULUS)) as f64 / 8.0;
-const KAHE_POLY_BYTES: f64 = (POLY_N * bits_per_coef(KAHE_MODULUS)) as f64 / 8.0;
 
 fn time_us<F: FnOnce() -> R, R>(f: F) -> (f64, R) {
     let t = Instant::now();
@@ -313,7 +307,7 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         .agg_open
         .pack(pp.cs.r_bound, cs_half, rho * ZETA)
         .body_len();
-    let agg_share_b = (cfg.kappa_kahe * POLY_N * bits_per_coef(CS_MODULUS)).div_ceil(8);
+    let agg_share_b = cfg.kappa_kahe * poly_packed_len(CS_MODULUS);
 
     // Per-phase timings (one round each).
     let (mse_c_us, _) = time_us(|| {
@@ -385,8 +379,8 @@ fn run_cell(s: usize, n: usize, cfg: &Config) -> Row {
         compress_us,
         sqrt_polys,
         useful_b: (n * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
-        wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * KAHE_POLY_BYTES,
-        wire_comm_b: n as f64 * HVC_POLY_BYTES,
+        wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * poly_packed_len(KAHE_MODULUS) as f64,
+        wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * fresh_open_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
     }
@@ -544,7 +538,7 @@ fn print_row(r: &Row) {
     // phases). Wire: client ctxt shrinks from μ·l to 2·⌈√(μ·l)⌉ polys;
     // comm/openings/server entries unchanged.
     let m = r.mu_kahe * r.l;
-    let client_ctxt_sqrt = r.sqrt_polys as f64 * KAHE_POLY_BYTES;
+    let client_ctxt_sqrt = r.sqrt_polys as f64 * poly_packed_len(KAHE_MODULUS) as f64;
     let wire_ctxt_sqrt = r.n as f64 * client_ctxt_sqrt;
     let wall_sim_us = per_round_us + r.compress_us;
     let wire_sim_total = wire_ctxt_sqrt + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
@@ -656,10 +650,10 @@ fn main() {
     println!("Panetière scaling bench  (budget: {}s)", budget.as_secs());
     println!(
         "ring: HVC {} bits/coef ({} B/poly) | KAHE {} bits/coef ({} B/poly) | t bits/symbol {}",
-        bits_per_coef(HVC_MODULUS),
-        HVC_POLY_BYTES as usize,
-        bits_per_coef(KAHE_MODULUS),
-        KAHE_POLY_BYTES as usize,
+        poly_packed_len(HVC_MODULUS) * 8 / POLY_N,
+        poly_packed_len(HVC_MODULUS),
+        poly_packed_len(KAHE_MODULUS) * 8 / POLY_N,
+        poly_packed_len(KAHE_MODULUS),
         BITS_PER_SYMBOL,
     );
     println!("per-round wall = fixed + l · per-chunk");

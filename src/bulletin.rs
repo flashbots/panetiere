@@ -2,9 +2,9 @@
 
 use std::sync::Mutex;
 
-use crate::cs::{Commitment, Opening};
+use crate::cs::{pack_poly, poly_packed_len, unpack_poly, Commitment, Opening};
 use crate::protocol::{ClientId, ServerId};
-use chipmunk_code::{CsPoly, KahePoly};
+use chipmunk_code::{CsPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS};
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
@@ -12,6 +12,42 @@ pub struct ClientBulletinEntry {
     pub ctxt: Vec<KahePoly>,
     /// Single CS commitment (μ_cs = κ_kahe packs the share-vector).
     pub comm: Commitment,
+}
+
+impl ClientBulletinEntry {
+    /// Bit-packed wire form: a `u16` ciphertext-slot count, the ciphertext
+    /// polynomials packed against `KAHE_MODULUS`, then the commitment.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            2 + self.ctxt.len() * poly_packed_len(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS),
+        );
+        out.extend_from_slice(&(self.ctxt.len() as u16).to_le_bytes());
+        for p in &self.ctxt {
+            pack_poly(p.coeffs(), KAHE_MODULUS, &mut out);
+        }
+        out.extend_from_slice(&self.comm.to_bytes());
+        out
+    }
+
+    /// Inverse of [`ClientBulletinEntry::to_bytes`]; `None` on any length
+    /// mismatch.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let n_ctxt = u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as usize;
+        let kahe_len = poly_packed_len(KAHE_MODULUS);
+        let hvc_len = poly_packed_len(HVC_MODULUS);
+        if bytes.len() != 2 + n_ctxt * kahe_len + hvc_len {
+            return None;
+        }
+        let mut ctxt = Vec::with_capacity(n_ctxt);
+        let mut start = 2;
+        for _ in 0..n_ctxt {
+            let (coeffs, next) = unpack_poly(bytes, start, KAHE_MODULUS);
+            start = next;
+            ctxt.push(KahePoly::from_coeffs(coeffs));
+        }
+        let comm = Commitment::from_bytes(&bytes[start..])?;
+        Some(ClientBulletinEntry { ctxt, comm })
+    }
 }
 
 #[derive(Clone)]
@@ -63,5 +99,30 @@ impl InMemoryBulletin {
 
     pub fn canonical(&self) -> Option<Vec<ClientId>> {
         self.inner.lock().unwrap().canonical.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chipmunk_code::{HVCPoly, Polynomial};
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn client_bulletin_entry_round_trip() {
+        let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
+        for mu_kahe in [1usize, 2, 4] {
+            let ctxt: Vec<KahePoly> = (0..mu_kahe).map(|_| KahePoly::rand_poly(&mut rng)).collect();
+            let entry = ClientBulletinEntry {
+                ctxt,
+                comm: Commitment { root: HVCPoly::rand_poly(&mut rng) },
+            };
+            let bytes = entry.to_bytes();
+            let back = ClientBulletinEntry::from_bytes(&bytes).unwrap();
+            assert_eq!(back.ctxt, entry.ctxt);
+            assert_eq!(back.comm.root, entry.comm.root);
+        }
+        assert!(ClientBulletinEntry::from_bytes(&[0u8]).is_none());
     }
 }

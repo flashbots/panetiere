@@ -736,6 +736,76 @@ fn unpack_bits(
     byte_idx
 }
 
+/// Bytes one polynomial occupies when bit-packed against `modulus` — each of
+/// the `N` coefficients in `⌈log₂(2·modulus+1)⌉` bits.
+pub fn poly_packed_len(modulus: i32) -> usize {
+    (POLY_N * bits_for_signed(modulus as u32) as usize).div_ceil(8)
+}
+
+/// Append one polynomial's coefficients to `out`, packed against `modulus`.
+/// Like the opening's `s`-region packing, values are offset by the full modulus
+/// rather than centered, so any representative in `[-modulus, modulus]` round-
+/// trips to the identical `i32` — commitment/equality checks that depend on the
+/// exact representative are unaffected.
+pub(crate) fn pack_poly(coeffs: &[i32], modulus: i32, out: &mut Vec<u8>) {
+    let bound = modulus as u32;
+    pack_bits(out, coeffs, bound, bits_for_signed(bound));
+}
+
+/// Inverse of [`pack_poly`]: read one polynomial's `N` coefficients starting at
+/// `start`, returning them and the next byte index.
+pub(crate) fn unpack_poly(input: &[u8], start: usize, modulus: i32) -> ([i32; POLY_N], usize) {
+    let bound = modulus as u32;
+    let mut coeffs = [0i32; POLY_N];
+    let next = unpack_bits(input, start, &mut coeffs, bound, bits_for_signed(bound));
+    (coeffs, next)
+}
+
+impl Commitment {
+    /// Bit-packed wire form: the single HVC root packed against `HVC_MODULUS`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(poly_packed_len(HVC_MODULUS));
+        pack_poly(self.root.coeffs(), HVC_MODULUS, &mut out);
+        out
+    }
+
+    /// Inverse of [`Commitment::to_bytes`]; `None` unless `bytes` is exactly one
+    /// packed HVC polynomial.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != poly_packed_len(HVC_MODULUS) {
+            return None;
+        }
+        let (coeffs, _) = unpack_poly(bytes, 0, HVC_MODULUS);
+        Some(Commitment { root: HVCPoly::from_coeffs(coeffs) })
+    }
+}
+
+/// Bit-pack a vector of CS-ring shares (a server's aggregate share) against
+/// `CS_MODULUS` — the same width the opening uses for its `s` region.
+pub fn pack_cs_shares(shares: &[CsPoly]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(shares.len() * poly_packed_len(CS_MODULUS));
+    for s in shares {
+        pack_poly(s.coeffs(), CS_MODULUS, &mut out);
+    }
+    out
+}
+
+/// Inverse of [`pack_cs_shares`]; `None` unless `bytes` is exactly `count`
+/// packed CS polynomials.
+pub fn unpack_cs_shares(bytes: &[u8], count: usize) -> Option<Vec<CsPoly>> {
+    if bytes.len() != count * poly_packed_len(CS_MODULUS) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut start = 0;
+    for _ in 0..count {
+        let (coeffs, next) = unpack_poly(bytes, start, CS_MODULUS);
+        start = next;
+        out.push(CsPoly::from_coeffs(coeffs));
+    }
+    Some(out)
+}
+
 /// Tightly bit-packed Opening for wire transport. Stores per-region bit widths
 /// so unpacking is self-describing. Layout of `bytes`:
 /// `pack(r) ‖ pack(s) ‖ pack(block_subtree) ‖ pack(path)`.
@@ -888,6 +958,31 @@ mod tests {
 
     fn rand_shares<R: Rng>(rng: &mut R, n: usize, mu: usize) -> Vec<Vec<CsPoly>> {
         (0..n).map(|_| rand_share_vec(rng, mu)).collect()
+    }
+
+    #[test]
+    fn pack_cs_shares_round_trip() {
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        for count in [1usize, 3, 8] {
+            let shares = rand_share_vec(&mut rng, count);
+            let bytes = pack_cs_shares(&shares);
+            assert_eq!(bytes.len(), count * poly_packed_len(CS_MODULUS));
+            assert!(bytes.len() < count * POLY_N * 4, "tighter than 4 bytes/coeff");
+            assert_eq!(unpack_cs_shares(&bytes, count).unwrap(), shares);
+        }
+        // Wrong length is rejected, not mis-parsed.
+        assert!(unpack_cs_shares(&[0u8; 3], 1).is_none());
+    }
+
+    #[test]
+    fn commitment_round_trip() {
+        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+        let comm = Commitment { root: HVCPoly::rand_poly(&mut rng) };
+        let bytes = comm.to_bytes();
+        assert_eq!(bytes.len(), poly_packed_len(HVC_MODULUS));
+        assert!(bytes.len() < POLY_N * 4);
+        assert_eq!(Commitment::from_bytes(&bytes).unwrap().root, comm.root);
+        assert!(Commitment::from_bytes(&[0u8; 3]).is_none());
     }
 
     #[test]
