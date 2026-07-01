@@ -260,6 +260,75 @@ fn end_to_end_recovers_sum() {
     assert_eq!(expected, recovered);
 }
 
+/// Aggregated flow recovers the same sum as the direct flow: clients' public
+/// ciphertexts/commitments are summed per group, re-summed across groups, and
+/// fed to `decrypt_aggregate` — openings still go to every server as usual.
+#[test]
+fn aggregated_recovers_same_sum() {
+    use panetiere::cs::{Cs, HidingMerkleCommitment};
+    use panetiere::kahe::{Kahe, KaheScheme};
+    use panetiere::protocol::aggregator::run_aggregator_round;
+    use panetiere::protocol::verify::decrypt_aggregate;
+
+    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+    let n_servers = 4;
+    let n_clients = 45; // > 40, spans 2 groups of ≤ 40
+    let n_groups = 2;
+
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
+
+    let mut client_entries = Vec::with_capacity(n_clients);
+    let mut inboxes: Vec<ServerInbox> = server_ids
+        .iter()
+        .map(|&sid| ServerInbox { server_id: sid, items: vec![] })
+        .collect();
+
+    for &cid in &client_ids {
+        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+            assert_eq!(sid, server_ids[idx]);
+            inboxes[idx].items.push((cid, ops));
+        }
+    }
+
+    let canonical = client_ids.clone();
+    let server_outputs: Vec<_> = inboxes
+        .iter()
+        .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+        .collect();
+
+    let direct = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+        .expect("direct verify failed");
+
+    // Partition clients into groups; each aggregator sums its group's publics.
+    let groups: Vec<Vec<(ClientId, _)>> = (0..n_groups)
+        .map(|g| {
+            client_entries
+                .iter()
+                .filter(|(cid, _)| cid.0 as usize % n_groups == g)
+                .cloned()
+                .collect()
+        })
+        .collect();
+    let aggregates: Vec<_> = groups.iter().map(|g| run_aggregator_round(g)).collect();
+
+    // Leader re-sums per-group aggregates across groups.
+    let group_ctxts: Vec<Vec<KahePoly>> =
+        aggregates.iter().map(|a| a.summed_ctxt.clone()).collect();
+    let group_comms: Vec<_> = aggregates.iter().map(|a| a.summed_comm.clone()).collect();
+    let total_ctxt = Kahe::agg_ctxt(&group_ctxts);
+    let total_comm = HidingMerkleCommitment::sum_commitments(&group_comms);
+
+    let aggregated = decrypt_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
+        .expect("aggregated verify failed");
+
+    assert_eq!(direct, aggregated);
+}
+
 #[test]
 fn tampered_agg_share_rejected() {
     let mut rng = ChaCha20Rng::from_seed([1u8; 32]);

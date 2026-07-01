@@ -75,6 +75,10 @@ Verifier  (aggregate_and_decrypt):
 
 The verifier output is a `μ_kahe·l`-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `tests/end_to_end.rs::end_to_end_recovers_sum` is the executable spec.
 
+### Aggregated flow (optional)
+
+When the public `(c_j, comm_j)` fan-in dominates (many clients, large payloads), an **aggregator** can sit between clients and the verifier. Clients in a group send their `(c_j, comm_j)` to the group's aggregator instead of broadcasting them; the aggregator runs `protocol::aggregator::run_aggregator_round` — `KAHE.agg_ctxt` + `CS.sum_commitments` over the group — and forwards one signed aggregate. The verifier re-sums the per-group aggregates (the same two associative ops) and calls `protocol::verify::decrypt_aggregate(pp, summed_ctxt, summed_comm, server_outputs)`, which verifies+decrypts exactly as `aggregate_and_decrypt` but takes the ciphertext/commitment already summed. **Openings are untouched** — they still go to the servers per-server, so the threshold/privacy model is identical to the base flow. This is purely additive: the base path above is unchanged. `tests/end_to_end.rs::aggregated_recovers_same_sum` asserts the aggregated path decodes byte-identically; `benches/protocol.rs` and `benches/scaling.rs` report the leader-side bytes/CPU saved (G group aggregates vs ρ client posts).
+
 ## Modules
 
 ### `kahe` — key-additive homomorphic encryption

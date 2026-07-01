@@ -73,28 +73,28 @@
 
 use std::time::{Duration, Instant};
 
-use chipmunk_code::{
-    KaheNTTPoly, KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA,
-};
-use panetiere::cs::poly_packed_len;
-use panetiere::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
+use chipmunk_code::{KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA};
+use panetiere::cs::{poly_packed_len, Commitment, Cs, HidingMerkleCommitment};
+use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
+use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::{
     cs_commit, kahe_encrypt, kahe_keygen, run_client_round, shamir_share,
 };
 use panetiere::protocol::server::{run_server_round, ServerInbox};
-use panetiere::protocol::verify::{aggregate_and_decrypt_timed, VerifyTimings};
+use panetiere::protocol::verify::{aggregate_and_decrypt_timed, decrypt_aggregate, VerifyTimings};
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 // (S, ρ): servers, anonymity-set size (= total clients, noise-budget-bounded).
-const CELLS: &[(usize, usize)] = &[(8, 200)];
+const CELLS: &[(usize, usize)] = &[(128, 100)];
 
-// Active clients per cell; the remaining ρ−active send cover traffic. IBLT is
-// sized to active, so this is the "smaller IBLT, same anonymity set" axis.
-const ACTIVE_CLIENTS: &[usize] = &[200, 150, 100, 50, 20];
+// Two points only: no cover (active = ρ) and the 100-100 active/cover split.
+// IBLT is sized to active, so the second row is "half the IBLT, same anonymity
+// set". Both at ρ = 200 (CELLS), within the noise budget.
+const ACTIVE_CLIENTS: &[usize] = &[100];
 
 struct Config {
     label: &'static str,
@@ -110,18 +110,26 @@ struct Config {
 // A_i but the same key sk, so the Shamir+CS pass amortizes over all l chunks.
 const MU_KAHE: usize = 76;
 
+// Aggregation depths to evaluate. Group size per depth is balanced so the
+// largest per-hop fan-in is ρ^{1/(layers+1)} (see `AggPlan`): 1-layer → ⌈√ρ⌉,
+// 2-layer → ⌈∛ρ⌉.
+const AGG_LAYERS: &[usize] = &[1];
+
 // Max total KAHE width the scheme supports (noise budget / IBLT capacity): the
 // encoding is at most MU_FULL polys ⇒ at most ⌈MU_FULL/MU_KAHE⌉ ≈ 189 chunks.
 // Each row extrapolates throughput to this full-utilization point.
 const MU_FULL: f64 = 14401.0;
 
-// Per-client element size: 4 KiB = 2048 symbols · 16 bits.
-const CONFIGS: &[Config] = &[Config {
-    label: "4KB",
-    gamma: 4,
-    payload_symbols: 2048,
-    kappa_kahe: 1,
-}];
+// Per-client element size = ξ symbols · 16 bits: 2048 ⇒ 4 KiB, 8192 ⇒ 16 KiB.
+const CONFIGS: &[Config] = &[
+    //    Config { label: "4KB", gamma: 4, payload_symbols: 2048, kappa_kahe: 1 },
+    Config {
+        label: "1KB",
+        gamma: 4,
+        payload_symbols: 512,
+        kappa_kahe: 1,
+    },
+];
 
 /// Network sim profile: per-message one-way latency = `lat_ms + U[0, jitter_ms)`
 /// (parallel arrivals take the max draw). Two link classes: client links
@@ -137,9 +145,27 @@ struct NetProfile {
 }
 
 const NETWORKS: &[NetProfile] = &[
-    NetProfile { label: "LAN  ", lat_ms: 0.5, jitter_ms: 0.2, client_mbps: 1000.0, server_mbps: 1000.0 },
-    NetProfile { label: "fiber", lat_ms: 25.0, jitter_ms: 10.0, client_mbps: 100.0, server_mbps: 1000.0 },
-    NetProfile { label: "dsl  ", lat_ms: 35.0, jitter_ms: 15.0, client_mbps: 20.0, server_mbps: 1000.0 },
+    NetProfile {
+        label: "LAN  ",
+        lat_ms: 0.5,
+        jitter_ms: 0.2,
+        client_mbps: 1000.0,
+        server_mbps: 1000.0,
+    },
+    NetProfile {
+        label: "fiber",
+        lat_ms: 25.0,
+        jitter_ms: 10.0,
+        client_mbps: 100.0,
+        server_mbps: 1000.0,
+    },
+    NetProfile {
+        label: "big  ",
+        lat_ms: 25.0,
+        jitter_ms: 10.0,
+        client_mbps: 100.0,
+        server_mbps: 4000.0,
+    },
 ];
 
 fn time_us<F: FnOnce() -> R, R>(f: F) -> (f64, R) {
@@ -166,6 +192,17 @@ fn fmt_bytes(b: f64) -> String {
     } else {
         format!("{:.2} MiB", b / (1024.0 * 1024.0))
     }
+}
+
+// `layer_counts`: aggregator count per level bottom-up; leader ingests the last.
+#[derive(Clone)]
+struct AggPlan {
+    layers: usize,
+    group_size: usize,
+    layer_counts: Vec<usize>,
+    agg_cpu_us: f64,
+    leader_us: f64,
+    recovered: bool,
 }
 
 struct Row {
@@ -196,16 +233,14 @@ struct Row {
     verify_interp_us: f64,
     verify_kahe_us: f64,
     mse_v_us: f64,
-    // sqrt-compression sim: per-client extra CPU (m ring mults) and the
-    // compressed wire width (2·⌈√m⌉ polys, m = μ·l).
-    compress_us: f64,
-    sqrt_polys: usize,
     // Bandwidth (bytes per round, totalled across all parties)
     useful_b: f64,
     wire_ctxt_b: f64,
     wire_comm_b: f64,
     wire_opening_b: f64,
     wire_server_b: f64,
+    // Aggregated flow, one entry per AGG_LAYERS depth.
+    agg_plans: Vec<AggPlan>,
 }
 
 fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
@@ -248,7 +283,11 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
     // One ξ-symbol element per active client. Small distinct values, ≪ t/2,
     // so summing across clients doesn't wrap.
     let payloads: Vec<Vec<i32>> = (0..active)
-        .map(|i| (0..cfg.payload_symbols).map(|j| i as i32 + j as i32 + 1).collect())
+        .map(|i| {
+            (0..cfg.payload_symbols)
+                .map(|j| i as i32 + j as i32 + 1)
+                .collect()
+        })
         .collect();
     // Active clients encode their element; the rest send cover traffic. Both
     // zero-pad to mu_kahe·l polys for KAHE encryption.
@@ -323,25 +362,7 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
         enc.pack()
     });
     let key0 = kahe_keygen(&mut rng, &pp);
-    let (client_kahe_us, ctxt0) = time_us(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
-
-    // ── sqrt-compression sim ─────────────────────────────────────────────
-    // Hypothetical client-side step: one ring multiplication per ciphertext
-    // element against a public NTT-resident poly, accumulated into 2·⌈√m⌉
-    // outputs which are all the client posts. CPU = m forward NTTs +
-    // m pointwise mult-accs + 2⌈√m⌉ inverse NTTs (the compression operand is
-    // public, so its NTT is precomputed). Recovery from the compressed form
-    // is NOT modelled — the real pipeline below still runs on full ctxts.
-    let m = ctxt0.len(); // = μ·l
-    let sqrt_polys = 2 * (m as f64).sqrt().ceil() as usize;
-    let comp_ntt = KaheNTTPoly::rand_ntt_poly(&mut rng);
-    let (compress_us, _compressed) = time_us(|| {
-        let mut acc = vec![KaheNTTPoly::default(); sqrt_polys];
-        for (j, p) in ctxt0.iter().enumerate() {
-            acc[j % sqrt_polys] += KaheNTTPoly::from(p) * comp_ntt;
-        }
-        acc.iter().map(KahePoly::from).collect::<Vec<KahePoly>>()
-    });
+    let (client_kahe_us, _ctxt0) = time_us(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
     let (client_share_us, shares0) = time_us(|| shamir_share(&mut rng, &pp, &key0, s));
     let (client_cs_us, _) = time_us(|| cs_commit(&mut rng, &pp, &shares0));
     let (server_us, _) = time_us(|| run_server_round(&inboxes[0], &canonical).unwrap());
@@ -360,6 +381,90 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
         // May Err (PeelStalled) on unrecoverable params — we time the attempt.
         let _ = MseEncoding::unpack(&mse_params, &recovered2[..n_polys]).decode();
     });
+
+    // Aggregated flow at each depth in AGG_LAYERS, measured live. Group size is
+    // balanced so the largest per-hop fan-in is ρ^{1/(layers+1)}: 1-layer ⌈√ρ⌉,
+    // 2-layer ⌈∛ρ⌉. Recovery is re-checked end-to-end through the tree.
+    let agg_plans: Vec<AggPlan> = AGG_LAYERS
+        .iter()
+        .map(|&layers| {
+            let g = match layers {
+                1 => (n as f64).sqrt(),
+                _ => (n as f64).powf(1.0 / (layers as f64 + 1.0)),
+            }
+            .ceil() as usize;
+            let g = g.max(2);
+
+            let a1 = n.div_ceil(g);
+            let l1_entries = |grp: usize| -> Vec<_> {
+                client_entries
+                    .iter()
+                    .filter(|(cid, _)| cid.0 as usize % a1 == grp)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            let (agg_cpu_us, _) = time_us(|| run_aggregator_round(&l1_entries(0)));
+            let l1: Vec<_> = (0..a1)
+                .map(|grp| run_aggregator_round(&l1_entries(grp)))
+                .collect();
+
+            // Fold up the tree: each higher level sums g aggregates at a time.
+            let mut layer_counts = vec![a1];
+            let mut ctxts: Vec<Vec<KahePoly>> = l1.iter().map(|a| a.summed_ctxt.clone()).collect();
+            let mut comms: Vec<Commitment> = l1.iter().map(|a| a.summed_comm.clone()).collect();
+            for _ in 1..layers {
+                let groups = ctxts.len().div_ceil(g);
+                ctxts = (0..groups)
+                    .map(|grp| {
+                        let cs: Vec<_> = ctxts
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| i % groups == grp)
+                            .map(|(_, c)| c.clone())
+                            .collect();
+                        Kahe::agg_ctxt(&cs)
+                    })
+                    .collect();
+                comms = (0..groups)
+                    .map(|grp| {
+                        let ms: Vec<_> = comms
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| i % groups == grp)
+                            .map(|(_, m)| m.clone())
+                            .collect();
+                        HidingMerkleCommitment::sum_commitments(&ms)
+                    })
+                    .collect();
+                layer_counts.push(ctxts.len());
+            }
+
+            let (leader_us, recovered) = {
+                let (us, res) = time_us(|| {
+                    let total_ctxt = Kahe::agg_ctxt(&ctxts);
+                    let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
+                    decrypt_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
+                });
+                let ok = match res {
+                    Ok(rec) => MseEncoding::unpack(&mse_params, &rec[..n_polys])
+                        .decode()
+                        .map(|d| d.len() == active)
+                        .unwrap_or(false),
+                    Err(_) => false,
+                };
+                (us, ok)
+            };
+
+            AggPlan {
+                layers,
+                group_size: g,
+                layer_counts,
+                agg_cpu_us,
+                leader_us,
+                recovered,
+            }
+        })
+        .collect();
 
     Row {
         s,
@@ -386,13 +491,12 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
         verify_interp_us: interpolation_us,
         verify_kahe_us: kahe_dec_us,
         mse_v_us,
-        compress_us,
-        sqrt_polys,
         useful_b: (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
         wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * poly_packed_len(KAHE_MODULUS) as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * fresh_open_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
+        agg_plans,
     }
 }
 
@@ -469,6 +573,36 @@ fn print_row(r: &Row) {
         useful_mb_s,
         fmt_us(1024.0 * 1024.0 / r.useful_b * per_round_us),
     );
+    let leader_direct_b = r.wire_ctxt_b + r.wire_comm_b;
+    let one_pub_b = leader_direct_b / r.n as f64; // one client post = one aggregate
+    let direct_verify_us = r.verify_agg_ctxt_us
+        + r.verify_sum_comm_us
+        + r.verify_opening_us
+        + r.verify_interp_us
+        + r.verify_kahe_us;
+    println!(
+        "  aggregated (direct leader: decode {}, ingest {} ctxt+comm):",
+        fmt_us(direct_verify_us),
+        fmt_bytes(leader_direct_b),
+    );
+    for p in &r.agg_plans {
+        let leader_in = *p.layer_counts.last().unwrap();
+        let tree: Vec<String> = std::iter::once(r.n)
+            .chain(p.layer_counts.iter().copied())
+            .map(|c| c.to_string())
+            .collect();
+        println!(
+            "    {}-layer (g={}, fan-in {}→1): agg/level {}, leader decode {}, ingest {} ({} aggregates){}",
+            p.layers,
+            p.group_size,
+            tree.join("→"),
+            fmt_us(p.agg_cpu_us),
+            fmt_us(p.leader_us),
+            fmt_bytes(leader_in as f64 * one_pub_b),
+            leader_in,
+            if p.recovered { "" } else { "  [UNRECOVERED]" },
+        );
+    }
 
     // Extrapolate to full utilization: total width MU_FULL ⇒ l_full chunks of
     // MU_KAHE. The per-chunk cost is ~constant, the fixed (Shamir+CS+tree) cost
@@ -520,11 +654,11 @@ fn print_row(r: &Row) {
     let server_fixed = r.wire_server_b / r.s as f64; // one ServerBulletinEntry
     let bulletin_fixed = r.wire_comm_b + r.wire_server_b;
 
-    println!("  per-role wire = fixed + l · per-chunk:");
+    let post_b = client_comm + client_ctxt;
+    println!("  per-role wire (out = emitted / in = ingested):");
     println!(
-        "    1 client = {}  [fixed {} (comm {} + {} openings→{}S)  +  {}·{} ctxt]",
+        "    1 client out = {}  [comm {} + {} openings→{}S  +  {}·{} ctxt]",
         fmt_bytes(client_fixed + client_ctxt),
-        fmt_bytes(client_fixed),
         fmt_bytes(client_comm),
         fmt_bytes(client_open),
         r.s,
@@ -532,65 +666,34 @@ fn print_row(r: &Row) {
         fmt_bytes(client_ctxt / l),
     );
     println!(
-        "    1 server = {}  [fixed {} (agg_open+agg_share)  +  per-chunk 0]",
+        "    1 server: out {} (agg_open+agg_share)   in {} ({} clients' openings)",
         fmt_bytes(server_fixed),
-        fmt_bytes(server_fixed),
+        fmt_bytes(r.wire_opening_b / r.s as f64),
+        r.n,
     );
     println!(
-        "    bulletin = {}  [fixed {} (comm {} + server entries {})  +  {}·{} ctxt]",
+        "    1 L1 aggregator: in {} (g posts)   out {} (1 aggregate)",
+        fmt_bytes(r.agg_plans[0].group_size as f64 * post_b),
+        fmt_bytes(post_b),
+    );
+    println!(
+        "    leader in: direct {} (comm {} + server entries {} + ctxt {})",
         fmt_bytes(bulletin_fixed + r.wire_ctxt_b),
-        fmt_bytes(bulletin_fixed),
         fmt_bytes(r.wire_comm_b),
         fmt_bytes(r.wire_server_b),
-        r.l,
-        fmt_bytes(r.wire_ctxt_b / l),
+        fmt_bytes(r.wire_ctxt_b),
     );
-
-    // ── sqrt-compression sim ────────────────────────────────────────────
-    // CPU: +compress_us per client (scales with l, like the other per-chunk
-    // phases). Wire: client ctxt shrinks from μ·l to 2·⌈√(μ·l)⌉ polys;
-    // comm/openings/server entries unchanged.
-    let m = r.mu_kahe * r.l;
-    let client_ctxt_sqrt = r.sqrt_polys as f64 * poly_packed_len(KAHE_MODULUS) as f64;
-    let wire_ctxt_sqrt = r.n as f64 * client_ctxt_sqrt;
-    let wall_sim_us = per_round_us + r.compress_us;
-    let wire_sim_total = wire_ctxt_sqrt + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
-    println!(
-        "  ── sqrt-compression sim: m={} → 2·⌈√m⌉={} polys/client ──",
-        m, r.sqrt_polys,
-    );
-    println!(
-        "    extra client CPU: {} (m ring mults; {} per mult)  →  wall {} (was {}, {:+.1}%)",
-        fmt_us(r.compress_us),
-        fmt_us(r.compress_us / m as f64),
-        fmt_us(wall_sim_us),
-        fmt_us(per_round_us),
-        (wall_sim_us / per_round_us - 1.0) * 100.0,
-    );
-    println!(
-        "    1 client out = {}  [comm {} + openings {} + ctxt {} (was {})]",
-        fmt_bytes(client_fixed + client_ctxt_sqrt),
-        fmt_bytes(client_comm),
-        fmt_bytes(client_open),
-        fmt_bytes(client_ctxt_sqrt),
-        fmt_bytes(client_ctxt),
-    );
-    println!(
-        "    bulletin = {} (was {}, {:.1}× smaller)   1 server out = {} (unchanged)",
-        fmt_bytes(bulletin_fixed + wire_ctxt_sqrt),
-        fmt_bytes(bulletin_fixed + r.wire_ctxt_b),
-        (bulletin_fixed + r.wire_ctxt_b) / (bulletin_fixed + wire_ctxt_sqrt),
-        fmt_bytes(server_fixed),
-    );
-    println!(
-        "    wire total = {} (was {})   efficiency {:.3e} (was {:.3e})   useful {:.3} MB/s (was {:.3})",
-        fmt_bytes(wire_sim_total),
-        fmt_bytes(wire_total),
-        r.useful_b / wire_sim_total,
-        efficiency,
-        r.useful_b / (wall_sim_us / 1e6) / 1e6,
-        useful_mb_s,
-    );
+    for p in &r.agg_plans {
+        let leader_in = *p.layer_counts.last().unwrap();
+        println!(
+            "      {}-layer aggregated: {} (server entries {} + {} aggregates {})",
+            p.layers,
+            fmt_bytes(r.wire_server_b + leader_in as f64 * post_b),
+            fmt_bytes(r.wire_server_b),
+            leader_in,
+            fmt_bytes(leader_in as f64 * post_b),
+        );
+    }
 
     // ── network sim ─────────────────────────────────────────────────────
     // Three sequential wire phases per round, kept separate from CPU wall:
@@ -608,7 +711,9 @@ fn print_row(r: &Row) {
     // No compute/transfer overlap is modelled, so e2e = CPU wall + net is
     // the conservative end of pipelined reality. Deterministic jitter seed.
     let mut nrng = ChaCha20Rng::from_seed([0x5E; 32]);
-    println!("  network sim (net = A client upload + B server post + C verifier read; e2e = cpu + net):");
+    println!(
+        "  network sim (net = A client upload + B server post + C verifier read; e2e = cpu + net):"
+    );
     for p in NETWORKS {
         // Mbit/s → bytes/µs. Client links vs cloud (server/bulletin/verifier).
         let xfer_cl = |b: f64| b / (p.client_mbps / 8.0);
@@ -623,29 +728,68 @@ fn print_row(r: &Row) {
             "    {} ({}+U[0,{})ms, client {} / cloud {} Mbps):",
             p.label, p.lat_ms, p.jitter_ms, p.client_mbps, p.server_mbps,
         );
-        for (tag, ctxt_per_client, cpu_us) in [
-            ("base", client_ctxt, per_round_us),
-            ("sqrt", client_ctxt_sqrt, wall_sim_us),
-        ] {
-            let post_b = client_comm + ctxt_per_client; // one client's bulletin post
-            let a = (maxlat(r.n) + xfer_cl(post_b)) // client→bulletin flow
+        // Direct flow: every client broadcasts its post (ctxt+comm) to the
+        // bulletin; phase A is gated by the bulletin's ingest of all N posts.
+        let a = (maxlat(r.n) + xfer_cl(post_b)) // client→bulletin flow
+            .max(maxlat(r.n) + xfer_cl(client_open)) // client→servers flow
+            .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
+            .max(maxlat(r.n) + xfer_srv(r.n as f64 * post_b)); // bulletin ingest
+        let b = maxlat(r.s) + xfer_srv(r.wire_server_b);
+        let c = maxlat(1) + xfer_srv(bulletin_fixed + r.wire_ctxt_b);
+        let net = a + b + c;
+        let e2e = per_round_us + net;
+        println!(
+            "      direct: net {:>10} [A {} + B {} + C {}]   e2e {:>10}  →  {:.3} MB/s (cpu-only {:.3})",
+            fmt_us(net),
+            fmt_us(a),
+            fmt_us(b),
+            fmt_us(c),
+            fmt_us(e2e),
+            r.useful_b / (e2e / 1e6) / 1e6,
+            r.useful_b / (per_round_us / 1e6) / 1e6,
+        );
+
+        // Aggregated flow: ctxt+comm go to aggregators (not broadcast); each
+        // level sums g and forwards one aggregate up the tree. Openings→servers
+        // and the server post are unchanged. Agg phase = Σ over levels of (one
+        // aggregator's CPU + one hop's transfer). Conservative (no overlap).
+        let cpu_base_agg =
+            (fixed_us - r.verify_opening_us - r.verify_interp_us - r.verify_sum_comm_us)
+                + (per_chunk_total_us - r.verify_agg_ctxt_us - r.verify_kahe_us);
+        for p in &r.agg_plans {
+            let g = p.group_size as f64;
+            let a = (maxlat(r.n) + xfer_cl(post_b)) // client→aggregator flow
                 .max(maxlat(r.n) + xfer_cl(client_open)) // client→servers flow
                 .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
-                .max(maxlat(r.n) + xfer_srv(r.n as f64 * post_b)); // bulletin ingest
+                .max(maxlat(p.layer_counts[0]) + xfer_srv(g * post_b)); // L1 ingest of g posts
+            let mut counts = p.layer_counts.clone();
+            counts.push(1); // leader
+            let mut agg = 0.0;
+            for h in 0..p.layers {
+                let (senders, receivers) = (counts[h], counts[h + 1]);
+                let fan_in = if receivers == 1 { senders as f64 } else { g };
+                agg += p.agg_cpu_us
+                    + (maxlat(senders) + xfer_srv(post_b)) // each sender uploads one aggregate
+                        .max(maxlat(receivers) + xfer_srv(fan_in * post_b)); // receiver ingest
+            }
             let b = maxlat(r.s) + xfer_srv(r.wire_server_b);
-            let c = maxlat(1) + xfer_srv(bulletin_fixed + r.n as f64 * ctxt_per_client);
-            let net = a + b + c;
-            let e2e = cpu_us + net;
+            let leader_in = *p.layer_counts.last().unwrap();
+            let c = maxlat(1) + xfer_srv(r.wire_server_b + leader_in as f64 * post_b);
+            let net = a + agg + b + c;
+            let cpu_agg = cpu_base_agg + p.leader_us;
+            let e2e = cpu_agg + net;
             println!(
-                "      {}: net {:>10} [A {} + B {} + C {}]   e2e {:>10}  →  {:.3} MB/s (cpu-only {:.3})",
-                tag,
+                "      agg L={} (g={:>2}): net {:>10} [A {} + Agg {} + B {} + C {}]   e2e {:>10}  →  {:.3} MB/s (cpu-only {:.3})",
+                p.layers,
+                p.group_size,
                 fmt_us(net),
                 fmt_us(a),
+                fmt_us(agg),
                 fmt_us(b),
                 fmt_us(c),
                 fmt_us(e2e),
                 r.useful_b / (e2e / 1e6) / 1e6,
-                r.useful_b / (cpu_us / 1e6) / 1e6,
+                r.useful_b / (cpu_agg / 1e6) / 1e6,
             );
         }
     }
@@ -674,7 +818,9 @@ fn main() {
         "  fixed   = shamir_share + cs_commit + server + verify_open + verify_interp + sum_comm"
     );
     println!("  chunk   = mse_c + kahe_enc + kahe_agg_ctxt + kahe_dec + mse_v");
-    println!("useful = l · active · ξ · log₂(t) bits per round  (only active clients carry payload)");
+    println!(
+        "useful = l · active · ξ · log₂(t) bits per round  (only active clients carry payload)"
+    );
     println!();
 
     'outer: for &(s, n) in CELLS {

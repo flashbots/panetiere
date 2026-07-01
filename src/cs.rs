@@ -946,6 +946,20 @@ impl Opening {
     }
 }
 
+/// Pack bounds for a fresh single-client opening (`s` at full modulus, since an
+/// aggregated representative isn't always centered).
+pub fn fresh_opening_pack_bounds(p: &CsParams) -> (u32, u32, u32) {
+    (p.beta_cs, CS_MODULUS as u32, chipmunk_code::ZETA)
+}
+
+/// Pack bounds for a server's aggregated opening over `rho` summed openings,
+/// capped at the crate's verify bounds. Pass the actual canonical-set size.
+pub fn aggregated_opening_pack_bounds(p: &CsParams, rho: u32) -> (u32, u32, u32) {
+    let r = rho.saturating_mul(p.beta_cs).min(p.r_bound);
+    let tree = rho.saturating_mul(chipmunk_code::ZETA).min(p.beta_agg_hvc);
+    (r, CS_MODULUS as u32, tree)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

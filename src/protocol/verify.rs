@@ -4,7 +4,7 @@ use std::time::Instant;
 use chipmunk_code::{CsPoly, KahePoly};
 
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use crate::cs::{Cs, HidingMerkleCommitment};
+use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
 use crate::sss::ShamirSharing;
 
@@ -153,4 +153,65 @@ pub fn aggregate_and_decrypt_timed(
     tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
 
     Ok((m, tt))
+}
+
+/// Aggregated-flow verifier: ciphertext and commitment are already summed over
+/// the whole client set, so there is no per-client `canonical` to cross-check.
+pub fn decrypt_aggregate(
+    pp: &ProtocolParams,
+    summed_ctxt: &[KahePoly],
+    summed_comm: &Commitment,
+    server_outputs: &[ServerBulletinEntry],
+) -> Result<Vec<KahePoly>, VerifyError> {
+    if server_outputs.is_empty() {
+        return Err(VerifyError::NoServers);
+    }
+    let kappa_kahe = pp.kahe.kappa_kahe;
+    let mu_kahe = pp.kahe.mu_kahe;
+    let l = pp.kahe.l;
+    let ctxt_len = mu_kahe * l;
+    let t = pp.shamir.t;
+
+    if server_outputs.len() < t {
+        return Err(VerifyError::BadServerCoverage);
+    }
+    if summed_ctxt.len() != ctxt_len {
+        return Err(VerifyError::InconsistentKappa(server_outputs[0].server_id));
+    }
+    let mut seen: HashSet<u32> = HashSet::with_capacity(server_outputs.len());
+    for sp in server_outputs {
+        if (sp.server_id.0 as usize) >= pp.cs.n_servers || !seen.insert(sp.server_id.0) {
+            return Err(VerifyError::BadServerCoverage);
+        }
+        if sp.agg_share.len() != kappa_kahe {
+            return Err(VerifyError::InconsistentKappa(sp.server_id));
+        }
+    }
+
+    for (i, sp) in server_outputs.iter().enumerate() {
+        if !HidingMerkleCommitment::verify(&pp.cs, summed_comm, &sp.agg_open) {
+            return Err(VerifyError::InvalidServerOpening(i));
+        }
+        if sp.agg_open.path_index != sp.server_id.0 as usize {
+            return Err(VerifyError::InvalidServerOpening(i));
+        }
+        if sp.agg_share.as_slice() != sp.agg_open.s() {
+            return Err(VerifyError::ShareOpeningMismatch(i));
+        }
+    }
+
+    let recovered_components: Vec<KahePoly> = (0..kappa_kahe)
+        .map(|k| {
+            let samples: Vec<(usize, CsPoly)> = server_outputs
+                .iter()
+                .take(t)
+                .map(|sp| (sp.server_id.0 as usize, sp.agg_share[k]))
+                .collect();
+            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples);
+            lift_cs_to_kahe(&recovered_cs)
+        })
+        .collect();
+    let agg_key = KaheAggKey::from_components(recovered_components);
+
+    Ok(Kahe::dec(&pp.kahe, &summed_ctxt.to_vec(), &agg_key))
 }

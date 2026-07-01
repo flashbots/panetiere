@@ -1,3 +1,4 @@
+pub mod aggregator;
 pub mod client;
 pub mod server;
 pub mod verify;
@@ -10,9 +11,22 @@ pub struct ClientId(pub u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct ServerId(pub u32);
 
+use chipmunk_code::KahePoly;
+
 use crate::cs::{Cs, HidingMerkleCommitment};
 use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::sss::ShamirParams;
+
+/// `KahePoly` count of one KAHE plaintext message (`μ_kahe · l`); every client
+/// contributes exactly this many, real or cover.
+pub fn message_polys(pp: &ProtocolParams) -> usize {
+    pp.kahe.mu_kahe * pp.kahe.l
+}
+
+/// All-zero KAHE message (cover): contributes nothing to the aggregated sum.
+pub fn zero_message(pp: &ProtocolParams) -> Vec<KahePoly> {
+    vec![KahePoly::default(); message_polys(pp)]
+}
 
 /// Bundle of public parameters carried through one protocol session.
 ///
