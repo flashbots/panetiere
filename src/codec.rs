@@ -138,6 +138,73 @@ pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     Ok(buf[HEADER_LEN..HEADER_LEN + len as usize].to_vec())
 }
 
+/// Per-round beacon: hash of all `rand` values, order- and duplicate-independent.
+pub fn beacon(rands: &[u16]) -> u16 {
+    use sha2::{Digest, Sha256};
+    let mut sorted: Vec<u16> = rands.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut h = Sha256::new();
+    for r in sorted {
+        h.update(r.to_le_bytes());
+    }
+    let d = h.finalize();
+    u16::from_le_bytes([d[0], d[1]])
+}
+
+/// Byte offset for each `(rand, size)` reservation, packing in `rand` order from
+/// `beacon` (wrapping) into `vector_bytes`, 2-byte aligned. `None` if it would
+/// overflow or its `rand` ties another (ambiguous order — dropped).
+pub fn allocate(reservations: &[(u16, usize)], beacon: u16, vector_bytes: usize) -> Vec<Option<usize>> {
+    let mut order: Vec<usize> = (0..reservations.len()).collect();
+    order.sort_by_key(|&i| (reservations[i].0.wrapping_sub(beacon), reservations[i].1));
+
+    let mut out = vec![None; reservations.len()];
+    let mut cursor = 0usize;
+    let mut pos = 0usize;
+    while pos < order.len() {
+        let rand = reservations[order[pos]].0;
+        let run_end = order[pos..]
+            .iter()
+            .position(|&j| reservations[j].0 != rand)
+            .map(|k| pos + k)
+            .unwrap_or(order.len());
+        if run_end - pos > 1 {
+            pos = run_end;
+            continue;
+        }
+        let aligned = reservations[order[pos]].1.next_multiple_of(BYTES_PER_COEFF);
+        if cursor + aligned <= vector_bytes {
+            out[order[pos]] = Some(cursor);
+            cursor += aligned;
+        }
+        pos += 1;
+    }
+    out
+}
+
+/// `vector_bytes`-wide buffer, zero except `payload` at `offset`, via [`encode_raw`].
+pub fn encode_at(offset: usize, vector_bytes: usize, payload: &[u8]) -> Vec<KahePoly> {
+    let mut buf = vec![0u8; vector_bytes];
+    let end = (offset + payload.len()).min(vector_bytes);
+    buf[offset..end].copy_from_slice(&payload[..end - offset]);
+    encode_raw(&buf)
+}
+
+/// Slice each `(offset, size)` range out of a decoded full-width plaintext.
+pub fn decode_ranges(plain: &[KahePoly], ranges: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, CodecError> {
+    let buf = decode_raw(plain)?;
+    let mut out = Vec::with_capacity(ranges.len());
+    for &(offset, size) in ranges {
+        let end = offset + size;
+        if end > buf.len() {
+            return Err(CodecError::LengthOverflow { claimed: end as u32, available: buf.len() });
+        }
+        out.push(buf[offset..end].to_vec());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +293,46 @@ mod tests {
             Err(CodecError::CoeffOutOfRange { .. }) => {}
             other => panic!("expected CoeffOutOfRange, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn beacon_order_independent() {
+        assert_eq!(beacon(&[7, 42, 1000]), beacon(&[1000, 7, 42, 42]));
+    }
+
+    #[test]
+    fn allocate_packs_and_overflows() {
+        // Two fit into a 2-poly vector, the third overflows.
+        let vector_bytes = 2 * BYTES_PER_POLY;
+        let res = vec![(10u16, 4096usize), (20, 4096), (30, 16)];
+        let offs = allocate(&res, 0, vector_bytes);
+        assert_eq!(offs[0], Some(0));
+        assert_eq!(offs[1], Some(4096));
+        assert_eq!(offs[2], None);
+    }
+
+    #[test]
+    fn allocate_drops_rand_tie() {
+        let offs = allocate(&[(5u16, 16), (5, 16), (9, 16)], 0, BYTES_PER_POLY);
+        assert_eq!(offs[0], None);
+        assert_eq!(offs[1], None);
+        assert!(offs[2].is_some());
+    }
+
+    #[test]
+    fn slot_sum_round_trips_per_reservation() {
+        let vector_bytes = 2 * BYTES_PER_POLY;
+        let res = vec![(10u16, 5usize), (20, 7)];
+        let b = beacon(&[10, 20]);
+        let offs = allocate(&res, b, vector_bytes);
+        let (o0, o1) = (offs[0].unwrap(), offs[1].unwrap());
+
+        let pa = encode_at(o0, vector_bytes, b"AAAAA");
+        let pb = encode_at(o1, vector_bytes, b"BBBBBBB");
+        let summed: Vec<KahePoly> = pa.iter().zip(pb.iter()).map(|(x, y)| *x + *y).collect();
+
+        let out = decode_ranges(&summed, &[(o0, 5), (o1, 7)]).unwrap();
+        assert_eq!(out[0], b"AAAAA");
+        assert_eq!(out[1], b"BBBBBBB");
     }
 }

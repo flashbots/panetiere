@@ -98,6 +98,20 @@ impl CsParams {
     pub fn stored_path_len(&self) -> usize {
         self.total_path_len()
     }
+
+    /// Packed byte length of one aggregated `ServerBulletinEntry`'s crypto
+    /// (`agg_open` + `agg_share`) over `rho` clients, mirroring `Opening::pack`
+    /// and `pack_cs_shares` without materialising them — for wire-budget planning.
+    pub fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
+        let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(self, rho);
+        let data_polys = opening_data_polys(self.block_size(), self.stored_path_len());
+        let open = ((self.kappa_cs * POLY_N) * bits_for_signed(r_b) as usize
+            + (self.mu_cs * POLY_N) * bits_for_signed(s_b) as usize
+            + (data_polys * POLY_N) * bits_for_signed(t_b) as usize
+            + 7)
+            / 8;
+        open + self.mu_cs * poly_packed_len(CS_MODULUS)
+    }
 }
 
 #[derive(Clone)]

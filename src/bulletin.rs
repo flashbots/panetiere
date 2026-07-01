@@ -29,6 +29,12 @@ impl ClientBulletinEntry {
         out
     }
 
+    /// Byte length of [`to_bytes`](Self::to_bytes) for `mu_kahe` ciphertext
+    /// slots, without building an entry — for wire-budget planning.
+    pub fn packed_len(mu_kahe: usize) -> usize {
+        2 + mu_kahe * poly_packed_len(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS)
+    }
+
     /// Inverse of [`ClientBulletinEntry::to_bytes`]; `None` on any length
     /// mismatch.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {

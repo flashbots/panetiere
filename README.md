@@ -24,7 +24,7 @@ src/
   sss.rs                    AdditiveSharing (n-of-n) + ShamirSharing (t-of-n) over the CS ring R_{q_cs}
   cs.rs                     BDLOP §5.3 hiding vector commitment over a chipmunk Merkle tree
   bulletin.rs               in-memory typed broadcast store
-  codec.rs                  bytes <-> KahePoly (header-prefixed and fixed-buffer flavors)
+  codec.rs                  bytes <-> KahePoly (header-prefixed / fixed-buffer flavors) + beacon-driven slot allocation
   mse.rs                    additive multi-set encoding (paper §3 Fig. 1) + pack/unpack to KahePoly
   protocol/{mod,client,server,verify}.rs   ProtocolParams + round drivers + public verifier
 tests/
@@ -355,9 +355,18 @@ pub fn encode    (bytes: &[u8])       -> Vec<KahePoly>;
 pub fn decode    (polys: &[KahePoly]) -> Result<Vec<u8>, CodecError>;
 pub fn encode_raw(bytes: &[u8])       -> Vec<KahePoly>;
 pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError>;
+
+// Beacon-driven slot allocation over a fixed shared message vector.
+pub fn beacon(rands: &[u16]) -> u16;                                             // hash of all rands
+pub fn allocate(reservations: &[(u16, usize)], beacon: u16, vector_bytes: usize) // (rand, size)
+    -> Vec<Option<usize>>;                                                       // per-reservation offset
+pub fn encode_at(offset: usize, vector_bytes: usize, payload: &[u8]) -> Vec<KahePoly>;
+pub fn decode_ranges(plain: &[KahePoly], ranges: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, CodecError>;
 ```
 
 Layout for both: 2 bytes per coefficient (little-endian `u16`), `N = 2048` coefficients per `KahePoly`, 4096 bytes per poly. Coefficients land in `[0, 65536) ⊂ [0, q_kahe)` so a fresh single-message encode/decode is exact. Decoding a sum is meaningful only when the application controls the encoding so per-coefficient sums stay below `t = 65536` (symbols are mod-`t`).
+
+**Schedule-and-message.** A two-round anonymous-broadcast schedule can share the (dominant) opening/key wire between rounds. Each client's plaintext is **one joint vector** `[reservation region ‖ message region]`, encrypted under **one** KAHE key with **one** Shamir-share + CS-opening set — the reservation region carries a tiny MSE `(rand, size)` token, the message region carries the payload placed at the client's allocated offset. `beacon` (hash of every decoded `rand`) fixes a per-round starting point so no client can grief its position; `allocate` visits reservations in `rand` order from the beacon and packs them contiguously into `vector_bytes` (2-byte aligned; `None` on overflow or a `rand` tie). Because the two regions ride one key, the openings — which dominate the wire (see the scaling bench) — are paid once instead of twice, and the message region skips the MSE's ~3× coding blowup. `encode_at`/`decode_ranges` write/read disjoint byte ranges into a fixed buffer that decode per-range under summation (no length header). Round `r`'s message is placed by round `r-1`'s decoded allocation, so the two regions of a joint ciphertext pipeline one round apart.
 
 ### `mse` — additive multi-set encoding (paper §3 Fig. 1)
 
@@ -477,6 +486,16 @@ S= 8 N= 300 (μ=  8, κ= 15, β= 2048) | client  12.2ms server   6.6ms verify   
 - **(μ=8, κ=15, β=2048)** — `block_size` halves (16 vs 32) because `1 + κ = 16` exactly hits the lower power-of-two; per-round drops to 28 ms (~half), but 128 rounds undo most of that on 1 MB. Pick this if the message you're sending is small (single round) and end-to-end latency matters more than throughput.
 
 A wider sweep over `(μ, κ, β) ∈ {4..24} × {64..4096}` confirmed these as the only two non-dominated cells: `block_size` cliffs at `κ ≤ 15`, `κ ≤ 31` are the dominant variable, and within a `block_size` class higher β (lower κ_min) buys ≤ 2 % per-round.
+
+#### Schedule-and-message
+
+`scaling.rs` also sweeps `AppCodec::Scheduled { message_bytes }` — the joint schedule-and-message
+round (`codec` docs above), measured directly as one KAHE round over `[reservation IBLT ‖ message
+vector]`. The reservation region is a tiny `(rand, size)` MSE token per client; the message region
+is the shared `message_bytes` vector split into an equal slot per active client. Because both ride
+one key, the opening/commitment/server-entry wire is counted once, and the message region skips the
+MSE's ~3× coding blowup — so at comparable useful throughput it roughly halves the ciphertext and
+lifts bandwidth efficiency vs. carrying the same payload through a single MSE round.
 
 #### Where time is spent
 

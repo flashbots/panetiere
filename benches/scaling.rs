@@ -74,6 +74,7 @@
 use std::time::{Duration, Instant};
 
 use chipmunk_code::{KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA};
+use panetiere::codec;
 use panetiere::cs::{poly_packed_len, Commitment, Cs, HidingMerkleCommitment};
 use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
@@ -89,7 +90,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
 // (S, ρ): servers, anonymity-set size (= total clients, noise-budget-bounded).
-const CELLS: &[(usize, usize)] = &[(128, 100)];
+const CELLS: &[(usize, usize)] = &[(16, 100)];
 
 // Two points only: no cover (active = ρ) and the 100-100 active/cover split.
 // IBLT is sized to active, so the second row is "half the IBLT, same anonymity
@@ -110,6 +111,21 @@ struct Config {
 // A_i but the same key sk, so the Shamir+CS pass amortizes over all l chunks.
 const MU_KAHE: usize = 76;
 
+/// Codec bytes per poly (chipmunk `N` coefficients × 2 bytes), matching `codec`.
+const BYTES_PER_POLY: usize = POLY_N * 2;
+
+/// `Mse` = single-round IBLT. `Scheduled` = one joint plaintext, reservation
+/// IBLT ‖ message vector of `message_bytes`, under one key (openings paid once).
+enum AppCodec {
+    Mse,
+    Scheduled { message_bytes: usize },
+}
+
+/// Scheduling token = (rand u16, size u16) → 2 MSE symbols.
+const SCHED_TOKEN_SYMBOLS: usize = 2;
+/// Messaging payload sizes swept in the scheduled (two-round) section.
+const SCHED_MESSAGE_BYTES: &[usize] = &[409600, 2097152];
+
 // Aggregation depths to evaluate. Group size per depth is balanced so the
 // largest per-hop fan-in is ρ^{1/(layers+1)} (see `AggPlan`): 1-layer → ⌈√ρ⌉,
 // 2-layer → ⌈∛ρ⌉.
@@ -124,9 +140,15 @@ const MU_FULL: f64 = 14401.0;
 const CONFIGS: &[Config] = &[
     //    Config { label: "4KB", gamma: 4, payload_symbols: 2048, kappa_kahe: 1 },
     Config {
-        label: "1KB",
+        label: "4KB",
         gamma: 4,
-        payload_symbols: 512,
+        payload_symbols: 2048,
+        kappa_kahe: 1,
+    },
+    Config {
+        label: "20KB",
+        gamma: 4,
+        payload_symbols: 10240,
         kappa_kahe: 1,
     },
 ];
@@ -212,6 +234,7 @@ struct Row {
     cover: usize,
     iblt_cells: usize,
     label: &'static str,
+    codec_label: (&'static str, &'static str),
     mu_kahe: usize,
     kappa: usize,
     gamma: usize,
@@ -243,7 +266,7 @@ struct Row {
     agg_plans: Vec<AggPlan>,
 }
 
-fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
+fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -> Row {
     let cover = n - active;
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&[
@@ -258,12 +281,26 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
     ]);
     let mut rng = ChaCha20Rng::from_seed(seed);
 
-    // IBLT sized to the active count only (cover clients add nothing): ~3
-    // buckets per insertion so peeling recovers all `active` messages.
+    // IBLT sized to active (cover adds nothing), ~3 buckets/insertion. `Mse`
+    // packs a ξ-element into it; `Scheduled` packs a (rand,size) token and
+    // appends a message vector — each active client an equal slot within it.
     let delta = (3 * active).div_ceil(cfg.gamma);
-    let mse_params = MseParams::new(cfg.gamma, delta, cfg.payload_symbols, [0xAA; 32]);
-    let n_polys = MseEncoding::n_polys(&mse_params);
-    // KAHE encrypts the encoding in l chunks of the fixed size MU_KAHE.
+    let (mse_params, sched_polys, slot_bytes, msg_vector_bytes) = match codec {
+        AppCodec::Mse => {
+            let p = MseParams::new(cfg.gamma, delta, cfg.payload_symbols, [0xAA; 32]);
+            let sp = MseEncoding::n_polys(&p);
+            (p, sp, 0, 0)
+        }
+        AppCodec::Scheduled { message_bytes } => {
+            let p = MseParams::new(cfg.gamma, delta, SCHED_TOKEN_SYMBOLS, [0xAA; 32]);
+            let sp = MseEncoding::n_polys(&p);
+            let slot = (message_bytes / active.max(1)).next_multiple_of(2);
+            (p, sp, slot, active * slot)
+        }
+    };
+    let msg_polys = msg_vector_bytes.div_ceil(BYTES_PER_POLY);
+    let n_polys = sched_polys + msg_polys;
+    // KAHE encrypts the whole joint plaintext in l chunks of the fixed MU_KAHE.
     let mu_kahe = MU_KAHE;
     let l = n_polys.div_ceil(mu_kahe);
 
@@ -280,26 +317,32 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
 
-    // One ξ-symbol element per active client. Small distinct values, ≪ t/2,
-    // so summing across clients doesn't wrap.
-    let payloads: Vec<Vec<i32>> = (0..active)
-        .map(|i| {
-            (0..cfg.payload_symbols)
-                .map(|j| i as i32 + j as i32 + 1)
-                .collect()
-        })
-        .collect();
-    // Active clients encode their element; the rest send cover traffic. Both
-    // zero-pad to mu_kahe·l polys for KAHE encryption.
+    // Active clients carry a distinct payload; cover clients contribute zero.
+    // Mse: a ξ-element. Scheduled: a (rand,size) token, then the client's slot.
+    let mse_payloads: Vec<Vec<i32>> = match codec {
+        AppCodec::Mse => (0..active)
+            .map(|i| (0..cfg.payload_symbols).map(|j| i as i32 + j as i32 + 1).collect())
+            .collect(),
+        AppCodec::Scheduled { .. } => {
+            (0..active).map(|i| vec![i as i32 + 1, slot_bytes as i32]).collect()
+        }
+    };
+    let byte_payloads: Vec<Vec<u8>> =
+        (0..active).map(|i| vec![(i as u8).wrapping_add(1); slot_bytes]).collect();
+    let ranges: Vec<(usize, usize)> = (0..active).map(|i| (i * slot_bytes, slot_bytes)).collect();
     let client_polys: Vec<Vec<KahePoly>> = (0..n)
         .map(|i| {
             let mut polys = if i < active {
                 let mut enc = MseEncoding::new(mse_params.clone());
-                enc.insert(&mut rng, &payloads[i]);
+                enc.insert(&mut rng, &mse_payloads[i]);
                 enc.pack()
             } else {
                 MseEncoding::cover(&mse_params)
             };
+            polys.resize(sched_polys, KahePoly::default());
+            if matches!(codec, AppCodec::Scheduled { .. }) && i < active {
+                polys.extend(codec::encode_at(ranges[i].0, msg_vector_bytes, &byte_payloads[i]));
+            }
             polys.resize(mu_kahe * l, KahePoly::default());
             polys
         })
@@ -332,10 +375,22 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
     // actually came back, so the bench yields CPU/bandwidth numbers regardless.
     let recovered_ok = match aggregate_and_decrypt_timed(&pp, &canonical, &client_entries, &outputs)
     {
-        Ok((recovered, _t0)) => MseEncoding::unpack(&mse_params, &recovered[..n_polys])
-            .decode()
-            .map(|d| d.len() == active)
-            .unwrap_or(false),
+        Ok((recovered, _t0)) => match codec {
+            AppCodec::Mse => MseEncoding::unpack(&mse_params, &recovered[..n_polys])
+                .decode()
+                .map(|d| d.len() == active)
+                .unwrap_or(false),
+            AppCodec::Scheduled { .. } => {
+                let tokens_ok = MseEncoding::unpack(&mse_params, &recovered[..sched_polys])
+                    .decode()
+                    .map(|d| d.len() == active)
+                    .unwrap_or(false);
+                let msgs_ok = codec::decode_ranges(&recovered[sched_polys..n_polys], &ranges)
+                    .map(|d| d == byte_payloads)
+                    .unwrap_or(false);
+                tokens_ok && msgs_ok
+            }
+        },
         Err(_) => false,
     };
 
@@ -356,11 +411,21 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
     let agg_share_b = cfg.kappa_kahe * poly_packed_len(CS_MODULUS);
 
     // Per-phase timings (one round each).
-    let (mse_c_us, _) = time_us(|| {
-        let mut enc = MseEncoding::new(mse_params.clone());
-        enc.insert(&mut rng, &payloads[0]);
-        enc.pack()
-    });
+    let (mse_c_us, _) = match codec {
+        AppCodec::Mse => time_us(|| {
+            let mut enc = MseEncoding::new(mse_params.clone());
+            enc.insert(&mut rng, &mse_payloads[0]);
+            enc.pack()
+        }),
+        AppCodec::Scheduled { .. } => time_us(|| {
+            let mut enc = MseEncoding::new(mse_params.clone());
+            enc.insert(&mut rng, &mse_payloads[0]);
+            let mut p = enc.pack();
+            p.resize(sched_polys, KahePoly::default());
+            p.extend(codec::encode_at(ranges[0].0, msg_vector_bytes, &byte_payloads[0]));
+            p
+        }),
+    };
     let key0 = kahe_keygen(&mut rng, &pp);
     let (client_kahe_us, _ctxt0) = time_us(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
     let (client_share_us, shares0) = time_us(|| shamir_share(&mut rng, &pp, &key0, s));
@@ -377,10 +442,16 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
         interpolation_us,
         kahe_dec_us,
     } = vt;
-    let (mse_v_us, _) = time_us(|| {
+    let (mse_v_us, _) = match codec {
         // May Err (PeelStalled) on unrecoverable params — we time the attempt.
-        let _ = MseEncoding::unpack(&mse_params, &recovered2[..n_polys]).decode();
-    });
+        AppCodec::Mse => time_us(|| {
+            let _ = MseEncoding::unpack(&mse_params, &recovered2[..n_polys]).decode();
+        }),
+        AppCodec::Scheduled { .. } => time_us(|| {
+            let _ = MseEncoding::unpack(&mse_params, &recovered2[..sched_polys]).decode();
+            let _ = codec::decode_ranges(&recovered2[sched_polys..n_polys], &ranges);
+        }),
+    };
 
     // Aggregated flow at each depth in AGG_LAYERS, measured live. Group size is
     // balanced so the largest per-hop fan-in is ρ^{1/(layers+1)}: 1-layer ⌈√ρ⌉,
@@ -446,10 +517,21 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
                     decrypt_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
                 });
                 let ok = match res {
-                    Ok(rec) => MseEncoding::unpack(&mse_params, &rec[..n_polys])
-                        .decode()
-                        .map(|d| d.len() == active)
-                        .unwrap_or(false),
+                    Ok(rec) => match codec {
+                        AppCodec::Mse => MseEncoding::unpack(&mse_params, &rec[..n_polys])
+                            .decode()
+                            .map(|d| d.len() == active)
+                            .unwrap_or(false),
+                        AppCodec::Scheduled { .. } => {
+                            MseEncoding::unpack(&mse_params, &rec[..sched_polys])
+                                .decode()
+                                .map(|d| d.len() == active)
+                                .unwrap_or(false)
+                                && codec::decode_ranges(&rec[sched_polys..n_polys], &ranges)
+                                    .map(|d| d == byte_payloads)
+                                    .unwrap_or(false)
+                        }
+                    },
                     Err(_) => false,
                 };
                 (us, ok)
@@ -473,11 +555,18 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
         cover,
         iblt_cells: mse_params.total_cells(),
         label: cfg.label,
+        codec_label: match codec {
+            AppCodec::Mse => ("mse_c", "mse_v"),
+            AppCodec::Scheduled { .. } => ("sm_enc", "sm_dec"),
+        },
         mu_kahe,
         kappa: cfg.kappa_kahe,
         gamma: cfg.gamma,
         delta,
-        xi: cfg.payload_symbols,
+        xi: match codec {
+            AppCodec::Mse => cfg.payload_symbols,
+            AppCodec::Scheduled { .. } => slot_bytes.div_ceil(2),
+        },
         l,
         recovered_ok,
         mse_c_us,
@@ -491,7 +580,10 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config) -> Row {
         verify_interp_us: interpolation_us,
         verify_kahe_us: kahe_dec_us,
         mse_v_us,
-        useful_b: (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
+        useful_b: match codec {
+            AppCodec::Mse => (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
+            AppCodec::Scheduled { .. } => (active * slot_bytes) as f64,
+        },
         wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * poly_packed_len(KAHE_MODULUS) as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * fresh_open_b as f64,
@@ -551,12 +643,14 @@ fn print_row(r: &Row) {
         fmt_us(r.verify_sum_comm_us),
     );
     println!(
-        "  per-chunk:   {:>10}   [mse_c {} + kahe_enc {} + verify_agg_ctxt {} + verify_kahe_dec {} + mse_v {}]   (×l={})",
+        "  per-chunk:   {:>10}   [{} {} + kahe_enc {} + verify_agg_ctxt {} + verify_kahe_dec {} + {} {}]   (×l={})",
         fmt_us(per_chunk_us),
+        r.codec_label.0,
         fmt_us(r.mse_c_us / r.l as f64),
         fmt_us(r.client_kahe_us / r.l as f64),
         fmt_us(r.verify_agg_ctxt_us / r.l as f64),
         fmt_us(r.verify_kahe_us / r.l as f64),
+        r.codec_label.1,
         fmt_us(r.mse_v_us / r.l as f64),
         r.l,
     );
@@ -833,9 +927,31 @@ fn main() {
                     println!("(budget exhausted; remaining cells skipped)");
                     break 'outer;
                 }
-                print_row(&run_cell(s, n, active, cfg));
+                print_row(&run_cell(s, n, active, cfg, &AppCodec::Mse));
             }
             println!();
+        }
+    }
+
+    // Schedule-and-message: one joint plaintext (reservation IBLT ‖ message
+    // vector) under one key, so openings are paid once. Measured directly.
+    println!("═══ scheduled Panetiere (schedule-and-message, joint plaintext) ═══");
+    'sched: for &(s, n) in CELLS {
+        for &active in ACTIVE_CLIENTS {
+            if active > n {
+                continue;
+            }
+            for cfg in CONFIGS {
+                for &message_bytes in SCHED_MESSAGE_BYTES {
+                    if start.elapsed() >= budget {
+                        println!("(budget exhausted; remaining cells skipped)");
+                        break 'sched;
+                    }
+                    println!("── schedule-and-message round (msg vector={message_bytes} B) ──");
+                    print_row(&run_cell(s, n, active, cfg, &AppCodec::Scheduled { message_bytes }));
+                    println!();
+                }
+            }
         }
     }
     println!("done in {:.1}s", start.elapsed().as_secs_f64());
