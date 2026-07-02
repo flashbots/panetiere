@@ -48,6 +48,13 @@ impl Sss for AdditiveSharing {
 /// using any subset of `t` shares.
 pub struct ShamirSharing;
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum SssError {
+    NotEnoughShares,
+    DuplicateIndex,
+    ZeroPoint,
+}
+
 #[derive(Clone, Debug)]
 pub struct ShamirParams {
     pub t: usize,
@@ -88,18 +95,28 @@ impl ShamirSharing {
     /// Recover the secret from any `t` `(index, share)` samples (0-based
     /// indices into the original `share()` output). Extra samples beyond `t`
     /// are ignored.
-    pub fn recover(params: &ShamirParams, samples: &[(usize, CsPoly)]) -> CsPoly {
+    pub fn recover(
+        params: &ShamirParams,
+        samples: &[(usize, CsPoly)],
+    ) -> Result<CsPoly, SssError> {
         let t = params.t;
-        assert!(samples.len() >= t, "need at least t samples");
+        if samples.len() < t {
+            return Err(SssError::NotEnoughShares);
+        }
         let xs: Vec<i32> = samples
             .iter()
             .take(t)
-            .map(|(idx, _)| (*idx as i32) + 1)
+            .map(|(idx, _)| reduce(*idx as i64 + 1))
             .collect();
-        // Distinct check: pairwise difference must be a unit in Z_q (i.e. nonzero mod q).
+        // Nonzero, pairwise-distinct points mod q ⇒ Lagrange denominators are units.
         for i in 0..t {
+            if xs[i] == 0 {
+                return Err(SssError::ZeroPoint);
+            }
             for j in (i + 1)..t {
-                debug_assert_ne!(xs[i], xs[j], "duplicate sample index");
+                if xs[i] == xs[j] {
+                    return Err(SssError::DuplicateIndex);
+                }
             }
         }
         let lagrange: Vec<i32> = (0..t)
@@ -122,7 +139,7 @@ impl ShamirSharing {
         for (slot, (_, share)) in samples.iter().take(t).enumerate() {
             acc = acc + scalar_mul(share, lagrange[slot]);
         }
-        acc
+        Ok(acc)
     }
 }
 
@@ -200,7 +217,7 @@ mod tests {
             assert_eq!(shares.len(), n);
             // Recover from the first t shares.
             let samples: Vec<_> = shares.iter().take(t).copied().enumerate().collect();
-            assert_eq!(ShamirSharing::recover(&params, &samples), secret);
+            assert_eq!(ShamirSharing::recover(&params, &samples).unwrap(), secret);
         }
     }
 
@@ -216,7 +233,7 @@ mod tests {
             for b in (a + 1)..n {
                 for c in (b + 1)..n {
                     let samples = vec![(a, shares[a]), (b, shares[b]), (c, shares[c])];
-                    assert_eq!(ShamirSharing::recover(&params, &samples), secret);
+                    assert_eq!(ShamirSharing::recover(&params, &samples).unwrap(), secret);
                 }
             }
         }
@@ -248,8 +265,40 @@ mod tests {
             .copied()
             .zip(summed.iter().copied())
             .collect();
-        let recovered = ShamirSharing::recover(&params, &samples);
+        let recovered = ShamirSharing::recover(&params, &samples).unwrap();
         let expected = secrets.iter().fold(CsPoly::default(), |a, s| a + *s);
         assert_eq!(recovered, expected);
+    }
+
+    #[test]
+    fn shamir_recover_rejects_bad_samples() {
+        let mut rng = ChaCha20Rng::from_seed([17u8; 32]);
+        let (t, n) = (3, 5);
+        let params = ShamirParams::new(t, n);
+        let secret = CsPoly::rand_poly(&mut rng);
+        let shares = ShamirSharing::share(&mut rng, &params, &secret);
+
+        let dup = vec![(0, shares[0]), (0, shares[0]), (2, shares[2])];
+        assert_eq!(
+            ShamirSharing::recover(&params, &dup),
+            Err(SssError::DuplicateIndex)
+        );
+
+        let short = vec![(0, shares[0]), (1, shares[1])];
+        assert_eq!(
+            ShamirSharing::recover(&params, &short),
+            Err(SssError::NotEnoughShares)
+        );
+
+        // Point idx+1 ≡ 0 mod q.
+        let zero = vec![
+            (CS_MODULUS as usize - 1, shares[0]),
+            (1, shares[1]),
+            (2, shares[2]),
+        ];
+        assert_eq!(
+            ShamirSharing::recover(&params, &zero),
+            Err(SssError::ZeroPoint)
+        );
     }
 }

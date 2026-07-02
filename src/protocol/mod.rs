@@ -37,6 +37,8 @@ pub struct ProtocolParams {
     pub kahe: KaheParams,
     pub cs: <HidingMerkleCommitment as Cs>::Params,
     pub shamir: ShamirParams,
+    /// Anonymity floor: never decrypt over fewer distinct clients. Default 1.
+    pub min_clients: usize,
 }
 
 impl ProtocolParams {
@@ -52,7 +54,7 @@ impl ProtocolParams {
         // μ_cs = κ_kahe (coupling); κ_cs = 5 (BDLOP hiding bound, spec).
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 5);
         let shamir = ShamirParams::new(t, n_servers);
-        Self { kahe, cs, shamir }
+        Self { kahe, cs, shamir, min_clients: 1 }
     }
 
     /// Explicit KAHE dimensions `(μ, κ)`; `l = 1`, `σ_s = σ_e = 15.72`,
@@ -95,6 +97,6 @@ impl ProtocolParams {
         // μ_cs = κ_kahe (coupling); κ_cs = 5 (BDLOP hiding bound, spec).
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, kahe.kappa_kahe, 5);
         let shamir = ShamirParams::new(t, n_servers);
-        Self { kahe, cs, shamir }
+        Self { kahe, cs, shamir, min_clients: 1 }
     }
 }

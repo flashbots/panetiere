@@ -86,9 +86,8 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePo
 /// 1024-byte buffer with each client's bytes intact in its own slot — i.e.
 /// anonymous broadcast in slot mode.
 ///
-/// After the q_kahe decoupling, `t = T_MODULUS_DEFAULT = 262_144` (≥ 2^16),
-/// so the codec's 16-bit-per-coefficient layout fits inside the plaintext
-/// modulus without further reworking.
+/// `t = T_MODULUS_DEFAULT = 65_536 = 2^16`, exactly the codec's
+/// 16-bit-per-coefficient layout.
 #[test]
 fn slot_mode_disjoint_clients_recover_each_payload() {
     let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
@@ -368,6 +367,72 @@ fn tampered_agg_share_rejected() {
         result,
         Err(panetiere::protocol::verify::VerifyError::ShareOpeningMismatch(_))
     ));
+}
+
+#[test]
+fn below_floor_anonymity_set_rejected() {
+    use panetiere::cs::{Cs, HidingMerkleCommitment};
+    use panetiere::kahe::{Kahe, KaheScheme};
+    use panetiere::protocol::verify::{decrypt_aggregate, VerifyError};
+
+    let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
+    let n_servers = 4;
+    let n_clients = 4;
+    let mut pp = ProtocolParams::setup(&mut rng, n_servers);
+    pp.min_clients = n_clients + 1;
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
+
+    let mut client_entries = Vec::new();
+    let mut inboxes: Vec<ServerInbox> = server_ids
+        .iter()
+        .map(|&sid| ServerInbox {
+            server_id: sid,
+            items: vec![],
+        })
+        .collect();
+    for &cid in &client_ids {
+        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        client_entries.push((round.client_id, round.encrypted_message));
+        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+            assert_eq!(sid, server_ids[idx]);
+            inboxes[idx].items.push((cid, ops));
+        }
+    }
+    let canonical = client_ids;
+    let server_outputs: Vec<_> = inboxes
+        .iter()
+        .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+        .collect();
+
+    let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
+    assert_eq!(
+        result,
+        Err(VerifyError::AnonymitySetTooSmall {
+            got: n_clients,
+            min: n_clients + 1
+        })
+    );
+
+    let ctxts: Vec<Vec<KahePoly>> = client_entries.iter().map(|(_, e)| e.ctxt.clone()).collect();
+    let comms: Vec<_> = client_entries.iter().map(|(_, e)| e.comm.clone()).collect();
+    let total_ctxt = Kahe::agg_ctxt(&ctxts);
+    let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
+    let result = decrypt_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs);
+    assert_eq!(
+        result,
+        Err(VerifyError::AnonymitySetTooSmall {
+            got: n_clients,
+            min: n_clients + 1
+        })
+    );
+
+    pp.min_clients = n_clients;
+    aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+        .expect("at-floor set must verify");
+    decrypt_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
+        .expect("at-floor set must verify");
 }
 
 #[test]

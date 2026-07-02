@@ -194,9 +194,7 @@ unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usi
     }
 }
 
-/// In-place: each coefficient of `poly` becomes `poly[i] · t` (mod q via
-/// KahePoly's add semantics — caller's responsibility to keep within range).
-/// Widened to i64 to support t up to ~2^19 at q ≈ 2^30.
+/// `poly[i] · scale` mod q, widened to i64 (q_kahe ≈ 2^28).
 fn scale_poly(poly: &KahePoly, scale: i32) -> KahePoly {
     let mut coeffs = [0i32; N];
     let q = chipmunk_code::KAHE_MODULUS as i64;
@@ -515,7 +513,7 @@ mod tests {
                 let secret_cs = kahe_to_cs_centered(k.component(c));
                 let shares = ShamirSharing::share(&mut rng, &shamir, &secret_cs);
                 let samples: Vec<(usize, CsPoly)> = (0..t).map(|i| (i, shares[i])).collect();
-                let recovered_cs = ShamirSharing::recover(&shamir, &samples);
+                let recovered_cs = ShamirSharing::recover(&shamir, &samples).unwrap();
                 lift_cs_to_kahe(&recovered_cs)
             })
             .collect();

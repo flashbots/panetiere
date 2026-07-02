@@ -6,7 +6,7 @@ use chipmunk_code::{CsPoly, KahePoly};
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
-use crate::sss::ShamirSharing;
+use crate::sss::{ShamirSharing, SssError};
 
 use super::{ClientId, ServerId};
 use super::ProtocolParams;
@@ -20,6 +20,8 @@ pub enum VerifyError {
     BadServerCoverage,
     InconsistentCanonical(ServerId),
     InconsistentKappa(ServerId),
+    AnonymitySetTooSmall { got: usize, min: usize },
+    ShareRecovery(SssError),
 }
 
 /// Public verifier (README step 9):
@@ -38,6 +40,17 @@ pub struct VerifyTimings {
     pub opening_verify_us: f64,
     pub interpolation_us: f64,
     pub kahe_dec_us: f64,
+}
+
+fn check_anonymity_floor(pp: &ProtocolParams, clients: &[ClientId]) -> Result<(), VerifyError> {
+    let got = clients.iter().collect::<HashSet<_>>().len();
+    if got < pp.min_clients {
+        return Err(VerifyError::AnonymitySetTooSmall {
+            got,
+            min: pp.min_clients,
+        });
+    }
+    Ok(())
 }
 
 pub fn aggregate_and_decrypt(
@@ -59,6 +72,7 @@ pub fn aggregate_and_decrypt_timed(
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
+    check_anonymity_floor(pp, canonical)?;
     let kappa_kahe = pp.kahe.kappa_kahe;
     let mu_kahe = pp.kahe.mu_kahe;
     let l = pp.kahe.l;
@@ -141,10 +155,11 @@ pub fn aggregate_and_decrypt_timed(
                 .take(t)
                 .map(|sp| (sp.server_id.0 as usize, sp.agg_share[k]))
                 .collect();
-            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples);
-            lift_cs_to_kahe(&recovered_cs)
+            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples)
+                .map_err(VerifyError::ShareRecovery)?;
+            Ok(lift_cs_to_kahe(&recovered_cs))
         })
-        .collect();
+        .collect::<Result<_, VerifyError>>()?;
     let agg_key = KaheAggKey::from_components(recovered_components);
     tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
@@ -188,6 +203,13 @@ pub fn decrypt_aggregate(
         }
     }
 
+    for sp in &server_outputs[1..] {
+        if sp.clients != server_outputs[0].clients {
+            return Err(VerifyError::InconsistentCanonical(sp.server_id));
+        }
+    }
+    check_anonymity_floor(pp, &server_outputs[0].clients)?;
+
     for (i, sp) in server_outputs.iter().enumerate() {
         if !HidingMerkleCommitment::verify(&pp.cs, summed_comm, &sp.agg_open) {
             return Err(VerifyError::InvalidServerOpening(i));
@@ -207,10 +229,11 @@ pub fn decrypt_aggregate(
                 .take(t)
                 .map(|sp| (sp.server_id.0 as usize, sp.agg_share[k]))
                 .collect();
-            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples);
-            lift_cs_to_kahe(&recovered_cs)
+            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples)
+                .map_err(VerifyError::ShareRecovery)?;
+            Ok(lift_cs_to_kahe(&recovered_cs))
         })
-        .collect();
+        .collect::<Result<_, VerifyError>>()?;
     let agg_key = KaheAggKey::from_components(recovered_components);
 
     Ok(Kahe::dec(&pp.kahe, &summed_ctxt.to_vec(), &agg_key))
