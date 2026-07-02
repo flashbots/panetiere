@@ -290,16 +290,17 @@ impl ProtocolParams {
 pub struct ClientRound {
     pub client_id: ClientId,
     pub encrypted_message: ClientBulletinEntry,
-    /// One Opening per server. Its s() is the κ_kahe-vector of Shamir shares for this server.
-    pub encrypted_openings: Vec<(ServerId, Opening)>,
+    /// Per-server ECIES envelope (pke::encrypt) over the bit-packed Opening.
+    /// The Opening's s() is the κ_kahe-vector of Shamir shares for that server.
+    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
 }
 
-pub fn run_client_round<R: Rng>(
+pub fn run_client_round<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     client_id: ClientId,
     message: <Kahe as KaheScheme>::Message,        // Vec<KahePoly> of length μ_kahe·l
-    servers: &[ServerId],
+    servers: &[(ServerId, pke::PublicKey)],
 ) -> ClientRound;
 
 pub struct ServerInbox {
@@ -309,6 +310,9 @@ pub struct ServerInbox {
 
 #[derive(Debug, PartialEq)]
 pub enum ServerRoundError { MissingClient(ClientId) }
+
+/// Open one client's sealed envelope into its Opening.
+pub fn unseal_opening(key: &pke::PrivateKey, sealed: &[u8]) -> Option<Opening>;
 
 pub fn run_server_round(
     inbox: &ServerInbox,

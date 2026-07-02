@@ -78,11 +78,12 @@ use panetiere::codec;
 use panetiere::cs::{poly_packed_len, Commitment, Cs, HidingMerkleCommitment};
 use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL, K_LIMBS};
+use panetiere::pke;
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::{
-    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, shamir_share,
+    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, seal_opening, shamir_share,
 };
-use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_timed, decrypt_aggregate, VerifyTimings};
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId};
@@ -243,12 +244,15 @@ struct Row {
     l: usize,
     recovered_ok: bool,
     // CPU (one round, no averaging). Fixed-per-round vs per-chunk split:
-    //   fixed:    client_share + client_cs + server + verify_opening + verify_interp + verify_sum_comm
+    //   fixed:    client_share + client_cs + client_seal + server_unseal + server
+    //             + verify_opening + verify_interp + verify_sum_comm
     //   per-chunk (×l): mse_c + client_kahe + verify_agg_ctxt + verify_kahe_dec + mse_v
     mse_c_us: f64, // total over l inserts
     client_kahe_us: f64,
     client_share_us: f64,
     client_cs_us: f64,
+    client_seal_us: f64,
+    server_unseal_us: f64,
     server_us: f64,
     verify_agg_ctxt_us: f64,
     verify_sum_comm_us: f64,
@@ -315,6 +319,12 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         T_MODULUS_DEFAULT,
     );
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> =
+        (0..s).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
 
     // Active clients carry a distinct payload; cover clients contribute zero.
@@ -356,11 +366,16 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             items: vec![],
         })
         .collect();
+    let mut sealed_inbox0: Vec<Vec<u8>> = Vec::with_capacity(n);
     for (i, &cid) in client_ids.iter().enumerate() {
-        let round = run_client_round(&mut rng, &pp, cid, client_polys[i].clone(), &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, client_polys[i].clone(), &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (_sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
-            inboxes[idx].items.push((cid, ops));
+        for (idx, (_sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+            let opening = unseal_opening(&server_keys[idx], &sealed).unwrap();
+            if idx == 0 {
+                sealed_inbox0.push(sealed);
+            }
+            inboxes[idx].items.push((cid, opening));
         }
     }
     let canonical = client_ids.clone();
@@ -395,12 +410,11 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     };
 
     // Wire ledger. Ciphertext + commitment (root) are uniform-mod-q → tight at
-    // ⌈log₂ q⌉. Openings are decomposed digits + small r/s, so we measure the
-    // REAL packed size via `Opening::pack` (per-region bit widths).
-    let o = &inboxes[0].items[0].1;
-    // Client→server opening is FRESH: r ≤ β_cs, tree digits ≤ ζ, s ≤ q_cs/2.
+    // ⌈log₂ q⌉. Openings are decomposed digits + small r/s, packed at
+    // per-region bit widths; the client→server form is the REAL ECIES-sealed
+    // envelope, measured off the wire bytes.
+    let fresh_open_b = sealed_inbox0[0].len();
     let cs_half = (CS_MODULUS as u32) / 2;
-    let fresh_open_b = o.pack(pp.cs.beta_cs, cs_half, ZETA).body_len();
     // Server-posted aggregate: r ≤ β_agg, tree digits ≤ ρ·ζ (ρ = canonical count);
     // plus agg_share = κ_kahe CS-ring polys at ⌈log₂ q_cs⌉ bits.
     let rho = canonical.len() as u32;
@@ -429,7 +443,20 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     let key0 = kahe_keygen(&mut rng, &pp);
     let (client_kahe_us, _ctxt0) = time_us(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
     let (client_share_us, shares0) = time_us(|| shamir_share(&mut rng, &pp, &key0, s));
-    let (client_cs_us, _) = time_us(|| cs_commit(&mut rng, &pp, &shares0));
+    let (client_cs_us, (_comm0, openings0)) = time_us(|| cs_commit(&mut rng, &pp, &shares0));
+    let (client_seal_us, _) = time_us(|| {
+        openings0
+            .iter()
+            .zip(&servers)
+            .map(|(op, (_, xpub))| seal_opening(&mut rng, &pp, op, xpub))
+            .collect::<Vec<_>>()
+    });
+    let (server_unseal_us, _) = time_us(|| {
+        sealed_inbox0
+            .iter()
+            .map(|sealed| unseal_opening(&server_keys[0], sealed).unwrap())
+            .collect::<Vec<_>>()
+    });
     let (server_us, _) = time_us(|| run_server_round(&inboxes[0], &canonical).unwrap());
     let (verify_us_total, (recovered2, vt)) = time_us(|| {
         aggregate_and_decrypt_timed(&pp, &canonical, &client_entries, &outputs).unwrap()
@@ -573,6 +600,8 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         client_kahe_us,
         client_share_us,
         client_cs_us,
+        client_seal_us,
+        server_unseal_us,
         server_us,
         verify_agg_ctxt_us: agg_ctxt_us,
         verify_sum_comm_us: sum_comm_us,
@@ -593,11 +622,14 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
 }
 
 fn print_row(r: &Row) {
-    // Fixed-per-round = Shamir share + CS commit + server + opening verify
-    //                 + Shamir interpolation + commitment summation.
+    // Fixed-per-round = Shamir share + CS commit + opening seal + server unseal
+    //                 + server + opening verify + Shamir interpolation
+    //                 + commitment summation.
     // Per-chunk (×l)   = MSE encode + KAHE enc + KAHE agg_ctxt + KAHE dec + MSE decode.
     let fixed_us = r.client_share_us
         + r.client_cs_us
+        + r.client_seal_us
+        + r.server_unseal_us
         + r.server_us
         + r.verify_opening_us
         + r.verify_interp_us
@@ -633,10 +665,12 @@ fn print_row(r: &Row) {
         },
     );
     println!(
-        "  fixed/round: {:>10}   [share {} + cs {} + server {} + verify_open {} + verify_interp {} + sum_comm {}]",
+        "  fixed/round: {:>10}   [share {} + cs {} + seal {} + unseal {} + server {} + verify_open {} + verify_interp {} + sum_comm {}]",
         fmt_us(fixed_us),
         fmt_us(r.client_share_us),
         fmt_us(r.client_cs_us),
+        fmt_us(r.client_seal_us),
+        fmt_us(r.server_unseal_us),
         fmt_us(r.server_us),
         fmt_us(r.verify_opening_us),
         fmt_us(r.verify_interp_us),
@@ -909,7 +943,7 @@ fn main() {
     );
     println!("per-round wall = fixed + l · per-chunk");
     println!(
-        "  fixed   = shamir_share + cs_commit + server + verify_open + verify_interp + sum_comm"
+        "  fixed   = shamir_share + cs_commit + seal + unseal + server + verify_open + verify_interp + sum_comm"
     );
     println!("  chunk   = mse_c + kahe_enc + kahe_agg_ctxt + kahe_dec + mse_v");
     println!(

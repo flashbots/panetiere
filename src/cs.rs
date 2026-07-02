@@ -837,10 +837,57 @@ pub struct PackedOpening {
     pub bytes: Vec<u8>,
 }
 
+/// `PackedOpening` header size on the wire: 9 × u32 LE.
+const PACKED_OPENING_HEADER_LEN: usize = 36;
+
 impl PackedOpening {
     /// Total byte length of the packed payload (header excluded).
     pub fn body_len(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Self-describing wire form: `9 × u32 LE header ‖ bytes`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(PACKED_OPENING_HEADER_LEN + self.bytes.len());
+        for v in [
+            self.server_index,
+            self.path_index,
+            self.kappa_cs,
+            self.mu_cs,
+            self.block_size,
+            self.stored_path_len,
+            self.r_bound,
+            self.s_bound,
+            self.tree_bound,
+        ] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&self.bytes);
+        out
+    }
+
+    /// Inverse of [`Self::to_bytes`]. Header *semantics* are validated later by
+    /// [`Opening::from_packed`]; this only checks the length.
+    pub fn from_bytes(data: &[u8]) -> Option<PackedOpening> {
+        if data.len() < PACKED_OPENING_HEADER_LEN {
+            return None;
+        }
+        let mut f = [0u32; 9];
+        for (i, v) in f.iter_mut().enumerate() {
+            *v = u32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        Some(PackedOpening {
+            server_index: f[0],
+            path_index: f[1],
+            kappa_cs: f[2],
+            mu_cs: f[3],
+            block_size: f[4],
+            stored_path_len: f[5],
+            r_bound: f[6],
+            s_bound: f[7],
+            tree_bound: f[8],
+            bytes: data[PACKED_OPENING_HEADER_LEN..].to_vec(),
+        })
     }
 }
 

@@ -1,10 +1,11 @@
-use rand::Rng;
+use rand::{CryptoRng, Rng};
 
 use chipmunk_code::CsPoly;
 
 use crate::bulletin::ClientBulletinEntry;
-use crate::cs::{Commitment, Cs, HidingMerkleCommitment, Opening};
+use crate::cs::{fresh_opening_pack_bounds, Commitment, Cs, HidingMerkleCommitment, Opening};
 use crate::kahe::{kahe_to_cs_centered, Kahe, KaheKey, KaheScheme};
+use crate::pke;
 use crate::sss::ShamirSharing;
 
 use super::{ClientId, ServerId};
@@ -13,12 +14,24 @@ use super::ProtocolParams;
 /// Output of a single client round (README steps 1–6).
 ///
 /// One CS commit per client (with `μ_cs = κ_kahe`), so each server's
-/// encrypted opening is a single `Opening` — its `s()` is the
+/// sealed opening wraps a single `Opening` — its `s()` is the
 /// `κ_kahe`-vector of Shamir shares for that server.
 pub struct ClientRound {
     pub client_id: ClientId,
     pub encrypted_message: ClientBulletinEntry,
-    pub encrypted_openings: Vec<(ServerId, Opening)>,
+    /// Per-server ECIES envelope over the bit-packed `Opening`.
+    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
+}
+
+/// Pack (fresh bounds) + ECIES-seal one per-server opening.
+pub fn seal_opening<R: CryptoRng + Rng>(
+    rng: &mut R,
+    pp: &ProtocolParams,
+    opening: &Opening,
+    recipient: &pke::PublicKey,
+) -> Vec<u8> {
+    let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp.cs);
+    pke::encrypt(rng, recipient, &opening.pack(r_b, s_b, t_b).to_bytes())
 }
 
 /// Sample a fresh KAHE secret key.
@@ -79,24 +92,27 @@ pub fn cs_commit<R: Rng>(
     HidingMerkleCommitment::commit(rng, &pp.cs, shares_per_server)
 }
 
-pub fn run_client_round<R: Rng>(
+pub fn run_client_round<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     client_id: ClientId,
     message: <Kahe as KaheScheme>::Message,
-    servers: &[ServerId],
+    servers: &[(ServerId, pke::PublicKey)],
 ) -> ClientRound {
     let key = kahe_keygen(rng, pp);
     let ctxt = kahe_encrypt(rng, pp, &key, &message);
     let shares_per_server = shamir_share(rng, pp, &key, servers.len());
     let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
 
-    let encrypted_openings: Vec<(ServerId, Opening)> =
-        servers.iter().copied().zip(openings.into_iter()).collect();
+    let sealed_openings = servers
+        .iter()
+        .zip(openings.iter())
+        .map(|((sid, xpub), opening)| (*sid, seal_opening(rng, pp, opening, xpub)))
+        .collect();
 
     ClientRound {
         client_id,
         encrypted_message: ClientBulletinEntry { ctxt, comm },
-        encrypted_openings,
+        sealed_openings,
     }
 }

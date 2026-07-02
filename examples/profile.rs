@@ -20,9 +20,10 @@
 
 use chipmunk_code::KahePoly;
 use rand::Rng;
+use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::{ClientId, ServerId};
-use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
@@ -74,6 +75,13 @@ fn main() {
         pp.kahe.sigma_s, pp.kahe.sigma_e, pp.kahe.t_modulus, pp.shamir.t
     );
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..s)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
     let canonical = client_ids.clone();
 
@@ -90,10 +98,11 @@ fn main() {
             let m: Vec<KahePoly> = (0..pp.kahe.mu_kahe)
                 .map(|_| rand_message_poly(&mut rng, pp.kahe.t_modulus))
                 .collect();
-            let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (_, op)) in round.encrypted_openings.into_iter().enumerate() {
-                inboxes[idx].items.push((cid, op));
+            for (idx, (_, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+                inboxes[idx].items.push((cid, opening));
             }
         }
         let outputs: Vec<_> = inboxes

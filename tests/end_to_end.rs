@@ -1,8 +1,9 @@
 use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
 use panetiere::codec;
+use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::{ClientId, ServerId};
-use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use rand::{Rng, SeedableRng};
@@ -35,9 +36,21 @@ fn reduce_centered_mod_t(poly: KahePoly, t: u32) -> KahePoly {
     KahePoly::from_coeffs(coeffs)
 }
 
-fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePoly, KahePoly) {
+fn run<R: rand::Rng + rand::CryptoRng>(
+    rng: &mut R,
+    n_servers: usize,
+    n_clients: usize,
+) -> (KahePoly, KahePoly) {
+    let mut rng = rng;
     let pp = ProtocolParams::setup(rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut messages = Vec::with_capacity(n_clients);
@@ -53,11 +66,12 @@ fn run<R: rand::Rng>(rng: &mut R, n_servers: usize, n_clients: usize) -> (KahePo
     for &cid in &client_ids {
         let m = rand_message_poly(rng, pp.kahe.t_modulus);
         messages.push(m);
-        let round = run_client_round(rng, &pp, cid, vec![m], &server_ids);
+        let round = run_client_round(rng, &pp, cid, vec![m], &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
 
@@ -109,6 +123,13 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut client_entries = Vec::new();
@@ -129,11 +150,12 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         let polys = codec::encode_raw(&buf);
         assert_eq!(polys.len(), 1, "slot buffer sized to one KahePoly");
 
-        let round = run_client_round(&mut rng, &pp, cid, polys, &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, polys, &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
 
@@ -206,6 +228,13 @@ fn slot_mode_8kb_message_multi_poly() {
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
     let canonical = client_ids.clone();
 
@@ -221,11 +250,12 @@ fn slot_mode_8kb_message_multi_poly() {
             .collect();
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = encoded[i][poly_idx];
-            let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+            let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, ops));
+                let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+                inboxes[idx].items.push((cid, opening));
             }
         }
         let outputs: Vec<_> = inboxes
@@ -276,6 +306,13 @@ fn aggregated_recovers_same_sum() {
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut client_entries = Vec::with_capacity(n_clients);
@@ -286,11 +323,12 @@ fn aggregated_recovers_same_sum() {
 
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
-        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
 
@@ -335,6 +373,13 @@ fn tampered_agg_share_rejected() {
     let n_clients = 4;
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut client_entries = Vec::new();
@@ -347,11 +392,12 @@ fn tampered_agg_share_rejected() {
         .collect();
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
-        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
     let canonical = client_ids;
@@ -381,6 +427,13 @@ fn below_floor_anonymity_set_rejected() {
     let mut pp = ProtocolParams::setup(&mut rng, n_servers);
     pp.min_clients = n_clients + 1;
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut client_entries = Vec::new();
@@ -393,11 +446,12 @@ fn below_floor_anonymity_set_rejected() {
         .collect();
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
-        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
     let canonical = client_ids;
@@ -442,6 +496,13 @@ fn high_norm_r_rejected_in_protocol() {
     let n_clients = 4;
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut client_entries = Vec::new();
@@ -454,11 +515,12 @@ fn high_norm_r_rejected_in_protocol() {
         .collect();
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
-        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
     // Corrupt one private opening before aggregation.
@@ -496,6 +558,13 @@ fn recovers_from_t_of_n_servers() {
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     assert_eq!(pp.shamir.t, 3);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
     let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
 
     let mut messages = Vec::with_capacity(n_clients);
@@ -510,11 +579,12 @@ fn recovers_from_t_of_n_servers() {
     for &cid in &client_ids {
         let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
         messages.push(m);
-        let round = run_client_round(&mut rng, &pp, cid, vec![m], &server_ids);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            inboxes[idx].items.push((cid, ops));
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            inboxes[idx].items.push((cid, opening));
         }
     }
     let canonical = client_ids.clone();

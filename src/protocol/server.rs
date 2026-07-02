@@ -3,9 +3,18 @@ use std::collections::HashMap;
 use chipmunk_code::CsPoly;
 
 use crate::bulletin::ServerBulletinEntry;
-use crate::cs::{Cs, HidingMerkleCommitment, Opening};
+use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
+use crate::pke;
 
 use super::{ClientId, ServerId};
+
+/// Open one client's ECIES envelope into its `Opening`; `None` on a bad seal
+/// or a malformed packed opening.
+pub fn unseal_opening(key: &pke::PrivateKey, sealed: &[u8]) -> Option<Opening> {
+    let plain = pke::decrypt(key, sealed).ok()?;
+    let packed = PackedOpening::from_bytes(&plain)?;
+    Opening::from_packed(&packed).ok()
+}
 
 /// Per-server inbox: one `Opening` per client (its `s()` is the κ_kahe-vector
 /// of that client's Shamir shares for this server).

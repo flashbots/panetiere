@@ -2,53 +2,80 @@ use chipmunk_code::{KahePoly, Polynomial};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use panetiere::cs::{Cs, HidingMerkleCommitment};
 use panetiere::kahe::{Kahe, KaheScheme};
+use panetiere::pke;
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::{ClientId, ServerId};
-use panetiere::protocol::server::{run_server_round, ServerInbox};
+use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, decrypt_aggregate};
 use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+
+fn gen_servers<R: rand::CryptoRng + rand::Rng>(
+    rng: &mut R,
+    n_servers: usize,
+) -> (Vec<pke::PrivateKey>, Vec<(ServerId, pke::PublicKey)>) {
+    let keys: Vec<pke::PrivateKey> =
+        (0..n_servers).map(|_| pke::PrivateKey::generate(rng)).collect();
+    let servers = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (ServerId(i as u32), k.public()))
+        .collect();
+    (keys, servers)
+}
 
 fn bench_client_round(c: &mut Criterion) {
     let mut g = c.benchmark_group("client_round");
     for &n_servers in &[2usize, 4, 8, 16] {
         let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
         let pp = ProtocolParams::setup(&mut rng, n_servers);
-        let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+        let (_keys, servers) = gen_servers(&mut rng, n_servers);
         let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
         g.bench_with_input(BenchmarkId::from_parameter(n_servers), &n_servers, |b, _| {
-            b.iter(|| run_client_round(&mut rng, &pp, ClientId(0), m.clone(), &server_ids))
+            b.iter(|| run_client_round(&mut rng, &pp, ClientId(0), m.clone(), &servers))
         });
     }
     g.finish();
 }
 
+/// Full server-side round: unseal every canonical client's envelope, then
+/// aggregate the openings.
 fn bench_server_round(c: &mut Criterion) {
     let mut g = c.benchmark_group("server_round");
     for &(n_servers, n_clients) in &[(4usize, 4usize), (4, 16), (4, 64)] {
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
         let pp = ProtocolParams::setup(&mut rng, n_servers);
-        let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-        let mut inbox = ServerInbox {
-            server_id: server_ids[0],
-            items: vec![],
-        };
+        let (keys, servers) = gen_servers(&mut rng, n_servers);
+        let mut sealed_inbox: Vec<(ClientId, Vec<u8>)> = vec![];
         let mut canonical = vec![];
         for ci in 0..n_clients {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
-            let (sid, ops) = round.encrypted_openings.into_iter().next().unwrap();
-            assert_eq!(sid, server_ids[0]);
-            inbox.items.push((cid, ops));
+            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let (sid, sealed) = round.sealed_openings.into_iter().next().unwrap();
+            assert_eq!(sid, servers[0].0);
+            sealed_inbox.push((cid, sealed));
         }
         g.bench_with_input(
             BenchmarkId::from_parameter(format!("S{}_C{}", n_servers, n_clients)),
             &(n_servers, n_clients),
-            |b, _| b.iter(|| run_server_round(&inbox, &canonical).unwrap()),
+            |b, _| {
+                b.iter(|| {
+                    let inbox = ServerInbox {
+                        server_id: servers[0].0,
+                        items: sealed_inbox
+                            .iter()
+                            .map(|(cid, sealed)| {
+                                (*cid, unseal_opening(&keys[0], sealed).unwrap())
+                            })
+                            .collect(),
+                    };
+                    run_server_round(&inbox, &canonical).unwrap()
+                })
+            },
         );
     }
     g.finish();
@@ -59,10 +86,10 @@ fn bench_verify(c: &mut Criterion) {
     for &(n_servers, n_clients) in &[(4usize, 4usize), (4, 16), (8, 16)] {
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
         let pp = ProtocolParams::setup(&mut rng, n_servers);
-        let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-        let mut inboxes: Vec<ServerInbox> = server_ids
+        let (keys, servers) = gen_servers(&mut rng, n_servers);
+        let mut inboxes: Vec<ServerInbox> = servers
             .iter()
-            .map(|&sid| ServerInbox {
+            .map(|&(sid, _)| ServerInbox {
                 server_id: sid,
                 items: vec![],
             })
@@ -73,11 +100,12 @@ fn bench_verify(c: &mut Criterion) {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
-                assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, ops));
+            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                assert_eq!(sid, servers[idx].0);
+                let opening = unseal_opening(&keys[idx], &sealed).unwrap();
+                inboxes[idx].items.push((cid, opening));
             }
         }
         let outputs: Vec<_> = inboxes
@@ -100,12 +128,12 @@ fn bench_aggregator_round(c: &mut Criterion) {
     for &group_size in &[20usize, 40] {
         let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
         let pp = ProtocolParams::setup(&mut rng, n_servers);
-        let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+        let (_keys, servers) = gen_servers(&mut rng, n_servers);
         let mut entries = Vec::with_capacity(group_size);
         for ci in 0..group_size {
             let cid = ClientId(ci as u32);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
             entries.push((round.client_id, round.encrypted_message));
         }
         g.bench_with_input(
@@ -125,10 +153,10 @@ fn bench_verify_aggregated(c: &mut Criterion) {
     for &(n_servers, n_clients) in &[(4usize, 40usize), (4, 80), (8, 80)] {
         let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
         let pp = ProtocolParams::setup(&mut rng, n_servers);
-        let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-        let mut inboxes: Vec<ServerInbox> = server_ids
+        let (keys, servers) = gen_servers(&mut rng, n_servers);
+        let mut inboxes: Vec<ServerInbox> = servers
             .iter()
-            .map(|&sid| ServerInbox { server_id: sid, items: vec![] })
+            .map(|&(sid, _)| ServerInbox { server_id: sid, items: vec![] })
             .collect();
         let mut client_entries: Vec<_> = vec![];
         let mut canonical = vec![];
@@ -136,11 +164,12 @@ fn bench_verify_aggregated(c: &mut Criterion) {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &server_ids);
+            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (sid, ops)) in round.encrypted_openings.into_iter().enumerate() {
-                assert_eq!(sid, server_ids[idx]);
-                inboxes[idx].items.push((cid, ops));
+            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                assert_eq!(sid, servers[idx].0);
+                let opening = unseal_opening(&keys[idx], &sealed).unwrap();
+                inboxes[idx].items.push((cid, opening));
             }
         }
         let outputs: Vec<_> = inboxes
