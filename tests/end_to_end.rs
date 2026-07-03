@@ -9,6 +9,83 @@ use panetiere::protocol::ProtocolParams;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
+/// Full round from a fixed seed: per-client ctxt + commitment bytes + sealed
+/// envelopes, plus the recovered message. Used to check that panetiere's
+/// rayon-parallelized phases are thread-count-invariant.
+fn run_full_round_bytes(
+    seed: [u8; 32],
+    n_servers: usize,
+    n_clients: usize,
+) -> (Vec<Vec<KahePoly>>, Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>, Vec<KahePoly>) {
+    let mut rng = ChaCha20Rng::from_seed(seed);
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
+    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
+    let server_keys: Vec<pke::PrivateKey> =
+        (0..n_servers).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+        .iter()
+        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
+        .collect();
+    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
+
+    let mut ctxts = Vec::with_capacity(n_clients);
+    let mut comm_bytes = Vec::with_capacity(n_clients);
+    let mut sealed_all = Vec::with_capacity(n_clients);
+    let mut client_entries = Vec::with_capacity(n_clients);
+    let mut inboxes: Vec<ServerInbox> = server_ids
+        .iter()
+        .map(|&sid| ServerInbox {
+            server_id: sid,
+            items: vec![],
+        })
+        .collect();
+
+    for &cid in &client_ids {
+        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
+        let round = run_client_round(&mut rng, &pp, cid, vec![m], &servers);
+        ctxts.push(round.encrypted_message.ctxt.clone());
+        comm_bytes.push(round.encrypted_message.comm.to_bytes());
+        let mut sealed_for_client = Vec::with_capacity(n_servers);
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+            assert_eq!(sid, server_ids[idx]);
+            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            sealed_for_client.push(sealed);
+            inboxes[idx].items.push((cid, opening));
+        }
+        sealed_all.push(sealed_for_client);
+        client_entries.push((round.client_id, round.encrypted_message));
+    }
+
+    let canonical = client_ids.clone();
+    let server_outputs: Vec<_> = inboxes
+        .iter()
+        .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+        .collect();
+    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+        .expect("verify failed");
+
+    (ctxts, comm_bytes, sealed_all, recovered)
+}
+
+/// The rayon-parallelized phases (kahe enc/dec/agg_ctxt, cs commit, seal,
+/// verify) fork RNG streams per work item so the transcript is bit-identical
+/// regardless of how many threads actually run it.
+#[test]
+fn full_round_is_thread_count_invariant() {
+    let seed = [77u8; 32];
+    let one = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap()
+        .install(|| run_full_round_bytes(seed, 5, 6));
+    let many = rayon::ThreadPoolBuilder::new()
+        .num_threads(8)
+        .build()
+        .unwrap()
+        .install(|| run_full_round_bytes(seed, 5, 6));
+    assert_eq!(one, many);
+}
+
 /// Sample a polynomial with coefficients centered in `[-t/2, t/2)` —
 /// matches the KAHE plaintext space `R_t`.
 fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use chipmunk_code::CsPoly;
+use rayon::prelude::*;
 
 use crate::bulletin::ServerBulletinEntry;
 use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
@@ -14,6 +15,12 @@ pub fn unseal_opening(key: &pke::PrivateKey, sealed: &[u8]) -> Option<Opening> {
     let plain = pke::decrypt(key, sealed).ok()?;
     let packed = PackedOpening::from_bytes(&plain)?;
     Opening::from_packed(&packed).ok()
+}
+
+/// Batch form of [`unseal_opening`] over a server's whole inbox, independent
+/// per item.
+pub fn unseal_openings(key: &pke::PrivateKey, sealed: &[Vec<u8>]) -> Vec<Option<Opening>> {
+    sealed.par_iter().map(|s| unseal_opening(key, s)).collect()
 }
 
 /// Per-server inbox: one `Opening` per client (its `s()` is the κ_kahe-vector

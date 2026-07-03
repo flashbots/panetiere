@@ -1,4 +1,6 @@
-use rand::{CryptoRng, Rng};
+use rand::{CryptoRng, Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
 
 use chipmunk_code::CsPoly;
 
@@ -104,10 +106,17 @@ pub fn run_client_round<R: CryptoRng + Rng>(
     let shares_per_server = shamir_share(rng, pp, &key, servers.len());
     let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
 
+    // Independent per server; forked seeds keep the result deterministic
+    // regardless of thread schedule.
+    let seeds = crate::fork_seeds(rng, servers.len());
     let sealed_openings = servers
-        .iter()
-        .zip(openings.iter())
-        .map(|((sid, xpub), opening)| (*sid, seal_opening(rng, pp, opening, xpub)))
+        .par_iter()
+        .zip(openings.par_iter())
+        .zip(seeds.par_iter())
+        .map(|(((sid, xpub), opening), seed)| {
+            let mut item_rng = ChaCha20Rng::from_seed(*seed);
+            (*sid, seal_opening(&mut item_rng, pp, opening, xpub))
+        })
         .collect();
 
     ClientRound {

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use chipmunk_code::{CsPoly, KahePoly};
+use rayon::prelude::*;
 
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
@@ -40,6 +41,27 @@ pub struct VerifyTimings {
     pub opening_verify_us: f64,
     pub interpolation_us: f64,
     pub kahe_dec_us: f64,
+}
+
+/// Check one server's `agg_open` against the summed commitment. Independent
+/// across servers, so callers run this via `par_iter` and scan the results
+/// serially to preserve the earliest-index error.
+fn verify_one_server(
+    pp: &ProtocolParams,
+    summed_comm: &Commitment,
+    i: usize,
+    sp: &ServerBulletinEntry,
+) -> Result<(), VerifyError> {
+    if !HidingMerkleCommitment::verify(&pp.cs, summed_comm, &sp.agg_open) {
+        return Err(VerifyError::InvalidServerOpening(i));
+    }
+    if sp.agg_open.path_index != sp.server_id.0 as usize {
+        return Err(VerifyError::InvalidServerOpening(i));
+    }
+    if sp.agg_share.as_slice() != sp.agg_open.s() {
+        return Err(VerifyError::ShareOpeningMismatch(i));
+    }
+    Ok(())
 }
 
 fn check_anonymity_floor(pp: &ProtocolParams, clients: &[ClientId]) -> Result<(), VerifyError> {
@@ -130,17 +152,13 @@ pub fn aggregate_and_decrypt_timed(
 
     // Single CS verification per server (μ_cs = κ_kahe packs all components).
     let now = Instant::now();
-    for (i, sp) in server_outputs.iter().enumerate() {
-        if !HidingMerkleCommitment::verify(&pp.cs, &summed_comm, &sp.agg_open) {
-            return Err(VerifyError::InvalidServerOpening(i));
-        }
-        // Shamir point (server_id) must match the slot `verify` bound `s()` to.
-        if sp.agg_open.path_index != sp.server_id.0 as usize {
-            return Err(VerifyError::InvalidServerOpening(i));
-        }
-        if sp.agg_share.as_slice() != sp.agg_open.s() {
-            return Err(VerifyError::ShareOpeningMismatch(i));
-        }
+    let results: Vec<Result<(), VerifyError>> = server_outputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, sp)| verify_one_server(pp, &summed_comm, i, sp))
+        .collect();
+    for r in results {
+        r?;
     }
     tt.opening_verify_us = now.elapsed().as_secs_f64() * 1e6;
 
@@ -210,16 +228,13 @@ pub fn decrypt_aggregate(
     }
     check_anonymity_floor(pp, &server_outputs[0].clients)?;
 
-    for (i, sp) in server_outputs.iter().enumerate() {
-        if !HidingMerkleCommitment::verify(&pp.cs, summed_comm, &sp.agg_open) {
-            return Err(VerifyError::InvalidServerOpening(i));
-        }
-        if sp.agg_open.path_index != sp.server_id.0 as usize {
-            return Err(VerifyError::InvalidServerOpening(i));
-        }
-        if sp.agg_share.as_slice() != sp.agg_open.s() {
-            return Err(VerifyError::ShareOpeningMismatch(i));
-        }
+    let results: Vec<Result<(), VerifyError>> = server_outputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, sp)| verify_one_server(pp, summed_comm, i, sp))
+        .collect();
+    for r in results {
+        r?;
     }
 
     let recovered_components: Vec<KahePoly> = (0..kappa_kahe)

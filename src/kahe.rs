@@ -40,8 +40,10 @@ use chipmunk_code::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, Polynomial, CS_MODULUS_OVER_TWO,
     KAHE_MODULUS_OVER_TWO, N,
 };
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use rand_distr::{Distribution, Normal};
+use rayon::prelude::*;
 
 /// KAHE scheme contract.
 pub trait KaheScheme {
@@ -135,13 +137,15 @@ fn sample_dg_poly<R: Rng>(rng: &mut R, sigma: f64) -> KahePoly {
     KahePoly::from_coeffs(coeffs)
 }
 
-/// `A · sk` where `sk` is already in NTT representation. Used by `enc`/`dec`
-/// to amortize the κ-NTT of the secret across all `l` chunks.
-fn matvec_ntt_sk(a_matrix_ntt: &[Vec<KaheNTTPoly>], sk_ntt: &[KaheNTTPoly]) -> Vec<KahePoly> {
-    a_matrix_ntt
-        .iter()
-        .map(|row| KahePoly::from(&pointwise_dot_kahe(row, sk_ntt)))
-        .collect()
+/// `(A_chunk · sk)[i]` where `sk` is already in NTT representation. Used by
+/// `enc`/`dec` to amortize the κ-NTT of the secret across all `l·μ` rows.
+fn pad_poly(
+    a_matrices_ntt: &[Vec<Vec<KaheNTTPoly>>],
+    sk_ntt: &[KaheNTTPoly],
+    chunk: usize,
+    i: usize,
+) -> KahePoly {
+    KahePoly::from(&pointwise_dot_kahe(&a_matrices_ntt[chunk][i], sk_ntt))
 }
 
 fn vec_add(a: &[KahePoly], b: &[KahePoly]) -> Vec<KahePoly> {
@@ -360,17 +364,19 @@ impl KaheScheme for Kahe {
         debug_assert_eq!(m.len(), pp.mu_kahe * pp.l);
         let t = pp.t_modulus as i32;
         let sk_ntt: Vec<KaheNTTPoly> = k.inner().iter().map(KaheNTTPoly::from).collect();
-        let mut out = Vec::with_capacity(pp.mu_kahe * pp.l);
-        for chunk in 0..pp.l {
-            let pad = matvec_ntt_sk(&pp.a_matrices_ntt[chunk], &sk_ntt);
-            let base = chunk * pp.mu_kahe;
-            for i in 0..pp.mu_kahe {
-                let e = sample_dg_poly(rng, pp.sigma_e);
+        let total = pp.mu_kahe * pp.l;
+        let seeds = crate::fork_seeds(rng, total);
+        (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                let (chunk, i) = (idx / pp.mu_kahe, idx % pp.mu_kahe);
+                let pad = pad_poly(&pp.a_matrices_ntt, &sk_ntt, chunk, i);
+                let mut item_rng = ChaCha20Rng::from_seed(seeds[idx]);
+                let e = sample_dg_poly(&mut item_rng, pp.sigma_e);
                 let te = scale_poly(&e, t);
-                out.push(m[base + i] + pad[i] + te);
-            }
-        }
-        out
+                m[idx] + pad + te
+            })
+            .collect()
     }
 
     /// `((c_i − A_i·sk_agg) mod q_kahe) reduced mod t`, per chunk. `sk_agg`'s
@@ -379,16 +385,16 @@ impl KaheScheme for Kahe {
         debug_assert_eq!(k.inner().len(), pp.kappa_kahe);
         debug_assert_eq!(c.len(), pp.mu_kahe * pp.l);
         let sk_ntt: Vec<KaheNTTPoly> = k.inner().iter().map(KaheNTTPoly::from).collect();
-        let mut out = Vec::with_capacity(pp.mu_kahe * pp.l);
-        for chunk in 0..pp.l {
-            let pad = matvec_ntt_sk(&pp.a_matrices_ntt[chunk], &sk_ntt);
-            let base = chunk * pp.mu_kahe;
-            for i in 0..pp.mu_kahe {
-                let raw = c[base + i] - pad[i];
-                out.push(poly_mod_t(&raw, pp.t_modulus));
-            }
-        }
-        out
+        let total = pp.mu_kahe * pp.l;
+        (0..total)
+            .into_par_iter()
+            .map(|idx| {
+                let (chunk, i) = (idx / pp.mu_kahe, idx % pp.mu_kahe);
+                let pad = pad_poly(&pp.a_matrices_ntt, &sk_ntt, chunk, i);
+                let raw = c[idx] - pad;
+                poly_mod_t(&raw, pp.t_modulus)
+            })
+            .collect()
     }
 
     fn agg_ctxt(cs: &[Vec<KahePoly>]) -> Vec<KahePoly> {
@@ -403,6 +409,7 @@ impl KaheScheme for Kahe {
         // result is ≡ Σ cᵢ (mod q), which is all `dec` (which subtracts the
         // aggregate pad then reduces mod t) requires.
         (0..len)
+            .into_par_iter()
             .map(|pos| {
                 let mut acc = [0i64; N];
                 accumulate_pos(&mut acc, cs, pos);

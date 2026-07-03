@@ -38,7 +38,9 @@ use chipmunk_code::{
     pointwise_dot_cs, pointwise_sum_polys, CsNTTPoly, CsPoly, HVCHash, HVCPoly, Polynomial, Tree,
     CS_MODULUS, HVC_MODULUS, HVC_WIDTH, N as POLY_N,
 };
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
+use rayon::prelude::*;
 
 pub trait Cs {
     type Params;
@@ -349,23 +351,41 @@ impl Cs for HidingMerkleCommitment {
         let stored_path_len = pp.stored_path_len();
 
         // Step 1: per-server block subtree → block root + decomposed body.
+        // Independent per server; `r`'s randomness is forked into per-server
+        // seeds so the result is deterministic regardless of thread schedule.
+        let seeds = crate::fork_seeds(rng, pp.n_servers);
+        let per_server: Vec<(HVCPoly, Vec<HVCPoly>, Vec<CsPoly>)> = shares
+            .par_iter()
+            .zip(seeds.par_iter())
+            .map(|(s_vec, seed)| {
+                let mut item_rng = ChaCha20Rng::from_seed(*seed);
+                let r: Vec<CsPoly> = (0..pp.kappa_cs)
+                    .map(|_| CsPoly::rand_mod_p(&mut item_rng, pp.beta_cs))
+                    .collect();
+                let raw_leaves = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, s_vec);
+
+                let mut dblock =
+                    Vec::with_capacity(block_subtree_node_count(block_size) * HVC_WIDTH);
+                let block_root = build_block_subtree(
+                    &pp.hasher,
+                    &raw_leaves,
+                    block_size,
+                    block_height,
+                    &mut dblock,
+                );
+                // rs = r ‖ s
+                let mut rs = r;
+                rs.extend_from_slice(s_vec);
+                (block_root, dblock, rs)
+            })
+            .collect();
+
         let mut block_roots = vec![HVCPoly::default(); pp.n_leaves];
         let mut server_block_data: Vec<Vec<HVCPoly>> = Vec::with_capacity(pp.n_servers);
         let mut server_rs: Vec<Vec<CsPoly>> = Vec::with_capacity(pp.n_servers);
-        for (i, s_vec) in shares.iter().enumerate() {
-            let r: Vec<CsPoly> = (0..pp.kappa_cs)
-                .map(|_| CsPoly::rand_mod_p(rng, pp.beta_cs))
-                .collect();
-            let raw_leaves = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, s_vec);
-
-            let mut dblock = Vec::with_capacity(block_subtree_node_count(block_size) * HVC_WIDTH);
-            let block_root =
-                build_block_subtree(&pp.hasher, &raw_leaves, block_size, block_height, &mut dblock);
+        for (i, (block_root, dblock, rs)) in per_server.into_iter().enumerate() {
             block_roots[i] = block_root;
             server_block_data.push(dblock);
-            // rs = r ‖ s
-            let mut rs = r;
-            rs.extend_from_slice(s_vec);
             server_rs.push(rs);
         }
 
@@ -375,6 +395,7 @@ impl Cs for HidingMerkleCommitment {
 
         // Step 3: pack openings (block body already built; append the path).
         let openings: Vec<Opening> = (0..pp.n_servers)
+            .into_par_iter()
             .map(|i| {
                 let mut data = server_block_data[i].clone();
                 let raw_path = tree.gen_proof(i);
