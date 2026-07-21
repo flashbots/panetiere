@@ -74,7 +74,7 @@ fn one_trial(
     };
     let pp = MseParams::with_layout(gamma, delta, xi, layout, prf_key);
     let mut enc = MseEncoding::new(pp);
-    let mut payload = vec![0i32; xi];
+    let mut payload = vec![0i64; xi];
     for _ in 0..n {
         for s in payload.iter_mut() {
             *s = rng.gen_range(0..1_000_000);

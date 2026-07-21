@@ -1,11 +1,12 @@
 //! Byte ↔ polynomial codec for KAHE messages.
 //!
 //! Layout: little-endian `u32` byte-length header, then the bytes themselves,
-//! padded with zeros up to the next even byte count, then packed two bytes per
-//! coefficient (little-endian `u16`). Each `KahePoly` carries `N = 2048`
-//! coefficients = `4096` bytes; the final poly is zero-padded to fill `N`
-//! coefficients. Coefficients land in `[0, 65536) ⊂ [0, q)` so a fresh single-
-//! client encode/decode is exact round-trip.
+//! padded with zeros up to the next 4-byte boundary, then packed four bytes per
+//! coefficient (little-endian `u32`). Each `KahePoly` carries `N = 2048`
+//! coefficients = `8192` bytes; the final poly is zero-padded to fill `N`
+//! coefficients. Coefficients land in `[0, 2^32) ⊂ [0, t = 2^36)` so a fresh
+//! single-client encode/decode is exact round-trip, with 2^4 per-coefficient
+//! headroom under mod-t summation.
 //!
 //! **Caveat on aggregation.** Decoding a *sum* of encoded messages is only
 //! meaningful for application-defined encodings (e.g. unique non-overlapping
@@ -14,11 +15,15 @@
 //! recovers `Σ m_i` as a polynomial; how to read meaning out of that is the
 //! application's choice.
 
-use chipmunk_code::{KahePoly, Polynomial, N};
+use chipmunk_code::{KahePoly, N};
 
-const BYTES_PER_COEFF: usize = 2;
+const BYTES_PER_COEFF: usize = 4;
 const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
 const HEADER_LEN: usize = 4;
+/// Per-coefficient symbol modulus (what fits in `BYTES_PER_COEFF` bytes).
+/// Strictly below t = 2^36, so legit slot data decrypts to non-negative
+/// centered residues `< 2^32` — anything else is overflow.
+const SYMBOL_MOD: i64 = 1 << 32;
 
 #[derive(Debug, PartialEq)]
 pub enum CodecError {
@@ -26,9 +31,10 @@ pub enum CodecError {
     Empty,
     /// Decoded length exceeds available payload bytes.
     LengthOverflow { claimed: u32, available: usize },
-    /// A coefficient lies outside `[0, 65536)` after `lift` — typically caused by
-    /// decoding a sum of encoded messages whose per-coefficient sums overflowed.
-    CoeffOutOfRange { index: usize, value: i32 },
+    /// A coefficient lies outside `[0, 2^32)` after centering — typically caused
+    /// by decoding a sum of encoded messages whose per-coefficient sums
+    /// overflowed the symbol modulus.
+    CoeffOutOfRange { index: usize, value: i64 },
 }
 
 /// Encode `bytes` into a sequence of polynomials, padding to a whole number of
@@ -37,13 +43,9 @@ pub enum CodecError {
 /// `decode_raw(sum_of_encoded)` returns the per-slot mixture without the
 /// header coefficients overflowing under summation.
 pub fn encode_raw(bytes: &[u8]) -> Vec<KahePoly> {
-    let mut buf = bytes.to_vec();
-    if buf.len() % BYTES_PER_COEFF != 0 {
-        buf.push(0);
-    }
-    // `coeffs_from_bytes` zero-pads short chunks internally, so the
+    // `coeffs_from_bytes` zero-pads short groups internally, so the
     // final under-filled chunk produces a correctly padded poly.
-    buf.chunks(BYTES_PER_POLY).map(coeffs_from_bytes).collect()
+    bytes.chunks(BYTES_PER_POLY).map(coeffs_from_bytes).collect()
 }
 
 /// Decode polynomials produced by `encode_raw`. Returns `polys.len() *
@@ -57,39 +59,33 @@ pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
         let mut p = *poly;
         p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
-            // A symbol is defined mod t = 2^16. It arrives either raw-unsigned
-            // `[0, 2^16)` (direct encode) or centered `[-2^15, 2^15)` (KAHE dec,
-            // `poly_mod_t`). Accept that union; reject genuine overflow (e.g. a
-            // summed-message coefficient ≥ 2^16 in magnitude).
-            if !(-(1 << 15)..(1 << 16)).contains(&c) {
+            // Symbols are `[0, 2^32)` both raw (direct encode) and after KAHE
+            // dec (`poly_mod_t` centers mod t = 2^36, which leaves values
+            // < 2^35 untouched). Anything else is genuine overflow.
+            if !(0..SYMBOL_MOD).contains(&c) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }
-            let u = c.rem_euclid(1 << 16);
-            buf.push((u & 0xFF) as u8);
-            buf.push(((u >> 8) & 0xFF) as u8);
+            buf.extend_from_slice(&(c as u32).to_le_bytes());
         }
     }
     Ok(buf)
 }
 
 fn coeffs_from_bytes(chunk: &[u8]) -> KahePoly {
-    let mut coeffs = [0i32; N];
-    for (i, pair) in chunk.chunks(BYTES_PER_COEFF).enumerate() {
-        let lo = pair[0] as u32;
-        let hi = if pair.len() == 2 { pair[1] as u32 } else { 0 };
-        coeffs[i] = (lo | (hi << 8)) as i32;
+    let mut coeffs = [0i64; N];
+    for (i, group) in chunk.chunks(BYTES_PER_COEFF).enumerate() {
+        let mut bytes = [0u8; 4];
+        bytes[..group.len()].copy_from_slice(group);
+        coeffs[i] = u32::from_le_bytes(bytes) as i64;
     }
     KahePoly::from_coeffs(coeffs)
 }
 
 /// Encode `bytes` into a sequence of polynomials. Always succeeds.
 pub fn encode(bytes: &[u8]) -> Vec<KahePoly> {
-    let mut buf = Vec::with_capacity(HEADER_LEN + bytes.len() + 1);
+    let mut buf = Vec::with_capacity(HEADER_LEN + bytes.len());
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(bytes);
-    if buf.len() % BYTES_PER_COEFF != 0 {
-        buf.push(0);
-    }
 
     let n_polys = buf.len().div_ceil(BYTES_PER_POLY).max(1);
     let mut polys = Vec::with_capacity(n_polys);
@@ -97,13 +93,13 @@ pub fn encode(bytes: &[u8]) -> Vec<KahePoly> {
         polys.push(coeffs_from_bytes(chunk));
     }
     while polys.len() < n_polys {
-        polys.push(KahePoly::from_coeffs([0i32; N]));
+        polys.push(KahePoly::from_coeffs([0i64; N]));
     }
     polys
 }
 
 /// Decode a sequence of polynomials produced by `encode`. Each coefficient must
-/// lie in `[0, 65536)` (after `lift`); otherwise `CoeffOutOfRange` is returned.
+/// lie in `[0, 2^32)` (after centering); otherwise `CoeffOutOfRange` is returned.
 pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     if polys.is_empty() {
         return Err(CodecError::Empty);
@@ -114,14 +110,11 @@ pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
         let mut p = *poly;
         p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
-            // See `decode_raw`: symbols are mod-t = 2^16, raw-unsigned or
-            // centered. Accept the union, reject genuine overflow.
-            if !(-(1 << 15)..(1 << 16)).contains(&c) {
+            // See `decode_raw`: symbols are `[0, 2^32)`.
+            if !(0..SYMBOL_MOD).contains(&c) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }
-            let u = c.rem_euclid(1 << 16);
-            buf.push((u & 0xFF) as u8);
-            buf.push(((u >> 8) & 0xFF) as u8);
+            buf.extend_from_slice(&(c as u32).to_le_bytes());
         }
     }
     if buf.len() < HEADER_LEN {
@@ -244,7 +237,7 @@ mod tests {
     #[test]
     fn round_trip_odd_length() {
         let msg = b"odd-length-message-with-31-byte";
-        assert_eq!(msg.len() % 2, 1);
+        assert_eq!(msg.len() % BYTES_PER_COEFF, 3);
         let polys = encode(msg);
         assert_eq!(decode(&polys).unwrap().as_slice(), msg);
     }
@@ -261,7 +254,7 @@ mod tests {
     fn raw_sum_of_disjoint_slots_decodes() {
         // Two clients writing into disjoint byte slots inside the same poly.
         // `encode_raw` skips the length header, so coefficient sums stay below
-        // 2^16 and `decode_raw` recovers the per-slot bytes.
+        // symbol modulus and `decode_raw` recovers the per-slot bytes.
         let mut buf_a = vec![0u8; BYTES_PER_POLY];
         let mut buf_b = vec![0u8; BYTES_PER_POLY];
         buf_a[0..4].copy_from_slice(b"AAAA");
@@ -286,8 +279,8 @@ mod tests {
 
     #[test]
     fn decode_rejects_oob_coeff() {
-        let mut coeffs = [0i32; N];
-        coeffs[0] = 1 << 17; // > 65535
+        let mut coeffs = [0i64; N];
+        coeffs[0] = 1 << 33; // ≥ 2^32
         let polys = vec![KahePoly::from_coeffs(coeffs)];
         match decode(&polys) {
             Err(CodecError::CoeffOutOfRange { .. }) => {}
@@ -304,10 +297,10 @@ mod tests {
     fn allocate_packs_and_overflows() {
         // Two fit into a 2-poly vector, the third overflows.
         let vector_bytes = 2 * BYTES_PER_POLY;
-        let res = vec![(10u16, 4096usize), (20, 4096), (30, 16)];
+        let res = vec![(10u16, BYTES_PER_POLY), (20, BYTES_PER_POLY), (30, 16)];
         let offs = allocate(&res, 0, vector_bytes);
         assert_eq!(offs[0], Some(0));
-        assert_eq!(offs[1], Some(4096));
+        assert_eq!(offs[1], Some(BYTES_PER_POLY));
         assert_eq!(offs[2], None);
     }
 

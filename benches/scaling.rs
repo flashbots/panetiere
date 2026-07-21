@@ -10,7 +10,7 @@
 //!   [D] derived   — exact byte arithmetic from packing formulas
 //!   [C] composed  — cost model `wall = fixed + l·chunk` over [M] medians
 //!                   (one client ∥ one server ∥ verifier; parties parallel)
-//!   [P] projected — full-utilization extrapolation and synthetic network sim
+//!   [P] projected — synthetic network sim
 //!
 //! Each cell runs ONE live round; every active client encodes a distinct
 //! (element, r). Recovery is attempted and reported, never asserted —
@@ -47,11 +47,11 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
 //! ──────────────────────────────────────────────────────────────────────
-//!  chipmunk param.rs: N = 2048, q_hvc = 40_961, q_cs = 147_457,
-//!                     q_kahe = 271_163_393, HVC_WIDTH = 3
-//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^16, σ_s = 15.72, σ_e = √2·σ_s
-//!                noise budget t·8σ_e·√ρ + ρ·t/2 < q_kahe/2 (ρ ≲ 240)
-//!  src/mse.rs:   BITS_PER_SYMBOL = 16, K_LIMBS = 2
+//!  chipmunk param.rs: N = 2048, q_hvc = 40_961, q_cs = 139_301,
+//!                     q_kahe = 347_280_875_347_969, HVC_WIDTH = 3
+//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^36, σ_s = σ_e = 15.72
+//!                noise budget t·8σ_e·√ρ + ρ·t/2 < q_kahe/2 (ρ ≲ 349)
+//!  src/mse.rs:   BITS_PER_SYMBOL = 36, K_LIMBS = 2
 //!  bench-internal: MSE PRF key = [0xAA; 32]; ChaCha20 seeds deterministic
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
 //!
@@ -64,7 +64,7 @@ use std::time::{Duration, Instant};
 
 use chipmunk_code::{KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA};
 use panetiere::codec;
-use panetiere::cs::{poly_packed_len, Commitment, Cs, HidingMerkleCommitment};
+use panetiere::cs::{poly_packed_len, poly_packed_len64, Commitment, Cs, HidingMerkleCommitment};
 use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL};
 use panetiere::pke;
@@ -93,15 +93,15 @@ struct Config {
     payload_symbols: usize, // ξ: per-client element size = ξ·log₂t bits
 }
 
-// MU_KAHE — the KAHE encryption chunk size, in polys. A fixed number, picked so
-// one chunk holds the encoding of a 1 KB-element IBLT for 100 clients:
-// ⌈BUCKETS · (1 + K_LIMBS + 512) / N⌉ = ⌈300·515/2048⌉ = 76. A larger message's
-// IBLT encoding spans l = ⌈n_polys/MU_KAHE⌉ chunks, each under its own matrix
-// A_i but the same key sk, so the Shamir+CS pass amortizes over all l chunks.
-const MU_KAHE: usize = 76;
+// MU_KAHE — the KAHE encryption chunk size, in polys (µ from the KAHE param
+// table, sized so one key covers a 20 KiB-element IBLT at ρ=300). A larger
+// message's IBLT encoding spans l = ⌈n_polys/MU_KAHE⌉ chunks, each under its
+// own matrix A_i but the same key sk, so the Shamir+CS pass amortizes over
+// all l chunks.
+const MU_KAHE: usize = 2002;
 
-/// Codec bytes per poly (chipmunk `N` coefficients × 2 bytes), matching `codec`.
-const BYTES_PER_POLY: usize = POLY_N * 2;
+/// Codec bytes per poly (chipmunk `N` coefficients × 4 bytes), matching `codec`.
+const BYTES_PER_POLY: usize = POLY_N * 4;
 
 /// Repetitions per measured phase; tables show the median, CSV keeps min/max.
 const REPS: usize = 5;
@@ -125,13 +125,8 @@ const SCHED_MESSAGE_BYTES: &[usize] = &[409600, 2097152];
 // 2-layer → ⌈∛ρ⌉.
 const AGG_LAYERS: &[usize] = &[1];
 
-// Max total KAHE width the scheme supports (noise budget / IBLT capacity): the
-// encoding is at most MU_FULL polys ⇒ at most ⌈MU_FULL/MU_KAHE⌉ ≈ 189 chunks.
-// Each row extrapolates throughput to this full-utilization point.
-const MU_FULL: f64 = 14401.0;
-
-// Per-client element size = ξ symbols · 16 bits: 2048 ⇒ 4 KiB, 10240 ⇒ 20 KiB.
-const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[2048, 10240];
+// Per-client element size = ξ symbols · 36 bits: 911 ⇒ 4 KiB, 4552 ⇒ 20 KiB.
+const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[911, 4552];
 
 // ── env sweep knobs (fall back to the consts above) ─────────────────────────
 
@@ -295,6 +290,7 @@ struct Row {
     delta: usize,
     xi: usize,
     l: usize,
+    n_polys: usize, // actual message length; ≤ μ·l (final chunk may be partial)
     recovered_ok: bool,
     // [M] CPU, per-round totals for one party (the ×l chunk work included).
     enc_app: Stat,
@@ -314,7 +310,7 @@ struct Row {
     open_env_b: usize,
     // [D] wire components (bytes).
     comm_client_b: usize,      // one commitment root
-    ctxt_chunk_client_b: usize, // one KAHE chunk (μ polys)
+    ctxt_client_b: usize,      // one client's full ciphertext (n_polys polys)
     agg_open_b: usize,          // server-posted aggregate opening
     agg_share_b: usize,         // server-posted agg_share (κ CS polys)
     // [D] round totals across all parties.
@@ -383,12 +379,12 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
 
     // Active clients carry a distinct payload; cover clients contribute zero.
     // Mse: a ξ-element. Scheduled: a (rand,size) token, then the client's slot.
-    let mse_payloads: Vec<Vec<i32>> = match codec {
+    let mse_payloads: Vec<Vec<i64>> = match codec {
         AppCodec::Mse => (0..active)
-            .map(|i| (0..cfg.payload_symbols).map(|j| i as i32 + j as i32 + 1).collect())
+            .map(|i| (0..cfg.payload_symbols).map(|j| i as i64 + j as i64 + 1).collect())
             .collect(),
         AppCodec::Scheduled { .. } => {
-            (0..active).map(|i| vec![i as i32 + 1, slot_bytes as i32]).collect()
+            (0..active).map(|i| vec![i as i64 + 1, slot_bytes as i64]).collect()
         }
     };
     let byte_payloads: Vec<Vec<u8>> =
@@ -407,7 +403,9 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             if matches!(codec, AppCodec::Scheduled { .. }) && i < active {
                 polys.extend(codec::encode_at(ranges[i].0, msg_vector_bytes, &byte_payloads[i]));
             }
-            polys.resize(mu_kahe * l, KahePoly::default());
+            // Pad covers/short encodings to the joint plaintext width — NOT to
+            // the μ·l chunk boundary; the final KAHE chunk may be partial.
+            polys.resize(n_polys, KahePoly::default());
             polys
         })
         .collect();
@@ -453,7 +451,7 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         .body_len();
     let agg_share_b = KAPPA_KAHE * poly_packed_len(CS_MODULUS);
     let comm_client_b = poly_packed_len(HVC_MODULUS);
-    let ctxt_chunk_client_b = mu_kahe * poly_packed_len(KAHE_MODULUS);
+    let ctxt_client_b = n_polys * poly_packed_len64(KAHE_MODULUS);
 
     // [M] per-phase CPU, median of REPS one-party runs each.
     let (enc_app, _) = match codec {
@@ -647,6 +645,7 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             AppCodec::Scheduled { .. } => SCHED_TOKEN_SYMBOLS,
         },
         l,
+        n_polys,
         recovered_ok,
         enc_app,
         kahe_enc,
@@ -663,14 +662,14 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         dec_app,
         open_env_b,
         comm_client_b,
-        ctxt_chunk_client_b,
+        ctxt_client_b,
         agg_open_b,
         agg_share_b,
         useful_b: match codec {
             AppCodec::Mse => (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
             AppCodec::Scheduled { .. } => (active * slot_bytes) as f64,
         },
-        wire_ctxt_b: n as f64 * (mu_kahe * l) as f64 * poly_packed_len(KAHE_MODULUS) as f64,
+        wire_ctxt_b: n as f64 * ctxt_client_b as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
@@ -711,7 +710,9 @@ fn model(r: &Row) -> Model {
     let agg_cpu_us = r.agg_plans.iter().map(|p| cpu_base_agg_us + p.leader.med).collect();
     Model {
         fixed_us,
-        chunk_us: chunk_total_us / r.l as f64,
+        // Per full μ-wide chunk equivalent — the final chunk may be partial,
+        // so normalize by actual polys, not by ⌈n_polys/μ⌉.
+        chunk_us: chunk_total_us * r.mu_kahe as f64 / r.n_polys as f64,
         wall_us,
         wire_total_b,
         efficiency: r.useful_b / wire_total_b,
@@ -802,13 +803,6 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
 fn net_all(r: &Row, m: &Model) -> Vec<NetPoint> {
     let mut nrng = ChaCha20Rng::from_seed([0x5E; 32]);
     NETWORKS.iter().map(|prof| net_sim(r, m, prof, &mut nrng)).collect()
-}
-
-fn full_util(r: &Row, m: &Model) -> (f64, f64) {
-    let l_full = MU_FULL / r.mu_kahe as f64;
-    let wall_us = m.fixed_us + m.chunk_us * l_full;
-    let useful_b = r.useful_b * l_full / r.l as f64;
-    (useful_b, wall_us)
 }
 
 // ── tables ──────────────────────────────────────────────────────────────────
@@ -903,14 +897,14 @@ fn print_tables(rows: &[Row]) {
     println!("── wire components, per emitter ([M] open_env off the wire; rest [D]) ───────");
     println!(
         "{:<4}{:>10}{:>15}   {:<30}{}",
-        "id", "comm/cl", "ctxt/chunk/cl", "open_env →1srv (×S /cl)", "srv_entry = agg_open + agg_share"
+        "id", "comm/cl", "ctxt/cl", "open_env →1srv (×S /cl)", "srv_entry = agg_open + agg_share"
     );
     for (i, r) in rows.iter().enumerate() {
         println!(
             "{:<4}{:>10}{:>15}   {:<30}{}",
             cell_id(i),
             fmt_bytes(r.comm_client_b as f64),
-            fmt_bytes(r.ctxt_chunk_client_b as f64),
+            fmt_bytes(r.ctxt_client_b as f64),
             format!(
                 "{} (×{} = {})",
                 fmt_bytes(r.open_env_b as f64),
@@ -988,18 +982,6 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
-    println!(
-        "── [P] full utilization (μ_total={}, l≈{:.0}; fixed and per-chunk cost held) ──",
-        MU_FULL,
-        MU_FULL / MU_KAHE as f64
-    );
-    println!("{:<4}{:>12}{:>10}", "id", "useful", "wall");
-    for (i, r) in rows.iter().enumerate() {
-        let (useful_b, wall_us) = full_util(r, &models[i]);
-        println!("{:<4}{:>12}{:>10}", cell_id(i), fmt_bytes(useful_b), fmt_us(wall_us));
-    }
-    println!();
-
     println!("── [P] network sim: e2e = [C] wall + synthetic net; MB/s = useful/e2e ───────");
     println!(
         "{:<4}{:<7}{:>12}{:>13}{:>12}{:>12}",
@@ -1065,10 +1047,9 @@ fn write_csv(rows: &[Row]) {
     }
     header.push_str(
         ",m_open_env_b\
-         ,d_comm_client_b,d_ctxt_chunk_client_b,d_agg_open_b,d_agg_share_b\
+         ,d_comm_client_b,d_ctxt_client_b,d_agg_open_b,d_agg_share_b\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
-         ,c_fixed_us,c_chunk_us,c_wall_us,c_efficiency,c_agg1_wall_us\
-         ,p_fullutil_useful_b,p_fullutil_wall_us",
+         ,c_fixed_us,c_chunk_us,c_wall_us,c_efficiency,c_agg1_wall_us",
     );
     for prof in NETWORKS {
         write!(
@@ -1116,7 +1097,7 @@ fn write_csv(rows: &[Row]) {
             ",{},{},{},{},{},{:.0},{:.0},{:.0},{:.0},{:.0}",
             r.open_env_b,
             r.comm_client_b,
-            r.ctxt_chunk_client_b,
+            r.ctxt_client_b,
             r.agg_open_b,
             r.agg_share_b,
             r.wire_ctxt_b,
@@ -1136,8 +1117,6 @@ fn write_csv(rows: &[Row]) {
             m.agg_cpu_us.first().copied().unwrap_or(0.0),
         )
         .unwrap();
-        let (fu_b, fu_wall) = full_util(r, &m);
-        write!(out, ",{:.0},{:.3}", fu_b, fu_wall).unwrap();
         let mbps = |e2e_us: f64| r.useful_b / (e2e_us / 1e6) / 1e6;
         for np in net_all(r, &m) {
             let (agg_net, agg_e2e) = np.agg.first().copied().unwrap_or((0.0, 0.0));
@@ -1201,8 +1180,8 @@ fn main() {
         "ring: HVC {} bits/coef ({} B/poly) | KAHE {} bits/coef ({} B/poly) | t bits/symbol {}",
         poly_packed_len(HVC_MODULUS) * 8 / POLY_N,
         poly_packed_len(HVC_MODULUS),
-        poly_packed_len(KAHE_MODULUS) * 8 / POLY_N,
-        poly_packed_len(KAHE_MODULUS),
+        poly_packed_len64(KAHE_MODULUS) * 8 / POLY_N,
+        poly_packed_len64(KAHE_MODULUS),
         BITS_PER_SYMBOL,
     );
     println!("provenance: [M] measured   — median of {} one-party reps (spread in csv)", REPS);

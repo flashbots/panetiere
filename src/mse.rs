@@ -39,19 +39,17 @@
 //! `KahePoly`s.
 //!
 //! MSE cell arithmetic runs in `Z_t` where `t = T_MODULUS_DEFAULT` is
-//! the KAHE plaintext modulus. With `t = 2^16` and `L = K_LIMBS = 2`,
-//! `r ∈ Z_{t^2} = Z_{2^32}`, so r-arithmetic fits in a `u64`. If a wider
-//! r-space is ever needed, bump `K_LIMBS` (and the `u64` arithmetic with
-//! it) — `L = 2` is plenty for the protocol's current operating point.
+//! the KAHE plaintext modulus. With `t = 2^36` and `L = K_LIMBS = 2`,
+//! `r ∈ Z_{t^2} = Z_{2^72}`, so r-arithmetic runs in `u128`.
 
-use chipmunk_code::{KahePoly, Polynomial, N};
+use chipmunk_code::{KahePoly, N};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use crate::kahe::T_MODULUS_DEFAULT;
 
-const T: i32 = T_MODULUS_DEFAULT as i32;
-const T_OVER_TWO: i32 = T / 2;
+const T: i64 = T_MODULUS_DEFAULT as i64;
+const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
 /// Bits of payload carried per symbol.
@@ -141,11 +139,10 @@ impl MseParams {
         (1 + K_LIMBS + self.payload_symbols) * self.total_cells()
     }
 
-    /// `t^K_LIMBS`, the size of the randomness space. Fits in `u64`
-    /// since `T_MODULUS_DEFAULT^2 = 2^36 < 2^64`.
-    pub fn r_space(&self) -> u64 {
-        let t = T_MODULUS_DEFAULT as u64;
-        let mut p: u64 = 1;
+    /// `t^K_LIMBS`, the size of the randomness space. `t^2 = 2^72`, so u128.
+    pub fn r_space(&self) -> u128 {
+        let t = T_MODULUS_DEFAULT as u128;
+        let mut p: u128 = 1;
         for _ in 0..K_LIMBS {
             p *= t;
         }
@@ -157,11 +154,11 @@ impl MseParams {
 pub struct MseEncoding {
     pub params: MseParams,
     /// Counters per cell; row-major `gamma × delta`.
-    pub c: Vec<i32>,
+    pub c: Vec<i64>,
     /// Randomness accumulator limbs. `k[ℓ]` has `gamma*delta` entries.
-    pub k: Vec<Vec<i32>>,
+    pub k: Vec<Vec<i64>>,
     /// Payload accumulator symbols. `v[s]` has `gamma*delta` entries.
-    pub v: Vec<Vec<i32>>,
+    pub v: Vec<Vec<i64>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -175,8 +172,8 @@ pub enum MseError {
 }
 
 #[inline]
-fn reduce(x: i64) -> i32 {
-    let mut r = x.rem_euclid(T as i64) as i32;
+fn reduce(x: i64) -> i64 {
+    let mut r = x.rem_euclid(T);
     if r > T_OVER_TWO {
         r -= T;
     }
@@ -185,11 +182,11 @@ fn reduce(x: i64) -> i32 {
 
 /// Canonical unsigned rep `[0, t)` from centered `[-t/2, t/2]`.
 #[inline]
-fn to_canonical(x: i32) -> u64 {
-    (x as i64).rem_euclid(T as i64) as u64
+fn to_canonical(x: i64) -> u128 {
+    x.rem_euclid(T) as u128
 }
 
-fn prf_bucket(key: &[u8; 32], row: usize, r: u64, delta: usize) -> usize {
+fn prf_bucket(key: &[u8; 32], row: usize, r: u128, delta: usize) -> usize {
     let mut h = Sha256::new();
     h.update(key);
     h.update((row as u32).to_le_bytes());
@@ -202,8 +199,8 @@ fn prf_bucket(key: &[u8; 32], row: usize, r: u64, delta: usize) -> usize {
 impl MseEncoding {
     pub fn new(params: MseParams) -> Self {
         let n = params.total_cells();
-        let k = (0..K_LIMBS).map(|_| vec![0i32; n]).collect();
-        let v = (0..params.payload_symbols).map(|_| vec![0i32; n]).collect();
+        let k = (0..K_LIMBS).map(|_| vec![0i64; n]).collect();
+        let v = (0..params.payload_symbols).map(|_| vec![0i64; n]).collect();
         Self {
             c: vec![0; n],
             k,
@@ -219,38 +216,38 @@ impl MseEncoding {
     /// Insert one element. `payload.len()` must equal
     /// `params.payload_symbols`; each entry is reduced mod `t`. Fresh
     /// randomness `r ← Z_{t^L}` is drawn from `rng`.
-    pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i32]) {
+    pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i64]) {
         let r_space = self.params.r_space();
-        let r: u64 = rng.gen::<u64>() % r_space;
+        let r: u128 = rng.gen::<u128>() % r_space;
         self.insert_with_r(payload, r);
     }
 
     /// Insert with caller-supplied randomness — useful for deterministic
     /// tests. `r` must be in `[0, t^K_LIMBS)`.
-    pub fn insert_with_r(&mut self, payload: &[i32], r: u64) {
+    pub fn insert_with_r(&mut self, payload: &[i64], r: u128) {
         assert_eq!(
             payload.len(),
             self.params.payload_symbols,
             "payload arity must match params.payload_symbols",
         );
         debug_assert!(r < self.params.r_space(), "r must be in [0, t^K_LIMBS)");
-        let t = T_MODULUS_DEFAULT as u64;
-        let mut limbs = [0i32; K_LIMBS];
+        let t = T_MODULUS_DEFAULT as u128;
+        let mut limbs = [0i64; K_LIMBS];
         let mut acc = r;
         for limb in limbs.iter_mut() {
             *limb = reduce((acc % t) as i64);
             acc /= t;
         }
-        let payload_reduced: Vec<i32> = payload.iter().map(|&x| reduce(x as i64)).collect();
+        let payload_reduced: Vec<i64> = payload.iter().map(|&x| reduce(x)).collect();
         for row in 0..self.params.gamma {
             let col = prf_bucket(&self.params.prf_key, row, r, self.params.row_delta(row));
             let idx = self.idx(row, col);
-            self.c[idx] = reduce(self.c[idx] as i64 + 1);
+            self.c[idx] = reduce(self.c[idx] + 1);
             for ell in 0..K_LIMBS {
-                self.k[ell][idx] = reduce(self.k[ell][idx] as i64 + limbs[ell] as i64);
+                self.k[ell][idx] = reduce(self.k[ell][idx] + limbs[ell]);
             }
             for s in 0..self.params.payload_symbols {
-                self.v[s][idx] = reduce(self.v[s][idx] as i64 + payload_reduced[s] as i64);
+                self.v[s][idx] = reduce(self.v[s][idx] + payload_reduced[s]);
             }
         }
     }
@@ -261,23 +258,23 @@ impl MseEncoding {
             return Err(MseError::ParamsMismatch);
         }
         for i in 0..self.c.len() {
-            self.c[i] = reduce(self.c[i] as i64 + other.c[i] as i64);
+            self.c[i] = reduce(self.c[i] + other.c[i]);
             for ell in 0..K_LIMBS {
-                self.k[ell][i] = reduce(self.k[ell][i] as i64 + other.k[ell][i] as i64);
+                self.k[ell][i] = reduce(self.k[ell][i] + other.k[ell][i]);
             }
             for s in 0..self.params.payload_symbols {
-                self.v[s][i] = reduce(self.v[s][i] as i64 + other.v[s][i] as i64);
+                self.v[s][i] = reduce(self.v[s][i] + other.v[s][i]);
             }
         }
         Ok(())
     }
 
     /// Peel pure cells until exhausted. Returns the recovered multiset
-    /// as a `Vec` of payload tuples (each `Vec<i32>` has length
+    /// as a `Vec` of payload tuples (each `Vec<i64>` has length
     /// `params.payload_symbols`), sorted lexicographically. Returns
     /// `Err(PeelStalled)` if any cell remains nonzero after no further
     /// pure cell can be found.
-    pub fn decode(&self) -> Result<Vec<Vec<i32>>, MseError> {
+    pub fn decode(&self) -> Result<Vec<Vec<i64>>, MseError> {
         let mut c = self.c.clone();
         let mut k = self.k.clone();
         let mut v = self.v.clone();
@@ -293,10 +290,10 @@ impl MseEncoding {
             }
         }
 
-        let mut emitted: Vec<Vec<i32>> = Vec::new();
-        let mut limb_signed = [0i32; K_LIMBS];
-        let mut x_star_buf = vec![0i32; self.params.payload_symbols];
-        let t_u64 = T_MODULUS_DEFAULT as u64;
+        let mut emitted: Vec<Vec<i64>> = Vec::new();
+        let mut limb_signed = [0i64; K_LIMBS];
+        let mut x_star_buf = vec![0i64; self.params.payload_symbols];
+        let t_u128 = T_MODULUS_DEFAULT as u128;
         // Outer loop terminates because every iteration that hits the
         // `c[idx] == 1` branch strictly reduces the multiset still
         // encoded in the matrices: one element is emitted and subtracted
@@ -311,13 +308,13 @@ impl MseEncoding {
             if c[idx] != 1 {
                 continue;
             }
-            let mut r_star: u64 = 0;
-            let mut place: u64 = 1;
+            let mut r_star: u128 = 0;
+            let mut place: u128 = 1;
             for ell in 0..K_LIMBS {
                 let signed = k[ell][idx];
                 limb_signed[ell] = signed;
                 r_star += to_canonical(signed) * place;
-                place *= t_u64;
+                place *= t_u128;
             }
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
@@ -327,12 +324,12 @@ impl MseEncoding {
                 let row_d = self.params.row_delta(i);
                 let j = prf_bucket(&self.params.prf_key, i, r_star, row_d);
                 let cell = self.params.row_offset(i) + j;
-                c[cell] = reduce(c[cell] as i64 - 1);
+                c[cell] = reduce(c[cell] - 1);
                 for ell in 0..K_LIMBS {
-                    k[ell][cell] = reduce(k[ell][cell] as i64 - limb_signed[ell] as i64);
+                    k[ell][cell] = reduce(k[ell][cell] - limb_signed[ell]);
                 }
                 for s in 0..self.params.payload_symbols {
-                    v[s][cell] = reduce(v[s][cell] as i64 - x_star_buf[s] as i64);
+                    v[s][cell] = reduce(v[s][cell] - x_star_buf[s]);
                 }
                 if c[cell] == 1 {
                     queue.push((i, j));
@@ -368,14 +365,14 @@ impl MseEncoding {
         let total = self.params.total_scalars();
         let n_polys = total.div_ceil(N);
         let mut polys = Vec::with_capacity(n_polys);
-        let mut buf = [0i32; N];
+        let mut buf = [0i64; N];
         let mut written = 0usize;
-        let mut feed = |val: i32, polys: &mut Vec<KahePoly>| {
+        let mut feed = |val: i64, polys: &mut Vec<KahePoly>| {
             buf[written % N] = val;
             written += 1;
             if written % N == 0 {
                 polys.push(KahePoly::from_coeffs(buf));
-                buf = [0i32; N];
+                buf = [0i64; N];
             }
         };
         for &x in &self.c {
@@ -402,7 +399,7 @@ impl MseEncoding {
     pub fn unpack(params: &MseParams, polys: &[KahePoly]) -> Self {
         let total = params.total_scalars();
         assert_eq!(polys.len(), total.div_ceil(N));
-        let mut flat: Vec<i32> = Vec::with_capacity(polys.len() * N);
+        let mut flat: Vec<i64> = Vec::with_capacity(polys.len() * N);
         for p in polys {
             let mut q = *p;
             q.normalize();
@@ -411,11 +408,11 @@ impl MseEncoding {
 
         let cells = params.total_cells();
         let c = flat[..cells].to_vec();
-        let k: Vec<Vec<i32>> = (0..K_LIMBS)
+        let k: Vec<Vec<i64>> = (0..K_LIMBS)
             .map(|ell| flat[(1 + ell) * cells..(2 + ell) * cells].to_vec())
             .collect();
         let v_base = (1 + K_LIMBS) * cells;
-        let v: Vec<Vec<i32>> = (0..params.payload_symbols)
+        let v: Vec<Vec<i64>> = (0..params.payload_symbols)
             .map(|s| flat[v_base + s * cells..v_base + (s + 1) * cells].to_vec())
             .collect();
         Self {
@@ -461,7 +458,7 @@ mod tests {
         for &x in &elements {
             enc.insert(&mut rng, &[x]);
         }
-        let mut recovered: Vec<i32> = enc
+        let mut recovered: Vec<i64> = enc
             .decode()
             .expect("decode")
             .into_iter()
@@ -485,7 +482,7 @@ mod tests {
             b.insert(&mut rng, &[x]);
         }
         a.add_assign(&b).unwrap();
-        let mut recovered: Vec<i32> = a
+        let mut recovered: Vec<i64> = a
             .decode()
             .expect("decode")
             .into_iter()
@@ -507,7 +504,7 @@ mod tests {
         assert_eq!(polys.len(), MseEncoding::n_polys(&pp));
         let restored = MseEncoding::unpack(&pp, &polys);
         assert_eq!(restored, enc);
-        let mut got: Vec<i32> = restored
+        let mut got: Vec<i64> = restored
             .decode()
             .expect("decode")
             .into_iter()
@@ -537,7 +534,7 @@ mod tests {
             .map(|(x, y)| *x + *y)
             .collect();
         let unioned = MseEncoding::unpack(&pp, &summed);
-        let mut got: Vec<i32> = unioned
+        let mut got: Vec<i64> = unioned
             .decode()
             .expect("decode")
             .into_iter()
@@ -555,7 +552,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
         let pp = params_for(4, 64, 4, 17);
         let mut enc = MseEncoding::new(pp);
-        let mut messages: Vec<Vec<i32>> = (0..10)
+        let mut messages: Vec<Vec<i64>> = (0..10)
             .map(|i| vec![i * 11, i * 13 + 1, i * 17 + 2, i * 19 + 3])
             .collect();
         for m in &messages {
@@ -567,17 +564,17 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → 32 symbols at BITS_PER_SYMBOL=16 (t=2^16). Smaller
+    /// 512-bit message → 15 symbols at BITS_PER_SYMBOL=36 (t=2^36). Smaller
     /// multiset but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = MseParams::payload_symbols_for_bits(512);
-        assert_eq!(xi, 32);
+        assert_eq!(xi, 15);
         let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
-        let mut messages: Vec<Vec<i32>> = (0..5)
-            .map(|i| (0..xi).map(|s| (i * 7 + s * 13) as i32).collect())
+        let mut messages: Vec<Vec<i64>> = (0..5)
+            .map(|i| (0..xi).map(|s| (i * 7 + s * 13) as i64).collect())
             .collect();
         for m in &messages {
             enc.insert(&mut rng, m);
@@ -605,11 +602,11 @@ mod tests {
         );
         assert_eq!(pp.total_cells(), 248);
         let mut enc = MseEncoding::new(pp);
-        let mut elements: Vec<i32> = (0..20).map(|i| i * 7 + 1).collect();
+        let mut elements: Vec<i64> = (0..20).map(|i| i * 7 + 1).collect();
         for &x in &elements {
             enc.insert(&mut rng, &[x]);
         }
-        let mut recovered: Vec<i32> = enc
+        let mut recovered: Vec<i64> = enc
             .decode()
             .expect("decode")
             .into_iter()

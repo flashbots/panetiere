@@ -88,11 +88,11 @@ fn full_round_is_thread_count_invariant() {
 
 /// Sample a polynomial with coefficients centered in `[-t/2, t/2)` —
 /// matches the KAHE plaintext space `R_t`.
-fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {
-    let half = t as i32 / 2;
-    let mut coeffs = [0i32; N];
+fn rand_message_poly<R: Rng>(rng: &mut R, t: u64) -> KahePoly {
+    let half = t as i64 / 2;
+    let mut coeffs = [0i64; N];
     for c in coeffs.iter_mut() {
-        *c = (rng.gen_range(0..t) as i32) - half;
+        *c = rng.gen_range(0..t) as i64 - half;
     }
     KahePoly::from_coeffs(coeffs)
 }
@@ -100,12 +100,12 @@ fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {
 /// Reduce each coefficient of `poly` mod `t` into centered range — used to
 /// compute the expected aggregate decryption (`Σm mod t`). Uses `normalize`
 /// (centered `[-q/2, q/2]`) so the mod-t residue isn't skewed by `q mod t`.
-fn reduce_centered_mod_t(poly: KahePoly, t: u32) -> KahePoly {
+fn reduce_centered_mod_t(poly: KahePoly, t: u64) -> KahePoly {
     let mut p = poly;
     p.normalize();
-    let t_i = t as i32;
+    let t_i = t as i64;
     let half = t_i / 2;
-    let mut coeffs = [0i32; N];
+    let mut coeffs = [0i64; N];
     for (out, &c) in coeffs.iter_mut().zip(p.coeffs().iter()) {
         let r = c.rem_euclid(t_i);
         *out = if r >= half { r - t_i } else { r };
@@ -177,8 +177,8 @@ fn run<R: rand::Rng + rand::CryptoRng>(
 /// 1024-byte buffer with each client's bytes intact in its own slot — i.e.
 /// anonymous broadcast in slot mode.
 ///
-/// `t = T_MODULUS_DEFAULT = 65_536 = 2^16`, exactly the codec's
-/// 16-bit-per-coefficient layout.
+/// `t = T_MODULUS_DEFAULT = 2^36`; the codec packs 32-bit symbols per
+/// coefficient, comfortably inside t.
 #[test]
 fn slot_mode_disjoint_clients_recover_each_payload() {
     let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
@@ -194,8 +194,8 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
     ];
     let n_clients = messages.len();
     const SLOT_SIZE: usize = 128;
-    // One KahePoly = N·2 bytes = 4096 at N=2048.
-    const TOTAL_BYTES: usize = 4096;
+    // One KahePoly = N·4 bytes = 8192 at N=2048.
+    const TOTAL_BYTES: usize = 8192;
     assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
@@ -266,9 +266,9 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
     }
 }
 
-/// 8 KB broadcast: total buffer is 8 polys (8192 bytes). Each of 4 clients
-/// writes a 2 KB payload into its own slot; we run the full protocol once per
-/// poly index of the encoded buffer (8 sub-rounds), recover the per-poly sums,
+/// 16 KB broadcast: total buffer is 2 polys (16384 bytes). Each of 4 clients
+/// writes a 4 KB payload into its own slot; we run the full protocol once per
+/// poly index of the encoded buffer (2 sub-rounds), recover the per-poly sums,
 /// concatenate, and assert each client's slot decodes byte-for-byte.
 ///
 #[test]
@@ -276,10 +276,10 @@ fn slot_mode_8kb_message_multi_poly() {
     let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
     let n_servers = 3;
     let n_clients = 4;
-    const SLOT_SIZE: usize = 2048;
-    const TOTAL_BYTES: usize = 8 * 1024;
-    // One KahePoly = N·2 bytes = 4096 at N=2048 → 8 KiB spans 2 polys.
-    const N_POLYS: usize = TOTAL_BYTES / 4096;
+    const SLOT_SIZE: usize = 4096;
+    const TOTAL_BYTES: usize = 16 * 1024;
+    // One KahePoly = N·4 bytes = 8192 at N=2048 → 16 KiB spans 2 polys.
+    const N_POLYS: usize = TOTAL_BYTES / 8192;
     assert_eq!(n_clients * SLOT_SIZE, TOTAL_BYTES);
 
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_clients);

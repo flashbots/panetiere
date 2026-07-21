@@ -2,7 +2,7 @@
 
 use std::sync::Mutex;
 
-use crate::cs::{pack_poly, poly_packed_len, unpack_poly, Commitment, Opening};
+use crate::cs::{pack_poly64, poly_packed_len, poly_packed_len64, unpack_poly64, Commitment, Opening};
 use crate::protocol::{ClientId, ServerId};
 use chipmunk_code::{CsPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS};
 
@@ -19,11 +19,11 @@ impl ClientBulletinEntry {
     /// polynomials packed against `KAHE_MODULUS`, then the commitment.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
-            2 + self.ctxt.len() * poly_packed_len(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS),
+            2 + self.ctxt.len() * poly_packed_len64(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS),
         );
         out.extend_from_slice(&(self.ctxt.len() as u16).to_le_bytes());
         for p in &self.ctxt {
-            pack_poly(p.coeffs(), KAHE_MODULUS, &mut out);
+            pack_poly64(p.coeffs(), KAHE_MODULUS, &mut out);
         }
         out.extend_from_slice(&self.comm.to_bytes());
         out
@@ -32,14 +32,14 @@ impl ClientBulletinEntry {
     /// Byte length of [`to_bytes`](Self::to_bytes) for `mu_kahe` ciphertext
     /// slots, without building an entry — for wire-budget planning.
     pub fn packed_len(mu_kahe: usize) -> usize {
-        2 + mu_kahe * poly_packed_len(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS)
+        2 + mu_kahe * poly_packed_len64(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS)
     }
 
     /// Inverse of [`ClientBulletinEntry::to_bytes`]; `None` on any length
     /// mismatch.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let n_ctxt = u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as usize;
-        let kahe_len = poly_packed_len(KAHE_MODULUS);
+        let kahe_len = poly_packed_len64(KAHE_MODULUS);
         let hvc_len = poly_packed_len(HVC_MODULUS);
         if bytes.len() != 2 + n_ctxt * kahe_len + hvc_len {
             return None;
@@ -47,7 +47,7 @@ impl ClientBulletinEntry {
         let mut ctxt = Vec::with_capacity(n_ctxt);
         let mut start = 2;
         for _ in 0..n_ctxt {
-            let (coeffs, next) = unpack_poly(bytes, start, KAHE_MODULUS);
+            let (coeffs, next) = unpack_poly64(bytes, start, KAHE_MODULUS);
             start = next;
             ctxt.push(KahePoly::from_coeffs(coeffs));
         }

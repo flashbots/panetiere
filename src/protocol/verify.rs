@@ -98,7 +98,9 @@ pub fn aggregate_and_decrypt_timed(
     let kappa_kahe = pp.kahe.kappa_kahe;
     let mu_kahe = pp.kahe.mu_kahe;
     let l = pp.kahe.l;
-    let ctxt_len = mu_kahe * l;
+    // Ciphertexts may end with a partial chunk; all clients must agree on the
+    // exact length (agg_ctxt sums positionally), bounded by μ·l.
+    let max_ctxt_len = mu_kahe * l;
     let t = pp.shamir.t;
 
     if server_outputs.len() < t {
@@ -128,12 +130,14 @@ pub fn aggregate_and_decrypt_timed(
 
     let mut ctxts: Vec<Vec<KahePoly>> = Vec::with_capacity(canonical.len());
     let mut comms = Vec::with_capacity(canonical.len());
+    let mut ctxt_len: Option<usize> = None;
     for cid in canonical {
         let i = *pub_index
             .get(cid)
             .ok_or(VerifyError::MissingClient(*cid))?;
         let (_, p) = &client_entries[i];
-        if p.ctxt.len() != ctxt_len {
+        let expected = *ctxt_len.get_or_insert(p.ctxt.len());
+        if p.ctxt.len() != expected || p.ctxt.len() > max_ctxt_len {
             return Err(VerifyError::InconsistentKappa(server_outputs[0].server_id));
         }
         ctxts.push(p.ctxt.clone());
@@ -202,13 +206,13 @@ pub fn decrypt_aggregate(
     let kappa_kahe = pp.kahe.kappa_kahe;
     let mu_kahe = pp.kahe.mu_kahe;
     let l = pp.kahe.l;
-    let ctxt_len = mu_kahe * l;
     let t = pp.shamir.t;
 
     if server_outputs.len() < t {
         return Err(VerifyError::BadServerCoverage);
     }
-    if summed_ctxt.len() != ctxt_len {
+    // Partial final chunk allowed; μ·l bounds the length.
+    if summed_ctxt.is_empty() || summed_ctxt.len() > mu_kahe * l {
         return Err(VerifyError::InconsistentKappa(server_outputs[0].server_id));
     }
     let mut seen: HashSet<u32> = HashSet::with_capacity(server_outputs.len());

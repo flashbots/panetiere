@@ -4,7 +4,7 @@
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
 //! `r ∈ B^{κ_cs}_{β_cs,q_cs}`. `a` is a length-`κ_cs` row vector, `B` is a
 //! `μ_cs × κ_cs` matrix. All BDLOP arithmetic lives on the **CS ring**
-//! `R_{q_cs}` (chipmunk's `CsPoly`, q_cs = 147457), decoupled from the HVC
+//! `R_{q_cs}` (chipmunk's `CsPoly`, q_cs = 139301), decoupled from the HVC
 //! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 40961).
 //!
 //! **CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span
@@ -281,8 +281,8 @@ impl HidingMerkleCommitment {
         assert!(kappa_cs >= 1, "κ_cs must be ≥ 1");
         // β_cs = fresh randomness radius; β_agg = aggregate verify bound,
         // sized so ρ ≤ β_agg/β_cs = 300 (covers the deployment's client count).
-        let beta_cs = 122;
-        let r_bound = 36600;
+        let beta_cs = 116;
+        let r_bound = 34800;
         // ρ_max·η = 300·ZETA = 10200, the aggregated HVC digit bound.
         let beta_agg_hvc = 300 * chipmunk_code::ZETA;
         let a_ntt: Vec<CsNTTPoly> = (0..kappa_cs)
@@ -702,7 +702,7 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 //
 // Tight pack uses just enough bits per coefficient for each region's bound:
 //   r:    ⌈log₂(2·r_bound + 1)⌉ bits
-//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 147457)
+//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 139301)
 //   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(69)⌉ = 7 bits
 
 /// Number of bits to encode signed values in [-bound, bound].
@@ -775,6 +775,84 @@ fn unpack_bits(
 /// the `N` coefficients in `⌈log₂(2·modulus+1)⌉` bits.
 pub fn poly_packed_len(modulus: i32) -> usize {
     (POLY_N * bits_for_signed(modulus as u32) as usize).div_ceil(8)
+}
+
+/// 64-bit variants for the KAHE ring (q ≈ 2^49.3 → 51 bits per coefficient).
+#[inline]
+fn bits_for_signed64(bound: u64) -> u32 {
+    let n = 2u128 * bound as u128 + 1;
+    (128 - n.leading_zeros()).max(1)
+}
+
+pub fn poly_packed_len64(modulus: i64) -> usize {
+    (POLY_N * bits_for_signed64(modulus as u64) as usize).div_ceil(8)
+}
+
+fn pack_bits64(out: &mut Vec<u8>, values: &[i64], bound: u64, bits: u32) {
+    debug_assert!(bits <= 56, "u64 accumulator supports up to 56-bit symbols");
+    let offset = bound as i64;
+    let max_u: u64 = (1u64 << bits) - 1;
+    let mut acc: u64 = 0;
+    let mut acc_bits: u32 = 0;
+    for &v in values {
+        debug_assert!(
+            v >= -(bound as i64) && v <= bound as i64,
+            "pack_bits64: value {v} outside [-{bound}, {bound}]"
+        );
+        let u = (v + offset) as u64;
+        debug_assert!(u <= max_u);
+        acc |= u << acc_bits;
+        acc_bits += bits;
+        while acc_bits >= 8 {
+            out.push(acc as u8);
+            acc >>= 8;
+            acc_bits -= 8;
+        }
+    }
+    if acc_bits > 0 {
+        out.push(acc as u8);
+    }
+}
+
+fn unpack_bits64(
+    input: &[u8],
+    start_byte: usize,
+    values: &mut [i64],
+    bound: u64,
+    bits: u32,
+) -> usize {
+    let offset = bound as i64;
+    let mask: u128 = (1u128 << bits) - 1;
+    // u128: acc_bits can reach bits-1+8 = 58 before draining, so byte shifts
+    // exceed the u64 range.
+    let mut acc: u128 = 0;
+    let mut acc_bits: u32 = 0;
+    let mut byte_idx = start_byte;
+    for v in values.iter_mut() {
+        while acc_bits < bits {
+            acc |= (input[byte_idx] as u128) << acc_bits;
+            byte_idx += 1;
+            acc_bits += 8;
+        }
+        *v = (acc & mask) as i64 - offset;
+        acc >>= bits;
+        acc_bits -= bits;
+    }
+    byte_idx
+}
+
+/// [`pack_poly`] for i64 coefficient arrays (KAHE ring).
+pub(crate) fn pack_poly64(coeffs: &[i64], modulus: i64, out: &mut Vec<u8>) {
+    let bound = modulus as u64;
+    pack_bits64(out, coeffs, bound, bits_for_signed64(bound));
+}
+
+/// [`unpack_poly`] for i64 coefficient arrays (KAHE ring).
+pub(crate) fn unpack_poly64(input: &[u8], start: usize, modulus: i64) -> ([i64; POLY_N], usize) {
+    let bound = modulus as u64;
+    let mut coeffs = [0i64; POLY_N];
+    let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound));
+    (coeffs, next)
 }
 
 /// Append one polynomial's coefficients to `out`, packed against `modulus`.
@@ -1133,7 +1211,7 @@ mod tests {
         let pp = HidingMerkleCommitment::setup(&mut rng, 4);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 73728 ≫ r_bound = 36600.
+        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 69650 ≫ r_bound = 34800.
         openings[1].r_mut()[0] = CsPoly::rand_poly(&mut rng);
         assert!(!HidingMerkleCommitment::verify(&pp, &comm, &openings[1]));
     }

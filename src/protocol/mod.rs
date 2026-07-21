@@ -58,7 +58,7 @@ impl ProtocolParams {
     }
 
     /// Explicit KAHE dimensions `(μ, κ)`; `l = 1`, `σ_s = σ_e = 15.72`,
-    /// `t_modulus = 2^16` (the `*_DEFAULT` constants).
+    /// `t_modulus = 2^36` (the `*_DEFAULT` constants).
     pub fn setup_with_kahe_dims<R: Rng>(
         rng: &mut R,
         n_servers: usize,
@@ -89,7 +89,7 @@ impl ProtocolParams {
         l: usize,
         sigma_s: f64,
         sigma_e: f64,
-        t_modulus: u32,
+        t_modulus: u64,
     ) -> Self {
         let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
         let kahe =

@@ -29,11 +29,11 @@ use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
-fn rand_message_poly<R: Rng>(rng: &mut R, t: u32) -> KahePoly {
-    let half = t as i32 / 2;
-    let mut coeffs = [0i32; chipmunk_code::N];
+fn rand_message_poly<R: Rng>(rng: &mut R, t: u64) -> KahePoly {
+    let half = t as i64 / 2;
+    let mut coeffs = [0i64; chipmunk_code::N];
     for c in coeffs.iter_mut() {
-        *c = (rng.gen_range(0..t) as i32) - half;
+        *c = rng.gen_range(0..t) as i64 - half;
     }
     KahePoly::from_coeffs(coeffs)
 }
@@ -51,7 +51,7 @@ fn main() {
     let iters = env_usize("PROFILE_ITERS", 10);
     let mu = env_usize("PROFILE_MU", 0);
     let kappa = env_usize("PROFILE_KAPPA", 0);
-    let t_modulus = env_usize("PROFILE_T", 0) as u32;
+    let t_modulus = env_usize("PROFILE_T", 0) as u64;
 
     let mut rng = ChaCha20Rng::from_seed([(s as u8).wrapping_mul(7) ^ n as u8; 32]);
     let pp = if mu > 0 && kappa > 0 && t_modulus > 0 {
