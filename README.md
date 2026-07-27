@@ -74,7 +74,7 @@ Verifier  (aggregate_and_decrypt):
   9d. return KAHE.dec(summed_ctxt, agg_key)             # = Σ m_j over canonical
 ```
 
-The verifier output is a $μ_{kahe}·l$-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `[tests/end_to_end.rs](tests/end_to_end.rs)`::end_to_end_recovers_sum` is the executable spec.
+The verifier output is a $μ_{kahe}·l$-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). [tests/end_to_end.rs](tests/end_to_end.rs)`::end_to_end_recovers_sum` is the executable spec.
 
 ### Aggregated flow (optional)
 
