@@ -42,7 +42,7 @@ Module file layout matches the conceptual layering: lattice primitives at the bo
 
 ## Protocol overview
 
-Symbols. `sk_j ∈ D_{σ_s}^{κ_kahe}` = client `j`'s short (discrete-Gaussian) KAHE secret key on the KAHE ring `R_{q_kahe}`. `m_j ∈ R_{q_kahe}^{μ_kahe}`, `c_j` = ciphertext (both on the KAHE ring). `(s_{j,1}, ..., s_{j,n})` = per-server Shamir shares of `sk_j` on the CS ring `R_{q_cs}` (each KAHE-key component is bridged into `R_{q_cs}` and shared componentwise across `κ_kahe` components). `comm_j` = single CS commitment to the per-server share-vector matrix; `d_{j,i}` = opening for server `i` carrying its `κ_kahe`-component share-vector. `t` = Shamir threshold.
+Symbols. $sk_j ∈ D_{σ_s}^{κ_{kahe}}$ = client $j$'s short (discrete-Gaussian) KAHE secret key on the KAHE ring $R_{q_{kahe}}$. $m_j ∈ R_{q_{kahe}}^{μ_{kahe}}$, $c_j$ = ciphertext (both on the KAHE ring). $(s_{j,1}, ..., s_{j,n})$ = per-server Shamir shares of $sk_j$ on the CS ring $R_{q_{cs}}$ (each KAHE-key component is bridged into $R_{q_{cs}}$ and shared componentwise across $κ_{kahe}$ components). $comm_j$ = single CS commitment to the per-server share-vector matrix; $d_{j,i}$ = opening for server $i$ carrying its $κ_{kahe}$-component share-vector. $t$ = Shamir threshold.
 
 ```
 Client j  (run_client_round):
@@ -73,19 +73,19 @@ Verifier  (aggregate_and_decrypt):
   9d. return KAHE.dec(summed_ctxt, agg_key)             # = Σ m_j over canonical
 ```
 
-The verifier output is a `μ_kahe·l`-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `tests/end_to_end.rs::end_to_end_recovers_sum` is the executable spec.
+The verifier output is a $μ_{kahe}·l$-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `tests/end_to_end.rs::end_to_end_recovers_sum` is the executable spec.
 
 ### Aggregated flow (optional)
 
-When the public `(c_j, comm_j)` fan-in dominates (many clients, large payloads), an **aggregator** can sit between clients and the verifier. Clients in a group send their `(c_j, comm_j)` to the group's aggregator instead of broadcasting them; the aggregator runs `protocol::aggregator::run_aggregator_round` — `KAHE.agg_ctxt` + `CS.sum_commitments` over the group — and forwards one signed aggregate. The verifier re-sums the per-group aggregates (the same two associative ops) and calls `protocol::verify::decrypt_aggregate(pp, summed_ctxt, summed_comm, server_outputs)`, which verifies+decrypts exactly as `aggregate_and_decrypt` but takes the ciphertext/commitment already summed. **Openings are untouched** — they still go to the servers per-server, so the threshold/privacy model is identical to the base flow. This is purely additive: the base path above is unchanged. `tests/end_to_end.rs::aggregated_recovers_same_sum` asserts the aggregated path decodes byte-identically; `benches/protocol.rs` and `benches/scaling.rs` report the leader-side bytes/CPU saved (G group aggregates vs ρ client posts).
+When the public $(c_j, comm_j)$ fan-in dominates (many clients, large payloads), an **aggregator** can sit between clients and the verifier. Clients in a group send their $(c_j, comm_j)$ to the group's aggregator instead of broadcasting them; the aggregator runs `protocol::aggregator::run_aggregator_round` — `KAHE.agg_ctxt` + `CS.sum_commitments` over the group — and forwards one signed aggregate. The verifier re-sums the per-group aggregates (the same two associative ops) and calls `protocol::verify::decrypt_aggregate(pp, summed_ctxt, summed_comm, server_outputs)`, which verifies+decrypts exactly as `aggregate_and_decrypt` but takes the ciphertext/commitment already summed. **Openings are untouched** — they still go to the servers per-server, so the threshold/privacy model is identical to the base flow. This is purely additive: the base path above is unchanged. `tests/end_to_end.rs::aggregated_recovers_same_sum` asserts the aggregated path decodes byte-identically; `benches/protocol.rs` and `benches/scaling.rs` report the leader-side bytes/CPU saved (G group aggregates vs ρ client posts).
 
 ## Modules
 
 ### `kahe` — key-additive homomorphic encryption
 
-RLWE-based KAHE on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, q_kahe ≈ 2^28), decoupled from the CS ring. Per-poly form: with a public `μ × κ` matrix `A` (NTT-resident), `Enc(m, sk) = m + A·sk + t·e mod q_kahe` (fresh error `e ← D_{σ_e}`); `Dec(c, sk) = ((c − A·sk) mod q_kahe) reduced mod t` in centered representatives. `enc` batches `l` ciphertext chunks under one key, each chunk using its own matrix `A_i`; messages and ciphertexts are flat `Vec<KahePoly>` of length `μ_kahe · l`.
+RLWE-based KAHE on its own ring $R_{q_{kahe}}$ (chipmunk's `KahePoly`, $q_{kahe} ≈ 2^28$), decoupled from the CS ring. Per-poly form: with a public $μ × κ$ matrix `A` (NTT-resident), `Enc(m, sk) = m + A·sk + t·e mod q_kahe` (fresh error $e ← D_{σ_e}$); `Dec(c, sk) = ((c − A·sk) mod q_kahe) reduced mod t` in centered representatives. `enc` batches `l` ciphertext chunks under one key, each chunk using its own matrix $A_i$; messages and ciphertexts are flat `Vec<KahePoly>` of length $μ_kahe · l$.
 
-`Gen` samples a *short* key (discrete Gaussian `D_{σ_s}^κ`). The `KaheKey` / `KaheAggKey` newtypes separate fresh keys (sole valid `Enc` input) from aggregate keys in `R_{q_kahe}^κ` (sole valid `Dec` input). The Shamir bridge (`Σ sk_j` interpolated from per-server share sums on the CS ring, then lifted into the KAHE ring) lives in `protocol::verify`, which builds a `KaheAggKey` via `KaheAggKey::from_components` after running `ShamirSharing::recover` componentwise and `lift_cs_to_kahe`.
+`Gen` samples a *short* key (discrete Gaussian $D_{σ_s}^κ$). The `KaheKey` / `KaheAggKey` newtypes separate fresh keys (sole valid `Enc` input) from aggregate keys in $R_{q_{kahe}}^κ$ (sole valid `Dec` input). The Shamir bridge ($Σ sk_j$ interpolated from per-server share sums on the CS ring, then lifted into the KAHE ring) lives in `protocol::verify`, which builds a `KaheAggKey` via `KaheAggKey::from_components` after running `ShamirSharing::recover` componentwise and `lift_cs_to_kahe`.
 
 ```rust
 pub trait KaheScheme {
@@ -137,7 +137,7 @@ Each round must use a fresh key (standard requirement, met by `gen` once per `ru
 
 ### `sss` — secret sharing
 
-Two implementations, both over the CS ring `R_{q_cs}` (chipmunk's `CsPoly`). `AdditiveSharing` is n-of-n (kept for parity / additive-only uses). `ShamirSharing` is t-of-n over `R_{q_cs}` with evaluation points `1..=n`; pairwise differences are units in `Z_{q_cs}*`, so Lagrange at `X = 0` is well-defined despite `R_{q_cs}` not being a field. The protocol uses Shamir; the CS↔KAHE bridge (`kahe_to_cs_centered` / `lift_cs_to_kahe`) crosses to the KAHE ring.
+Two implementations, both over the CS ring $R_{q_{cs}}$ (chipmunk's `CsPoly`). `AdditiveSharing` is n-of-n (kept for parity / additive-only uses). `ShamirSharing` is t-of-n over $R_{q_{cs}}$ with evaluation points $1..=n$; pairwise differences are units in $Z_{q_{cs}}*$, so Lagrange at $X = 0$ is well-defined despite $R_{q_{cs}}$ not being a field. The protocol uses Shamir; the CS↔KAHE bridge (`kahe_to_cs_centered` / `lift_cs_to_kahe`) crosses to the KAHE ring.
 
 ```rust
 pub trait Sss {
@@ -164,9 +164,9 @@ impl ShamirSharing {
 
 ### `cs` — BDLOP-style hiding vector commitment over a homomorphic Merkle tree
 
-All BDLOP arithmetic lives on the **CS ring** `R_{q_cs}` (chipmunk's `CsPoly`, q_cs = 147457); the chipmunk Merkle-tree hash lives on the **HVC ring** `R_{q_hvc}` (q_hvc = 40961). `Commit` packs a per-server `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` into a single BDLOP leaf: with `r ← B_{β_cs}^{κ_cs}` random, `c¹ = a^T r`, `c²_k = B_k r + s_k`, leaf-block `= (c¹, c²_0, ..., c²_{μ-1})` (all `CsPoly`) zero-padded to `block_size = (1 + μ_cs).next_power_of_two()`. The `n_servers` block roots occupy positions of a chipmunk `Tree<HVCHash>`. The opening stores `(r, s)` on the CS ring, the **entire decomposed leaf-block subtree** (`2·block_size − 2` decomposed nodes), and the chipmunk Merkle path *above* the block root in decomposed `(left, right)` pairs — all on the HVC ring.
+All BDLOP arithmetic lives on the **CS ring** $R_{q_{cs}}$ (chipmunk's `CsPoly`, $q_{cs} = 147457$); the chipmunk Merkle-tree hash lives on the **HVC ring** $R_{q_{hvc}}$ ($q_{hvc} = 40961$). `Commit` packs a per-server $μ_{cs}$-component share vector $s ∈ R_{q_cs}^{μ_{cs}}$ into a single BDLOP leaf: with $r ← B_{β_{cs}}^{κ_{cs}}$ random, $c¹ = a^T r$, $c²_k = B_k r + s_k$, leaf-block $= (c¹, c²_0, ..., c²_{μ-1})$ (all `CsPoly`) zero-padded to `block_size = (1 + μ_cs).next_power_of_two()`. The `n_servers` block roots occupy positions of a chipmunk `Tree<HVCHash>`. The opening stores `(r, s)` on the CS ring, the **entire decomposed leaf-block subtree** (`2·block_size − 2` decomposed nodes), and the chipmunk Merkle path *above* the block root in decomposed `(left, right)` pairs — all on the HVC ring.
 
-**CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span `[-q_cs/2, q_cs/2]`, larger than `q_hvc`. To feed it into the HVC tree hash, each leaf element is base-69 (`2ζ+1`) decomposed into `HVC_WIDTH = 3` `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); digits are tiny (`|·| ≤ ζ = 34 ≪ q_hvc`) so they embed losslessly. The left-inverse `CsPoly::project_r_from_hvc` is linear in the digits.
+**CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span $[-q_{cs}/2, q_{cs}/2]$, larger than $q_{hvc}$. To feed it into the HVC tree hash, each leaf element is base-69 ($2ζ+1$) decomposed into `HVC_WIDTH = 3` `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); digits are tiny ($|·| ≤ ζ = 34 ≪ q_hvc$) so they embed losslessly. The left-inverse `CsPoly::project_r_from_hvc` is linear in the digits.
 
 Why store the whole block subtree decomposed? `decompose_r` is non-linear in raw values; `hash_separate_inputs` is linear over decomposed inputs. Summing openings pointwise is correct only in the decomposed representation — recomputing decompositions after summation would not be linear.
 
@@ -232,7 +232,7 @@ impl HidingMerkleCommitment {
 impl Cs for HidingMerkleCommitment { /* default setup_with_dims(.., 1, 5) */ }
 ```
 
-`Verify` reconstructs the raw CS leaf-block from `(r, s, a, B)`, walks up the block subtree (level 0 via `project_r_from_hvc` on the CS ring, higher levels via `projection_r` on the HVC ring, each stored decomp hashed to the freshly computed parent), then walks the stored decomposed path above the block root. It also bounds `‖r‖∞ ≤ r_bound` (CS ring) and every decomposed digit by `beta_agg_hvc`.
+`Verify` reconstructs the raw CS leaf-block from $(r, s, a, B)$, walks up the block subtree (level 0 via `project_r_from_hvc` on the CS ring, higher levels via `projection_r` on the HVC ring, each stored decomp hashed to the freshly computed parent), then walks the stored decomposed path above the block root. It also bounds $‖r‖∞ ≤ r_{bound}$ (CS ring) and every decomposed digit by `beta_agg_hvc`.
 
 ### `bulletin` — in-memory broadcast store
 
@@ -265,7 +265,7 @@ impl InMemoryBulletin {
 
 ### `protocol` — params + round drivers + verifier
 
-`ProtocolParams` couples KAHE, CS, and Shamir in one bundle and enforces `μ_cs = κ_kahe` (one CS pipeline carries the entire `κ_kahe`-component share-vector per server, replacing what would otherwise be `κ_kahe` parallel CS instances).
+`ProtocolParams` couples KAHE, CS, and Shamir in one bundle and enforces $μ_{cs} = κ_{kahe}$ (one CS pipeline carries the entire $κ_{kahe}$-component share-vector per server, replacing what would otherwise be $κ_{kahe}$ parallel CS instances).
 
 ```rust
 pub struct ProtocolParams {
@@ -341,7 +341,7 @@ pub fn aggregate_and_decrypt(
 ) -> Result<Vec<KahePoly>, VerifyError>;
 ```
 
-`aggregate_and_decrypt` requires at least `t` distinct, in-range server outputs (`BadServerCoverage`), enforces every `ServerBulletinEntry.clients` matches `canonical` (`InconsistentCanonical`), and checks `agg_share == agg_open.s()` per server (`ShareOpeningMismatch`). It runs **one** CS verification per server (the `μ_cs = κ_kahe` packing) and recovers the aggregate KAHE key by Lagrange interpolation across the first `t` servers, componentwise over the `κ_kahe` components (then lifting each from the CS ring to the KAHE ring). Tampered Merkle openings reject via `InvalidServerOpening`.
+`aggregate_and_decrypt` requires at least $t$ distinct, in-range server outputs (`BadServerCoverage`), enforces every `ServerBulletinEntry.clients` matches `canonical` (`InconsistentCanonical`), and checks `agg_share == agg_open.s()` per server (`ShareOpeningMismatch`). It runs **one** CS verification per server (the $μ_{cs} = κ_{kahe}$ packing) and recovers the aggregate KAHE key by Lagrange interpolation across the first $t$ servers, componentwise over the $κ_{kahe}$ components (then lifting each from the CS ring to the KAHE ring). Tampered Merkle openings reject via `InvalidServerOpening`.
 
 ### `codec` — bytes ↔ `KahePoly`
 
@@ -374,7 +374,7 @@ Layout for both: 2 bytes per coefficient (little-endian `u16`), `N = 2048` coeff
 
 ### `mse` — additive multi-set encoding (paper §3 Fig. 1)
 
-The application payload. Matrices `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` of shape `γ × δ` over `Z_t` (`t = T_MODULUS_DEFAULT = 2^16`, the KAHE plaintext modulus). `L = K_LIMBS = 2` base-`t` randomness limbs, so per-element randomness `r ∈ Z_{t^2} = Z_{2^32}`; `ξ = payload_symbols` symbols per element, each in `Z_t`, so one insert rides a `ξ · 16`-bit message. C and K are shared across the V symbols. Insert one element with fresh `r ← Z_{t^L}`: split `r` into limbs `r_ℓ`, and for each row `i ∈ [γ]` compute `j := PRF(prf_key, (i, r)) mod row_delta(i)` and `C[i,j] += 1`, `K_ℓ[i,j] += r_ℓ`, `V_s[i,j] += x_s`. `Decode` peels cells with `C = 1`, reconstructs `r = Σ r_ℓ·t^ℓ`, reads the `ξ`-symbol payload, emits it, and subtracts the element's contribution from every row via the PRF. Theorem 3 correctness: `2^{-(γ-2) log ρ} + negl(λ)`. PRF is SHA-256 keyed by `prf_key`. `RowLayout` lets later rows shrink geometrically for a smaller structure.
+The application payload. Matrices $(C, K_0…K_{L-1}, V_0…V_{ξ-1})$ of shape $γ × δ$ over $Z_t$ (`t = T_MODULUS_DEFAULT = 2^16`, the KAHE plaintext modulus). `L = K_LIMBS = 2` base-$t$ randomness limbs, so per-element randomness $r ∈ Z_{t^2} = Z_{2^32}$; `ξ = payload_symbols` symbols per element, each in $Z_t$, so one insert rides a $ξ · 16$-bit message. C and K are shared across the V symbols. Insert one element with fresh $r ← Z_{t^L}$: split $r$ into limbs $r_ℓ$, and for each row $i ∈ [γ]$ compute `j := PRF(prf_key, (i, r)) mod row_delta(i)` and $C[i,j] += 1$, $K_ℓ[i,j] += r_ℓ$, $V_s[i,j] += x_s$. `Decode` peels cells with $C = 1$, reconstructs $r = Σ r_ℓ·t^ℓ$, reads the $ξ$-symbol payload, emits it, and subtracts the element's contribution from every row via the PRF. Theorem 3 correctness: $2^{-(γ-2) log ρ} + negl(λ)$. PRF is SHA-256 keyed by `prf_key`. `RowLayout` lets later rows shrink geometrically for a smaller structure.
 
 ```rust
 #[derive(Clone, Debug, PartialEq)]
@@ -433,27 +433,27 @@ impl MseEncoding {
 }
 ```
 
-`pack` flattens `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_panetiere` is the executable spec.
+`pack` flattens $(C, K_0…K_{L-1}, V_0…V_{ξ-1})$ row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_panetiere` is the executable spec.
 
 ## Security properties
 
 - **Binding** (commitment): given `comm`, an adversary cannot produce a different `(r', s', path')` that verifies — Module-SIS hardness on the BDLOP leaf (CS ring) and Ring-SIS hardness on every internal Merkle node (HVC ring).
-- **Hiding** (commitment, single opening): the BDLOP leaf `(a^T r, B r + s)` is statistically uniform over `R_{q_cs}^{1+μ_cs}` by the leftover hash lemma when `r` is short and the matrix `(a | B)` has enough min-entropy.
-- **Strong hiding** (sum of openings): pointwise sums of low-norm `r`s stay low-norm with margin; the linear hash + decomposed-path representation makes summed openings verify against the summed root; per-client `s_j` remains hidden under any subset of summands.
-- **Threshold liveness**: any `t` honest servers' `agg_share`s suffice to recover `Σ sk_j` via Lagrange; up to `n − t` servers can be offline or corrupted.
-- **Integrity**: `aggregate_and_decrypt` rejects tampered Merkle openings (`InvalidServerOpening`), tampered key shares (`ShareOpeningMismatch`), inconsistent canonical sets (`InconsistentCanonical`), and shape mismatches (`InconsistentKappa`); honest output is `Σ m_j` over canonical clients, nothing else.
+- **Hiding** (commitment, single opening): the BDLOP leaf $(a^T r, B r + s)$ is statistically uniform over $R_{q_{cs}}^{1+μ_{cs}}$ by the leftover hash lemma when $r$ is short and the matrix $(a | B)$ has enough min-entropy.
+- **Strong hiding** (sum of openings): pointwise sums of low-norm $r$s stay low-norm with margin; the linear hash + decomposed-path representation makes summed openings verify against the summed root; per-client $s_j$ remains hidden under any subset of summands.
+- **Threshold liveness**: any $t$ honest servers' `agg_share`s suffice to recover $Σ sk_j$ via Lagrange; up to $n − t$ servers can be offline or corrupted.
+- **Integrity**: `aggregate_and_decrypt` rejects tampered Merkle openings (`InvalidServerOpening`), tampered key shares (`ShareOpeningMismatch`), inconsistent canonical sets (`InconsistentCanonical`), and shape mismatches (`InconsistentKappa`); honest output is $Σ m_j$ over canonical clients, nothing else.
 - **Anonymity**: assumes at least one honest server refuses to decrypt any set other than the canonical one. **This is NOT enforced by this PoC** — there is no consensus / canonical-set-enforcement module; a `canonical` slice is passed in by the caller and `aggregate_and_decrypt` only checks that every server agrees on it, not that it is the "right" set. Enforcing canonicality is out of scope here.
 
 ## Parameters and limits
 
-Three rings, all `Z_q[x]/(x^N+1)` with `N = 2048` and `q ≡ 1 mod 2N` (from chipmunk):
+Three rings, all $Z_q[x]/(x^N+1)$ with `N = 2048` and `q ≡ 1 mod 2N` (from chipmunk):
 - **HVC** (`HVCPoly`, Merkle internal hash nodes): `q_hvc = 40_961` (~15.3 bits), `HVC_WIDTH = 3` decomposed polys per node, `ZETA = 34` decomposition base bound.
 - **CS** (`CsPoly`, BDLOP commitment leaf + Shamir sharing + CS-side aggregation): `q_cs = 147_457` (~17.2 bits), `q_cs/2 = 73_728`.
 - **KAHE** (`KahePoly`, KAHE encryption + codec + MSE): `q_kahe = 271_163_393` (~28 bits).
 
 Tree height = `⌈log2(block_size · n_servers)⌉`, where `block_size = (1 + μ_cs).next_power_of_two()`.
 
-KAHE defaults (`Kahe::setup`): `(μ, κ, l) = (1, 1, 1)`, `σ_s = σ_e = 15.72`, `t = 2^16` — sized for ~128-bit RLWE at N=2048 with noise budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` holding for ρ ≲ 240. The scaling bench compares two operating points: **(μ=16, κ=31)** with `block_size = 32` (best 1 MB throughput) and **(μ=8, κ=15)** with `block_size = 16` (best per-round latency — `1+κ` exactly hits the lower power-of-two).
+KAHE defaults (`Kahe::setup`): `(μ, κ, l) = (1, 1, 1)`, `σ_s = σ_e = 15.72`, `t = 2^16` — sized for ~128-bit RLWE at N=2048 with noise budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` holding for ρ ≲ 240. The scaling bench compares two operating points: **$(μ=16, κ=31)$** with `block_size = 32` (best 1 MB throughput) and **$(μ=8, κ=15)$** with `block_size = 16` (best per-round latency — `1+κ` exactly hits the lower power-of-two).
 
 CS defaults (`HidingMerkleCommitment::setup`): `μ_cs = 1, κ_cs = 5, β_cs = 122, r_bound = 36600, β_agg_hvc = 300·ζ = 10200`. The protocol couples `μ_cs := κ_kahe` so a single CS pipeline carries the entire share-vector.
 
