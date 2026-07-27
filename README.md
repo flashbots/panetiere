@@ -13,7 +13,7 @@ RAYON_NUM_THREADS=8 cargo bench -j 8 --bench scaling                   # progres
 RAYON_NUM_THREADS=8 cargo run -j 8 --release --example demo            # slot-mode broadcast demo
 ```
 
-`bench.sh` and `scripts/run_demo.sh` are thin wrappers around the above. The crate depends on `chipmunk_code` (a pinned git dependency, `github.com/Ruteri/Chipmunk`) for the lattice primitives (Ring-SIS hash, dynamic-height Merkle tree, NTT polynomial multiplication; the `fast-ntt` feature enables Barrett + AVX2 NTT across all three rings — HVC, CS, KAHE).
+`bench.sh` and `scripts/run_demo.sh` are thin wrappers around the above. The crate depends on `chipmunk_code` (a pinned git dependency, [github.com/Ruteri/Chipmunk](https://github.com/Ruteri/Chipmunk)) for the lattice primitives (Ring-SIS hash, dynamic-height Merkle tree, NTT polynomial multiplication; the `fast-ntt` feature enables Barrett + AVX2 NTT across all three rings — HVC, CS, KAHE).
 
 ## Repository layout
 
