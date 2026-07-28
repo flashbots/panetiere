@@ -9,6 +9,7 @@ pub mod pke;
 pub mod prony;
 pub mod protocol;
 pub mod rs;
+pub mod scaling_bench;
 pub mod sig;
 pub mod sss;
 
