@@ -5,11 +5,13 @@
 //! provenance-tagged tables (one row per cell) plus `scaling_sweep.csv`
 //! with every number including min/max spread:
 //!
-//!   [M] measured  — per-phase CPU, median of REPS one-party runs; plus the
-//!                   ECIES-sealed opening envelope size read off the wire
+//!   [M] measured  — per-phase CPU, median of REPS one-party runs through the
+//!                   same APIs the protocol uses; plus wire sizes read off
+//!                   real packed bytes (sealed opening envelope, server entry)
 //!   [D] derived   — exact byte arithmetic from packing formulas
-//!   [C] composed  — cost model `wall = fixed + l·chunk` over [M] medians
-//!                   (one client ∥ one server ∥ verifier; parties parallel)
+//!   [C] composed  — cost model `wall = fixed + l·chunk` over [M] medians;
+//!                   one client → one server → verifier, summed as a serial
+//!                   pipeline (one party of each kind, not ρ of them)
 //!   [P] projected — synthetic network sim
 //!
 //! Each cell runs ONE live round; every active client encodes a distinct
@@ -52,8 +54,10 @@
 //!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^36, σ_s = σ_e = 15.72
 //!                noise budget t·8σ_e·√ρ + ρ·t/2 < q_kahe/2 (ρ ≲ 349)
 //!  src/mse.rs:   BITS_PER_SYMBOL = 36, K_LIMBS = 2
-//!  bench-internal: MSE PRF key = [0xAA; 32]; ChaCha20 seeds deterministic
+//!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
+//!                  over (S, ρ, active, ξ, codec), so cells never share a stream
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
+//!  asserted per cell: agg_open + agg_share == CsParams::aggregated_server_crypto_len
 //!
 //! Run with:
 //!   RAYON_NUM_THREADS=8 cargo bench -j 8 --bench scaling
@@ -62,31 +66,34 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use chipmunk_code::{KahePoly, CS_MODULUS, HVC_MODULUS, KAHE_MODULUS, N as POLY_N, ZETA};
+use chipmunk_code::{KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
 use panetiere::codec;
-use panetiere::cs::{poly_packed_len, poly_packed_len64, Commitment, Cs, HidingMerkleCommitment};
+use panetiere::cs::{
+    aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
+    Cs, HidingMerkleCommitment,
+};
 use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL};
 use panetiere::pke;
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::{
-    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, seal_opening, shamir_share,
+    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, seal_openings, shamir_share,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, unseal_openings, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_timed, decrypt_aggregate, VerifyTimings};
 use panetiere::protocol::ProtocolParams;
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use sha2::{Digest, Sha256};
 
 const SERVERS: &[usize] = &[8, 16, 64];
 
 // (clients_total, clients_active): explicit pairs, not a cross product.
 const CLIENTS: &[(usize, usize)] = &[(100, 100), (300, 300), (300, 100)];
 
-// γ (MSE rows) and κ_kahe (KAHE key components) are fixed, not swept.
+// γ (MSE rows) is fixed, not swept.
 const GAMMA: usize = 4;
-const KAPPA_KAHE: usize = 1;
 
 struct Config {
     label: String,
@@ -105,6 +112,9 @@ const BYTES_PER_POLY: usize = POLY_N * 4;
 
 /// Repetitions per measured phase; tables show the median, CSV keeps min/max.
 const REPS: usize = 5;
+
+/// One cell is one protocol execution.
+const SESSION: SessionId = SessionId([0x5C; 32]);
 
 /// `Mse` = single-round IBLT. `Scheduled` = one joint plaintext, reservation
 /// IBLT ‖ message vector of `message_bytes`, under one key (openings paid once).
@@ -233,8 +243,11 @@ fn measure<R>(mut f: impl FnMut() -> R) -> (Stat, R) {
     let mut out = None;
     for _ in 0..REPS {
         let t = Instant::now();
-        out = Some(f());
+        let r = f();
         times.push(t.elapsed().as_secs_f64() * 1e6);
+        // Assign after stopping the clock: dropping the previous rep's result
+        // (a multi-MB ciphertext at large ξ) must not land inside the window.
+        out = Some(r);
     }
     (stat(times), out.unwrap())
 }
@@ -312,7 +325,7 @@ struct Row {
     comm_client_b: usize,      // one commitment root
     ctxt_client_b: usize,      // one client's full ciphertext (n_polys polys)
     agg_open_b: usize,          // server-posted aggregate opening
-    agg_share_b: usize,         // server-posted agg_share (κ CS polys)
+    agg_share_b: usize,         // server-posted agg_share (one CS poly)
     // [D] round totals across all parties.
     useful_b: f64,
     wire_ctxt_b: f64,
@@ -322,18 +335,32 @@ struct Row {
     agg_plans: Vec<AggPlan>,
 }
 
+/// Per-cell RNG seed: domain-separated hash over every parameter that defines
+/// the cell, including the codec. Hashing (not byte-packing) keeps distinct
+/// cells on distinct streams regardless of magnitude.
+fn cell_seed(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -> [u8; 32] {
+    let (codec_tag, codec_arg) = match codec {
+        AppCodec::Mse => (0u64, 0u64),
+        AppCodec::Scheduled { message_bytes } => (1, *message_bytes as u64),
+    };
+    let mut h = Sha256::new();
+    h.update(b"panetiere-scaling-cell-v1");
+    for v in [
+        s as u64,
+        n as u64,
+        active as u64,
+        cfg.payload_symbols as u64,
+        codec_tag,
+        codec_arg,
+    ] {
+        h.update(v.to_le_bytes());
+    }
+    h.finalize().into()
+}
+
 fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -> Row {
     let cover = n - active;
-    let mut seed = [0u8; 32];
-    seed[..6].copy_from_slice(&[
-        s as u8,
-        n as u8,
-        (n >> 8) as u8,
-        active as u8,
-        cfg.payload_symbols as u8,
-        (cfg.payload_symbols >> 8) as u8,
-    ]);
-    let mut rng = ChaCha20Rng::from_seed(seed);
+    let mut rng = ChaCha20Rng::from_seed(cell_seed(s, n, active, cfg, codec));
 
     // IBLT sized to active (cover adds nothing), ~3 buckets/insertion. `Mse`
     // packs a ξ-element into it; `Scheduled` packs a (rand,size) token and
@@ -362,7 +389,6 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         &mut rng,
         s,
         mu_kahe,
-        KAPPA_KAHE,
         l,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
@@ -418,14 +444,16 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             items: vec![],
         })
         .collect();
-    let mut sealed_inbox0: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut sealed_inbox0: Vec<(ClientId, Vec<u8>)> = Vec::with_capacity(n);
     for (i, &cid) in client_ids.iter().enumerate() {
-        let round = run_client_round(&mut rng, &pp, cid, client_polys[i].clone(), &servers);
+        let round =
+            run_client_round(&mut rng, &pp, &SESSION, cid, client_polys[i].clone(), &servers);
         client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (_sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-            let opening = unseal_opening(&server_keys[idx], &sealed).unwrap();
+        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+            assert_eq!(sid, servers[idx].0);
+            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).unwrap();
             if idx == 0 {
-                sealed_inbox0.push(sealed);
+                sealed_inbox0.push((cid, sealed));
             }
             inboxes[idx].items.push((cid, opening));
         }
@@ -440,16 +468,17 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     // ⌈log₂ q⌉. Openings are decomposed digits + small r/s, packed at
     // per-region bit widths; the client→server form is the REAL ECIES-sealed
     // envelope, measured off the wire bytes.
-    let open_env_b = sealed_inbox0[0].len();
-    let cs_half = (CS_MODULUS as u32) / 2;
-    // Server-posted aggregate: r ≤ β_agg, tree digits ≤ ρ·ζ (ρ = canonical count);
-    // plus agg_share = κ_kahe CS-ring polys at ⌈log₂ q_cs⌉ bits.
+    let open_env_b = sealed_inbox0[0].1.len();
+    // Server-posted aggregate, at the same bounds the servers would pack with.
     let rho = canonical.len() as u32;
-    let agg_open_b = outputs[0]
-        .agg_open
-        .pack(pp.cs.r_bound, cs_half, rho * ZETA)
-        .body_len();
-    let agg_share_b = KAPPA_KAHE * poly_packed_len(CS_MODULUS);
+    let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(&pp.cs, rho);
+    let agg_open_b = outputs[0].agg_open.pack(r_b, s_b, t_b).to_bytes().len();
+    let agg_share_b = pack_cs_shares(std::slice::from_ref(&outputs[0].agg_share)).len();
+    // Pins the wire-planning formula to what packing actually emits.
+    assert_eq!(
+        agg_open_b + agg_share_b,
+        pp.cs.aggregated_server_crypto_len(rho)
+    );
     let comm_client_b = poly_packed_len(HVC_MODULUS);
     let ctxt_client_b = n_polys * poly_packed_len64(KAHE_MODULUS);
 
@@ -473,14 +502,8 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     let (kahe_enc, _ctxt0) = measure(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
     let (share, shares0) = measure(|| shamir_share(&mut rng, &pp, &key0, s));
     let (cs, (_comm0, openings0)) = measure(|| cs_commit(&mut rng, &pp, &shares0));
-    let (seal, _) = measure(|| {
-        openings0
-            .iter()
-            .zip(&servers)
-            .map(|(op, (_, xpub))| seal_opening(&mut rng, &pp, op, xpub))
-            .collect::<Vec<_>>()
-    });
-    let (unseal, _) = measure(|| unseal_openings(&server_keys[0], &sealed_inbox0));
+    let (seal, _) = measure(|| seal_openings(&mut rng, &pp, &SESSION, client_ids[0], &openings0, &servers));
+    let (unseal, _) = measure(|| unseal_openings(&server_keys[0], &SESSION, servers[0].0, &sealed_inbox0));
     let (server, _) = measure(|| run_server_round(&inboxes[0], &canonical).unwrap());
 
     // Verify: REPS full runs, field-wise medians over the returned timings.
@@ -508,21 +531,29 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     let v_interp = vstat(|v| v.interpolation_us);
     let v_kahe_dec = vstat(|v| v.kahe_dec_us);
 
+    // `decode` returns the multiset sorted lexicographically; compare against
+    // the inserted payloads by value, not just by count.
+    let expected_payloads = {
+        let mut p = mse_payloads.clone();
+        p.sort();
+        p
+    };
     let check_decode = |rec: &[KahePoly]| -> bool {
+        let tokens = match codec {
+            AppCodec::Mse => &rec[..n_polys],
+            AppCodec::Scheduled { .. } => &rec[..sched_polys],
+        };
+        let tokens_ok = MseEncoding::unpack(&mse_params, tokens)
+            .decode()
+            .map(|d| d == expected_payloads)
+            .unwrap_or(false);
         match codec {
-            AppCodec::Mse => MseEncoding::unpack(&mse_params, &rec[..n_polys])
-                .decode()
-                .map(|d| d.len() == active)
-                .unwrap_or(false),
+            AppCodec::Mse => tokens_ok,
             AppCodec::Scheduled { .. } => {
-                let tokens_ok = MseEncoding::unpack(&mse_params, &rec[..sched_polys])
-                    .decode()
-                    .map(|d| d.len() == active)
-                    .unwrap_or(false);
-                let msgs_ok = codec::decode_ranges(&rec[sched_polys..n_polys], &ranges)
-                    .map(|d| d == byte_payloads)
-                    .unwrap_or(false);
-                tokens_ok && msgs_ok
+                tokens_ok
+                    && codec::decode_ranges(&rec[sched_polys..n_polys], &ranges)
+                        .map(|d| d == byte_payloads)
+                        .unwrap_or(false)
             }
         }
     };
@@ -562,18 +593,17 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             let g = g.max(2);
 
             let a1 = n.div_ceil(g);
-            let l1_entries = |grp: usize| -> Vec<_> {
-                client_entries
-                    .iter()
-                    .filter(|(cid, _)| cid.0 as usize % a1 == grp)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
-            let e0 = l1_entries(0);
-            let (agg_cpu, _) = measure(|| run_aggregator_round(&e0));
-            let l1: Vec<_> = (0..a1)
-                .map(|grp| run_aggregator_round(&l1_entries(grp)))
+            let l1_groups: Vec<Vec<_>> = (0..a1)
+                .map(|grp| {
+                    client_entries
+                        .iter()
+                        .filter(|(cid, _)| cid.0 as usize % a1 == grp)
+                        .cloned()
+                        .collect()
+                })
                 .collect();
+            let (agg_cpu, _) = measure(|| run_aggregator_round(&l1_groups[0]));
+            let l1: Vec<_> = l1_groups.iter().map(|g| run_aggregator_round(g)).collect();
 
             // Fold up the tree: each higher level sums g aggregates at a time.
             let mut layer_counts = vec![a1];
@@ -710,9 +740,10 @@ fn model(r: &Row) -> Model {
     let agg_cpu_us = r.agg_plans.iter().map(|p| cpu_base_agg_us + p.leader.med).collect();
     Model {
         fixed_us,
-        // Per full μ-wide chunk equivalent — the final chunk may be partial,
-        // so normalize by actual polys, not by ⌈n_polys/μ⌉.
-        chunk_us: chunk_total_us * r.mu_kahe as f64 / r.n_polys as f64,
+        // Mean cost of one actual chunk, so `fixed + l·chunk == wall` exactly.
+        // The final chunk may be partial — read `polys` vs `μ` in the cells
+        // table for how full it is.
+        chunk_us: chunk_total_us / r.l as f64,
         wall_us,
         wire_total_b,
         efficiency: r.useful_b / wire_total_b,
@@ -798,11 +829,14 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
     }
 }
 
-// Deterministic per row: one rng seeded [0x5E; 32], profiles drawn in order,
-// so tables and CSV see identical draws.
+// Deterministic per row, and reseeded per profile so every profile sees the
+// same latency draws — profiles then differ only by bandwidth. Tables and CSV
+// call this independently and get identical numbers.
 fn net_all(r: &Row, m: &Model) -> Vec<NetPoint> {
-    let mut nrng = ChaCha20Rng::from_seed([0x5E; 32]);
-    NETWORKS.iter().map(|prof| net_sim(r, m, prof, &mut nrng)).collect()
+    NETWORKS
+        .iter()
+        .map(|prof| net_sim(r, m, prof, &mut ChaCha20Rng::from_seed([0x5E; 32])))
+        .collect()
 }
 
 // ── tables ──────────────────────────────────────────────────────────────────
@@ -812,12 +846,13 @@ fn print_tables(rows: &[Row]) {
 
     println!("── cells ───────────────────────────────────────────────────────────────────");
     println!(
-        "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>4}{:>7}  {}",
-        "id", "S", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "l", "cells", "recovered"
+        "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>4}{:>8}{:>7}{:>7}  {}",
+        "id", "S", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "l", "polys", "μ", "cells",
+        "recovered"
     );
     for (i, r) in rows.iter().enumerate() {
         println!(
-            "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>4}{:>7}  {}",
+            "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>4}{:>8}{:>7}{:>7}  {}",
             cell_id(i),
             r.s,
             r.n,
@@ -828,10 +863,13 @@ fn print_tables(rows: &[Row]) {
             r.delta,
             r.xi,
             r.l,
+            r.n_polys,
+            r.mu_kahe,
             r.iblt_cells,
             if r.recovered_ok { "yes" } else { "NO" },
         );
     }
+    println!("    (polys < l·μ ⇒ the final KAHE chunk is partial)");
     println!();
 
     println!(
@@ -894,7 +932,7 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
-    println!("── wire components, per emitter ([M] open_env off the wire; rest [D]) ───────");
+    println!("── wire components, per emitter ([M] off the wire except comm/ctxt, [D]) ────");
     println!(
         "{:<4}{:>10}{:>15}   {:<30}{}",
         "id", "comm/cl", "ctxt/cl", "open_env →1srv (×S /cl)", "srv_entry = agg_open + agg_share"
@@ -960,7 +998,7 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
-    println!("── [C] model: wall = fixed + l·chunk (one client ∥ one server ∥ verifier) ───");
+    println!("── [C] model: wall = fixed + l·chunk (client → server → verifier, serial) ───");
     println!(
         "{:<4}{:>10}{:>10}{:>4}{:>10}{:>12}{:>13}{:>10}{:>12}",
         "id", "fixed", "chunk", "l", "wall", "useful", "wire/round", "eff", "agg1-wall"
@@ -1041,7 +1079,7 @@ fn write_csv(rows: &[Row]) {
     ];
 
     let mut header = String::new();
-    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,mu_kahe,iblt_cells,recovered,agg1_recovered");
+    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,n_polys,mu_kahe,iblt_cells,recovered,agg1_recovered");
     for (name, _) in phases {
         write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", name).unwrap();
     }
@@ -1063,7 +1101,7 @@ fn write_csv(rows: &[Row]) {
     // Param columns s..iblt_cells (skipping the run-local `id`) identify a
     // cell for cross-run dedup in append mode.
     let param_key = |line: &str| -> String {
-        line.split(',').skip(1).take(11).collect::<Vec<_>>().join(",")
+        line.split(',').skip(1).take(12).collect::<Vec<_>>().join(",")
     };
 
     let mut out = String::new();
@@ -1071,7 +1109,7 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
             r.n,
@@ -1082,6 +1120,7 @@ fn write_csv(rows: &[Row]) {
             r.delta,
             r.xi,
             r.l,
+            r.n_polys,
             r.mu_kahe,
             r.iblt_cells,
             r.recovered_ok,
@@ -1188,7 +1227,7 @@ fn main() {
     println!("            [D] derived    — exact byte arithmetic from packing formulas");
     println!("            [C] composed   — model wall = fixed + l·chunk over [M] medians");
     println!("            [P] projected  — extrapolation / synthetic network sim");
-    println!("useful = l · active · ξ · log₂(t) bits/round (only active clients carry payload)");
+    println!("useful = active · ξ · log₂(t) bits/round (only active clients carry payload)");
     println!();
 
     let cells = cells();

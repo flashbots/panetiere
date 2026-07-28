@@ -4,6 +4,7 @@ pub mod cs;
 pub mod kahe;
 pub mod mse;
 pub mod pke;
+pub mod prony;
 pub mod protocol;
 pub mod sss;
 

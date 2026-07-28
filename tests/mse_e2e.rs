@@ -8,12 +8,19 @@ use chipmunk_code::{KahePoly, Polynomial};
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+
+/// One protocol execution per poly index, so each gets a distinct session id.
+fn session_for(k: usize) -> SessionId {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&(k as u64).to_le_bytes());
+    SessionId(bytes)
+}
 
 /// MSE arithmetic now lives in `Z_t` (KAHE plaintext modulus, default
 /// `t = 262_144`), large enough to carry random `r` values and small element
@@ -57,6 +64,7 @@ fn mse_recovers_through_panetiere() {
 
     let mut recovered_polys = Vec::with_capacity(n_polys);
     for k in 0..n_polys {
+        let session = session_for(k);
         let mut client_entries = Vec::new();
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
@@ -67,10 +75,11 @@ fn mse_recovers_through_panetiere() {
             .collect();
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = vec![client_polys[i][k]];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &session, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (_sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                let opening = unseal_opening(&server_keys[idx], &session, cid, sid, &sealed)
+                    .expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -143,6 +152,7 @@ fn cover_clients_do_not_inflate_iblt() {
 
     let mut recovered_polys = Vec::with_capacity(n_polys);
     for k in 0..n_polys {
+        let session = session_for(k);
         let mut client_entries = Vec::new();
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
@@ -153,10 +163,11 @@ fn cover_clients_do_not_inflate_iblt() {
             .collect();
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = vec![client_polys[i][k]];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &session, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (_sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                let opening = unseal_opening(&server_keys[idx], &session, cid, sid, &sealed)
+                    .expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -212,7 +223,7 @@ fn multi_symbol_cover_through_panetiere() {
     let n_polys = MseEncoding::n_polys(&mse_params);
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
-    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, n_polys, 1);
+    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, n_polys);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> =
         (0..n_servers).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
@@ -225,6 +236,7 @@ fn multi_symbol_cover_through_panetiere() {
 
     let mut recovered_polys = Vec::with_capacity(n_polys);
     for k in 0..n_polys {
+        let session = session_for(k);
         let mut client_entries = Vec::new();
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
@@ -232,10 +244,11 @@ fn multi_symbol_cover_through_panetiere() {
             .collect();
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = vec![client_polys[i][k]];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &session, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (_sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                let opening = unseal_opening(&server_keys[idx], &session, cid, sid, &sealed)
+                    .expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }

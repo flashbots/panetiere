@@ -15,28 +15,30 @@
 //! `CsPoly::project_r_from_hvc` is linear in the digits, so summed opening
 //! digits project to the summed leaf — keeping `sum_openings` correct.
 //!
+//! **Leaf label.** The `ξ = 1 + μ_cs` raw leaf elements are bridged into
+//! `u = dec_{q_cs}(m) ∈ R^{ξ·HVC_WIDTH}` and hashed in one shot by [`LeafHash`]:
+//! `label = g^T · u`. One flat Ajtai hash, no intermediate levels.
+//!
 //! The chipmunk Merkle tree is the (non-hiding) vector commitment over the
-//! `n_servers` per-server **block roots** (each an `HVCPoly`); their
+//! `n_servers` per-server **leaf labels** (each an `HVCPoly`); their
 //! composition is statistically `ρ`-addition hiding + position binding.
 //!
 //! Each opening stores:
 //! 1. `r` (length `κ_cs`) and the share vector `s` (length `μ_cs`), as `CsPoly`.
-//! 2. The decomposed block subtree — every node from the leaves up to (but
-//!    excluding) the block root. Level 0 (the BDLOP leaves) is decomposed via
-//!    the CS→HVC bridge; higher levels via HVC `decompose_r`. That's
-//!    `2·block_size − 2` decomposed nodes (`HVC_WIDTH` `HVCPoly` each).
-//! 3. The chipmunk Merkle path above the block root — `stored_path_len`
+//! 2. `u` — the bridged leaf digits, `ξ·HVC_WIDTH` `HVCPoly`.
+//! 3. The chipmunk Merkle path above the leaf label — `stored_path_len`
 //!    `(left, right)` sibling pairs in decomposed (`HVC`) form.
 //!
-//! Why store the subtree decomposed?  Decomposition is *non-linear* in raw
-//! values, so we cannot recompute decompositions of summed `(r, s)` from
-//! scratch. But `hash_separate_inputs` is *linear over decomposed inputs* and
-//! the projections are linear, so summing the stored decompositions pointwise
-//! keeps `sum_openings` correct.
+//! Why store `u` rather than the raw leaf?  Decomposition is *non-linear* in
+//! raw values, so we cannot recompute the decomposition of a summed `(r, s)`
+//! from scratch. But `LeafHash::hash` is linear over its digit inputs and the
+//! projections are linear, so summing stored digits pointwise keeps
+//! `sum_openings` correct.
 
 use chipmunk_code::{
-    pointwise_dot_cs, pointwise_sum_polys, CsNTTPoly, CsPoly, HVCHash, HVCPoly, Polynomial, Tree,
-    CS_MODULUS, HVC_MODULUS, HVC_WIDTH, N as POLY_N,
+    pointwise_dot as pointwise_dot_hvc, pointwise_dot_cs, pointwise_sum_polys, CsNTTPoly, CsPoly,
+    HVCHash, HVCNTTPoly, HVCPoly, Polynomial, Tree, CS_MODULUS, HVC_MODULUS, HVC_WIDTH,
+    N as POLY_N,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -60,6 +62,38 @@ pub trait Cs {
     fn sum_openings(os: &[&Self::Opening]) -> Self::Opening;
 }
 
+/// `g ∈ R_{q_hvc}^{ξ·HVC_WIDTH}`: the Ajtai hash labelling one vector-commitment
+/// leaf, over `ξ = 1 + μ_cs` elements of `HVC_WIDTH` digits each.
+pub struct LeafHash {
+    g: Vec<HVCNTTPoly>,
+}
+
+impl LeafHash {
+    fn init<R: Rng>(rng: &mut R, xi: usize) -> Self {
+        LeafHash {
+            g: (0..xi * HVC_WIDTH)
+                .map(|_| HVCNTTPoly::from(&HVCPoly::rand_poly(rng)))
+                .collect(),
+        }
+    }
+
+    /// `g^T · u`, linear in `u` — that linearity is what lets `sum_openings` add
+    /// stored digits pointwise. Defer to SIMD `pointwise_dot`; a hand-rolled
+    /// mul/add loop costs ~2×.
+    fn hash(&self, u: &[HVCPoly]) -> HVCPoly {
+        assert_eq!(u.len(), self.g.len());
+        let u_ntt: Vec<HVCNTTPoly> = u
+            .iter()
+            .map(|x| {
+                let mut x = *x;
+                x.lift();
+                HVCNTTPoly::from(&x)
+            })
+            .collect();
+        HVCPoly::from(&pointwise_dot_hvc(&self.g, &u_ntt))
+    }
+}
+
 /// BDLOP matrix-form public parameters. `a`/`B` live on the CS ring.
 pub struct CsParams {
     pub a_ntt: Vec<CsNTTPoly>,
@@ -76,43 +110,43 @@ pub struct CsParams {
     /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·34 = 10200). Checked
     /// in `verify` so a forged opening can't use out-of-range digits.
     pub beta_agg_hvc: u32,
+    /// Labels a leaf from its `ξ·HVC_WIDTH` bridged digits.
+    pub leaf_hash: LeafHash,
+    /// Hashes sibling pairs in the tree above the leaves.
     pub hasher: HVCHash,
     pub n_servers: usize,
     pub n_leaves: usize,
 }
 
 impl CsParams {
-    pub fn block_size(&self) -> usize {
-        (1 + self.mu_cs).next_power_of_two()
+    /// Leaf vector width: `c¹` plus the `μ_cs` components of `c²`.
+    pub fn xi(&self) -> usize {
+        1 + self.mu_cs
     }
 
-    pub fn block_height(&self) -> usize {
-        self.block_size().trailing_zeros() as usize
-    }
-
-    /// Depth of the chipmunk tree over the per-server block roots.
+    /// Depth of the chipmunk tree over the per-server leaf labels.
     pub fn total_path_len(&self) -> usize {
         self.n_leaves.trailing_zeros() as usize
     }
 
-    /// The whole tree path above each block root is stored (the block subtree
-    /// is held separately, decomposed, in the opening body).
+    /// The whole tree path above each leaf label is stored (the leaf digits are
+    /// held separately in the opening body).
     pub fn stored_path_len(&self) -> usize {
         self.total_path_len()
     }
 
     /// Packed byte length of one aggregated `ServerBulletinEntry`'s crypto
-    /// (`agg_open` + `agg_share`) over `rho` clients, mirroring `Opening::pack`
-    /// and `pack_cs_shares` without materialising them — for wire-budget planning.
+    /// (`agg_open` + `agg_share`) over `rho` clients, mirroring
+    /// `PackedOpening::to_bytes` and `pack_cs_shares` without materialising them
+    /// — for wire-budget planning.
     pub fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
         let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(self, rho);
-        let data_polys = opening_data_polys(self.block_size(), self.stored_path_len());
-        let open = ((self.kappa_cs * POLY_N) * bits_for_signed(r_b) as usize
+        let data_polys = opening_data_polys(self.xi(), self.stored_path_len());
+        let body = ((self.kappa_cs * POLY_N) * bits_for_signed(r_b) as usize
             + (self.mu_cs * POLY_N) * bits_for_signed(s_b) as usize
-            + (data_polys * POLY_N) * bits_for_signed(t_b) as usize
-            + 7)
-            / 8;
-        open + self.mu_cs * poly_packed_len(CS_MODULUS)
+            + (data_polys * POLY_N) * bits_for_signed(t_b) as usize)
+            .div_ceil(8);
+        PACKED_OPENING_HEADER_LEN + body + self.mu_cs * poly_packed_len(CS_MODULUS)
     }
 }
 
@@ -127,35 +161,16 @@ pub struct Opening {
     pub path_index: usize,
     kappa_cs: usize,
     mu_cs: usize,
-    block_size: usize,
     stored_path_len: usize,
     /// `r` (κ_cs) ‖ `s` (μ_cs), on the CS ring.
     rs: Box<[CsPoly]>,
-    /// Decomposed block subtree ‖ decomposed path, on the HVC ring.
+    /// Bridged leaf digits `u` ‖ decomposed path, on the HVC ring.
     data: Box<[HVCPoly]>,
 }
 
-fn block_subtree_node_count(block_size: usize) -> usize {
-    2 * block_size - 2
-}
-
-fn block_level_size(block_size: usize, level: usize) -> usize {
-    block_size >> level
-}
-
-fn block_level_offset(block_size: usize, level: usize) -> usize {
-    let mut acc = 0usize;
-    let mut count = block_size;
-    for _ in 0..level {
-        acc += count;
-        count /= 2;
-    }
-    acc
-}
-
-/// Number of `HVCPoly` in an opening's `data` (block subtree + path).
-fn opening_data_polys(block_size: usize, stored_path_len: usize) -> usize {
-    block_subtree_node_count(block_size) * HVC_WIDTH + stored_path_len * 2 * HVC_WIDTH
+/// Number of `HVCPoly` in an opening's `data` (leaf digits + path).
+fn opening_data_polys(xi: usize, stored_path_len: usize) -> usize {
+    xi * HVC_WIDTH + stored_path_len * 2 * HVC_WIDTH
 }
 
 impl Opening {
@@ -165,8 +180,8 @@ impl Opening {
     pub fn mu_cs(&self) -> usize {
         self.mu_cs
     }
-    pub fn block_size(&self) -> usize {
-        self.block_size
+    pub fn xi(&self) -> usize {
+        1 + self.mu_cs
     }
     pub fn stored_path_len(&self) -> usize {
         self.stored_path_len
@@ -187,16 +202,18 @@ impl Opening {
         &mut self.rs[self.kappa_cs..self.kappa_cs + self.mu_cs]
     }
 
-    /// Decomposed node at block-subtree `level` (0 = leaves), position `idx`.
-    pub fn block_node(&self, level: usize, idx: usize) -> &[HVCPoly] {
-        let level_offset = block_level_offset(self.block_size, level);
-        let start = (level_offset + idx) * HVC_WIDTH;
-        &self.data[start..start + HVC_WIDTH]
+    /// The bridged leaf digits `u = dec_{q_cs}(m)`, `ξ·HVC_WIDTH` long.
+    pub fn u(&self) -> &[HVCPoly] {
+        &self.data[..self.xi() * HVC_WIDTH]
+    }
+
+    /// Digits of leaf element `k ∈ [0, ξ)`.
+    fn u_element(&self, k: usize) -> &[HVCPoly] {
+        &self.data[k * HVC_WIDTH..(k + 1) * HVC_WIDTH]
     }
 
     pub fn path_node(&self, level: usize) -> (&[HVCPoly], &[HVCPoly]) {
-        let base =
-            block_subtree_node_count(self.block_size) * HVC_WIDTH + level * 2 * HVC_WIDTH;
+        let base = self.xi() * HVC_WIDTH + level * 2 * HVC_WIDTH;
         (
             &self.data[base..base + HVC_WIDTH],
             &self.data[base + HVC_WIDTH..base + 2 * HVC_WIDTH],
@@ -226,43 +243,12 @@ fn leaf_block(
     leaves
 }
 
-/// Build a server's block subtree from its `1 + μ_cs` raw CS leaves. Appends
-/// the decomposed subtree (level 0 via the CS→HVC bridge, higher levels via
-/// HVC `decompose_r`) to `data` and returns the block root (an `HVCPoly`).
-fn build_block_subtree(
-    hasher: &HVCHash,
-    raw_leaves: &[CsPoly],
-    block_size: usize,
-    block_height: usize,
-    data: &mut Vec<HVCPoly>,
-) -> HVCPoly {
-    // Level 0: CS leaves, padded to block_size.
-    let leaves_cs: Vec<CsPoly> = raw_leaves
+/// Bridge the `ξ` raw CS leaf elements into their HVC digits `u = dec_{q_cs}(m)`.
+fn bridge_leaf(raw_leaves: &[CsPoly]) -> Vec<HVCPoly> {
+    raw_leaves
         .iter()
-        .copied()
-        .chain(std::iter::repeat(CsPoly::default()).take(block_size - raw_leaves.len()))
-        .collect();
-    // Store level-0 digits (CS→HVC bridge).
-    for leaf in &leaves_cs {
-        data.extend_from_slice(&leaf.decompose_r_to_hvc());
-    }
-    // Level 1 (HVCPoly): hash CS-bridged sibling pairs.
-    let mut cur: Vec<HVCPoly> = leaves_cs
-        .chunks(2)
-        .map(|p| hasher.hash_separate_inputs(&p[0].decompose_r_to_hvc(), &p[1].decompose_r_to_hvc()))
-        .collect();
-    // Levels 1..block_height: store level h (HVC), advance to h+1.
-    for _h in 1..block_height {
-        for node in &cur {
-            data.extend_from_slice(&node.decompose_r());
-        }
-        cur = cur
-            .chunks(2)
-            .map(|p| hasher.decom_then_hash(&p[0], &p[1]))
-            .collect();
-    }
-    debug_assert_eq!(cur.len(), 1);
-    cur[0]
+        .flat_map(|leaf| leaf.decompose_r_to_hvc())
+        .collect()
 }
 
 fn position_list(index: usize, depth: usize) -> Vec<bool> {
@@ -295,8 +281,9 @@ impl HidingMerkleCommitment {
                     .collect()
             })
             .collect();
+        let leaf_hash = LeafHash::init(rng, 1 + mu_cs);
         let hasher = HVCHash::init(rng);
-        // Chipmunk tree is over the per-server block roots.
+        // Chipmunk tree is over the per-server leaf labels.
         let n_leaves = num_servers.next_power_of_two().max(2);
         CsParams {
             a_ntt,
@@ -306,6 +293,7 @@ impl HidingMerkleCommitment {
             beta_cs,
             r_bound,
             beta_agg_hvc,
+            leaf_hash,
             hasher,
             n_servers: num_servers,
             n_leaves,
@@ -327,16 +315,16 @@ impl Cs for HidingMerkleCommitment {
 
     /// Commit per-server share vectors and emit one opening per server.
     ///
-    /// 1. **Per-server BDLOP leaves + block subtree.** Draw fresh randomness
+    /// 1. **Per-server BDLOP leaf + label.** Draw fresh randomness
     ///    `r_i ∈ B^{κ_cs}_{β_cs,q_cs}` (uniform `[-β_cs, β_cs]`), compute the
-    ///    `1 + μ_cs` raw CS leaves `(a^T r_i, B r_i + s_i)`, then hash them up
-    ///    via the CS→HVC bridge to a block root (an `HVCPoly`). The decomposed
-    ///    subtree is appended to the opening body.
-    /// 2. **Chipmunk Merkle tree over block roots.** Build a standard chipmunk
-    ///    `Tree` over `n_leaves = next_pow2(n_servers)` block roots. Its `root`
+    ///    `ξ = 1 + μ_cs` raw CS leaf elements `(a^T r_i, B r_i + s_i)`, bridge
+    ///    them to digits `u_i`, and label the leaf with the single Ajtai hash
+    ///    `g^T · u_i` (an `HVCPoly`). `u_i` is the opening body.
+    /// 2. **Chipmunk Merkle tree over leaf labels.** Build a standard chipmunk
+    ///    `Tree` over `n_leaves = next_pow2(n_servers)` labels. Its `root`
     ///    is the commitment.
-    /// 3. **Opening layout.** `rs = r ‖ s` (CS ring); `data =` decomposed block
-    ///    subtree ‖ decomposed tree path above the block root.
+    /// 3. **Opening layout.** `rs = r ‖ s` (CS ring); `data = u ‖` decomposed
+    ///    tree path above the leaf label.
     fn commit<R: Rng>(
         rng: &mut R,
         pp: &CsParams,
@@ -346,13 +334,11 @@ impl Cs for HidingMerkleCommitment {
         for s in shares {
             assert_eq!(s.len(), pp.mu_cs, "each share must have μ_cs components");
         }
-        let block_size = pp.block_size();
-        let block_height = pp.block_height();
         let stored_path_len = pp.stored_path_len();
 
-        // Step 1: per-server block subtree → block root + decomposed body.
-        // Independent per server; `r`'s randomness is forked into per-server
-        // seeds so the result is deterministic regardless of thread schedule.
+        // Step 1: per-server leaf digits + label. Independent per server; `r`'s
+        // randomness is forked into per-server seeds so the result is
+        // deterministic regardless of thread schedule.
         let seeds = crate::fork_seeds(rng, pp.n_servers);
         let per_server: Vec<(HVCPoly, Vec<HVCPoly>, Vec<CsPoly>)> = shares
             .par_iter()
@@ -362,55 +348,45 @@ impl Cs for HidingMerkleCommitment {
                 let r: Vec<CsPoly> = (0..pp.kappa_cs)
                     .map(|_| CsPoly::rand_mod_p(&mut item_rng, pp.beta_cs))
                     .collect();
-                let raw_leaves = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, s_vec);
-
-                let mut dblock =
-                    Vec::with_capacity(block_subtree_node_count(block_size) * HVC_WIDTH);
-                let block_root = build_block_subtree(
-                    &pp.hasher,
-                    &raw_leaves,
-                    block_size,
-                    block_height,
-                    &mut dblock,
-                );
+                let u = bridge_leaf(&leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, s_vec));
+                let label = pp.leaf_hash.hash(&u);
                 // rs = r ‖ s
                 let mut rs = r;
                 rs.extend_from_slice(s_vec);
-                (block_root, dblock, rs)
+                (label, u, rs)
             })
             .collect();
 
-        let mut block_roots = vec![HVCPoly::default(); pp.n_leaves];
-        let mut server_block_data: Vec<Vec<HVCPoly>> = Vec::with_capacity(pp.n_servers);
+        let mut labels = vec![HVCPoly::default(); pp.n_leaves];
+        let mut server_u: Vec<Vec<HVCPoly>> = Vec::with_capacity(pp.n_servers);
         let mut server_rs: Vec<Vec<CsPoly>> = Vec::with_capacity(pp.n_servers);
-        for (i, (block_root, dblock, rs)) in per_server.into_iter().enumerate() {
-            block_roots[i] = block_root;
-            server_block_data.push(dblock);
+        for (i, (label, u, rs)) in per_server.into_iter().enumerate() {
+            labels[i] = label;
+            server_u.push(u);
             server_rs.push(rs);
         }
 
-        // Step 2: chipmunk tree over the block roots.
-        let tree = Tree::<HVCHash>::new_with_leaf_nodes(&block_roots, &pp.hasher);
+        // Step 2: chipmunk tree over the leaf labels.
+        let tree = Tree::<HVCHash>::new_with_leaf_nodes(&labels, &pp.hasher);
         let root = tree.root();
 
-        // Step 3: pack openings (block body already built; append the path).
+        // Step 3: pack openings (leaf digits already built; append the path).
         let openings: Vec<Opening> = (0..pp.n_servers)
             .into_par_iter()
             .map(|i| {
-                let mut data = server_block_data[i].clone();
+                let mut data = server_u[i].clone();
                 let raw_path = tree.gen_proof(i);
                 debug_assert_eq!(raw_path.nodes.len(), stored_path_len);
                 for (l, r) in raw_path.nodes.iter().take(stored_path_len) {
                     data.extend_from_slice(&l.decompose_r());
                     data.extend_from_slice(&r.decompose_r());
                 }
-                debug_assert_eq!(data.len(), opening_data_polys(block_size, stored_path_len));
+                debug_assert_eq!(data.len(), opening_data_polys(pp.xi(), stored_path_len));
                 Opening {
                     server_index: i,
                     path_index: raw_path.index,
                     kappa_cs: pp.kappa_cs,
                     mu_cs: pp.mu_cs,
-                    block_size,
                     stored_path_len,
                     rs: server_rs[i].clone().into_boxed_slice(),
                     data: data.into_boxed_slice(),
@@ -423,31 +399,28 @@ impl Cs for HidingMerkleCommitment {
 
     /// Verify reverses `commit`:
     /// 1. Shape + norm checks (`‖r‖∞ ≤ r_bound` on the CS ring).
-    /// 2. Recompute the raw CS leaves from `(r, s, a, B)`.
-    /// 3. Walk the block subtree: project each stored decomp back (level 0 via
-    ///    `project_r_from_hvc` → compare CsPoly; higher levels via
-    ///    `projection_r` → compare HVCPoly), hashing stored-decomp sibling
-    ///    pairs to the next level. Yields the block root.
-    /// 4. Walk the chipmunk path above the block root to the commitment root.
+    /// 2. Recompute the raw CS leaf elements from `(r, s, a, B)` and check that
+    ///    each stored digit group projects back to it (`project_r_from_hvc`).
+    /// 3. Label the leaf from the stored digits: `g^T · u`.
+    /// 4. Walk the chipmunk path above the leaf label to the commitment root.
     fn verify(pp: &CsParams, c: &Commitment, o: &Opening) -> bool {
         // Step 1
         if o.kappa_cs() != pp.kappa_cs
             || o.mu_cs() != pp.mu_cs
-            || o.block_size() != pp.block_size()
             || o.stored_path_len() != pp.stored_path_len()
         {
             return false;
         }
         // Guard backing buffers before the accessors slice into them.
         if o.rs.len() != pp.kappa_cs + pp.mu_cs
-            || o.data.len() != opening_data_polys(pp.block_size(), pp.stored_path_len())
+            || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
         {
             return false;
         }
         if !o.r().iter().all(|p| p.infinity_norm() <= pp.r_bound) {
             return false;
         }
-        // Bound the base-(2η+1) HVC decomposition digits (block subtree + path)
+        // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
         // by β_agg_hvc, so a forged opening can't substitute out-of-range digits
         // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
         // after aggregation), well within β_agg_hvc = ρ_max·ζ.
@@ -455,56 +428,21 @@ impl Cs for HidingMerkleCommitment {
             return false;
         }
 
-        let block_size = pp.block_size();
-        let block_height = pp.block_height();
-
-        // Step 2: raw CS leaves, padded.
+        // Step 2: raw CS leaf elements vs. the stored bridge digits.
         let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, o.r(), o.s());
-        let expected_cs: Vec<CsPoly> = raw
-            .iter()
-            .copied()
-            .chain(std::iter::repeat(CsPoly::default()).take(block_size - raw.len()))
-            .collect();
-
-        // Step 3a: level 0 (CS ring). Project stored bridge digits, compare.
-        for (k, exp) in expected_cs.iter().enumerate() {
-            if CsPoly::project_r_from_hvc(o.block_node(0, k)) != *exp {
+        for (k, exp) in raw.iter().enumerate() {
+            if CsPoly::project_r_from_hvc(o.u_element(k)) != *exp {
                 return false;
             }
         }
-        // Hash level-0 stored digits into level 1 (HVC).
-        let mut expected_level: Vec<HVCPoly> = (0..block_size / 2)
-            .map(|m| {
-                pp.hasher
-                    .hash_separate_inputs(o.block_node(0, 2 * m), o.block_node(0, 2 * m + 1))
-            })
-            .collect();
 
-        // Step 3b: levels 1..block_height (HVC ring).
-        for h in 1..block_height {
-            let level_size = block_level_size(block_size, h);
-            for k in 0..level_size {
-                if HVCPoly::projection_r(o.block_node(h, k)) != expected_level[k] {
-                    return false;
-                }
-            }
-            let next_size = level_size / 2;
-            let mut next: Vec<HVCPoly> = Vec::with_capacity(next_size);
-            for m in 0..next_size {
-                next.push(
-                    pp.hasher
-                        .hash_separate_inputs(o.block_node(h, 2 * m), o.block_node(h, 2 * m + 1)),
-                );
-            }
-            expected_level = next;
-        }
-        debug_assert_eq!(expected_level.len(), 1);
-        let leaf_block_root = expected_level[0];
+        // Step 3: one flat Ajtai hash over the stored digits.
+        let leaf_label = pp.leaf_hash.hash(o.u());
 
-        // Step 4: chipmunk path above the block root.
+        // Step 4: chipmunk path above the leaf label.
         let stored_path_len = o.stored_path_len();
         if stored_path_len == 0 {
-            return c.root == leaf_block_root;
+            return c.root == leaf_label;
         }
 
         let (top_l, top_r) = o.path_node(0);
@@ -535,7 +473,7 @@ impl Cs for HidingMerkleCommitment {
         } else {
             HVCPoly::projection_r(last_l)
         };
-        stored_running == leaf_block_root
+        stored_running == leaf_label
     }
 
     fn sum_commitments(cs: &[Commitment]) -> Commitment {
@@ -550,7 +488,6 @@ impl Cs for HidingMerkleCommitment {
         let idx = os[0].server_index;
         let kappa_cs = os[0].kappa_cs();
         let mu_cs = os[0].mu_cs();
-        let block_size = os[0].block_size();
         let stored_path_len = os[0].stored_path_len();
         let path_index = os[0].path_index;
         let total = os[0].data.len();
@@ -559,7 +496,6 @@ impl Cs for HidingMerkleCommitment {
             assert_eq!(o.server_index, idx);
             assert_eq!(o.kappa_cs(), kappa_cs);
             assert_eq!(o.mu_cs(), mu_cs);
-            assert_eq!(o.block_size(), block_size);
             assert_eq!(o.stored_path_len(), stored_path_len);
             assert_eq!(o.path_index, path_index);
             debug_assert_eq!(o.data.len(), total);
@@ -650,7 +586,6 @@ impl Cs for HidingMerkleCommitment {
             path_index,
             kappa_cs,
             mu_cs,
-            block_size,
             stored_path_len,
             rs: rs.into_boxed_slice(),
             data: data.into_boxed_slice(),
@@ -695,10 +630,10 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 // ============================================================
 //
 // An opening has 4 regions with different coefficient bounds:
-//   r              (κ_cs CS polys, bounded by β_cs fresh / r_bound aggregated)
-//   s              (μ_cs CS polys, bounded by q_cs/2)
-//   block subtree  ((2·block_size − 2) · HVC_WIDTH HVC polys, decomposed at ZETA)
-//   path           (stored_path_len · 2 · HVC_WIDTH HVC polys, decomposed at ZETA)
+//   r            (κ_cs CS polys, bounded by β_cs fresh / r_bound aggregated)
+//   s            (μ_cs CS polys, bounded by q_cs/2)
+//   leaf digits  (ξ · HVC_WIDTH HVC polys, decomposed at ZETA)
+//   path         (stored_path_len · 2 · HVC_WIDTH HVC polys, decomposed at ZETA)
 //
 // Tight pack uses just enough bits per coefficient for each region's bound:
 //   r:    ⌈log₂(2·r_bound + 1)⌉ bits
@@ -921,14 +856,13 @@ pub fn unpack_cs_shares(bytes: &[u8], count: usize) -> Option<Vec<CsPoly>> {
 
 /// Tightly bit-packed Opening for wire transport. Stores per-region bit widths
 /// so unpacking is self-describing. Layout of `bytes`:
-/// `pack(r) ‖ pack(s) ‖ pack(block_subtree) ‖ pack(path)`.
+/// `pack(r) ‖ pack(s) ‖ pack(leaf digits) ‖ pack(path)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackedOpening {
     pub server_index: u32,
     pub path_index: u32,
     pub kappa_cs: u32,
     pub mu_cs: u32,
-    pub block_size: u32,
     pub stored_path_len: u32,
     pub r_bound: u32,
     pub s_bound: u32,
@@ -936,8 +870,8 @@ pub struct PackedOpening {
     pub bytes: Vec<u8>,
 }
 
-/// `PackedOpening` header size on the wire: 9 × u32 LE.
-const PACKED_OPENING_HEADER_LEN: usize = 36;
+/// `PackedOpening` header size on the wire: 8 × u32 LE.
+pub const PACKED_OPENING_HEADER_LEN: usize = 32;
 
 impl PackedOpening {
     /// Total byte length of the packed payload (header excluded).
@@ -945,7 +879,7 @@ impl PackedOpening {
         self.bytes.len()
     }
 
-    /// Self-describing wire form: `9 × u32 LE header ‖ bytes`.
+    /// Self-describing wire form: `8 × u32 LE header ‖ bytes`.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(PACKED_OPENING_HEADER_LEN + self.bytes.len());
         for v in [
@@ -953,7 +887,6 @@ impl PackedOpening {
             self.path_index,
             self.kappa_cs,
             self.mu_cs,
-            self.block_size,
             self.stored_path_len,
             self.r_bound,
             self.s_bound,
@@ -971,7 +904,7 @@ impl PackedOpening {
         if data.len() < PACKED_OPENING_HEADER_LEN {
             return None;
         }
-        let mut f = [0u32; 9];
+        let mut f = [0u32; 8];
         for (i, v) in f.iter_mut().enumerate() {
             *v = u32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap());
         }
@@ -980,11 +913,10 @@ impl PackedOpening {
             path_index: f[1],
             kappa_cs: f[2],
             mu_cs: f[3],
-            block_size: f[4],
-            stored_path_len: f[5],
-            r_bound: f[6],
-            s_bound: f[7],
-            tree_bound: f[8],
+            stored_path_len: f[4],
+            r_bound: f[5],
+            s_bound: f[6],
+            tree_bound: f[7],
             bytes: data[PACKED_OPENING_HEADER_LEN..].to_vec(),
         })
     }
@@ -1008,13 +940,13 @@ impl Opening {
     /// - `r_bound`: ∞-norm bound on `r` (`β_cs` for fresh openings,
     ///   `CsParams::r_bound` for aggregated).
     /// - `s_bound`: ∞-norm bound on `s` (q_cs/2 for arbitrary share values).
-    /// - `tree_bound`: ∞-norm bound on decomposed nodes (`ZETA` fresh,
-    ///   `ρ·ZETA` after summing ρ openings).
+    /// - `tree_bound`: ∞-norm bound on digits (`ZETA` fresh, `ρ·ZETA` after
+    ///   summing ρ openings).
     pub fn pack(&self, r_bound: u32, s_bound: u32, tree_bound: u32) -> PackedOpening {
         let r_bits = bits_for_signed(r_bound);
         let s_bits = bits_for_signed(s_bound);
         let tree_bits = bits_for_signed(tree_bound);
-        let data_polys = opening_data_polys(self.block_size, self.stored_path_len);
+        let data_polys = opening_data_polys(self.xi(), self.stored_path_len);
         let est_bytes = ((self.kappa_cs * POLY_N) * r_bits as usize
             + (self.mu_cs * POLY_N) * s_bits as usize
             + (data_polys * POLY_N) * tree_bits as usize
@@ -1036,7 +968,6 @@ impl Opening {
             path_index: self.path_index as u32,
             kappa_cs: self.kappa_cs as u32,
             mu_cs: self.mu_cs as u32,
-            block_size: self.block_size as u32,
             stored_path_len: self.stored_path_len as u32,
             r_bound,
             s_bound,
@@ -1049,21 +980,18 @@ impl Opening {
     pub fn from_packed(p: &PackedOpening) -> Result<Opening, OpeningDecodeError> {
         let kappa_cs = p.kappa_cs as usize;
         let mu_cs = p.mu_cs as usize;
-        let block_size = p.block_size as usize;
         let stored_path_len = p.stored_path_len as usize;
 
         if kappa_cs == 0
-            || block_size < 2
-            || !block_size.is_power_of_two()
+            || mu_cs == 0
             || kappa_cs > MAX_OPENING_DIM
             || mu_cs > MAX_OPENING_DIM
-            || block_size > MAX_OPENING_DIM
             || stored_path_len > MAX_OPENING_DIM
         {
             return Err(OpeningDecodeError::BadHeader);
         }
 
-        let data_polys = opening_data_polys(block_size, stored_path_len);
+        let data_polys = opening_data_polys(1 + mu_cs, stored_path_len);
         let r_bits = bits_for_signed(p.r_bound);
         let s_bits = bits_for_signed(p.s_bound);
         let tree_bits = bits_for_signed(p.tree_bound);
@@ -1089,7 +1017,7 @@ impl Opening {
             byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.s_bound, s_bits);
             *poly = CsPoly::from_coeffs(tmp);
         }
-        // Unpack block subtree + path (HVC)
+        // Unpack leaf digits + path (HVC)
         for poly in data.iter_mut() {
             byte_idx = unpack_bits(&p.bytes, byte_idx, poly.coeffs_mut(), p.tree_bound, tree_bits);
         }
@@ -1098,7 +1026,6 @@ impl Opening {
             path_index: p.path_index as usize,
             kappa_cs,
             mu_cs,
-            block_size,
             stored_path_len,
             rs: rs.into_boxed_slice(),
             data: data.into_boxed_slice(),
@@ -1180,7 +1107,7 @@ mod tests {
         for n_servers in [1usize, 2, 3, 5, 7] {
             let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, 3, 5);
             assert_eq!(pp.mu_cs, 3);
-            assert_eq!(pp.block_size(), 4);
+            assert_eq!(pp.xi(), 4);
             let shares = rand_shares(&mut rng, n_servers, pp.mu_cs);
             let (comm, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
             for o in &openings {
@@ -1197,7 +1124,7 @@ mod tests {
     fn commit_verify_mu_4() {
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
         let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 4, 5);
-        assert_eq!(pp.block_size(), 8);
+        assert_eq!(pp.xi(), 5);
         let shares = rand_shares(&mut rng, 4, 4);
         let (comm, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         for o in &openings {
@@ -1293,7 +1220,7 @@ mod tests {
             assert_eq!(o.s(), unpacked.s());
             assert_eq!(o.server_index, unpacked.server_index);
             assert_eq!(o.path_index, unpacked.path_index);
-            assert_eq!(o.block_node(0, 0), unpacked.block_node(0, 0));
+            assert_eq!(o.u(), unpacked.u());
             if o.stored_path_len() > 0 {
                 let (l0, r0) = o.path_node(0);
                 let (l1, r1) = unpacked.path_node(0);
@@ -1323,28 +1250,93 @@ mod tests {
             let unpacked = Opening::from_packed(&packed).unwrap();
             assert_eq!(agg.r(), unpacked.r());
             assert_eq!(agg.s(), unpacked.s());
-            assert_eq!(agg.block_node(0, 0), unpacked.block_node(0, 0));
+            assert_eq!(agg.u(), unpacked.u());
         }
     }
 
+    /// `sum_openings` needs the label of a sum to be the sum of the labels.
+    #[test]
+    fn leaf_hash_is_linear() {
+        let mut rng = ChaCha20Rng::from_seed([103u8; 32]);
+        for xi in [1usize, 2, 5] {
+            let lh = LeafHash::init(&mut rng, xi);
+            let len = xi * HVC_WIDTH;
+            let a: Vec<HVCPoly> = (0..len).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
+            let b: Vec<HVCPoly> = (0..len).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
+            let summed: Vec<HVCPoly> = a.iter().zip(&b).map(|(x, y)| *x + *y).collect();
+            assert_eq!(lh.hash(&summed), lh.hash(&a) + lh.hash(&b), "xi={xi}");
+        }
+    }
+
+    /// The flat leaf hash must not move the wire size at the deployed μ_cs = 1.
+    #[test]
+    fn opening_size_unchanged_at_mu_1() {
+        for path in 0usize..5 {
+            assert_eq!(opening_data_polys(2, path), 6 + 6 * path);
+        }
+    }
+
+    /// ξ = 1 + μ_cs is no longer rounded up to a power of two, so odd widths are
+    /// first-class.
+    #[test]
+    fn commit_verify_sum_across_widths() {
+        let mut rng = ChaCha20Rng::from_seed([104u8; 32]);
+        for mu_cs in [1usize, 2, 3, 4, 5] {
+            let n_servers = 4;
+            let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, mu_cs, 5);
+            assert_eq!(pp.xi(), 1 + mu_cs);
+            let shares_a = rand_shares(&mut rng, n_servers, mu_cs);
+            let shares_b = rand_shares(&mut rng, n_servers, mu_cs);
+            let (comm_a, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
+            let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
+            for o in &opens_a {
+                assert!(
+                    HidingMerkleCommitment::verify(&pp, &comm_a, o),
+                    "fresh opening failed at μ_cs={mu_cs}"
+                );
+                assert_eq!(o.u().len(), pp.xi() * HVC_WIDTH);
+            }
+            let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
+            for i in 0..n_servers {
+                let summed = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]);
+                for k in 0..mu_cs {
+                    assert_eq!(summed.s()[k], shares_a[i][k] + shares_b[i][k]);
+                }
+                assert!(
+                    HidingMerkleCommitment::verify(&pp, &comm_sum, &summed),
+                    "aggregate opening failed at μ_cs={mu_cs}"
+                );
+            }
+        }
+    }
+
+    /// `N = 2048` is a multiple of 8, so no region pads and the body is exactly
+    /// its bit budget — a tighter pin than a ratio, which moves with the region
+    /// mix (`s` packs 18/32, digits 7/32).
     #[test]
     fn pack_size_reduction() {
         let mut rng = ChaCha20Rng::from_seed([102u8; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 5, 5);
-        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
-        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-        let o = &openings[0];
-        let data_polys = opening_data_polys(o.block_size(), o.stored_path_len());
-        let rs_polys = o.kappa_cs() + o.mu_cs();
-        let in_mem_bytes = data_polys * std::mem::size_of::<HVCPoly>()
-            + rs_polys * std::mem::size_of::<CsPoly>();
-        let packed = o.pack(pp.beta_cs, CS_MODULUS as u32 / 2, chipmunk_code::ZETA);
-        let packed_bytes = packed.body_len();
-        assert!(
-            packed_bytes * 4 <= in_mem_bytes,
-            "packed {} not ≤ in_mem {} / 4",
-            packed_bytes,
-            in_mem_bytes
-        );
+        for mu_cs in [1usize, 5] {
+            let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, mu_cs, 5);
+            let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+            let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+            let o = &openings[0];
+            let data_polys = opening_data_polys(o.xi(), o.stored_path_len());
+            let rs_polys = o.kappa_cs() + o.mu_cs();
+            let in_mem_bytes = data_polys * std::mem::size_of::<HVCPoly>()
+                + rs_polys * std::mem::size_of::<CsPoly>();
+            let packed = o.pack(pp.beta_cs, CS_MODULUS as u32 / 2, chipmunk_code::ZETA);
+            let packed_bytes = packed.body_len();
+
+            let expected = (o.kappa_cs() * POLY_N * bits_for_signed(pp.beta_cs) as usize
+                + o.mu_cs() * POLY_N * bits_for_signed(CS_MODULUS as u32 / 2) as usize
+                + data_polys * POLY_N * bits_for_signed(chipmunk_code::ZETA) as usize)
+                / 8;
+            assert_eq!(packed_bytes, expected, "μ_cs={mu_cs}");
+            assert!(
+                packed_bytes * 3 <= in_mem_bytes,
+                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 3"
+            );
+        }
     }
 }

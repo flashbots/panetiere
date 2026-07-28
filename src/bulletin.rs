@@ -60,10 +60,10 @@ impl ClientBulletinEntry {
 pub struct ServerBulletinEntry {
     pub server_id: ServerId,
     pub clients: Vec<ClientId>,
-    /// Single aggregated `Opening` whose `s()` is the κ_kahe-vector of summed shares.
+    /// Single aggregated `Opening` whose `s()[0]` is the summed share.
     pub agg_open: Opening,
-    /// Mirrors `agg_open.s()` (componentwise sum of per-client shares at this server's point).
-    pub agg_share: Vec<CsPoly>,
+    /// Mirrors `agg_open.s()[0]` (sum of per-client shares at this server's point).
+    pub agg_share: CsPoly,
 }
 
 #[derive(Default)]

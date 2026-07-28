@@ -10,7 +10,7 @@
 use panetiere::codec;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
@@ -50,6 +50,7 @@ fn main() {
     );
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
+    let session = SessionId([0xD1; 32]);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
         .map(|_| pke::PrivateKey::generate(&mut rng))
@@ -74,11 +75,12 @@ fn main() {
         let polys = codec::encode_raw(&buf);
         assert_eq!(polys.len(), 1, "slot layout sized to fit one KahePoly");
 
-        let round = run_client_round(&mut rng, &pp, cid, polys, &servers);
+        let round = run_client_round(&mut rng, &pp, &session, cid, polys, &servers);
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &session, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }

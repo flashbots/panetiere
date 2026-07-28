@@ -10,14 +10,13 @@ use crate::kahe::{kahe_to_cs_centered, Kahe, KaheKey, KaheScheme};
 use crate::pke;
 use crate::sss::ShamirSharing;
 
-use super::{ClientId, ServerId};
 use super::ProtocolParams;
+use super::{opening_aad, ClientId, ServerId, SessionId};
 
 /// Output of a single client round (README steps 1–6).
 ///
-/// One CS commit per client (with `μ_cs = κ_kahe`), so each server's
-/// sealed opening wraps a single `Opening` — its `s()` is the
-/// `κ_kahe`-vector of Shamir shares for that server.
+/// One CS commit per client, so each server's sealed opening wraps a single
+/// `Opening` — its `s()` is that server's Shamir share of the KAHE key.
 pub struct ClientRound {
     pub client_id: ClientId,
     pub encrypted_message: ClientBulletinEntry,
@@ -25,15 +24,50 @@ pub struct ClientRound {
     pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
 }
 
-/// Pack (fresh bounds) + ECIES-seal one per-server opening.
+/// Pack (fresh bounds) + ECIES-seal one per-server opening, bound to
+/// `(sid, client_id, server_id)`.
 pub fn seal_opening<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
+    sid: &SessionId,
+    client_id: ClientId,
+    server_id: ServerId,
     opening: &Opening,
     recipient: &pke::PublicKey,
 ) -> Vec<u8> {
     let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp.cs);
-    pke::encrypt(rng, recipient, &opening.pack(r_b, s_b, t_b).to_bytes())
+    pke::encrypt(
+        rng,
+        recipient,
+        &opening.pack(r_b, s_b, t_b).to_bytes(),
+        &opening_aad(sid, client_id, server_id),
+    )
+}
+
+/// Batch form of [`seal_opening`] over one client's per-server openings.
+/// Independent per server; forked seeds keep the result deterministic
+/// regardless of thread schedule.
+pub fn seal_openings<R: CryptoRng + Rng>(
+    rng: &mut R,
+    pp: &ProtocolParams,
+    sid: &SessionId,
+    client_id: ClientId,
+    openings: &[Opening],
+    servers: &[(ServerId, pke::PublicKey)],
+) -> Vec<(ServerId, Vec<u8>)> {
+    let seeds = crate::fork_seeds(rng, servers.len());
+    servers
+        .par_iter()
+        .zip(openings.par_iter())
+        .zip(seeds.par_iter())
+        .map(|(((sid_server, xpub), opening), seed)| {
+            let mut item_rng = ChaCha20Rng::from_seed(*seed);
+            (
+                *sid_server,
+                seal_opening(&mut item_rng, pp, sid, client_id, *sid_server, opening, xpub),
+            )
+        })
+        .collect()
 }
 
 /// Sample a fresh KAHE secret key.
@@ -51,52 +85,42 @@ pub fn kahe_encrypt<R: Rng>(
     Kahe::enc(rng, &pp.kahe, key, message)
 }
 
-/// Phase 2 — bridge each KAHE-key component into R_{q_cs} via centered-rep
-/// re-interpretation, Shamir-share each component across `n_servers`, then
-/// transpose into per-server share vectors of length `κ_kahe`.
+/// Phase 2 — bridge the KAHE key into R_{q_cs} via centered-rep
+/// re-interpretation and Shamir-share it across `n_servers`. `out[i]` is
+/// server `i`'s share.
 ///
 /// Asserts the structural couplings (`n_servers == pp.cs.n_servers == pp.shamir.n`
-/// and `μ_cs == κ_kahe`) — these are invariants of `ProtocolParams` setup but
+/// and `μ_cs == 1`) — these are invariants of `ProtocolParams` setup but
 /// re-checked here so a misuse of this phase fails loudly.
 pub fn shamir_share<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     key: &KaheKey,
     n_servers: usize,
-) -> Vec<Vec<CsPoly>> {
+) -> Vec<CsPoly> {
     assert_eq!(n_servers, pp.cs.n_servers, "server count must match CS params");
     assert_eq!(n_servers, pp.shamir.n, "server count must match Shamir params");
-    let kappa_kahe = pp.kahe.kappa_kahe;
-    assert_eq!(
-        kappa_kahe, pp.cs.mu_cs,
-        "ProtocolParams must couple μ_cs = κ_kahe"
-    );
+    assert_eq!(pp.cs.mu_cs, 1, "one committed share per server");
 
-    // shares_per_component[k][i] = f_k(point_{i+1}).
-    let shares_per_component: Vec<Vec<CsPoly>> = (0..kappa_kahe)
-        .map(|k| {
-            let secret_cs = kahe_to_cs_centered(key.component(k));
-            ShamirSharing::share(rng, &pp.shamir, &secret_cs)
-        })
-        .collect();
-    (0..n_servers)
-        .map(|i| (0..kappa_kahe).map(|k| shares_per_component[k][i]).collect())
-        .collect()
+    ShamirSharing::share(rng, &pp.shamir, &kahe_to_cs_centered(key.inner()))
 }
 
-/// Phase 3 — CS commit to the per-server share matrix. Returns the public
-/// commitment and the per-server openings.
+/// Phase 3 — CS commit to the per-server shares. The commitment scheme takes a
+/// `μ_cs`-vector per position, which the protocol instantiates at `μ_cs = 1`.
+/// Returns the public commitment and the per-server openings.
 pub fn cs_commit<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
-    shares_per_server: &[Vec<CsPoly>],
+    shares_per_server: &[CsPoly],
 ) -> (Commitment, Vec<Opening>) {
-    HidingMerkleCommitment::commit(rng, &pp.cs, shares_per_server)
+    let as_vectors: Vec<Vec<CsPoly>> = shares_per_server.iter().map(|s| vec![*s]).collect();
+    HidingMerkleCommitment::commit(rng, &pp.cs, &as_vectors)
 }
 
 pub fn run_client_round<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
+    sid: &SessionId,
     client_id: ClientId,
     message: <Kahe as KaheScheme>::Message,
     servers: &[(ServerId, pke::PublicKey)],
@@ -106,18 +130,7 @@ pub fn run_client_round<R: CryptoRng + Rng>(
     let shares_per_server = shamir_share(rng, pp, &key, servers.len());
     let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
 
-    // Independent per server; forked seeds keep the result deterministic
-    // regardless of thread schedule.
-    let seeds = crate::fork_seeds(rng, servers.len());
-    let sealed_openings = servers
-        .par_iter()
-        .zip(openings.par_iter())
-        .zip(seeds.par_iter())
-        .map(|(((sid, xpub), opening), seed)| {
-            let mut item_rng = ChaCha20Rng::from_seed(*seed);
-            (*sid, seal_opening(&mut item_rng, pp, opening, xpub))
-        })
-        .collect();
+    let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
 
     ClientRound {
         client_id,

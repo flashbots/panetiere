@@ -22,7 +22,7 @@ use chipmunk_code::KahePoly;
 use rand::Rng;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
@@ -50,28 +50,27 @@ fn main() {
     let n = env_usize("PROFILE_N", 16);
     let iters = env_usize("PROFILE_ITERS", 10);
     let mu = env_usize("PROFILE_MU", 0);
-    let kappa = env_usize("PROFILE_KAPPA", 0);
     let t_modulus = env_usize("PROFILE_T", 0) as u64;
 
     let mut rng = ChaCha20Rng::from_seed([(s as u8).wrapping_mul(7) ^ n as u8; 32]);
-    let pp = if mu > 0 && kappa > 0 && t_modulus > 0 {
+    let pp = if mu > 0 && t_modulus > 0 {
         ProtocolParams::setup_with_kahe_dims_full(
-            &mut rng, s, mu, kappa,
+            &mut rng, s, mu,
             1,
             panetiere::kahe::SIGMA_S_DEFAULT,
             panetiere::kahe::SIGMA_E_DEFAULT,
             t_modulus,
         )
-    } else if mu > 0 && kappa > 0 {
-        ProtocolParams::setup_with_kahe_dims(&mut rng, s, mu, kappa)
+    } else if mu > 0 {
+        ProtocolParams::setup_with_kahe_dims(&mut rng, s, mu)
     } else {
         ProtocolParams::setup(&mut rng, s)
     };
 
     eprintln!(
-        "profile: S={} N={} iters={} (μ_kahe={}, κ_kahe={}, μ_cs={}, σ_s={:.3}, σ_e={:.3}, t={}, threshold={})",
+        "profile: S={} N={} iters={} (μ_kahe={}, μ_cs={}, σ_s={:.3}, σ_e={:.3}, t={}, threshold={})",
         s, n, iters,
-        pp.kahe.mu_kahe, pp.kahe.kappa_kahe, pp.cs.mu_cs,
+        pp.kahe.mu_kahe, pp.cs.mu_cs,
         pp.kahe.sigma_s, pp.kahe.sigma_e, pp.kahe.t_modulus, pp.shamir.t
     );
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
@@ -86,6 +85,10 @@ fn main() {
     let canonical = client_ids.clone();
 
     for iter in 0..iters {
+        // One session per iteration, as a real deployment would do per round.
+        let mut sid_bytes = [0u8; 32];
+        sid_bytes[..8].copy_from_slice(&(iter as u64).to_le_bytes());
+        let sid = SessionId(sid_bytes);
         let mut client_entries = Vec::with_capacity(n);
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
@@ -98,10 +101,11 @@ fn main() {
             let m: Vec<KahePoly> = (0..pp.kahe.mu_kahe)
                 .map(|_| rand_message_poly(&mut rng, pp.kahe.t_modulus))
                 .collect();
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &sid, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (_, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &sealed).expect("unseal");
+            for (idx, (sid_server, sealed)) in round.sealed_openings.into_iter().enumerate() {
+                let opening = unseal_opening(&server_keys[idx], &sid, cid, sid_server, &sealed)
+                    .expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }

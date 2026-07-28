@@ -7,24 +7,39 @@ use crate::bulletin::ServerBulletinEntry;
 use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
 use crate::pke;
 
-use super::{ClientId, ServerId};
+use super::{opening_aad, ClientId, ServerId, SessionId};
 
-/// Open one client's ECIES envelope into its `Opening`; `None` on a bad seal
-/// or a malformed packed opening.
-pub fn unseal_opening(key: &pke::PrivateKey, sealed: &[u8]) -> Option<Opening> {
-    let plain = pke::decrypt(key, sealed).ok()?;
+/// Open one client's ECIES envelope into its `Opening`; `None` on a bad seal, a
+/// malformed packed opening, or a `(sid, client_id, server_id)` other than the
+/// one it was sealed under.
+pub fn unseal_opening(
+    key: &pke::PrivateKey,
+    sid: &SessionId,
+    client_id: ClientId,
+    server_id: ServerId,
+    sealed: &[u8],
+) -> Option<Opening> {
+    let plain = pke::decrypt(key, sealed, &opening_aad(sid, client_id, server_id)).ok()?;
     let packed = PackedOpening::from_bytes(&plain)?;
     Opening::from_packed(&packed).ok()
 }
 
 /// Batch form of [`unseal_opening`] over a server's whole inbox, independent
-/// per item.
-pub fn unseal_openings(key: &pke::PrivateKey, sealed: &[Vec<u8>]) -> Vec<Option<Opening>> {
-    sealed.par_iter().map(|s| unseal_opening(key, s)).collect()
+/// per item. Each entry carries its `ClientId`: it is part of the bound context.
+pub fn unseal_openings(
+    key: &pke::PrivateKey,
+    sid: &SessionId,
+    server_id: ServerId,
+    sealed: &[(ClientId, Vec<u8>)],
+) -> Vec<Option<Opening>> {
+    sealed
+        .par_iter()
+        .map(|(cid, s)| unseal_opening(key, sid, *cid, server_id, s))
+        .collect()
 }
 
-/// Per-server inbox: one `Opening` per client (its `s()` is the κ_kahe-vector
-/// of that client's Shamir shares for this server).
+/// Per-server inbox: one `Opening` per client (its `s()[0]` is that client's
+/// Shamir share for this server).
 pub struct ServerInbox {
     pub server_id: ServerId,
     pub items: Vec<(ClientId, Opening)>,
@@ -36,7 +51,7 @@ pub enum ServerRoundError {
 }
 
 /// Sum the canonical clients' openings into a single aggregated `Opening` and
-/// extract the summed κ_kahe-component share vector.
+/// extract the summed share.
 pub fn run_server_round(
     inbox: &ServerInbox,
     canonical: &[ClientId],
@@ -59,8 +74,8 @@ pub fn run_server_round(
     let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs);
     // For Shamir t-of-n with linear interpolation, summing per-server shares
     // across canonical clients gives the share of `Σ sk_j` at this server's
-    // point. `agg_share` mirrors `agg_open.s()` componentwise.
-    let agg_share: Vec<CsPoly> = agg_open.s().to_vec();
+    // point. `agg_share` mirrors `agg_open.s()`.
+    let agg_share: CsPoly = agg_open.s()[0];
 
     Ok(ServerBulletinEntry {
         server_id: inbox.server_id,

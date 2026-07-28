@@ -3,7 +3,9 @@
 //! The canonical PKE for sealing per-server openings to a relay's long-lived
 //! exchange key. Wire form of a sealed envelope:
 //! `ephemeral_pubkey (65 B, SEC1 uncompressed) ‖ nonce (12 B) ‖ ciphertext+tag`.
-//! The ephemeral pubkey doubles as the AEAD associated data.
+//! The AEAD associated data is `ephemeral_pubkey ‖ aad`, where the caller's
+//! `aad` binds the envelope to its protocol context — see
+//! [`crate::protocol::opening_aad`]. Decryption with a different context fails.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -67,11 +69,21 @@ fn derive_aes_key(shared_secret: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Seal `plaintext` to `recipient` under a fresh ephemeral key.
+/// Bind the envelope to its ephemeral key and the caller's context.
+fn full_aad(eph_pub: &[u8], aad: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(eph_pub.len() + aad.len());
+    out.extend_from_slice(eph_pub);
+    out.extend_from_slice(aad);
+    out
+}
+
+/// Seal `plaintext` to `recipient` under a fresh ephemeral key, bound to `aad`.
+/// [`decrypt`] must be given the identical `aad` or it returns [`PkeError::Aead`].
 pub fn encrypt<R: CryptoRng + RngCore>(
     rng: &mut R,
     recipient: &PublicKey,
     plaintext: &[u8],
+    aad: &[u8],
 ) -> Vec<u8> {
     let ephemeral = p256::SecretKey::random(rng);
     let shared = diffie_hellman(ephemeral.to_nonzero_scalar(), recipient.0.as_affine());
@@ -85,7 +97,10 @@ pub fn encrypt<R: CryptoRng + RngCore>(
     let ciphertext = cipher
         .encrypt(
             Nonce::from_slice(&nonce),
-            Payload { msg: plaintext, aad: eph_pub.as_bytes() },
+            Payload {
+                msg: plaintext,
+                aad: &full_aad(eph_pub.as_bytes(), aad),
+            },
         )
         .expect("AES-GCM encrypt of an in-memory buffer");
 
@@ -96,7 +111,8 @@ pub fn encrypt<R: CryptoRng + RngCore>(
     out
 }
 
-pub fn decrypt(recipient: &PrivateKey, sealed: &[u8]) -> Result<Vec<u8>, PkeError> {
+/// Open an envelope sealed by [`encrypt`] under the same `aad`.
+pub fn decrypt(recipient: &PrivateKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, PkeError> {
     if sealed.len() < SEAL_OVERHEAD {
         return Err(PkeError::TooShort);
     }
@@ -108,7 +124,13 @@ pub fn decrypt(recipient: &PrivateKey, sealed: &[u8]) -> Result<Vec<u8>, PkeErro
 
     let cipher = Aes256Gcm::new((&key).into());
     cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: eph_bytes })
+        .decrypt(
+            Nonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &full_aad(eph_bytes, aad),
+            },
+        )
         .map_err(|_| PkeError::Aead)
 }
 
@@ -131,20 +153,44 @@ mod tests {
         let sk = PrivateKey::generate(&mut rng);
         let pk = sk.public();
 
-        let sealed = encrypt(&mut rng, &pk, b"hello panetiere");
+        let sealed = encrypt(&mut rng, &pk, b"hello panetiere", b"ctx");
         assert_eq!(sealed.len(), b"hello panetiere".len() + SEAL_OVERHEAD);
-        assert_eq!(decrypt(&sk, &sealed).unwrap(), b"hello panetiere");
+        assert_eq!(decrypt(&sk, &sealed, b"ctx").unwrap(), b"hello panetiere");
 
         let mut tampered = sealed.clone();
         *tampered.last_mut().unwrap() ^= 1;
-        assert_eq!(decrypt(&sk, &tampered), Err(PkeError::Aead));
+        assert_eq!(decrypt(&sk, &tampered, b"ctx"), Err(PkeError::Aead));
 
         let other = PrivateKey::generate(&mut rng);
-        assert_eq!(decrypt(&other, &sealed), Err(PkeError::Aead));
+        assert_eq!(decrypt(&other, &sealed, b"ctx"), Err(PkeError::Aead));
 
         let re = PrivateKey::from_bytes(&sk.to_bytes()).unwrap();
-        assert_eq!(decrypt(&re, &sealed).unwrap(), b"hello panetiere");
+        assert_eq!(decrypt(&re, &sealed, b"ctx").unwrap(), b"hello panetiere");
         let re_pk = PublicKey::from_sec1_bytes(&pk.to_sec1_bytes()).unwrap();
         assert_eq!(re_pk, pk);
+    }
+
+    /// Any change to the associated data makes the envelope unopenable — this is
+    /// what binds a sealed opening to its (session, client, server) context.
+    #[test]
+    fn wrong_aad_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([19u8; 32]);
+        let sk = PrivateKey::generate(&mut rng);
+        let pk = sk.public();
+
+        let aad = b"panetiere/opening/v1:sid=1,client=2,server=3";
+        let sealed = encrypt(&mut rng, &pk, b"opening bytes", aad);
+        assert_eq!(decrypt(&sk, &sealed, aad).unwrap(), b"opening bytes");
+
+        for i in 0..aad.len() {
+            let mut other = aad.to_vec();
+            other[i] ^= 1;
+            assert_eq!(decrypt(&sk, &sealed, &other), Err(PkeError::Aead));
+        }
+        assert_eq!(decrypt(&sk, &sealed, b""), Err(PkeError::Aead));
+        // Empty aad is itself a valid, distinct context.
+        let bare = encrypt(&mut rng, &pk, b"opening bytes", b"");
+        assert_eq!(decrypt(&sk, &bare, b"").unwrap(), b"opening bytes");
+        assert_eq!(decrypt(&sk, &bare, aad), Err(PkeError::Aead));
     }
 }

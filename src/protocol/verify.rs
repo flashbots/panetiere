@@ -20,7 +20,7 @@ pub enum VerifyError {
     NoServers,
     BadServerCoverage,
     InconsistentCanonical(ServerId),
-    InconsistentKappa(ServerId),
+    InconsistentCiphertextLen(ServerId),
     AnonymitySetTooSmall { got: usize, min: usize },
     ShareRecovery(SssError),
 }
@@ -28,8 +28,8 @@ pub enum VerifyError {
 /// Public verifier (README step 9):
 /// 1. sum ciphertexts and commitments over the canonical client set
 /// 2. for each server, check `agg_open` opens the summed commitment
-/// 3. recover the aggregate KAHE key from any `t` per-server `agg_share` vectors
-///    via Shamir interpolation (componentwise)
+/// 3. recover the aggregate KAHE key from any `t` per-server `agg_share`s
+///    via Shamir interpolation
 /// 4. decrypt the summed ciphertext with `Σ sk_j`
 /// Per-phase wall-time breakdown produced by [`aggregate_and_decrypt_timed`].
 /// `agg_ctxt_us` and `kahe_dec_us` scale with `pp.kahe.l` (per-chunk); the
@@ -58,10 +58,25 @@ fn verify_one_server(
     if sp.agg_open.path_index != sp.server_id.0 as usize {
         return Err(VerifyError::InvalidServerOpening(i));
     }
-    if sp.agg_share.as_slice() != sp.agg_open.s() {
+    if sp.agg_share != sp.agg_open.s()[0] {
         return Err(VerifyError::ShareOpeningMismatch(i));
     }
     Ok(())
+}
+
+/// Interpolate `Σ sk_j` from the first `t` servers' shares, then lift to R_{q_kahe}.
+fn recover_agg_key(
+    pp: &ProtocolParams,
+    server_outputs: &[ServerBulletinEntry],
+) -> Result<KahePoly, VerifyError> {
+    let samples: Vec<(usize, CsPoly)> = server_outputs
+        .iter()
+        .take(pp.shamir.t)
+        .map(|sp| (sp.server_id.0 as usize, sp.agg_share))
+        .collect();
+    let recovered_cs =
+        ShamirSharing::recover(&pp.shamir, &samples).map_err(VerifyError::ShareRecovery)?;
+    Ok(lift_cs_to_kahe(&recovered_cs))
 }
 
 fn check_anonymity_floor(pp: &ProtocolParams, clients: &[ClientId]) -> Result<(), VerifyError> {
@@ -95,7 +110,6 @@ pub fn aggregate_and_decrypt_timed(
         return Err(VerifyError::NoServers);
     }
     check_anonymity_floor(pp, canonical)?;
-    let kappa_kahe = pp.kahe.kappa_kahe;
     let mu_kahe = pp.kahe.mu_kahe;
     let l = pp.kahe.l;
     // Ciphertexts may end with a partial chunk; all clients must agree on the
@@ -110,9 +124,6 @@ pub fn aggregate_and_decrypt_timed(
     for sp in server_outputs {
         if (sp.server_id.0 as usize) >= pp.cs.n_servers || !seen.insert(sp.server_id.0) {
             return Err(VerifyError::BadServerCoverage);
-        }
-        if sp.agg_share.len() != kappa_kahe {
-            return Err(VerifyError::InconsistentKappa(sp.server_id));
         }
     }
 
@@ -138,7 +149,9 @@ pub fn aggregate_and_decrypt_timed(
         let (_, p) = &client_entries[i];
         let expected = *ctxt_len.get_or_insert(p.ctxt.len());
         if p.ctxt.len() != expected || p.ctxt.len() > max_ctxt_len {
-            return Err(VerifyError::InconsistentKappa(server_outputs[0].server_id));
+            return Err(VerifyError::InconsistentCiphertextLen(
+                server_outputs[0].server_id,
+            ));
         }
         ctxts.push(p.ctxt.clone());
         comms.push(p.comm.clone());
@@ -166,23 +179,11 @@ pub fn aggregate_and_decrypt_timed(
     }
     tt.opening_verify_us = now.elapsed().as_secs_f64() * 1e6;
 
-    // Lagrange-interpolate each KAHE key component from the first `t`
-    // servers' summed Shamir shares (R_{q_cs}), then bridge each into
-    // R_{q_kahe} via centered-rep lift before wrapping as `KaheAggKey`.
+    // Lagrange-interpolate the KAHE key from the first `t` servers' summed
+    // Shamir shares (R_{q_cs}), then bridge into R_{q_kahe} via centered-rep
+    // lift before wrapping as `KaheAggKey`.
     let now = Instant::now();
-    let recovered_components: Vec<KahePoly> = (0..kappa_kahe)
-        .map(|k| {
-            let samples: Vec<(usize, CsPoly)> = server_outputs
-                .iter()
-                .take(t)
-                .map(|sp| (sp.server_id.0 as usize, sp.agg_share[k]))
-                .collect();
-            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples)
-                .map_err(VerifyError::ShareRecovery)?;
-            Ok(lift_cs_to_kahe(&recovered_cs))
-        })
-        .collect::<Result<_, VerifyError>>()?;
-    let agg_key = KaheAggKey::from_components(recovered_components);
+    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
     tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
@@ -203,7 +204,6 @@ pub fn decrypt_aggregate(
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
-    let kappa_kahe = pp.kahe.kappa_kahe;
     let mu_kahe = pp.kahe.mu_kahe;
     let l = pp.kahe.l;
     let t = pp.shamir.t;
@@ -213,15 +213,14 @@ pub fn decrypt_aggregate(
     }
     // Partial final chunk allowed; μ·l bounds the length.
     if summed_ctxt.is_empty() || summed_ctxt.len() > mu_kahe * l {
-        return Err(VerifyError::InconsistentKappa(server_outputs[0].server_id));
+        return Err(VerifyError::InconsistentCiphertextLen(
+            server_outputs[0].server_id,
+        ));
     }
     let mut seen: HashSet<u32> = HashSet::with_capacity(server_outputs.len());
     for sp in server_outputs {
         if (sp.server_id.0 as usize) >= pp.cs.n_servers || !seen.insert(sp.server_id.0) {
             return Err(VerifyError::BadServerCoverage);
-        }
-        if sp.agg_share.len() != kappa_kahe {
-            return Err(VerifyError::InconsistentKappa(sp.server_id));
         }
     }
 
@@ -241,19 +240,7 @@ pub fn decrypt_aggregate(
         r?;
     }
 
-    let recovered_components: Vec<KahePoly> = (0..kappa_kahe)
-        .map(|k| {
-            let samples: Vec<(usize, CsPoly)> = server_outputs
-                .iter()
-                .take(t)
-                .map(|sp| (sp.server_id.0 as usize, sp.agg_share[k]))
-                .collect();
-            let recovered_cs = ShamirSharing::recover(&pp.shamir, &samples)
-                .map_err(VerifyError::ShareRecovery)?;
-            Ok(lift_cs_to_kahe(&recovered_cs))
-        })
-        .collect::<Result<_, VerifyError>>()?;
-    let agg_key = KaheAggKey::from_components(recovered_components);
+    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
 
     Ok(Kahe::dec(&pp.kahe, &summed_ctxt.to_vec(), &agg_key))
 }

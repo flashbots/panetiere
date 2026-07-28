@@ -5,12 +5,15 @@ use panetiere::kahe::{Kahe, KaheScheme};
 use panetiere::pke;
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, decrypt_aggregate};
 use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+
+/// Each bench group is one protocol execution.
+const SESSION: SessionId = SessionId([0xB4; 32]);
 
 fn gen_servers<R: rand::CryptoRng + rand::Rng>(
     rng: &mut R,
@@ -34,7 +37,7 @@ fn bench_client_round(c: &mut Criterion) {
         let (_keys, servers) = gen_servers(&mut rng, n_servers);
         let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
         g.bench_with_input(BenchmarkId::from_parameter(n_servers), &n_servers, |b, _| {
-            b.iter(|| run_client_round(&mut rng, &pp, ClientId(0), m.clone(), &servers))
+            b.iter(|| run_client_round(&mut rng, &pp, &SESSION, ClientId(0), m.clone(), &servers))
         });
     }
     g.finish();
@@ -54,7 +57,7 @@ fn bench_server_round(c: &mut Criterion) {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &SESSION, cid, m, &servers);
             let (sid, sealed) = round.sealed_openings.into_iter().next().unwrap();
             assert_eq!(sid, servers[0].0);
             sealed_inbox.push((cid, sealed));
@@ -69,7 +72,7 @@ fn bench_server_round(c: &mut Criterion) {
                         items: sealed_inbox
                             .iter()
                             .map(|(cid, sealed)| {
-                                (*cid, unseal_opening(&keys[0], sealed).unwrap())
+                                (*cid, unseal_opening(&keys[0], &SESSION, *cid, servers[0].0, sealed).unwrap())
                             })
                             .collect(),
                     };
@@ -100,11 +103,11 @@ fn bench_verify(c: &mut Criterion) {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &SESSION, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
             for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
                 assert_eq!(sid, servers[idx].0);
-                let opening = unseal_opening(&keys[idx], &sealed).unwrap();
+                let opening = unseal_opening(&keys[idx], &SESSION, cid, sid, &sealed).unwrap();
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -133,7 +136,7 @@ fn bench_aggregator_round(c: &mut Criterion) {
         for ci in 0..group_size {
             let cid = ClientId(ci as u32);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &SESSION, cid, m, &servers);
             entries.push((round.client_id, round.encrypted_message));
         }
         g.bench_with_input(
@@ -164,11 +167,11 @@ fn bench_verify_aggregated(c: &mut Criterion) {
             let cid = ClientId(ci as u32);
             canonical.push(cid);
             let m = vec![KahePoly::rand_poly(&mut rng); pp.kahe.mu_kahe];
-            let round = run_client_round(&mut rng, &pp, cid, m, &servers);
+            let round = run_client_round(&mut rng, &pp, &SESSION, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
             for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
                 assert_eq!(sid, servers[idx].0);
-                let opening = unseal_opening(&keys[idx], &sealed).unwrap();
+                let opening = unseal_opening(&keys[idx], &SESSION, cid, sid, &sealed).unwrap();
                 inboxes[idx].items.push((cid, opening));
             }
         }
