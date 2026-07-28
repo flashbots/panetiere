@@ -21,6 +21,9 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! INPUTS (knobs — sweep via env, or edit the defaults below)
 //! ──────────────────────────────────────────────────────────────────────
+//!  Sweep order is clients → servers → protocol, protocol innermost, so a
+//!  budget cut-off leaves complete protocol comparisons at every (client,
+//!  server) point reached rather than one protocol across all of them.
 //!  SERVERS: S                              server counts to sweep
 //!  CLIENTS: (clients_total, clients_active) clients_total−active send cover;
 //!                                           IBLT is sized to active, not total.
@@ -66,7 +69,7 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use chipmunk_code::{KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
+use chipmunk_code::{DgtNTTPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
 use panetiere::codec;
 use panetiere::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
@@ -76,14 +79,25 @@ use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODU
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL};
 use panetiere::pke;
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
+use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
+use panetiere::bulletin::dgt_packed_len;
+use panetiere::digest::{digest, embed, DIGEST_POLYS};
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::{
-    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, seal_openings, shamir_share,
+    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, run_client_round_rs, seal_openings,
+    shamir_share,
 };
-use panetiere::protocol::server::{run_server_round, unseal_opening, unseal_openings, ServerInbox};
-use panetiere::protocol::verify::{aggregate_and_decrypt_timed, decrypt_aggregate, VerifyTimings};
+use panetiere::protocol::server::{
+    run_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
+};
+use panetiere::protocol::verify::{
+    aggregate_and_decrypt_rs, aggregate_and_decrypt_timed, decrypt_aggregate, RsVerifyTimings,
+    VerifyError, VerifyTimings,
+};
 use panetiere::protocol::ProtocolParams;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::protocol::{ClientId, NodeId, ServerId, SessionId};
+use panetiere::rs::Rs;
+use panetiere::sig::SigningKey;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
@@ -140,6 +154,19 @@ const SCHED_TOKEN_SYMBOLS: usize = 2;
 /// scheduled sweep runs once per message size, reusing CONFIGS[0].
 const SCHED_MESSAGE_BYTES: &[usize] = &[409600, 2097152];
 
+// RS-sharded ingress: (k, n) pairs run live, one extra round per pair per cell
+// (so the default is a single point). The pair fixes the redundancy `n−k`; `n`
+// and `k` both rise together when a cell has more threshold servers. The
+// k-sweep in the `[D] rs sizing` table is exact arithmetic and costs nothing,
+// so only measure what measurement actually settles.
+const RS_PLANS: &[(usize, usize)] = &[(14, 16)];
+
+/// k values priced (not measured) in the sizing table, at n = k+2.
+const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
+
+/// Aggregation ceiling the digest ring is sized for (see `digest::DigestParams`).
+const RS_RHO_MAX: usize = 300;
+
 // Aggregation depths to evaluate. Group size per depth is balanced so the
 // largest per-hop fan-in is ρ^{1/(layers+1)} (see `AggPlan`): 1-layer → ⌈√ρ⌉,
 // 2-layer → ⌈∛ρ⌉.
@@ -179,16 +206,6 @@ fn sweep_clients() -> Vec<(usize, usize)> {
             })
             .collect(),
     }
-}
-
-// servers × (clients_total, clients_active), flattened to one cell list.
-fn cells() -> Vec<(usize, usize, usize)> {
-    let servers = env_list::<usize>("SWEEP_SERVERS").unwrap_or_else(|| SERVERS.to_vec());
-    let clients = sweep_clients();
-    servers
-        .iter()
-        .flat_map(|&s| clients.iter().map(move |&(total, active)| (s, total, active)))
-        .collect()
 }
 
 fn sweep_configs() -> Vec<Config> {
@@ -301,6 +318,31 @@ struct AggPlan {
     recovered: bool,
 }
 
+/// One live RS-sharded round. `reconstruct` is the identity-set path (nodes
+/// `0..k` hold the blocks, so it is a concatenation); `reconstruct_lagrange` is
+/// the same with the sample set shifted by one, i.e. what a lane outage costs.
+struct RsPlan {
+    k: usize,
+    n_nodes: usize,
+    share_b: usize,
+    bulletin_b: usize,
+    dgt_embed: Stat,
+    dgt_hash: Stat,
+    rs_enc: Stat,
+    node_sum: Stat,
+    v_sig: Stat,
+    v_open: Stat,
+    v_interp: Stat,
+    v_reconstruct: Stat,
+    v_reconstruct_lagrange: Stat,
+    v_syndrome: Stat,
+    v_kahe_dec: Stat,
+    v_digest: Stat,
+    recovered: bool,
+    /// Which mechanism rejected a single flipped coefficient in one lane's sum.
+    lane_lie_caught: &'static str,
+}
+
 struct Row {
     s: usize,
     n: usize, // ρ — total clients = anonymity set
@@ -343,6 +385,7 @@ struct Row {
     wire_opening_b: f64,
     wire_server_b: f64,
     agg_plans: Vec<AggPlan>,
+    rs_plans: Vec<RsPlan>,
 }
 
 /// Per-cell RNG seed: domain-separated hash over every parameter that defines
@@ -371,7 +414,8 @@ fn cell_seed(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) 
 
 fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -> Row {
     let cover = n - active;
-    let mut rng = ChaCha20Rng::from_seed(cell_seed(s, n, active, cfg, codec));
+    let seed = cell_seed(s, n, active, cfg, codec);
+    let mut rng = ChaCha20Rng::from_seed(seed);
 
     // IBLT sized to active (cover adds nothing), ~3 buckets/insertion. `Mse`
     // packs a ξ-element into it; `Scheduled` packs a (rand,size) token and
@@ -713,6 +757,172 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         })
         .collect();
 
+    // RS-sharded ingress, measured live: its own `pp` (μ = n_polys + 1, the
+    // extra slot holding Enc(H(m))), its own client rounds, one node round per
+    // lane, and the full verify. The ciphertext never reaches the bulletin, so
+    // the comparison against the direct/aggregated flows is per-role wire, not
+    // just CPU.
+    let t_modulus = match codec {
+        AppCodec::Prony => PRONY_PRIME,
+        _ => T_MODULUS_DEFAULT,
+    };
+    let rs_plans: Vec<RsPlan> = rs_specs()
+        .iter()
+        .map(|&(spec_k, spec_n)| {
+            // Every threshold server is also a lane, so n ≥ S; the pair fixes
+            // n−k, not k.
+            let n_nodes = spec_n.max(s);
+            let k = n_nodes - (spec_n - spec_k);
+            let mut rrng = ChaCha20Rng::from_seed(rs_seed(&seed, k, n_nodes));
+            let pp_rs = ProtocolParams::setup_rs_mode(
+                &mut rrng, s, n_polys, k, n_nodes, t_modulus, RS_RHO_MAX, [0x42; 32],
+            );
+            let rs_keys: Vec<pke::PrivateKey> =
+                (0..s).map(|_| pke::PrivateKey::generate(&mut rrng)).collect();
+            let rs_servers: Vec<(ServerId, pke::PublicKey)> = server_ids
+                .iter()
+                .map(|&sid| (sid, rs_keys[sid.0 as usize].public()))
+                .collect();
+
+            let rounds: Vec<_> = client_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &cid)| {
+                    let sk = SigningKey::generate(&mut rrng);
+                    run_client_round_rs(
+                        &mut rrng,
+                        &pp_rs,
+                        &SESSION,
+                        cid,
+                        client_polys[i].clone(),
+                        &rs_servers,
+                        &sk,
+                    )
+                })
+                .collect();
+            let entries: Vec<(ClientId, RsClientBulletinEntry)> = rounds
+                .iter()
+                .map(|r| (r.client_id, r.bulletin.clone()))
+                .collect();
+
+            let rs_outputs: Vec<_> = (0..s)
+                .map(|j| {
+                    let items = rounds
+                        .iter()
+                        .map(|r| {
+                            let (sid, sealed) = &r.sealed_openings[j];
+                            let op = unseal_opening(&rs_keys[j], &SESSION, r.client_id, *sid, sealed)
+                                .unwrap();
+                            (r.client_id, op)
+                        })
+                        .collect();
+                    run_server_round(
+                        &ServerInbox { server_id: server_ids[j], items },
+                        &canonical,
+                    )
+                    .unwrap()
+                })
+                .collect();
+
+            let node_inboxes: Vec<RsNodeInbox> = (0..n_nodes)
+                .map(|j| RsNodeInbox {
+                    node_id: NodeId(j as u32),
+                    items: rounds
+                        .iter()
+                        .map(|r| (r.client_id, r.rs_shares[j].clone()))
+                        .collect(),
+                })
+                .collect();
+            let (node_sum, _) = measure(|| run_node_round(&node_inboxes[0], &canonical).unwrap());
+            let node_outputs: Vec<RsNodeBulletinEntry> = node_inboxes
+                .iter()
+                .map(|inb| run_node_round(inb, &canonical).unwrap())
+                .collect();
+
+            // Embedding into the digest ring is n_polys forward NTTs; the Ajtai
+            // hash is DIGEST_POLYS AVX2 dots over them; encoding is
+            // (n−k)·n_polys·N modmuls, since systematic shares are the blocks.
+            let dp = pp_rs.digest.as_ref().unwrap();
+            let key0 = kahe_keygen(&mut rrng, &pp_rs);
+            let ctxt0 = kahe_encrypt(&mut rrng, &pp_rs, &key0, &client_polys[0]);
+            let (dgt_embed, embedded0) = measure(|| embed(&ctxt0));
+            let (dgt_hash, _) = measure(|| digest(dp, &embedded0));
+            let rs_params = pp_rs.rs.as_ref().unwrap();
+            let (rs_enc, shares0) = measure(|| Rs::encode(rs_params, &embedded0));
+            let share_b = shares0[0].len() * dgt_packed_len();
+
+            let run_verify = |nodes: &[RsNodeBulletinEntry]| {
+                aggregate_and_decrypt_rs(&pp_rs, &SESSION, &canonical, &entries, &rs_outputs, nodes)
+            };
+            let mut rvts: Vec<RsVerifyTimings> = Vec::with_capacity(REPS);
+            let mut rs_recovered: Option<Vec<KahePoly>> = None;
+            for _ in 0..REPS {
+                if let Ok((rec, vt)) = run_verify(&node_outputs) {
+                    rvts.push(vt);
+                    rs_recovered = Some(rec);
+                }
+            }
+            let rstat = |f: fn(&RsVerifyTimings) -> f64| {
+                if rvts.is_empty() {
+                    Stat::default()
+                } else {
+                    stat(rvts.iter().map(f).collect())
+                }
+            };
+
+            // Lane outage: shift the sample set off the identity so the
+            // reconstruction actually interpolates.
+            let shifted: Vec<RsNodeBulletinEntry> = node_outputs[1..].to_vec();
+            let mut lag: Vec<f64> = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                if let Ok((_, vt)) = run_verify(&shifted) {
+                    lag.push(vt.reconstruct_us);
+                }
+            }
+
+            // A single flipped coefficient in one lane's sum must not decode.
+            // A +1 coefficient-domain bump: stays inside the norm bound, so it
+            // reaches the algebraic checks rather than tripping the range check.
+            let mut lying = node_outputs.clone();
+            let mut unit = [0i64; POLY_N];
+            unit[0] = 1;
+            lying[0].share_sum[0] =
+                lying[0].share_sum[0] + DgtNTTPoly::from_kahe(&KahePoly::from_coeffs(unit));
+            let lane_lie_caught = match run_verify(&lying) {
+                Err(VerifyError::LaneMismatch(_)) => "syndrome",
+                Err(VerifyError::DigestMismatch) => "digest",
+                Err(VerifyError::CiphertextOutOfRange) => "norm",
+                Err(_) => "other",
+                Ok(_) => "MISSED",
+            };
+
+            RsPlan {
+                k,
+                n_nodes,
+                share_b,
+                bulletin_b: RsClientBulletinEntry::packed_len(DIGEST_POLYS),
+                dgt_embed,
+                dgt_hash,
+                rs_enc,
+                node_sum,
+                v_sig: rstat(|v| v.sig_verify_us),
+                v_open: rstat(|v| v.opening_verify_us),
+                v_interp: rstat(|v| v.interpolation_us),
+                v_reconstruct: rstat(|v| v.reconstruct_us),
+                v_reconstruct_lagrange: if lag.is_empty() {
+                    Stat::default()
+                } else {
+                    stat(lag)
+                },
+                v_syndrome: rstat(|v| v.syndrome_us),
+                v_kahe_dec: rstat(|v| v.kahe_dec_us),
+                v_digest: rstat(|v| v.digest_us),
+                recovered: rs_recovered.as_deref().map(check_decode).unwrap_or(false),
+                lane_lie_caught,
+            }
+        })
+        .collect();
+
     Row {
         s,
         n,
@@ -780,7 +990,38 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
         agg_plans,
+        rs_plans,
     }
+}
+
+/// `SWEEP_RS="14x16,32x34"`; empty string skips the RS section entirely.
+fn rs_specs() -> Vec<(usize, usize)> {
+    match std::env::var("SWEEP_RS") {
+        Err(_) => RS_PLANS.to_vec(),
+        Ok(raw) if raw.trim().is_empty() => vec![],
+        Ok(raw) => raw
+            .split(',')
+            .map(|c| {
+                let (k, n) = c
+                    .trim()
+                    .split_once('x')
+                    .unwrap_or_else(|| panic!("bad SWEEP_RS pair {c:?} (want KxN)"));
+                (
+                    k.parse().unwrap_or_else(|_| panic!("bad k in {c:?}")),
+                    n.parse().unwrap_or_else(|_| panic!("bad n in {c:?}")),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn rs_seed(cell: &[u8; 32], k: usize, n_nodes: usize) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"panetiere/bench/rs/v1");
+    h.update(cell);
+    h.update((k as u64).to_le_bytes());
+    h.update((n_nodes as u64).to_le_bytes());
+    h.finalize().into()
 }
 
 // ── [C] cost model over [M] medians ─────────────────────────────────────────
@@ -794,6 +1035,7 @@ struct Model {
     post_b: f64,        // one client bulletin post = comm + all l ctxt chunks
     client_open_b: f64, // one client's S sealed openings
     agg_cpu_us: Vec<f64>, // per AggPlan
+    rs_cpu_us: Vec<f64>,  // per RsPlan
 }
 
 fn model(r: &Row) -> Model {
@@ -814,6 +1056,34 @@ fn model(r: &Row) -> Model {
     let cpu_base_agg_us = (fixed_us - r.v_open.med - r.v_interp.med - r.v_sum_comm.med)
         + (chunk_total_us - r.v_agg_ctxt.med - r.v_kahe_dec.med);
     let agg_cpu_us = r.agg_plans.iter().map(|p| cpu_base_agg_us + p.leader.med).collect();
+    // RS flow: client pays app-encode + encrypt + RS-encode + key work; one
+    // node sums its lane; the verifier no longer sums ciphertexts at all.
+    let rs_cpu_us = r
+        .rs_plans
+        .iter()
+        .map(|p| {
+            r.enc_app.med
+                + r.kahe_enc.med
+                + p.dgt_embed.med
+                + p.dgt_hash.med
+                + p.rs_enc.med
+                + r.share.med
+                + r.cs.med
+                + r.seal.med
+                + r.unseal.med
+                + r.server.med
+                + p.node_sum.med
+                + p.v_sig.med
+                + r.v_sum_comm.med
+                + p.v_open.med
+                + p.v_interp.med
+                + p.v_reconstruct.med
+                + p.v_syndrome.med
+                + p.v_kahe_dec.med
+                + p.v_digest.med
+                + r.dec_app.med
+        })
+        .collect();
     Model {
         fixed_us,
         // Mean cost of one actual chunk, so `fixed + l·chunk == wall` exactly.
@@ -826,6 +1096,7 @@ fn model(r: &Row) -> Model {
         post_b: (r.wire_comm_b + r.wire_ctxt_b) / r.n as f64,
         client_open_b: r.wire_opening_b / r.n as f64,
         agg_cpu_us,
+        rs_cpu_us,
     }
 }
 
@@ -845,6 +1116,7 @@ struct NetPoint {
     direct_net_us: f64,
     direct_e2e_us: f64,
     agg: Vec<(f64, f64)>, // (net_us, e2e_us) per AggPlan
+    rs: Vec<(f64, f64)>,  // (net_us, e2e_us) per RsPlan
 }
 
 fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> NetPoint {
@@ -898,10 +1170,43 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
         })
         .collect();
 
+    // RS flow: the client uplinks n coded shares (total (n/k)·C) plus its S
+    // openings; the bulletin only ever sees the constant-size post. A node
+    // ingests ρ shares of C/k. The verifier reads k lane sums, the server
+    // entries, the node posts and every client's bulletin post (it must check
+    // the signatures and sum the digests).
+    let rs = r
+        .rs_plans
+        .iter()
+        .zip(&m.rs_cpu_us)
+        .map(|(p, &rs_cpu_us)| {
+            let share_b = p.share_b as f64;
+            let client_shares_b = p.n_nodes as f64 * share_b;
+            let node_in_b = r.n as f64 * share_b;
+            let a = (maxlat(r.n) + xfer_cl(client_shares_b + p.bulletin_b as f64)) // client uplink
+                .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
+                .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
+                .max(maxlat(r.n) + xfer_srv(node_in_b)) // one lane's ingest
+                .max(maxlat(r.n) + xfer_srv(r.n as f64 * p.bulletin_b as f64)); // bulletin ingest
+            let b = (maxlat(r.s) + xfer_srv(r.wire_server_b))
+                .max(maxlat(p.n_nodes) + xfer_srv(p.n_nodes as f64 * share_b));
+            // All n share-sums: k reconstruct, the rest are the syndrome.
+            let c = maxlat(1)
+                + xfer_srv(
+                    p.n_nodes as f64 * share_b
+                        + r.wire_server_b
+                        + r.n as f64 * p.bulletin_b as f64,
+                );
+            let net_us = a + b + c;
+            (net_us, rs_cpu_us + net_us)
+        })
+        .collect();
+
     NetPoint {
         direct_net_us,
         direct_e2e_us: m.wall_us + direct_net_us,
         agg,
+        rs,
     }
 }
 
@@ -1008,6 +1313,93 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
+    if rows.iter().any(|r| !r.rs_plans.is_empty()) {
+        println!("── [M] cpu — rs-sharded ingress (client rs_enc / node sum / verifier) ───────");
+        println!(
+            "{:<4}{:>8}  {:>8}{:>8}{:>9}{:>10} {:>9}{:>9}{:>11}{:>10}{:>9}{:>10}  {:<10}{}",
+            "id", "k/n", "embed", "hash", "rs_enc", "node_sum", "sig", "open", "reconstruct",
+            "syndrome", "digest", "kahe_dec", "recovered", "lane lie"
+        );
+        for (i, r) in rows.iter().enumerate() {
+            for p in &r.rs_plans {
+                println!(
+                    "{:<4}{:>8}  {:>8}{:>8}{:>9}{:>10} {:>9}{:>9}{:>11}{:>10}{:>9}{:>10}  {:<10}{}",
+                    cell_id(i),
+                    format!("{}/{}", p.k, p.n_nodes),
+                    fmt_us(p.dgt_embed.med),
+                    fmt_us(p.dgt_hash.med),
+                    fmt_us(p.rs_enc.med),
+                    fmt_us(p.node_sum.med),
+                    fmt_us(p.v_sig.med),
+                    fmt_us(p.v_open.med),
+                    fmt_us(p.v_reconstruct.med),
+                    fmt_us(p.v_syndrome.med),
+                    fmt_us(p.v_digest.med),
+                    fmt_us(p.v_kahe_dec.med),
+                    if p.recovered { "yes" } else { "NO" },
+                    p.lane_lie_caught,
+                );
+            }
+        }
+        println!(
+            "    (reconstruct is the identity sample set — a concatenation. With one lane down it\n     interpolates instead: {})",
+            rows.iter()
+                .flat_map(|r| r.rs_plans.iter())
+                .map(|p| fmt_us(p.v_reconstruct_lagrange.med))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!();
+
+        println!("── [D] rs sizing — measured at the run k/n, priced across k at n = k+2 ──────");
+        println!(
+            "{:<4}{:>5}{:>14}{:>12}{:>16}{:>15}{:>14}  {}",
+            "id", "k", "share = C/k", "bulletin", "client egress", "node ingress", "verifier in",
+            "gate"
+        );
+        for (i, r) in rows.iter().enumerate() {
+            if r.rs_plans.is_empty() {
+                continue;
+            }
+            let bulletin_b = r.rs_plans[0].bulletin_b as f64;
+            let open_b = (r.open_env_b * r.s) as f64;
+            let ctxt_b = r.ctxt_client_b as f64;
+            for &k in RS_SIZING_K {
+                let n_nodes = (k + 2).max(r.s);
+                let share_b = (r.n_polys.div_ceil(k) * dgt_packed_len()) as f64;
+                let egress = n_nodes as f64 * share_b + open_b + bulletin_b;
+                let node_in = r.n as f64 * share_b;
+                // All n share-sums, not k: the verifier runs the spare-lane
+                // syndrome, which needs every share the bulletin carries.
+                let verifier_in =
+                    n_nodes as f64 * share_b + r.n as f64 * bulletin_b + r.wire_server_b;
+                // 100 Mbit client uplink against a 1 Gbit lane downlink.
+                let gate = if egress / 12.5e6 > node_in / 125e6 {
+                    "client NIC"
+                } else {
+                    "node ingest"
+                };
+                println!(
+                    "{:<4}{:>5}{:>14}{:>12}{:>16}{:>15}{:>14}  {}",
+                    if k == RS_SIZING_K[0] { cell_id(i) } else { String::new() },
+                    k,
+                    fmt_bytes(share_b),
+                    fmt_bytes(bulletin_b),
+                    fmt_bytes(egress),
+                    fmt_bytes(node_in),
+                    fmt_bytes(verifier_in),
+                    gate,
+                );
+            }
+            println!(
+                "    (broadcast baseline: client egress {}, per-node ingress {})",
+                fmt_bytes(ctxt_b + open_b + r.comm_client_b as f64),
+                fmt_bytes(r.n as f64 * ctxt_b),
+            );
+        }
+        println!();
+    }
+
     println!("── wire components, per emitter ([M] off the wire except comm/ctxt, [D]) ────");
     println!(
         "{:<4}{:>10}{:>15}   {:<30}{}",
@@ -1098,8 +1490,18 @@ fn print_tables(rows: &[Row]) {
 
     println!("── [P] network sim: e2e = [C] wall + synthetic net; MB/s = useful/e2e ───────");
     println!(
-        "{:<4}{:<7}{:>12}{:>13}{:>12}{:>12}",
-        "id", "net", "direct e2e", "direct MB/s", "agg-1 e2e", "agg-1 MB/s"
+        "{:<4}{:<7}{:>12}{:>13}{:>12}{:>12}{}",
+        "id",
+        "net",
+        "direct e2e",
+        "direct MB/s",
+        "agg-1 e2e",
+        "agg-1 MB/s",
+        if rows.iter().any(|r| !r.rs_plans.is_empty()) {
+            format!("{:>12}{:>12}", "rs e2e", "rs MB/s")
+        } else {
+            String::new()
+        },
     );
     for (i, r) in rows.iter().enumerate() {
         let nets = net_all(r, &models[i]);
@@ -1107,14 +1509,22 @@ fn print_tables(rows: &[Row]) {
             let (agg_e2e, agg_mbps) = np.agg.first().map_or(("-".into(), "-".into()), |(_, e2e)| {
                 (fmt_us(*e2e), format!("{:.3}", r.useful_b / (e2e / 1e6) / 1e6))
             });
+            let rs = np.rs.first().map_or(String::new(), |(_, e2e)| {
+                format!(
+                    "{:>12}{:>12.3}",
+                    fmt_us(*e2e),
+                    r.useful_b / (e2e / 1e6) / 1e6
+                )
+            });
             println!(
-                "{:<4}{:<7}{:>12}{:>13.3}{:>12}{:>12}",
+                "{:<4}{:<7}{:>12}{:>13.3}{:>12}{:>12}{}",
                 cell_id(i),
                 prof.label,
                 fmt_us(np.direct_e2e_us),
                 r.useful_b / (np.direct_e2e_us / 1e6) / 1e6,
                 agg_e2e,
                 agg_mbps,
+                rs,
             );
         }
     }
@@ -1134,6 +1544,10 @@ fn print_tables(rows: &[Row]) {
 
 const CSV_PATH: &str = "scaling_sweep.csv";
 
+fn rs0(r: &Row) -> Option<&RsPlan> {
+    r.rs_plans.first()
+}
+
 fn write_csv(rows: &[Row]) {
     type PhaseGet = fn(&Row) -> Stat;
     let phases: &[(&str, PhaseGet)] = &[
@@ -1152,10 +1566,24 @@ fn write_csv(rows: &[Row]) {
         ("dec_app", |r| r.dec_app),
         ("agg1_level", |r| r.agg_plans.first().map_or(Stat::default(), |p| p.agg_cpu)),
         ("agg1_leader", |r| r.agg_plans.first().map_or(Stat::default(), |p| p.leader)),
+        ("rs_dgt_embed", |r| rs0(r).map_or(Stat::default(), |p| p.dgt_embed)),
+        ("rs_dgt_hash", |r| rs0(r).map_or(Stat::default(), |p| p.dgt_hash)),
+        ("rs_enc", |r| rs0(r).map_or(Stat::default(), |p| p.rs_enc)),
+        ("rs_node_sum", |r| rs0(r).map_or(Stat::default(), |p| p.node_sum)),
+        ("rs_verify_sig", |r| rs0(r).map_or(Stat::default(), |p| p.v_sig)),
+        ("rs_verify_open", |r| rs0(r).map_or(Stat::default(), |p| p.v_open)),
+        ("rs_verify_interp", |r| rs0(r).map_or(Stat::default(), |p| p.v_interp)),
+        ("rs_reconstruct", |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct)),
+        ("rs_reconstruct_lagrange", |r| {
+            rs0(r).map_or(Stat::default(), |p| p.v_reconstruct_lagrange)
+        }),
+        ("rs_verify_kahe_dec", |r| rs0(r).map_or(Stat::default(), |p| p.v_kahe_dec)),
+        ("rs_syndrome", |r| rs0(r).map_or(Stat::default(), |p| p.v_syndrome)),
+        ("rs_verify_digest", |r| rs0(r).map_or(Stat::default(), |p| p.v_digest)),
     ];
 
     let mut header = String::new();
-    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,n_polys,mu_kahe,iblt_cells,recovered,agg1_recovered");
+    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,n_polys,mu_kahe,iblt_cells,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
     for (name, _) in phases {
         write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", name).unwrap();
     }
@@ -1163,12 +1591,13 @@ fn write_csv(rows: &[Row]) {
         ",m_open_env_b\
          ,d_comm_client_b,d_ctxt_client_b,d_agg_open_b,d_agg_share_b\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
-         ,c_fixed_us,c_chunk_us,c_wall_us,c_efficiency,c_agg1_wall_us",
+         ,d_rs_share_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
+         ,c_fixed_us,c_chunk_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
     );
     for prof in NETWORKS {
         write!(
             header,
-            ",p_{0}_direct_net_us,p_{0}_direct_e2e_us,p_{0}_direct_mbps,p_{0}_agg1_net_us,p_{0}_agg1_e2e_us,p_{0}_agg1_mbps",
+            ",p_{0}_direct_net_us,p_{0}_direct_e2e_us,p_{0}_direct_mbps,p_{0}_agg1_net_us,p_{0}_agg1_e2e_us,p_{0}_agg1_mbps,p_{0}_rs_net_us,p_{0}_rs_e2e_us,p_{0}_rs_mbps",
             prof.label
         )
         .unwrap();
@@ -1185,7 +1614,7 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
             r.n,
@@ -1201,6 +1630,10 @@ fn write_csv(rows: &[Row]) {
             r.iblt_cells,
             r.recovered_ok,
             r.agg_plans.first().map_or(false, |p| p.recovered),
+            rs0(r).map_or(0, |p| p.k),
+            rs0(r).map_or(0, |p| p.n_nodes),
+            rs0(r).map_or(false, |p| p.recovered),
+            rs0(r).map_or("-", |p| p.lane_lie_caught),
         )
         .unwrap();
         for (_, get) in phases {
@@ -1222,28 +1655,50 @@ fn write_csv(rows: &[Row]) {
             r.useful_b,
         )
         .unwrap();
+        let (rs_share_b, rs_bulletin_b, rs_egress_b, rs_node_in_b) = match rs0(r) {
+            None => (0.0, 0.0, 0.0, 0.0),
+            Some(p) => (
+                p.share_b as f64,
+                p.bulletin_b as f64,
+                p.n_nodes as f64 * p.share_b as f64
+                    + (r.open_env_b * r.s) as f64
+                    + p.bulletin_b as f64,
+                r.n as f64 * p.share_b as f64,
+            ),
+        };
         write!(
             out,
-            ",{:.3},{:.3},{:.3},{:.6e},{:.3}",
+            ",{:.0},{:.0},{:.0},{:.0}",
+            rs_share_b, rs_bulletin_b, rs_egress_b, rs_node_in_b
+        )
+        .unwrap();
+        write!(
+            out,
+            ",{:.3},{:.3},{:.3},{:.6e},{:.3},{:.3}",
             m.fixed_us,
             m.chunk_us,
             m.wall_us,
             m.efficiency,
             m.agg_cpu_us.first().copied().unwrap_or(0.0),
+            m.rs_cpu_us.first().copied().unwrap_or(0.0),
         )
         .unwrap();
         let mbps = |e2e_us: f64| r.useful_b / (e2e_us / 1e6) / 1e6;
         for np in net_all(r, &m) {
             let (agg_net, agg_e2e) = np.agg.first().copied().unwrap_or((0.0, 0.0));
+            let (rs_net, rs_e2e) = np.rs.first().copied().unwrap_or((0.0, 0.0));
             write!(
                 out,
-                ",{:.3},{:.3},{:.4},{:.3},{:.3},{:.4}",
+                ",{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4}",
                 np.direct_net_us,
                 np.direct_e2e_us,
                 mbps(np.direct_e2e_us),
                 agg_net,
                 agg_e2e,
                 mbps(agg_e2e),
+                rs_net,
+                rs_e2e,
+                mbps(rs_e2e),
             )
             .unwrap();
         }
@@ -1306,41 +1761,51 @@ fn main() {
     println!("useful = active · ξ · log₂(t) bits/round (only active clients carry payload)");
     println!();
 
-    let cells = cells();
+    let servers = env_list::<usize>("SWEEP_SERVERS").unwrap_or_else(|| SERVERS.to_vec());
+    let clients = sweep_clients();
     let configs = sweep_configs();
     let sched_bytes =
         env_list::<usize>("SWEEP_SCHED_BYTES").unwrap_or_else(|| SCHED_MESSAGE_BYTES.to_vec());
 
+    // The protocol sweep, flattened once. Scheduled ignores ξ (its token IBLT
+    // is fixed at 2 symbols), so it varies over sched_bytes with configs[0].
+    let variants: Vec<(&Config, AppCodec, String)> = configs
+        .iter()
+        .flat_map(|cfg| {
+            [
+                (cfg, AppCodec::Mse, format!("mse {}", cfg.label)),
+                (cfg, AppCodec::Prony, format!("prony {}", cfg.label)),
+            ]
+        })
+        .chain(sched_bytes.iter().map(|&mb| {
+            (
+                &configs[0],
+                AppCodec::Scheduled { message_bytes: mb },
+                format!("sched msg={}", fmt_bytes(mb as f64)),
+            )
+        }))
+        .collect();
+
     let mut rows: Vec<Row> = Vec::new();
     let mut skipped = false;
 
-    // Single-round MSE cells, then scheduled cells (dedup'd: the scheduled
-    // codec ignores ξ, so it sweeps sched_bytes once with configs[0]).
-    let mut run = |cfg: &Config, codec: &AppCodec, desc: String| {
-        for &(s, clients_total, clients_active) in &cells {
-            if start.elapsed() >= budget {
-                skipped = true;
-                return;
+    // Nesting is clients → servers → protocol, protocol innermost, so a budget
+    // cut-off leaves *complete* protocol comparisons at every (client, server)
+    // point it reached rather than one protocol across all of them.
+    'sweep: for &(clients_total, clients_active) in &clients {
+        for &s in &servers {
+            for (cfg, codec, desc) in &variants {
+                if start.elapsed() >= budget {
+                    skipped = true;
+                    break 'sweep;
+                }
+                eprintln!(
+                    "running cell {}: clients={clients_total}x{clients_active} S={s} {desc}",
+                    cell_id(rows.len())
+                );
+                rows.push(run_cell(s, clients_total, clients_active, cfg, codec));
             }
-            eprintln!(
-                "running cell {}: S={s} clients_total={clients_total} clients_active={clients_active} {desc}",
-                cell_id(rows.len())
-            );
-            rows.push(run_cell(s, clients_total, clients_active, cfg, codec));
         }
-    };
-    // MSE and Prony back-to-back per ξ, so the [P] sim compares the two
-    // single-round flows at the same element size under identical draws.
-    for cfg in &configs {
-        run(cfg, &AppCodec::Mse, format!("mse {}", cfg.label));
-        run(cfg, &AppCodec::Prony, format!("prony {}", cfg.label));
-    }
-    for &message_bytes in &sched_bytes {
-        run(
-            &configs[0],
-            &AppCodec::Scheduled { message_bytes },
-            format!("sched msg={}", fmt_bytes(message_bytes as f64)),
-        );
     }
     if skipped {
         println!("(budget exhausted; remaining cells skipped)");

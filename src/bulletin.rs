@@ -3,8 +3,12 @@
 use std::sync::Mutex;
 
 use crate::cs::{pack_poly64, poly_packed_len, poly_packed_len64, unpack_poly64, Commitment, Opening};
-use crate::protocol::{ClientId, ServerId};
-use chipmunk_code::{CsPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS};
+use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
+use crate::rs::Share;
+use crate::sig;
+use chipmunk_code::{
+    CsPoly, DgtNTTPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N,
+};
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
@@ -54,6 +58,123 @@ impl ClientBulletinEntry {
         let comm = Commitment::from_bytes(&bytes[start..])?;
         Some(ClientBulletinEntry { ctxt, comm })
     }
+}
+
+/// RS-mode client post. The ciphertext is not here — it went to the nodes as
+/// coded shares — so what the bulletin carries is the commitment plus the
+/// Ajtai digest of that ciphertext, signed. Constant size in the message length.
+///
+/// The digest is **cleartext**: its input is the ciphertext, which the coded
+/// shares already publish, and `Enc(0)` is random-looking so a cover client's
+/// digest is not a distinguishable constant.
+#[derive(Clone)]
+pub struct RsClientBulletinEntry {
+    pub comm: Commitment,
+    /// `A · ct` over the digest ring, `DIGEST_POLYS` elements.
+    pub digest: Vec<DgtNTTPoly>,
+    pub pubkey: [u8; sig::PUBKEY_LEN],
+    pub sig: [u8; sig::SIG_LEN],
+}
+
+/// Packed bytes of one digest-ring element.
+///
+/// Raw little-endian `u64` rather than bit-packed: `pack_bits64` caps symbols at
+/// 56 bits (`cs.rs`) and `q_dgt` needs 62, so tight packing would need a wider
+/// accumulator. The loss is `8 − 62/8 = 0.25` B/coeff — 3 % of the digest, which
+/// is itself ~0.1 % of a round — so it is not worth a second bit-packer.
+pub fn dgt_packed_len() -> usize {
+    POLY_N * 8
+}
+
+fn pack_dgt(p: &DgtNTTPoly, out: &mut Vec<u8>) {
+    for &c in p.coeffs().iter() {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+}
+
+fn unpack_dgt(bytes: &[u8], start: usize) -> (DgtNTTPoly, usize) {
+    let mut raw = [0u64; POLY_N];
+    for (i, r) in raw.iter_mut().enumerate() {
+        let o = start + i * 8;
+        *r = u64::from_le_bytes(bytes[o..o + 8].try_into().expect("8 bytes"));
+    }
+    (DgtNTTPoly::from_raw(&raw), start + dgt_packed_len())
+}
+
+impl RsClientBulletinEntry {
+    /// What the client signs. Binds the post to the session and the client, so
+    /// an envelope cannot be replayed into another round or reattributed.
+    pub fn signing_bytes(
+        sid: &SessionId,
+        client_id: ClientId,
+        comm: &Commitment,
+        digest: &[DgtNTTPoly],
+    ) -> Vec<u8> {
+        const DOMAIN: &[u8] = b"panetiere/rs-bulletin/v2";
+        let mut out = Vec::with_capacity(DOMAIN.len() + 36 + poly_packed_len(HVC_MODULUS));
+        out.extend_from_slice(DOMAIN);
+        out.extend_from_slice(&sid.0);
+        out.extend_from_slice(&client_id.0.to_le_bytes());
+        out.extend_from_slice(&(digest.len() as u16).to_le_bytes());
+        out.extend_from_slice(&comm.to_bytes());
+        for p in digest {
+            pack_dgt(p, &mut out);
+        }
+        out
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::packed_len(self.digest.len()));
+        out.extend_from_slice(&self.comm.to_bytes());
+        for p in &self.digest {
+            pack_dgt(p, &mut out);
+        }
+        out.extend_from_slice(&self.pubkey);
+        out.extend_from_slice(&self.sig);
+        out
+    }
+
+    /// Independent of the message length — that is the point of the mode.
+    pub fn packed_len(digest_polys: usize) -> usize {
+        poly_packed_len(HVC_MODULUS)
+            + digest_polys * dgt_packed_len()
+            + sig::PUBKEY_LEN
+            + sig::SIG_LEN
+    }
+
+    pub fn from_bytes(bytes: &[u8], digest_polys: usize) -> Option<Self> {
+        if bytes.len() != Self::packed_len(digest_polys) {
+            return None;
+        }
+        let hvc_len = poly_packed_len(HVC_MODULUS);
+        let comm = Commitment::from_bytes(&bytes[..hvc_len])?;
+        let mut digest = Vec::with_capacity(digest_polys);
+        let mut start = hvc_len;
+        for _ in 0..digest_polys {
+            let (p, next) = unpack_dgt(bytes, start);
+            digest.push(p);
+            start = next;
+        }
+        let mut pubkey = [0u8; sig::PUBKEY_LEN];
+        pubkey.copy_from_slice(&bytes[start..start + sig::PUBKEY_LEN]);
+        let mut s = [0u8; sig::SIG_LEN];
+        s.copy_from_slice(&bytes[start + sig::PUBKEY_LEN..]);
+        Some(RsClientBulletinEntry {
+            comm,
+            digest,
+            pubkey,
+            sig: s,
+        })
+    }
+}
+
+/// One node's contribution in the RS mode: the positional sum of the coded
+/// shares it received, over exactly `clients`.
+#[derive(Clone)]
+pub struct RsNodeBulletinEntry {
+    pub node_id: NodeId,
+    pub clients: Vec<ClientId>,
+    pub share_sum: Share,
 }
 
 #[derive(Clone)]

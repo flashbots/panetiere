@@ -4,10 +4,13 @@ use rayon::prelude::*;
 
 use chipmunk_code::CsPoly;
 
-use crate::bulletin::ClientBulletinEntry;
+use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry};
 use crate::cs::{fresh_opening_pack_bounds, Commitment, Cs, HidingMerkleCommitment, Opening};
+use crate::digest::{digest, embed};
 use crate::kahe::{kahe_to_cs_centered, Kahe, KaheKey, KaheScheme};
 use crate::pke;
+use crate::rs::{Rs, Share};
+use crate::sig::SigningKey;
 use crate::sss::ShamirSharing;
 
 use super::ProtocolParams;
@@ -115,6 +118,63 @@ pub fn cs_commit<R: Rng>(
 ) -> (Commitment, Vec<Opening>) {
     let as_vectors: Vec<Vec<CsPoly>> = shares_per_server.iter().map(|s| vec![*s]).collect();
     HidingMerkleCommitment::commit(rng, &pp.cs, &as_vectors)
+}
+
+/// Output of one RS-mode client round. The ciphertext leaves as `n` coded
+/// shares instead of a bulletin post; `rs_shares[j]` goes to node `j`.
+pub struct RsClientRound {
+    pub client_id: ClientId,
+    pub bulletin: RsClientBulletinEntry,
+    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
+    pub rs_shares: Vec<Share>,
+}
+
+/// RS-sharded ingress round. `message` is `pp.kahe.mu_kahe` polys. The
+/// ciphertext is embedded into the digest ring once; that embedding is both what
+/// gets RS-coded across the nodes and what gets Ajtai-hashed, so the digest
+/// needs no plaintext slot and travels the bulletin in the clear.
+pub fn run_client_round_rs<R: CryptoRng + Rng>(
+    rng: &mut R,
+    pp: &ProtocolParams,
+    sid: &SessionId,
+    client_id: ClientId,
+    message: <Kahe as KaheScheme>::Message,
+    servers: &[(ServerId, pke::PublicKey)],
+    signing_key: &SigningKey,
+) -> RsClientRound {
+    let rs = pp.rs.as_ref().expect("RS mode params");
+    let dp = pp.digest.as_ref().expect("digest params");
+    assert_eq!(
+        message.len(),
+        pp.kahe.mu_kahe,
+        "message must be exactly the payload width"
+    );
+
+    let key = kahe_keygen(rng, pp);
+    let ctxt = kahe_encrypt(rng, pp, &key, &message);
+    let embedded = embed(&ctxt);
+    let h = digest(dp, &embedded);
+    let rs_shares = Rs::encode(rs, &embedded);
+
+    let shares_per_server = shamir_share(rng, pp, &key, servers.len());
+    let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
+    let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
+
+    let sig = signing_key.sign(&RsClientBulletinEntry::signing_bytes(
+        sid, client_id, &comm, &h,
+    ));
+
+    RsClientRound {
+        client_id,
+        bulletin: RsClientBulletinEntry {
+            comm,
+            digest: h,
+            pubkey: signing_key.verifying_key().to_sec1_bytes(),
+            sig,
+        },
+        sealed_openings,
+        rs_shares,
+    }
 }
 
 pub fn run_client_round<R: CryptoRng + Rng>(

@@ -3,11 +3,12 @@ use std::collections::HashMap;
 use chipmunk_code::CsPoly;
 use rayon::prelude::*;
 
-use crate::bulletin::ServerBulletinEntry;
+use crate::bulletin::{RsNodeBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
 use crate::pke;
+use crate::rs::{Rs, Share};
 
-use super::{opening_aad, ClientId, ServerId, SessionId};
+use super::{opening_aad, ClientId, NodeId, ServerId, SessionId};
 
 /// Open one client's ECIES envelope into its `Opening`; `None` on a bad seal, a
 /// malformed packed opening, or a `(sid, client_id, server_id)` other than the
@@ -48,6 +49,47 @@ pub struct ServerInbox {
 #[derive(Debug, PartialEq)]
 pub enum ServerRoundError {
     MissingClient(ClientId),
+}
+
+/// One RS lane's inbox: the coded share each client sent to this node. Both
+/// threshold servers and share-only lanes use it — the two roles differ in
+/// whether they *also* run [`run_server_round`], not in how they sum shares.
+pub struct RsNodeInbox {
+    pub node_id: NodeId,
+    pub items: Vec<(ClientId, Share)>,
+}
+
+/// Positionally sum this node's coded shares over exactly `canonical`.
+///
+/// Summing in the digest ring keeps the result the *unreduced* integer sum, so
+/// lane `j`'s sum is share `j` of `Σ ct` over the integers — which is what the
+/// Ajtai digest binds. All-or-nothing over `canonical`, mirroring
+/// [`run_server_round`]: summing a different set would silently desync this lane
+/// from `Σ sk`.
+pub fn run_node_round(
+    inbox: &RsNodeInbox,
+    canonical: &[ClientId],
+) -> Result<RsNodeBulletinEntry, ServerRoundError> {
+    let index: HashMap<ClientId, usize> = inbox
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, (cid, _))| (*cid, i))
+        .collect();
+
+    let mut selected: Vec<&[chipmunk_code::DgtNTTPoly]> = Vec::with_capacity(canonical.len());
+    for cid in canonical {
+        let i = *index
+            .get(cid)
+            .ok_or(ServerRoundError::MissingClient(*cid))?;
+        selected.push(inbox.items[i].1.as_slice());
+    }
+
+    Ok(RsNodeBulletinEntry {
+        node_id: inbox.node_id,
+        clients: canonical.to_vec(),
+        share_sum: Rs::sum_shares(&selected),
+    })
 }
 
 /// Sum the canonical clients' openings into a single aggregated `Opening` and

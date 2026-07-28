@@ -1,5 +1,6 @@
 pub mod aggregator;
 pub mod client;
+pub mod dispute;
 pub mod server;
 pub mod verify;
 
@@ -10,6 +11,12 @@ pub struct ClientId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct ServerId(pub u32);
+
+/// An RS lane. The first `n_servers` nodes are the threshold servers (they also
+/// hold an opening); any beyond that carry a coded share and nothing else,
+/// which is what lets `n` exceed `S` and `k` grow without paying more openings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct NodeId(pub u32);
 
 /// Identifier of one protocol execution.
 ///
@@ -34,7 +41,9 @@ pub fn opening_aad(sid: &SessionId, client: ClientId, server: ServerId) -> Vec<u
 use chipmunk_code::KahePoly;
 
 use crate::cs::{Cs, HidingMerkleCommitment};
+use crate::digest::DigestParams;
 use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
+use crate::rs::RsParams;
 use crate::sss::ShamirParams;
 
 /// `KahePoly` count of one KAHE plaintext message (`μ_kahe · l`); every client
@@ -58,6 +67,9 @@ pub struct ProtocolParams {
     pub shamir: ShamirParams,
     /// Anonymity floor: never decrypt over fewer distinct clients. Default 1.
     pub min_clients: usize,
+    /// Set only in the RS-sharded ingress mode; `None` is the broadcast flow.
+    pub rs: Option<RsParams>,
+    pub digest: Option<DigestParams>,
 }
 
 impl ProtocolParams {
@@ -72,7 +84,7 @@ impl ProtocolParams {
         let kahe = Kahe::setup(rng);
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         let shamir = ShamirParams::new(t, n_servers);
-        Self { kahe, cs, shamir, min_clients: 1 }
+        Self { kahe, cs, shamir, min_clients: 1, rs: None, digest: None }
     }
 
     /// Explicit KAHE width `μ`; `l = 1`, `σ_s = σ_e = 15.72`,
@@ -106,7 +118,50 @@ impl ProtocolParams {
         let kahe = Kahe::setup_with_dims(rng, mu_kahe, l, sigma_s, sigma_e, t_modulus);
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         let shamir = ShamirParams::new(t, n_servers);
-        Self { kahe, cs, shamir, min_clients: 1 }
+        Self { kahe, cs, shamir, min_clients: 1, rs: None, digest: None }
+    }
+}
+
+impl ProtocolParams {
+    /// RS-sharded ingress mode. `payload_polys` is the plaintext width, and
+    /// also `μ_kahe` — the digest is an Ajtai hash of the *ciphertext*, so it
+    /// needs no plaintext slot and no encryption.
+    ///
+    /// `n_nodes` may exceed `n_servers`: the extra nodes are lanes that hold a
+    /// coded share and no key material. `rho_max` bounds the aggregation the
+    /// digest ring can represent exactly, and is what the verifier range-checks.
+    pub fn setup_rs_mode<R: Rng>(
+        rng: &mut R,
+        n_servers: usize,
+        payload_polys: usize,
+        k: usize,
+        n_nodes: usize,
+        t_modulus: u64,
+        rho_max: usize,
+        digest_seed: [u8; 32],
+    ) -> Self {
+        assert!(payload_polys >= 1, "payload must be ≥ 1 poly");
+        assert!(
+            n_nodes >= n_servers,
+            "every threshold server is also a lane; n_nodes ≥ n_servers"
+        );
+        let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
+        let kahe = Kahe::setup_with_dims(
+            rng,
+            payload_polys,
+            1,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            t_modulus,
+        );
+        Self {
+            kahe,
+            cs: HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS),
+            shamir: ShamirParams::new(t, n_servers),
+            min_clients: 1,
+            rs: Some(RsParams::new(k, n_nodes)),
+            digest: Some(DigestParams::from_seed(digest_seed, payload_polys, rho_max)),
+        }
     }
 }
 

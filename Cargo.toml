@@ -8,7 +8,7 @@ edition = "2021"
 # cycles in `crossbeam_epoch` rayon overhead with no measurable speedup at
 # n_leaves ≤ 64. Re-enable when n_leaves ≫ #cores.
 chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
-p256 = { version = "0.13", features = ["ecdh"] }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa"] }
 aes-gcm = "0.10"
 rand = "0.8"
 rand_chacha = "0.3"

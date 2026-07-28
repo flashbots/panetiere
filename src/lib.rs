@@ -1,11 +1,14 @@
 pub mod bulletin;
 pub mod codec;
 pub mod cs;
+pub mod digest;
 pub mod kahe;
 pub mod mse;
 pub mod pke;
 pub mod prony;
 pub mod protocol;
+pub mod rs;
+pub mod sig;
 pub mod sss;
 
 pub use chipmunk_code::path::Path;

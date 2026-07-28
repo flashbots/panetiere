@@ -4,12 +4,15 @@ use std::time::Instant;
 use chipmunk_code::{CsPoly, KahePoly};
 use rayon::prelude::*;
 
-use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
+use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
+use crate::rs::{Rs, RsError};
+use chipmunk_code::DgtNTTPoly;
+use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
 
-use super::{ClientId, ServerId};
+use super::{ClientId, NodeId, ServerId, SessionId};
 use super::ProtocolParams;
 
 #[derive(Debug, PartialEq)]
@@ -23,6 +26,19 @@ pub enum VerifyError {
     InconsistentCiphertextLen(ServerId),
     AnonymitySetTooSmall { got: usize, min: usize },
     ShareRecovery(SssError),
+    /// RS mode only.
+    NotRsMode,
+    NotEnoughNodes,
+    BadNodeCoverage,
+    InconsistentNodeCanonical(NodeId),
+    BadSignature(ClientId),
+    Reconstruct(RsError),
+    /// Spare lanes contradict the reconstruction — these disagreed.
+    LaneMismatch(Vec<NodeId>),
+    DigestMismatch,
+    /// Reconstruction exceeded `ρ_max·q_kahe/2`, so it is not a sum of honest
+    /// ciphertexts and the digest would bind nothing.
+    CiphertextOutOfRange,
 }
 
 /// Public verifier (README step 9):
@@ -191,6 +207,182 @@ pub fn aggregate_and_decrypt_timed(
     tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
 
     Ok((m, tt))
+}
+
+/// Per-phase wall time for [`aggregate_and_decrypt_rs`]. `reconstruct_us`
+/// replaces the direct flow's `agg_ctxt_us`: the nodes already did the summing,
+/// so the verifier only interpolates.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct RsVerifyTimings {
+    pub sig_verify_us: f64,
+    pub sum_comm_us: f64,
+    pub opening_verify_us: f64,
+    pub interpolation_us: f64,
+    pub reconstruct_us: f64,
+    /// Spare-lane syndrome check; zero when no lane beyond `k` reported.
+    pub syndrome_us: f64,
+    /// Ajtai digest check plus the norm bound it depends on.
+    pub digest_us: f64,
+    pub kahe_dec_us: f64,
+}
+
+/// RS-mode verifier.
+///
+/// The ciphertext never reaches here whole: `k` node share-sums are
+/// interpolated back into `Σ ct`, which is exact because coding and
+/// aggregation are both `Z_q`-linear. The digest slot is summed from the
+/// bulletin instead, decrypted alongside, and checked against the recovered
+/// plaintext — see [`crate::digest`] for what that check does and does not
+/// catch.
+pub fn aggregate_and_decrypt_rs(
+    pp: &ProtocolParams,
+    sid: &SessionId,
+    canonical: &[ClientId],
+    client_entries: &[(ClientId, RsClientBulletinEntry)],
+    server_outputs: &[ServerBulletinEntry],
+    node_outputs: &[RsNodeBulletinEntry],
+) -> Result<(Vec<KahePoly>, RsVerifyTimings), VerifyError> {
+    let rs = pp.rs.as_ref().ok_or(VerifyError::NotRsMode)?;
+    let dp = pp.digest.as_ref().ok_or(VerifyError::NotRsMode)?;
+    if server_outputs.is_empty() {
+        return Err(VerifyError::NoServers);
+    }
+    check_anonymity_floor(pp, canonical)?;
+    if server_outputs.len() < pp.shamir.t {
+        return Err(VerifyError::BadServerCoverage);
+    }
+    if node_outputs.len() < rs.k {
+        return Err(VerifyError::NotEnoughNodes);
+    }
+
+    let mut seen: HashSet<u32> = HashSet::with_capacity(server_outputs.len());
+    for sp in server_outputs {
+        if (sp.server_id.0 as usize) >= pp.cs.n_servers || !seen.insert(sp.server_id.0) {
+            return Err(VerifyError::BadServerCoverage);
+        }
+        if sp.clients != canonical {
+            return Err(VerifyError::InconsistentCanonical(sp.server_id));
+        }
+    }
+    // `Σ sk` and `Σ ct` must cover exactly the same set or decryption yields
+    // noise, so the lanes are held to the same roster as the servers.
+    let mut seen_nodes: HashSet<u32> = HashSet::with_capacity(node_outputs.len());
+    for np in node_outputs {
+        if (np.node_id.0 as usize) >= rs.n || !seen_nodes.insert(np.node_id.0) {
+            return Err(VerifyError::BadNodeCoverage);
+        }
+        if np.clients != canonical {
+            return Err(VerifyError::InconsistentNodeCanonical(np.node_id));
+        }
+    }
+
+    let pub_index: HashMap<ClientId, usize> = client_entries
+        .iter()
+        .enumerate()
+        .map(|(i, (cid, _))| (*cid, i))
+        .collect();
+    let entries: Vec<&RsClientBulletinEntry> = canonical
+        .iter()
+        .map(|cid| {
+            pub_index
+                .get(cid)
+                .map(|i| &client_entries[*i].1)
+                .ok_or(VerifyError::MissingClient(*cid))
+        })
+        .collect::<Result<_, _>>()?;
+
+    let mut tt = RsVerifyTimings::default();
+
+    let now = Instant::now();
+    let sig_results: Vec<Result<(), VerifyError>> = canonical
+        .par_iter()
+        .zip(entries.par_iter())
+        .map(|(cid, e)| {
+            let vk = sig::VerifyingKey::from_sec1_bytes(&e.pubkey)
+                .map_err(|_| VerifyError::BadSignature(*cid))?;
+            vk.verify(
+                &RsClientBulletinEntry::signing_bytes(sid, *cid, &e.comm, &e.digest),
+                &e.sig,
+            )
+            .map_err(|_| VerifyError::BadSignature(*cid))
+        })
+        .collect();
+    for r in sig_results {
+        r?;
+    }
+    tt.sig_verify_us = now.elapsed().as_secs_f64() * 1e6;
+
+    let now = Instant::now();
+    let comms: Vec<Commitment> = entries.iter().map(|e| e.comm.clone()).collect();
+    let summed_comm = HidingMerkleCommitment::sum_commitments(&comms);
+    tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
+
+    let now = Instant::now();
+    let results: Vec<Result<(), VerifyError>> = server_outputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, sp)| verify_one_server(pp, &summed_comm, i, sp))
+        .collect();
+    for r in results {
+        r?;
+    }
+    tt.opening_verify_us = now.elapsed().as_secs_f64() * 1e6;
+
+    let now = Instant::now();
+    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
+    tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
+
+    let ell = pp.kahe.mu_kahe;
+    let now = Instant::now();
+    let samples: Vec<(usize, &[DgtNTTPoly])> = node_outputs
+        .iter()
+        .map(|np| (np.node_id.0 as usize, np.share_sum.as_slice()))
+        .collect();
+    let summed_ntt =
+        Rs::reconstruct(rs, ell, &samples).map_err(VerifyError::Reconstruct)?;
+    tt.reconstruct_us = now.elapsed().as_secs_f64() * 1e6;
+
+    // Spare lanes are a syndrome: the lane-sums are a codeword of the same code,
+    // so any surplus share must agree with the reconstruction. Exact, and it
+    // fires before the digest.
+    let now = Instant::now();
+    let bad = Rs::inconsistent_shares(rs, &summed_ntt, &samples);
+    if !bad.is_empty() {
+        return Err(VerifyError::LaneMismatch(
+            bad.into_iter().map(|i| NodeId(i as u32)).collect(),
+        ));
+    }
+    tt.syndrome_us = now.elapsed().as_secs_f64() * 1e6;
+
+    // The digest binds the *unreduced* integer sum, so the norm bound is not a
+    // sanity check — it is the premise the collision-resistance argument rests
+    // on. Check it before trusting the hash comparison.
+    let now = Instant::now();
+    let summed_h: Vec<DgtNTTPoly> = (0..crate::digest::DIGEST_POLYS)
+        .map(|i| {
+            entries
+                .iter()
+                .fold(DgtNTTPoly::default(), |acc, e| acc + e.digest[i])
+        })
+        .collect();
+    for e in &entries {
+        if e.digest.len() != crate::digest::DIGEST_POLYS {
+            return Err(VerifyError::DigestMismatch);
+        }
+    }
+    let centered = crate::digest::centered_within_bound(dp, &summed_ntt)
+        .ok_or(VerifyError::CiphertextOutOfRange)?;
+    if !crate::digest::check(dp, &summed_ntt, &summed_h) {
+        return Err(VerifyError::DigestMismatch);
+    }
+    tt.digest_us = now.elapsed().as_secs_f64() * 1e6;
+
+    let now = Instant::now();
+    let summed_ctxt = crate::digest::to_kahe(&centered);
+    let plain = Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key);
+    tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
+
+    Ok((plain, tt))
 }
 
 /// Aggregated-flow verifier: ciphertext and commitment are already summed over
