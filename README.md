@@ -13,7 +13,8 @@ RAYON_NUM_THREADS=8 cargo bench -j 8 --bench scaling                   # progres
 RAYON_NUM_THREADS=8 cargo run -j 8 --release --example demo            # slot-mode broadcast demo
 ```
 
-`bench.sh` and `scripts/run_demo.sh` are thin wrappers around the above. The crate depends on `chipmunk_code` (a pinned git dependency, [github.com/Ruteri/Chipmunk](https://github.com/Ruteri/Chipmunk)) for the lattice primitives (Ring-SIS hash, dynamic-height Merkle tree, NTT polynomial multiplication; the `fast-ntt` feature enables Barrett + AVX2 NTT across all three rings — HVC, CS, KAHE).
+
+[bench.sh](bench.sh) and [scripts/run_demo.sh](scripts/run_demo.sh) are thin wrappers around the above. The crate depends on `chipmunk_code` (a pinned git dependency, [github.com/Ruteri/Chipmunk](https://github.com/Ruteri/Chipmunk)) for the lattice primitives (Ring-SIS hash, dynamic-height Merkle tree, NTT polynomial multiplication; the `fast-ntt` feature enables Barrett + AVX2 NTT across all three rings — HVC, CS, KAHE).
 
 ## Repository layout
 
@@ -73,11 +74,11 @@ Verifier  (aggregate_and_decrypt):
   9d. return KAHE.dec(summed_ctxt, agg_key)             # = Σ m_j over canonical
 ```
 
-The verifier output is a $μ_{kahe}·l$-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). `tests/end_to_end.rs::end_to_end_recovers_sum` is the executable spec.
+The verifier output is a $μ_{kahe}·l$-vector of KAHE-ring polynomials whose coefficient-wise meaning is the application's choice (slot mode, MSE peeling, custom encoding). [tests/end_to_end.rs](tests/end_to_end.rs)`::end_to_end_recovers_sum` is the executable spec.
 
 ### Aggregated flow (optional)
 
-When the public $(c_j, comm_j)$ fan-in dominates (many clients, large payloads), an **aggregator** can sit between clients and the verifier. Clients in a group send their $(c_j, comm_j)$ to the group's aggregator instead of broadcasting them; the aggregator runs `protocol::aggregator::run_aggregator_round` — `KAHE.agg_ctxt` + `CS.sum_commitments` over the group — and forwards one signed aggregate. The verifier re-sums the per-group aggregates (the same two associative ops) and calls `protocol::verify::decrypt_aggregate(pp, summed_ctxt, summed_comm, server_outputs)`, which verifies+decrypts exactly as `aggregate_and_decrypt` but takes the ciphertext/commitment already summed. **Openings are untouched** — they still go to the servers per-server, so the threshold/privacy model is identical to the base flow. This is purely additive: the base path above is unchanged. `tests/end_to_end.rs::aggregated_recovers_same_sum` asserts the aggregated path decodes byte-identically; `benches/protocol.rs` and `benches/scaling.rs` report the leader-side bytes/CPU saved (G group aggregates vs ρ client posts).
+When the public $(c_j, comm_j)$ fan-in dominates (many clients, large payloads), an **aggregator** can sit between clients and the verifier. Clients in a group send their $(c_j, comm_j)$ to the group's aggregator instead of broadcasting them; the aggregator runs `protocol::aggregator::run_aggregator_round` — `KAHE.agg_ctxt` + `CS.sum_commitments` over the group — and forwards one signed aggregate. The verifier re-sums the per-group aggregates (the same two associative ops) and calls `protocol::verify::decrypt_aggregate(pp, summed_ctxt, summed_comm, server_outputs)`, which verifies+decrypts exactly as `aggregate_and_decrypt` but takes the ciphertext/commitment already summed. **Openings are untouched** — they still go to the servers per-server, so the threshold/privacy model is identical to the base flow. This is purely additive: the base path above is unchanged. [tests/end_to_end.rs](tests/end_to_end.rs)`::aggregated_recovers_same_sum` asserts the aggregated path decodes byte-identically; [benches/protocol.rs](benches/protocol.rs) and [benches/scaling.rs](benches/scaling.rs) report the leader-side bytes/CPU saved (G group aggregates vs ρ client posts).
 
 ## Modules
 
@@ -440,7 +441,7 @@ impl MseEncoding {
 }
 ```
 
-`pack` flattens $(C, K_0…K_{L-1}, V_0…V_{ξ-1})$ row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. `tests/mse_e2e.rs::mse_recovers_through_panetiere` is the executable spec.
+`pack` flattens $(C, K_0…K_{L-1}, V_0…V_{ξ-1})$ row-major into a coefficient stream in that order. `unpack` is the inverse, lifting each `KahePoly`'s coefficients to canonical signed reps. Pointwise sum of packed encodings unpacks to the multiset union — this is the property the protocol exploits to carry an MSE end-to-end. [tests/mse_e2e.rs](tests/mse_e2e.rs)`::mse_recovers_through_panetiere` is the executable spec.
 
 ## Security properties
 
@@ -476,7 +477,7 @@ cargo bench --bench scaling             # (S, N) cell × (μ_kahe, κ_kahe) vari
 cargo run --release --example demo      # 6 clients × 128-byte slots over a 1024-byte buffer
 ```
 
-`tests/end_to_end.rs::end_to_end_recovers_sum` is the canonical executable spec. Other coverage in that file: `slot_mode_disjoint_clients_recover_each_payload`, `slot_mode_8kb_message_multi_poly`, `tampered_agg_share_rejected`, `high_norm_r_rejected_in_protocol`, `recovers_from_t_of_n_servers`. `tests/mse_e2e.rs::mse_recovers_through_panetiere` carries an MSE multiset end-to-end.
+[tests/end_to_end.rs](tests/end_to_end.rs_`::end_to_end_recovers_sum` is the canonical executable spec. Other coverage in that file: `slot_mode_disjoint_clients_recover_each_payload`, `slot_mode_8kb_message_multi_poly`, `tampered_agg_share_rejected`, `high_norm_r_rejected_in_protocol`, `recovers_from_t_of_n_servers`. [tests/mse_e2e.rs](tests/mse_e2e.rs)`::mse_recovers_through_panetiere` carries an MSE multiset end-to-end.
 
 ### Scaling bench
 
@@ -500,7 +501,7 @@ A wider sweep over `(μ, κ, β) ∈ {4..24} × {64..4096}` confirmed these as t
 
 #### Schedule-and-message
 
-`scaling.rs` also sweeps `AppCodec::Scheduled { message_bytes }` — the joint schedule-and-message
+[benches/scaling.rs](benches/scaling.rs) also sweeps `AppCodec::Scheduled { message_bytes }` — the joint schedule-and-message
 round (`codec` docs above), measured directly as one KAHE round over `[reservation IBLT ‖ message
 vector]`. The reservation region is a tiny `(rand, size)` MSE token per client; the message region
 is the shared `message_bytes` vector split into an equal slot per active client. Because both ride
