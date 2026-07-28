@@ -28,10 +28,6 @@ harness = false
 name = "scaling"
 harness = false
 
-[[bench]]
-name = "scheduling"
-harness = false
-
 # Release-with-debug-info profile for callgrind / perf. Use via `cargo build
 # --profile profiling --bin <bin>` or `cargo bench --profile profiling`.
 [profile.profiling]
