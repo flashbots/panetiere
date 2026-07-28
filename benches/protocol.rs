@@ -1,4 +1,4 @@
-use chipmunk_code::{KahePoly, Polynomial};
+use chipmunk_code::KahePoly;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use panetiere::cs::{Cs, HidingMerkleCommitment};
 use panetiere::kahe::{Kahe, KaheScheme};

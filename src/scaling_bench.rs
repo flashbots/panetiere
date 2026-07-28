@@ -29,7 +29,8 @@
 //!                                           IBLT is sized to active, not total.
 //!  CONFIGS: ξ             payload symbols/client (useful bits = ξ·log₂ t)
 //!  SCHED_MESSAGE_BYTES:   message-vector sizes for the scheduled flow
-//!  NETWORKS: per-profile one-way latency + uniform jitter, link Mbit/s
+//!  NETWORKS: per-profile one-way latency + uniform jitter, and Mbit/s for each
+//!            of the three link classes (client, server, bulletin/recipient)
 //!  env:     SWEEP_SERVERS          "8,16,64"          overrides SERVERS
 //!           SWEEP_CLIENTS          "100x100,300x300"  overrides CLIENTS
 //!           SWEEP_PAYLOAD_SYMBOLS  "2048,10240"       overrides CONFIGS ξ
@@ -55,7 +56,10 @@
 //!  chipmunk param.rs: N = 2048, q_hvc = 40_961, q_cs = 139_301,
 //!                     q_kahe = 347_280_875_347_969, HVC_WIDTH = 3
 //!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^36, σ_s = σ_e = 15.72
-//!                noise budget t·8σ_e·√ρ + ρ·t/2 < q_kahe/2 (ρ ≲ 349)
+//!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
+//!                — reported per cell as `eps`, the exponent that condition
+//!                actually buys at that (ρ, μ). It falls with √ρ and with
+//!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
 //!  src/mse.rs:   BITS_PER_SYMBOL = 36, K_LIMBS = 2
 //!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
 //!                  over (S, ρ, active, ξ, codec), so cells never share a stream
@@ -220,18 +224,22 @@ fn sweep_configs() -> Vec<Config> {
 }
 
 /// Network sim profile: per-message one-way latency = `lat_ms + U[0, jitter_ms)`
-/// (parallel arrivals take the max draw). Two link classes: client links
-/// (residential, the slow side) and server-side links (servers, bulletin,
-/// verifier — cloud, ~Gbit). Each endpoint serializes its own bytes at its
-/// class rate, both directions.
+/// (parallel arrivals take the max draw). Three link classes: client links
+/// (residential, the slow side), server links (relays and aggregators), and the
+/// bulletin/recipient link — the one endpoint that ingests every client's post
+/// and is read in full by the verifier, so it saturates first. Each endpoint
+/// serializes its own bytes at its class rate, both directions.
 struct NetProfile {
     label: &'static str,
     lat_ms: f64,
     jitter_ms: f64,
     client_mbps: f64,
     server_mbps: f64,
+    bulletin_mbps: f64,
 }
 
+// The `bul*` profiles hold the servers at 1 Gbit and vary only the bulletin, so
+// the delta against `1Gbit` is exactly what a faster recipient link buys.
 const NETWORKS: &[NetProfile] = &[
     NetProfile {
         label: "1Gbit",
@@ -239,6 +247,7 @@ const NETWORKS: &[NetProfile] = &[
         jitter_ms: 10.0,
         client_mbps: 100.0,
         server_mbps: 1000.0,
+        bulletin_mbps: 1000.0,
     },
     NetProfile {
         label: "4Gbit",
@@ -246,6 +255,50 @@ const NETWORKS: &[NetProfile] = &[
         jitter_ms: 10.0,
         client_mbps: 100.0,
         server_mbps: 4000.0,
+        bulletin_mbps: 4000.0,
+    },
+    NetProfile {
+        label: "bul8",
+        lat_ms: 60.0,
+        jitter_ms: 10.0,
+        client_mbps: 100.0,
+        server_mbps: 1000.0,
+        bulletin_mbps: 8000.0,
+    },
+    NetProfile {
+        label: "bul20",
+        lat_ms: 60.0,
+        jitter_ms: 10.0,
+        client_mbps: 100.0,
+        server_mbps: 1000.0,
+        bulletin_mbps: 20000.0,
+    },
+    // Client uplink at 1 Gbit instead of 100 Mbit, across the same bulletin
+    // range. Pairs with `bul8`/`bul20` to separate the two links: same bulletin,
+    // only the client rate differs.
+    NetProfile {
+        label: "cl1Gb4",
+        lat_ms: 60.0,
+        jitter_ms: 10.0,
+        client_mbps: 1000.0,
+        server_mbps: 1000.0,
+        bulletin_mbps: 4000.0,
+    },
+    NetProfile {
+        label: "cl1Gb8",
+        lat_ms: 60.0,
+        jitter_ms: 10.0,
+        client_mbps: 1000.0,
+        server_mbps: 1000.0,
+        bulletin_mbps: 8000.0,
+    },
+    NetProfile {
+        label: "cl1Gb20",
+        lat_ms: 60.0,
+        jitter_ms: 10.0,
+        client_mbps: 1000.0,
+        server_mbps: 1000.0,
+        bulletin_mbps: 20000.0,
     },
 ];
 
@@ -296,6 +349,17 @@ fn fmt_bytes(b: f64) -> String {
         format!("{:.2} KiB", b / 1024.0)
     } else {
         format!("{:.2} MiB", b / (1024.0 * 1024.0))
+    }
+}
+
+/// `2^-eps` failure probability, or `-` where the parameters give no bound.
+fn fmt_eps(eps: f64) -> String {
+    if eps <= 0.0 {
+        "-".into()
+    } else if eps.is_infinite() {
+        "exact".into()
+    } else {
+        format!("{:.0}", eps)
     }
 }
 
@@ -356,6 +420,13 @@ struct Row {
     xi: usize,
     l: usize,
     n_polys: usize, // actual message length; ≤ μ·l (final chunk may be partial)
+    /// Where this row's timings were taken: `host`, `tdx`, `host-rest`, or
+    /// `tdx+host` once merged.
+    env: String,
+    /// Rayon pool width and CPU affinity mask. A merge across differing thread
+    /// counts is not meaningful, so it is refused.
+    threads: usize,
+    affinity: String,
     recovered_ok: bool,
     // [M] CPU, per-round totals for one party (the ×l chunk work included).
     enc_app: Stat,
@@ -371,13 +442,21 @@ struct Row {
     v_interp: Stat,
     v_kahe_dec: Stat,
     dec_app: Stat,
+    /// One fresh opening against one commitment — the per-opening `VC.Vf` unit,
+    /// as distinct from `v_open`, which times the S-way parallel verify.
+    v_one_open: Stat,
     // [M] wire: real ML-KEM-sealed opening envelope (client → one server).
     open_env_b: usize,
     // [D] wire components (bytes).
     comm_client_b: usize,      // one commitment root
     ctxt_client_b: usize,      // one client's full ciphertext (n_polys polys)
+    kahe_key_b: usize,         // one KAHE key (κ_kahe = 1 ring element)
+    plaintext_b: usize,        // KAHE plaintext, n_polys elements of R_t
     agg_open_b: usize,          // server-posted aggregate opening
     agg_share_b: usize,         // server-posted agg_share (one CS poly)
+    /// Correctness exponent the KAHE condition yields at this (ρ, n_polys):
+    /// a round decodes with probability ≥ 1 − 2^−eps. `0` = no guarantee.
+    eps_correct: f64,
     // [D] round totals across all parties.
     useful_b: f64,
     wire_ctxt_b: f64,
@@ -386,6 +465,413 @@ struct Row {
     wire_server_b: f64,
     agg_plans: Vec<AggPlan>,
     rs_plans: Vec<RsPlan>,
+}
+
+/// A phase whose slowest rep exceeds its fastest by more than this was competing
+/// with something — another workload, or a rayon pool straddling both sockets.
+const CONTENTION_RATIO: f64 = 2.0;
+
+/// The worst-spread phases of a cell, or `None` if every phase was stable.
+/// Catches a contaminated cell while the sweep is still running rather than
+/// during analysis afterwards.
+fn contention(r: &Row) -> Option<String> {
+    let mut worst: Vec<(f64, &str)> = PHASES
+        .iter()
+        .filter_map(|p| {
+            let st = (p.get)(r);
+            // A phase this run does not own reads as zero, not as fast.
+            (st.min > 0.0 && st.max / st.min > CONTENTION_RATIO)
+                .then(|| (st.max / st.min, p.name))
+        })
+        .collect();
+    if worst.is_empty() {
+        return None;
+    }
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    Some(
+        worst
+            .iter()
+            .take(3)
+            .map(|(ratio, name)| format!("{name} {ratio:.1}x"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+/// Group size balancing the largest per-hop fan-in at `ρ^{1/(layers+1)}`. Pure in
+/// `(n, layers)`, so a row rebuilt from CSV reproduces the same topology as the
+/// run that wrote it.
+fn agg_group_size(n: usize, layers: usize) -> usize {
+    let g = match layers {
+        1 => (n as f64).sqrt(),
+        _ => (n as f64).powf(1.0 / (layers as f64 + 1.0)),
+    }
+    .ceil() as usize;
+    g.max(2)
+}
+
+/// Which phases a run's timings are authoritative for. Setup and the live round
+/// are unaffected — this only gates whether a phase's `Stat` is recorded, so a
+/// split run and a whole run walk identical code.
+#[derive(Clone, Copy, PartialEq)]
+struct Roles {
+    client: bool,
+    server: bool,
+    verifier: bool,
+    agg: bool,
+    rs: bool,
+}
+
+impl Roles {
+    /// `BENCH_ROLES=client`, `=server,verifier,agg,rs`, or absent for everything.
+    fn from_env() -> Self {
+        match std::env::var("BENCH_ROLES") {
+            Err(_) => Self::all(),
+            Ok(raw) => Self::from_env_str(&raw),
+        }
+    }
+
+    fn from_env_str(raw: &str) -> Self {
+        if raw.trim().is_empty() || raw.trim() == "all" {
+            return Self::all();
+        }
+        let mut roles = Roles {
+            client: false,
+            server: false,
+            verifier: false,
+            agg: false,
+            rs: false,
+        };
+        for name in raw.split(',').map(str::trim) {
+            match name {
+                "client" => roles.client = true,
+                "server" => roles.server = true,
+                "verifier" => roles.verifier = true,
+                "agg" => roles.agg = true,
+                "rs" => roles.rs = true,
+                other => panic!(
+                    "bad BENCH_ROLES entry {other:?} \
+                     (want client|server|verifier|agg|rs|all)"
+                ),
+            }
+        }
+        roles
+    }
+
+    fn all() -> Self {
+        Roles {
+            client: true,
+            server: true,
+            verifier: true,
+            agg: true,
+            rs: true,
+        }
+    }
+
+    /// Tag for the `env` column. A whole run is `host`; a client-only run is
+    /// where TDX measurements come from, so it is tagged as such.
+    fn env_tag(&self) -> &'static str {
+        match (*self == Self::all(), self.client) {
+            (true, _) => "host",
+            (false, true) => "tdx",
+            (false, false) => "host-rest",
+        }
+    }
+}
+
+/// `Stat` only when this run owns the phase, otherwise zero — so a merge can tell
+/// "not measured here" from "measured as fast".
+fn owned(keep: bool, s: Stat) -> Stat {
+    if keep {
+        s
+    } else {
+        Stat::default()
+    }
+}
+
+/// The CPU set this process may run on, e.g. `0-7`. Records whether a run was
+/// pinned, which decides whether its timings are comparable to another's.
+fn affinity() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_else(|| "?".into())
+}
+
+/// Largest `ε` for which KAHE addition correctness holds at `rho` aggregations
+/// over a `mu`-element ciphertext: a round decodes with probability ≥ 1 − 2^−ε.
+///
+/// Inverts `q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))`. Returns 0 when the
+/// modulus leaves no room for noise at all, and `∞` when every coefficient fits
+/// deterministically.
+fn correctness_epsilon(rho: usize, mu: usize) -> f64 {
+    let q = KAHE_MODULUS as f64;
+    let t = T_MODULUS_DEFAULT as f64;
+    let sigma = SIGMA_E_DEFAULT;
+    let (rho_f, nmu) = (rho as f64, (POLY_N * mu) as f64);
+    // Headroom left for the error term once the ρ plaintexts have their share.
+    let slack = q / t - rho_f;
+    if slack <= 0.0 {
+        return 0.0;
+    }
+    let l = slack * slack / (8.0 * rho_f * sigma * sigma);
+    // 2e^−L is the per-coefficient tail mass; ln_1p/exp_m1 keep the union bound
+    // over nμ coefficients accurate when it is tiny.
+    let tail = 2.0 * (-l).exp();
+    if tail >= 1.0 {
+        return 0.0;
+    }
+    let p_fail = -((nmu * (-tail).ln_1p()).exp_m1());
+    if p_fail <= 0.0 {
+        return f64::INFINITY;
+    }
+    -p_fail.log2()
+}
+
+#[cfg(test)]
+mod eps_tests {
+    use super::correctness_epsilon;
+
+    /// Hand-worked against the condition: at ρ=300 over a 1602-poly ciphertext
+    /// the slack q/t − ρ = 4753.4 gives L = 38.1, and the union bound over
+    /// n·μ = 3.28M coefficients leaves ≈ 2^−32.
+    #[test]
+    fn matches_hand_computation() {
+        let eps = correctness_epsilon(300, 1602);
+        assert!((eps - 32.2).abs() < 0.2, "got {eps}");
+    }
+
+    /// ρ enters as √ρ and μ only as log(nμ), so widening the ciphertext costs
+    /// far less correctness than adding clients.
+    #[test]
+    fn rho_dominates_mu() {
+        let base = correctness_epsilon(300, 1602);
+        assert!(correctness_epsilon(300, 1602 * 4) > base - 3.0);
+        assert!(correctness_epsilon(600, 1602) < base - 15.0);
+    }
+
+    /// Past the point where ρ plaintexts alone fill the modulus there is no
+    /// bound left to report.
+    #[test]
+    fn no_headroom_reports_zero() {
+        assert_eq!(correctness_epsilon(6000, 16), 0.0);
+    }
+
+    /// Few enough aggregations and the tail vanishes outright.
+    #[test]
+    fn small_round_is_exact() {
+        assert!(correctness_epsilon(16, 2).is_infinite());
+    }
+}
+
+#[cfg(test)]
+mod csv_tests {
+    use super::*;
+
+    /// Every phase gets a distinct value so a swapped column shows up as a
+    /// mismatch rather than passing by coincidence.
+    fn sample_row() -> Row {
+        let mut r = Row {
+            s: 8,
+            n: 300,
+            active: 100,
+            cover: 200,
+            iblt_cells: 300,
+            flow: "mse",
+            payload_client_b: 4099,
+            mu_kahe: 2002,
+            delta: 75,
+            xi: 911,
+            l: 1,
+            n_polys: 134,
+            env: "host".into(),
+            threads: 8,
+            affinity: "0-7".into(),
+            recovered_ok: true,
+            enc_app: Stat::default(),
+            kahe_enc: Stat::default(),
+            share: Stat::default(),
+            cs: Stat::default(),
+            seal: Stat::default(),
+            unseal: Stat::default(),
+            server: Stat::default(),
+            v_agg_ctxt: Stat::default(),
+            v_sum_comm: Stat::default(),
+            v_open: Stat::default(),
+            v_interp: Stat::default(),
+            v_kahe_dec: Stat::default(),
+            dec_app: Stat::default(),
+            v_one_open: Stat::default(),
+            open_env_b: 57862,
+            comm_client_b: 4352,
+            ctxt_client_b: 1715200,
+            kahe_key_b: 12800,
+            plaintext_b: 1234560,
+            agg_open_b: 106240,
+            agg_share_b: 4864,
+            eps_correct: 35.9,
+            useful_b: 409900.0,
+            wire_ctxt_b: 5.0e8,
+            wire_comm_b: 1.3e6,
+            wire_opening_b: 1.4e8,
+            wire_server_b: 8.9e5,
+            agg_plans: vec![AggPlan {
+                layers: AGG_LAYERS[0],
+                group_size: agg_group_size(300, AGG_LAYERS[0]),
+                layer_counts: vec![300usize.div_ceil(agg_group_size(300, AGG_LAYERS[0]))],
+                agg_cpu: Stat::default(),
+                leader: Stat::default(),
+                recovered: true,
+            }],
+            rs_plans: vec![RsPlan {
+                k: 14,
+                n_nodes: 16,
+                share_b: 1884160,
+                bulletin_b: 8192,
+                dgt_embed: Stat::default(),
+                dgt_hash: Stat::default(),
+                rs_enc: Stat::default(),
+                node_sum: Stat::default(),
+                v_sig: Stat::default(),
+                v_open: Stat::default(),
+                v_interp: Stat::default(),
+                v_reconstruct: Stat::default(),
+                v_reconstruct_lagrange: Stat::default(),
+                v_syndrome: Stat::default(),
+                v_kahe_dec: Stat::default(),
+                v_digest: Stat::default(),
+                recovered: true,
+                lane_lie_caught: "syndrome",
+            }],
+        };
+        for (i, p) in PHASES.iter().enumerate() {
+            let base = (i as f64 + 1.0) * 100.0;
+            (p.set)(
+                &mut r,
+                Stat {
+                    med: base,
+                    min: base - 10.0,
+                    max: base + 10.0,
+                },
+            );
+        }
+        r
+    }
+
+    /// Round-trip through the real writer and reader, so a column added to one and
+    /// not the other fails here.
+    #[test]
+    fn row_survives_csv_round_trip() {
+        let row = sample_row();
+        let dir = std::env::temp_dir().join(format!("panetiere-csv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rt.csv");
+        std::env::set_var("BENCH_CSV", &path);
+        std::env::remove_var("SWEEP_APPEND");
+        write_csv(std::slice::from_ref(&row));
+
+        let back = read_rows(path.to_str().unwrap()).unwrap();
+        assert_eq!(back.len(), 1);
+        let b = &back[0];
+
+        assert_eq!((b.s, b.n, b.active, b.cover), (row.s, row.n, row.active, row.cover));
+        assert_eq!(b.flow, row.flow);
+        assert_eq!(b.n_polys, row.n_polys);
+        assert_eq!(b.env, row.env);
+        assert_eq!(b.threads, row.threads);
+        assert_eq!(b.affinity, row.affinity);
+        assert_eq!(b.open_env_b, row.open_env_b);
+        assert_eq!(b.agg_open_b, row.agg_open_b);
+        assert_eq!(b.plaintext_b, row.plaintext_b);
+        assert!((b.eps_correct - row.eps_correct).abs() < 0.01);
+        assert_eq!(b.rs_plans[0].k, 14);
+        assert_eq!(b.rs_plans[0].lane_lie_caught, "syndrome");
+        // Topology is recomputed, not stored — it must land on the same values.
+        assert_eq!(b.agg_plans[0].group_size, row.agg_plans[0].group_size);
+        assert_eq!(b.agg_plans[0].layer_counts, row.agg_plans[0].layer_counts);
+
+        for p in PHASES {
+            let (want, got) = ((p.get)(&row), (p.get)(b));
+            assert!(
+                (want.med - got.med).abs() < 0.01
+                    && (want.min - got.min).abs() < 0.01
+                    && (want.max - got.max).abs() < 0.01,
+                "{}: wrote {:?} read {:?}",
+                p.name,
+                (want.med, want.min, want.max),
+                (got.med, got.min, got.max)
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The role split has to partition the phases: a phase owned by nobody would
+    /// silently never be recorded by any run.
+    #[test]
+    fn every_phase_has_an_owner_reachable_from_roles() {
+        let all = Roles::all();
+        for p in PHASES {
+            let owned_by_all = match p.owner {
+                Owner::Client => all.client,
+                Owner::Server => all.server,
+                Owner::Verifier => all.verifier,
+                Owner::Agg => all.agg,
+                Owner::Rs => all.rs,
+            };
+            assert!(owned_by_all, "{} unreachable", p.name);
+        }
+        let client_only = Roles::from_env_str("client");
+        assert!(PHASES.iter().any(|p| p.owner == Owner::Client));
+        assert!(!client_only.server && !client_only.verifier);
+    }
+
+    #[test]
+    fn contention_flags_a_wide_spread_and_ignores_unmeasured() {
+        let mut r = sample_row();
+        // Un-owned phases read as all-zero; that must not look like contention.
+        for p in PHASES {
+            (p.set)(&mut r, Stat::default());
+        }
+        assert!(contention(&r).is_none());
+
+        (PHASES[0].set)(
+            &mut r,
+            Stat {
+                med: 20.0,
+                min: 10.0,
+                max: 30.0,
+            },
+        );
+        assert!(contention(&r).unwrap().contains(PHASES[0].name));
+    }
+}
+
+/// Paper-table role totals: the phases a single party of each kind runs per
+/// round. The three sum to the `[C]` serial wall.
+fn client_us(r: &Row) -> f64 {
+    r.enc_app.med + r.kahe_enc.med + r.share.med + r.cs.med + r.seal.med
+}
+
+fn server_us(r: &Row) -> f64 {
+    r.unseal.med + r.server.med
+}
+
+fn recipient_us(r: &Row) -> f64 {
+    r.v_agg_ctxt.med + r.v_sum_comm.med + r.v_open.med + r.v_interp.med + r.v_kahe_dec.med
+        + r.dec_app.med
+}
+
+/// Everything one client puts on the wire: bulletin post plus its S openings.
+fn client_post_b(r: &Row) -> usize {
+    r.comm_client_b + r.ctxt_client_b + r.s * r.open_env_b
+}
+
+fn server_entry_b(r: &Row) -> usize {
+    r.agg_open_b + r.agg_share_b
 }
 
 /// Per-cell RNG seed: domain-separated hash over every parameter that defines
@@ -412,7 +898,14 @@ fn cell_seed(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) 
     h.finalize().into()
 }
 
-fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -> Row {
+fn run_cell(
+    s: usize,
+    n: usize,
+    active: usize,
+    cfg: &Config,
+    codec: &AppCodec,
+    roles: Roles,
+) -> Row {
     let cover = n - active;
     let seed = cell_seed(s, n, active, cfg, codec);
     let mut rng = ChaCha20Rng::from_seed(seed);
@@ -591,7 +1084,12 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     let key0 = kahe_keygen(&mut rng, &pp);
     let (kahe_enc, _ctxt0) = measure(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
     let (share, shares0) = measure(|| shamir_share(&mut rng, &pp, &key0, s));
-    let (cs, (_comm0, openings0)) = measure(|| cs_commit(&mut rng, &pp, &shares0));
+    let (cs, (comm0, openings0)) = measure(|| cs_commit(&mut rng, &pp, &shares0));
+    // One position of one commitment — the `VC.Vf` unit. `v_open` below times the
+    // verifier's S-way parallel pass instead, so the two are not interchangeable.
+    let (v_one_open, one_open_ok) =
+        measure(|| HidingMerkleCommitment::verify(&pp.cs, &comm0, &openings0[0]));
+    assert!(one_open_ok, "fresh opening must verify");
     let (seal, _) = measure(|| seal_openings(&mut rng, &pp, &SESSION, client_ids[0], &openings0, &servers));
     let (unseal, _) = measure(|| unseal_openings(&server_keys[0], &SESSION, servers[0].0, &sealed_inbox0));
     let (server, _) = measure(|| run_server_round(&inboxes[0], &canonical).unwrap());
@@ -688,13 +1186,7 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     let agg_plans: Vec<AggPlan> = AGG_LAYERS
         .iter()
         .map(|&layers| {
-            let g = match layers {
-                1 => (n as f64).sqrt(),
-                _ => (n as f64).powf(1.0 / (layers as f64 + 1.0)),
-            }
-            .ceil() as usize;
-            let g = g.max(2);
-
+            let g = agg_group_size(n, layers);
             let a1 = n.div_ceil(g);
             let l1_groups: Vec<Vec<_>> = (0..a1)
                 .map(|grp| {
@@ -958,25 +1450,35 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         },
         l,
         n_polys,
+        env: roles.env_tag().to_string(),
+        threads: rayon::current_num_threads(),
+        affinity: affinity(),
         recovered_ok,
-        enc_app,
-        kahe_enc,
-        share,
-        cs,
-        seal,
-        unseal,
-        server,
-        v_agg_ctxt,
-        v_sum_comm,
-        v_open,
-        v_interp,
-        v_kahe_dec,
-        dec_app,
+        // Every phase is measured; only the ones this run owns are recorded, so a
+        // split run and a whole run execute identical code.
+        enc_app: owned(roles.client, enc_app),
+        kahe_enc: owned(roles.client, kahe_enc),
+        share: owned(roles.client, share),
+        cs: owned(roles.client, cs),
+        seal: owned(roles.client, seal),
+        unseal: owned(roles.server, unseal),
+        server: owned(roles.server, server),
+        v_agg_ctxt: owned(roles.verifier, v_agg_ctxt),
+        v_sum_comm: owned(roles.verifier, v_sum_comm),
+        v_open: owned(roles.verifier, v_open),
+        v_interp: owned(roles.verifier, v_interp),
+        v_kahe_dec: owned(roles.verifier, v_kahe_dec),
+        dec_app: owned(roles.verifier, dec_app),
+        v_one_open: owned(roles.verifier, v_one_open),
         open_env_b,
         comm_client_b,
         ctxt_client_b,
+        kahe_key_b: poly_packed_len64(KAHE_MODULUS),
+        plaintext_b: n_polys * POLY_N * BITS_PER_SYMBOL / 8,
         agg_open_b,
         agg_share_b,
+        // ρ = every client's ciphertext is summed, cover included.
+        eps_correct: correctness_epsilon(n, n_polys),
         useful_b: match codec {
             AppCodec::Mse => (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
             AppCodec::Prony => {
@@ -989,8 +1491,36 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
-        agg_plans,
-        rs_plans,
+        agg_plans: agg_plans
+            .into_iter()
+            .map(|mut p| {
+                p.agg_cpu = owned(roles.agg, p.agg_cpu);
+                p.leader = owned(roles.agg, p.leader);
+                p
+            })
+            .collect(),
+        rs_plans: rs_plans
+            .into_iter()
+            .map(|mut p| {
+                for st in [
+                    &mut p.dgt_embed,
+                    &mut p.dgt_hash,
+                    &mut p.rs_enc,
+                    &mut p.node_sum,
+                    &mut p.v_sig,
+                    &mut p.v_open,
+                    &mut p.v_interp,
+                    &mut p.v_reconstruct,
+                    &mut p.v_reconstruct_lagrange,
+                    &mut p.v_syndrome,
+                    &mut p.v_kahe_dec,
+                    &mut p.v_digest,
+                ] {
+                    *st = owned(roles.rs, *st);
+                }
+                p
+            })
+            .collect(),
     }
 }
 
@@ -1120,9 +1650,10 @@ struct NetPoint {
 }
 
 fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> NetPoint {
-    // Mbit/s → bytes/µs. Client links vs cloud (server/bulletin/verifier).
+    // Mbit/s → bytes/µs, one closure per link class.
     let xfer_cl = |b: f64| b / (prof.client_mbps / 8.0);
     let xfer_srv = |b: f64| b / (prof.server_mbps / 8.0);
+    let xfer_bul = |b: f64| b / (prof.bulletin_mbps / 8.0);
     let mut maxlat = |k: usize| -> f64 {
         (0..k)
             .map(|_| prof.lat_ms + nrng.gen::<f64>() * prof.jitter_ms)
@@ -1133,9 +1664,9 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
     let a = (maxlat(r.n) + xfer_cl(m.post_b)) // client→bulletin flow
         .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
         .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
-        .max(maxlat(r.n) + xfer_srv(r.n as f64 * m.post_b)); // bulletin ingest
-    let b = maxlat(r.s) + xfer_srv(r.wire_server_b);
-    let c = maxlat(1) + xfer_srv(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b);
+        .max(maxlat(r.n) + xfer_bul(r.n as f64 * m.post_b)); // bulletin ingest
+    let b = maxlat(r.s) + xfer_bul(r.wire_server_b);
+    let c = maxlat(1) + xfer_bul(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b);
     let direct_net_us = a + b + c;
 
     // Aggregated flow: ctxt+comm go to aggregators (not broadcast); each level
@@ -1162,9 +1693,9 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
                     + (maxlat(senders) + xfer_srv(m.post_b)) // sender uplink
                         .max(maxlat(receivers) + xfer_srv(fan_in * m.post_b)); // receiver ingest
             }
-            let b = maxlat(r.s) + xfer_srv(r.wire_server_b);
+            let b = maxlat(r.s) + xfer_bul(r.wire_server_b);
             let leader_in = *p.layer_counts.last().unwrap();
-            let c = maxlat(1) + xfer_srv(r.wire_server_b + leader_in as f64 * m.post_b);
+            let c = maxlat(1) + xfer_bul(r.wire_server_b + leader_in as f64 * m.post_b);
             let net_us = a + agg_us + b + c;
             (net_us, agg_cpu_us + net_us)
         })
@@ -1187,12 +1718,12 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
                 .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
                 .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
                 .max(maxlat(r.n) + xfer_srv(node_in_b)) // one lane's ingest
-                .max(maxlat(r.n) + xfer_srv(r.n as f64 * p.bulletin_b as f64)); // bulletin ingest
-            let b = (maxlat(r.s) + xfer_srv(r.wire_server_b))
+                .max(maxlat(r.n) + xfer_bul(r.n as f64 * p.bulletin_b as f64)); // bulletin ingest
+            let b = (maxlat(r.s) + xfer_bul(r.wire_server_b))
                 .max(maxlat(p.n_nodes) + xfer_srv(p.n_nodes as f64 * share_b));
             // All n share-sums: k reconstruct, the rest are the syndrome.
             let c = maxlat(1)
-                + xfer_srv(
+                + xfer_bul(
                     p.n_nodes as f64 * share_b
                         + r.wire_server_b
                         + r.n as f64 * p.bulletin_b as f64,
@@ -1251,6 +1782,60 @@ fn print_tables(rows: &[Row]) {
         );
     }
     println!("    (polys < l·μ ⇒ the final KAHE chunk is partial)");
+    println!();
+
+    println!("── per role, one party of each kind ([M] cpu, [D] wire, eps = correctness) ──");
+    println!(
+        "{:<4}{:>11}{:>10}{:>6}  {:>11}{:>11}{:>12}  {:>12}{:>12}{:>7}",
+        "id", "msg/cl", "ρ/act", "S", "client", "server", "recipient", "client →", "server →", "eps"
+    );
+    for (i, r) in rows.iter().enumerate() {
+        println!(
+            "{:<4}{:>11}{:>10}{:>6}  {:>11}{:>11}{:>12}  {:>12}{:>12}{:>7}",
+            cell_id(i),
+            fmt_bytes(r.payload_client_b as f64),
+            format!("{}/{}", r.n, r.active),
+            r.s,
+            fmt_us(client_us(r)),
+            fmt_us(server_us(r)),
+            fmt_us(recipient_us(r)),
+            fmt_bytes(client_post_b(r) as f64),
+            fmt_bytes(server_entry_b(r) as f64),
+            fmt_eps(r.eps_correct),
+        );
+    }
+    println!("    (client → = comm + ctxt + S·open_env; server → = agg_open + agg_share)");
+    println!();
+
+    println!("── components: vector commitment | KAHE ([M] times, [D] sizes) ──────────────");
+    println!(
+        "{:4}{:─^42} {:─^57}",
+        "", " vector commitment (γ = S) ", " KAHE "
+    );
+    println!(
+        "{:<4}{:>11}{:>11}{:>10}{:>10} {:>12}{:>12}{:>11}{:>11}{:>11}",
+        "id", "comm", "opening", "com", "vf", "plaintext", "ctxt", "key", "enc", "dec"
+    );
+    for (i, r) in rows.iter().enumerate() {
+        println!(
+            "{:<4}{:>11}{:>11}{:>10}{:>10} {:>12}{:>12}{:>11}{:>11}{:>11}",
+            cell_id(i),
+            fmt_bytes(r.comm_client_b as f64),
+            fmt_bytes((r.open_env_b - pke::SEAL_OVERHEAD) as f64),
+            fmt_us(r.cs.med),
+            fmt_us(r.v_one_open.med),
+            fmt_bytes(r.plaintext_b as f64),
+            fmt_bytes(r.ctxt_client_b as f64),
+            fmt_bytes(r.kahe_key_b as f64),
+            fmt_us(r.kahe_enc.med),
+            fmt_us(r.v_kahe_dec.med),
+        );
+    }
+    println!(
+        "    (opening is the packed body, sealed adds {} B of ML-KEM; `com` commits all S \
+         positions, `vf` opens one)",
+        pke::SEAL_OVERHEAD
+    );
     println!();
 
     println!(
@@ -1490,7 +2075,7 @@ fn print_tables(rows: &[Row]) {
 
     println!("── [P] network sim: e2e = [C] wall + synthetic net; MB/s = useful/e2e ───────");
     println!(
-        "{:<4}{:<7}{:>12}{:>13}{:>12}{:>12}{}",
+        "{:<4}{:<9}{:>12}{:>13}{:>12}{:>12}{}",
         "id",
         "net",
         "direct e2e",
@@ -1517,7 +2102,7 @@ fn print_tables(rows: &[Row]) {
                 )
             });
             println!(
-                "{:<4}{:<7}{:>12}{:>13.3}{:>12}{:>12}{}",
+                "{:<4}{:<9}{:>12}{:>13.3}{:>12}{:>12}{}",
                 cell_id(i),
                 prof.label,
                 fmt_us(np.direct_e2e_us),
@@ -1529,12 +2114,15 @@ fn print_tables(rows: &[Row]) {
         }
     }
     println!(
-        "    ({}+U[0,{})ms … per profile; client/cloud Mbps: {})",
+        "    ({}+U[0,{})ms … per profile; client/server/bulletin Mbps: {})",
         NETWORKS[0].lat_ms,
         NETWORKS[0].jitter_ms,
         NETWORKS
             .iter()
-            .map(|p| format!("{} {}/{}", p.label, p.client_mbps, p.server_mbps))
+            .map(|p| format!(
+                "{} {}/{}/{}",
+                p.label, p.client_mbps, p.server_mbps, p.bulletin_mbps
+            ))
             .collect::<Vec<_>>()
             .join(", ")
     );
@@ -1542,56 +2130,105 @@ fn print_tables(rows: &[Row]) {
 
 // ── csv ─────────────────────────────────────────────────────────────────────
 
-const CSV_PATH: &str = "scaling_sweep.csv";
+const CSV_PATH_DEFAULT: &str = "scaling_sweep.csv";
+
+/// Output path. Overridable so a split run can keep its halves apart — a host
+/// run, a TDX run and their merge cannot share one file.
+fn csv_path() -> String {
+    std::env::var("BENCH_CSV").unwrap_or_else(|_| CSV_PATH_DEFAULT.to_string())
+}
 
 fn rs0(r: &Row) -> Option<&RsPlan> {
     r.rs_plans.first()
 }
 
+/// Which role owns a phase — the same grouping `client_us`/`server_us`/
+/// `recipient_us` use, so gating and composing cannot disagree.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Owner {
+    Client,
+    Server,
+    Verifier,
+    Agg,
+    Rs,
+}
+
+/// One timing column: its name, its owning role, and how to read and write it on
+/// a `Row`. The CSV writer, the CSV reader and `merge` all drive off this table,
+/// so a column cannot exist in one and not the others.
+struct PhaseCol {
+    name: &'static str,
+    owner: Owner,
+    get: fn(&Row) -> Stat,
+    set: fn(&mut Row, Stat),
+}
+
+/// Setters for plan-nested phases no-op when the plan is absent, which is the
+/// case whenever that flow was skipped for the run.
+const PHASES: &[PhaseCol] = &[
+    PhaseCol { name: "enc_app", owner: Owner::Client, get: |r| r.enc_app, set: |r, s| r.enc_app = s },
+    PhaseCol { name: "kahe_enc", owner: Owner::Client, get: |r| r.kahe_enc, set: |r, s| r.kahe_enc = s },
+    PhaseCol { name: "share", owner: Owner::Client, get: |r| r.share, set: |r, s| r.share = s },
+    PhaseCol { name: "cs_commit", owner: Owner::Client, get: |r| r.cs, set: |r, s| r.cs = s },
+    PhaseCol { name: "seal", owner: Owner::Client, get: |r| r.seal, set: |r, s| r.seal = s },
+    PhaseCol { name: "unseal", owner: Owner::Server, get: |r| r.unseal, set: |r, s| r.unseal = s },
+    PhaseCol { name: "server_round", owner: Owner::Server, get: |r| r.server, set: |r, s| r.server = s },
+    PhaseCol { name: "verify_agg_ctxt", owner: Owner::Verifier, get: |r| r.v_agg_ctxt, set: |r, s| r.v_agg_ctxt = s },
+    PhaseCol { name: "verify_sum_comm", owner: Owner::Verifier, get: |r| r.v_sum_comm, set: |r, s| r.v_sum_comm = s },
+    PhaseCol { name: "verify_open", owner: Owner::Verifier, get: |r| r.v_open, set: |r, s| r.v_open = s },
+    PhaseCol { name: "verify_interp", owner: Owner::Verifier, get: |r| r.v_interp, set: |r, s| r.v_interp = s },
+    PhaseCol { name: "verify_kahe_dec", owner: Owner::Verifier, get: |r| r.v_kahe_dec, set: |r, s| r.v_kahe_dec = s },
+    PhaseCol { name: "verify_one_open", owner: Owner::Verifier, get: |r| r.v_one_open, set: |r, s| r.v_one_open = s },
+    PhaseCol { name: "dec_app", owner: Owner::Verifier, get: |r| r.dec_app, set: |r, s| r.dec_app = s },
+    PhaseCol {
+        name: "agg1_level",
+        owner: Owner::Agg,
+        get: |r| r.agg_plans.first().map_or(Stat::default(), |p| p.agg_cpu),
+        set: |r, s| {
+            if let Some(p) = r.agg_plans.first_mut() {
+                p.agg_cpu = s
+            }
+        },
+    },
+    PhaseCol {
+        name: "agg1_leader",
+        owner: Owner::Agg,
+        get: |r| r.agg_plans.first().map_or(Stat::default(), |p| p.leader),
+        set: |r, s| {
+            if let Some(p) = r.agg_plans.first_mut() {
+                p.leader = s
+            }
+        },
+    },
+    PhaseCol { name: "rs_dgt_embed", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.dgt_embed), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.dgt_embed = s } } },
+    PhaseCol { name: "rs_dgt_hash", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.dgt_hash), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.dgt_hash = s } } },
+    PhaseCol { name: "rs_enc", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.rs_enc), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.rs_enc = s } } },
+    PhaseCol { name: "rs_node_sum", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.node_sum), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.node_sum = s } } },
+    PhaseCol { name: "rs_verify_sig", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_sig), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_sig = s } } },
+    PhaseCol { name: "rs_verify_open", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_open), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_open = s } } },
+    PhaseCol { name: "rs_verify_interp", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_interp), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_interp = s } } },
+    PhaseCol { name: "rs_reconstruct", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_reconstruct = s } } },
+    PhaseCol { name: "rs_reconstruct_lagrange", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct_lagrange), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_reconstruct_lagrange = s } } },
+    PhaseCol { name: "rs_verify_kahe_dec", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_kahe_dec), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_kahe_dec = s } } },
+    PhaseCol { name: "rs_syndrome", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_syndrome), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_syndrome = s } } },
+    PhaseCol { name: "rs_verify_digest", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_digest), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_digest = s } } },
+];
+
 fn write_csv(rows: &[Row]) {
-    type PhaseGet = fn(&Row) -> Stat;
-    let phases: &[(&str, PhaseGet)] = &[
-        ("enc_app", |r| r.enc_app),
-        ("kahe_enc", |r| r.kahe_enc),
-        ("share", |r| r.share),
-        ("cs_commit", |r| r.cs),
-        ("seal", |r| r.seal),
-        ("unseal", |r| r.unseal),
-        ("server_round", |r| r.server),
-        ("verify_agg_ctxt", |r| r.v_agg_ctxt),
-        ("verify_sum_comm", |r| r.v_sum_comm),
-        ("verify_open", |r| r.v_open),
-        ("verify_interp", |r| r.v_interp),
-        ("verify_kahe_dec", |r| r.v_kahe_dec),
-        ("dec_app", |r| r.dec_app),
-        ("agg1_level", |r| r.agg_plans.first().map_or(Stat::default(), |p| p.agg_cpu)),
-        ("agg1_leader", |r| r.agg_plans.first().map_or(Stat::default(), |p| p.leader)),
-        ("rs_dgt_embed", |r| rs0(r).map_or(Stat::default(), |p| p.dgt_embed)),
-        ("rs_dgt_hash", |r| rs0(r).map_or(Stat::default(), |p| p.dgt_hash)),
-        ("rs_enc", |r| rs0(r).map_or(Stat::default(), |p| p.rs_enc)),
-        ("rs_node_sum", |r| rs0(r).map_or(Stat::default(), |p| p.node_sum)),
-        ("rs_verify_sig", |r| rs0(r).map_or(Stat::default(), |p| p.v_sig)),
-        ("rs_verify_open", |r| rs0(r).map_or(Stat::default(), |p| p.v_open)),
-        ("rs_verify_interp", |r| rs0(r).map_or(Stat::default(), |p| p.v_interp)),
-        ("rs_reconstruct", |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct)),
-        ("rs_reconstruct_lagrange", |r| {
-            rs0(r).map_or(Stat::default(), |p| p.v_reconstruct_lagrange)
-        }),
-        ("rs_verify_kahe_dec", |r| rs0(r).map_or(Stat::default(), |p| p.v_kahe_dec)),
-        ("rs_syndrome", |r| rs0(r).map_or(Stat::default(), |p| p.v_syndrome)),
-        ("rs_verify_digest", |r| rs0(r).map_or(Stat::default(), |p| p.v_digest)),
-    ];
+    let phases = PHASES;
 
     let mut header = String::new();
-    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,n_polys,mu_kahe,iblt_cells,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
-    for (name, _) in phases {
-        write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", name).unwrap();
+    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
+    for p in phases {
+        write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", p.name).unwrap();
     }
     header.push_str(
         ",m_open_env_b\
          ,d_comm_client_b,d_ctxt_client_b,d_agg_open_b,d_agg_share_b\
+         ,d_open_body_b,d_kahe_key_b,d_plaintext_b,d_client_post_b,d_server_entry_b,d_epsilon\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
          ,d_rs_share_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
+         ,c_client_us,c_server_us,c_recipient_us\
          ,c_fixed_us,c_chunk_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
     );
     for prof in NETWORKS {
@@ -1603,10 +2240,11 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
     }
 
-    // Param columns s..iblt_cells (skipping the run-local `id`) identify a
-    // cell for cross-run dedup in append mode.
+    // Param columns s..env (skipping the run-local `id`) identify a cell for
+    // cross-run dedup in append mode. `env` is part of the key so a tdx row and a
+    // host row for the same cell coexist instead of evicting each other.
     let param_key = |line: &str| -> String {
-        line.split(',').skip(1).take(12).collect::<Vec<_>>().join(",")
+        line.split(',').skip(1).take(13).collect::<Vec<_>>().join(",")
     };
 
     let mut out = String::new();
@@ -1614,7 +2252,7 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
             r.n,
@@ -1628,6 +2266,9 @@ fn write_csv(rows: &[Row]) {
             r.n_polys,
             r.mu_kahe,
             r.iblt_cells,
+            r.env,
+            r.threads,
+            r.affinity,
             r.recovered_ok,
             r.agg_plans.first().map_or(false, |p| p.recovered),
             rs0(r).map_or(0, |p| p.k),
@@ -1636,18 +2277,24 @@ fn write_csv(rows: &[Row]) {
             rs0(r).map_or("-", |p| p.lane_lie_caught),
         )
         .unwrap();
-        for (_, get) in phases {
-            let st = get(r);
+        for p in phases {
+            let st = (p.get)(r);
             write!(out, ",{:.3},{:.3},{:.3}", st.med, st.min, st.max).unwrap();
         }
         write!(
             out,
-            ",{},{},{},{},{},{:.0},{:.0},{:.0},{:.0},{:.0}",
+            ",{},{},{},{},{},{},{},{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.0}",
             r.open_env_b,
             r.comm_client_b,
             r.ctxt_client_b,
             r.agg_open_b,
             r.agg_share_b,
+            r.open_env_b - pke::SEAL_OVERHEAD,
+            r.kahe_key_b,
+            r.plaintext_b,
+            client_post_b(r),
+            server_entry_b(r),
+            r.eps_correct,
             r.wire_ctxt_b,
             r.wire_comm_b,
             r.wire_opening_b,
@@ -1670,6 +2317,14 @@ fn write_csv(rows: &[Row]) {
             out,
             ",{:.0},{:.0},{:.0},{:.0}",
             rs_share_b, rs_bulletin_b, rs_egress_b, rs_node_in_b
+        )
+        .unwrap();
+        write!(
+            out,
+            ",{:.3},{:.3},{:.3}",
+            client_us(r),
+            server_us(r),
+            recipient_us(r),
         )
         .unwrap();
         write!(
@@ -1711,7 +2366,7 @@ fn write_csv(rows: &[Row]) {
     let append = std::env::var("SWEEP_APPEND").map_or(false, |v| v == "1");
     let mut lines: Vec<String> = Vec::new();
     if append {
-        if let Ok(old) = std::fs::read_to_string(CSV_PATH) {
+        if let Ok(old) = std::fs::read_to_string(csv_path()) {
             let mut it = old.lines();
             if it.next() == Some(header.as_str()) {
                 let new_keys: Vec<String> = out.lines().map(param_key).collect();
@@ -1719,7 +2374,7 @@ fn write_csv(rows: &[Row]) {
                     it.filter(|l| !new_keys.contains(&param_key(l))).map(String::from),
                 );
             } else {
-                eprintln!("csv schema changed; overwriting {CSV_PATH}");
+                eprintln!("csv schema changed; overwriting {}", csv_path());
             }
         }
     }
@@ -1733,7 +2388,318 @@ fn write_csv(rows: &[Row]) {
         merged.push_str(rest);
         merged.push('\n');
     }
-    std::fs::write(CSV_PATH, merged).unwrap();
+    std::fs::write(csv_path(), merged).unwrap();
+}
+
+// ── reading rows back, and splicing two environments ────────────────────────
+
+/// Rebuild a `Row` from one CSV line. Only the fields the CSV carries are
+/// restored; the aggregator topology is recomputed from `ρ` via
+/// [`agg_group_size`] rather than stored, and is therefore identical to the run
+/// that wrote the line.
+fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
+    let cells: Vec<&str> = line.split(',').collect();
+    if cells.len() != header.len() {
+        return Err(format!(
+            "row has {} fields, header has {}",
+            cells.len(),
+            header.len()
+        ));
+    }
+    let at = |name: &str| -> Result<&str, String> {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .map(|i| cells[i])
+            .ok_or_else(|| format!("missing column {name}"))
+    };
+    let num = |name: &str| -> Result<f64, String> {
+        at(name)?
+            .parse::<f64>()
+            .map_err(|e| format!("{name}: {e}"))
+    };
+    let idx = |name: &str| -> Result<usize, String> { Ok(num(name)? as usize) };
+    let flag = |name: &str| -> Result<bool, String> { Ok(at(name)? == "true") };
+    let stat = |name: &str| -> Result<Stat, String> {
+        Ok(Stat {
+            med: num(&format!("m_{name}_us_med"))?,
+            min: num(&format!("m_{name}_us_min"))?,
+            max: num(&format!("m_{name}_us_max"))?,
+        })
+    };
+
+    let n = idx("rho")?;
+    // `flow` and `lane_lie_caught` are `&'static str` in `Row`; map the parsed
+    // text back onto the fixed set rather than leaking a string.
+    let flow = match at("flow")? {
+        "mse" => "mse",
+        "prony" => "prony",
+        "sched" => "sched",
+        other => return Err(format!("unknown flow {other:?}")),
+    };
+
+    // One agg plan and one RS plan is what the CSV can express; the layer count
+    // is implied by AGG_LAYERS, which `merge` checks is a single entry.
+    let layers = AGG_LAYERS[0];
+    let g = agg_group_size(n, layers);
+    let agg_plans = vec![AggPlan {
+        layers,
+        group_size: g,
+        layer_counts: vec![n.div_ceil(g)],
+        agg_cpu: stat("agg1_level")?,
+        leader: stat("agg1_leader")?,
+        recovered: flag("agg1_recovered")?,
+    }];
+
+    let rs_k = idx("rs_k")?;
+    let rs_plans = if rs_k == 0 {
+        vec![]
+    } else {
+        vec![RsPlan {
+            k: rs_k,
+            n_nodes: idx("rs_n")?,
+            share_b: num("d_rs_share_b")? as usize,
+            bulletin_b: num("d_rs_bulletin_b")? as usize,
+            dgt_embed: stat("rs_dgt_embed")?,
+            dgt_hash: stat("rs_dgt_hash")?,
+            rs_enc: stat("rs_enc")?,
+            node_sum: stat("rs_node_sum")?,
+            v_sig: stat("rs_verify_sig")?,
+            v_open: stat("rs_verify_open")?,
+            v_interp: stat("rs_verify_interp")?,
+            v_reconstruct: stat("rs_reconstruct")?,
+            v_reconstruct_lagrange: stat("rs_reconstruct_lagrange")?,
+            v_syndrome: stat("rs_syndrome")?,
+            v_kahe_dec: stat("rs_verify_kahe_dec")?,
+            v_digest: stat("rs_verify_digest")?,
+            recovered: flag("rs_recovered")?,
+            lane_lie_caught: match at("rs_lane_lie")? {
+                "syndrome" => "syndrome",
+                "digest" => "digest",
+                "norm" => "norm",
+                "other" => "other",
+                "MISSED" => "MISSED",
+                _ => "-",
+            },
+        }]
+    };
+
+    let mut row = Row {
+        s: idx("s")?,
+        n,
+        active: idx("active")?,
+        cover: idx("cover")?,
+        iblt_cells: idx("iblt_cells")?,
+        flow,
+        payload_client_b: idx("payload_client_b")?,
+        mu_kahe: idx("mu_kahe")?,
+        delta: idx("delta")?,
+        xi: idx("xi")?,
+        l: idx("l")?,
+        n_polys: idx("n_polys")?,
+        env: at("env")?.to_string(),
+        threads: idx("m_threads")?,
+        affinity: at("m_affinity")?.to_string(),
+        recovered_ok: flag("recovered")?,
+        enc_app: Stat::default(),
+        kahe_enc: Stat::default(),
+        share: Stat::default(),
+        cs: Stat::default(),
+        seal: Stat::default(),
+        unseal: Stat::default(),
+        server: Stat::default(),
+        v_agg_ctxt: Stat::default(),
+        v_sum_comm: Stat::default(),
+        v_open: Stat::default(),
+        v_interp: Stat::default(),
+        v_kahe_dec: Stat::default(),
+        dec_app: Stat::default(),
+        v_one_open: Stat::default(),
+        open_env_b: idx("m_open_env_b")?,
+        comm_client_b: idx("d_comm_client_b")?,
+        ctxt_client_b: idx("d_ctxt_client_b")?,
+        kahe_key_b: idx("d_kahe_key_b")?,
+        plaintext_b: idx("d_plaintext_b")?,
+        agg_open_b: idx("d_agg_open_b")?,
+        agg_share_b: idx("d_agg_share_b")?,
+        eps_correct: num("d_epsilon")?,
+        useful_b: num("d_useful_b")?,
+        wire_ctxt_b: num("d_wire_ctxt_b")?,
+        wire_comm_b: num("d_wire_comm_b")?,
+        wire_opening_b: num("d_wire_opening_b")?,
+        wire_server_b: num("d_wire_server_b")?,
+        agg_plans,
+        rs_plans,
+    };
+    // Plain phases go through the same table the writer used, so the two cannot
+    // drift. Plan-nested ones were already set above.
+    for p in PHASES {
+        if matches!(p.owner, Owner::Agg | Owner::Rs) {
+            continue;
+        }
+        (p.set)(&mut row, stat(p.name)?);
+    }
+    Ok(row)
+}
+
+/// Cell identity for splicing: the param columns, minus `env`, so a `tdx` row and
+/// a `host` row for the same cell match each other.
+fn cell_key(r: &Row) -> String {
+    format!(
+        "{},{},{},{},{},{},{},{},{},{},{},{}",
+        r.s,
+        r.n,
+        r.active,
+        r.cover,
+        r.flow,
+        r.payload_client_b,
+        r.delta,
+        r.xi,
+        r.l,
+        r.n_polys,
+        r.mu_kahe,
+        r.iblt_cells
+    )
+}
+
+/// Human-readable cell label for the overhead table.
+fn cell_key_short(r: &Row) -> String {
+    format!(
+        "S{} {}/{} {} {}B",
+        r.s, r.n, r.active, r.flow, r.payload_client_b
+    )
+}
+
+fn read_rows(path: &str) -> Result<Vec<Row>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().ok_or_else(|| format!("{path}: empty"))?.split(',').collect();
+    lines
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| row_from_csv(&header, l).map_err(|e| format!("{path}: {e}")))
+        .collect()
+}
+
+/// Splice a client-side run into an otherwise host-measured one.
+///
+/// Only the client-owned timings move; everything else comes from the host row.
+/// The composed and projected columns are then recomputed from the spliced
+/// timings by the normal `model`/`net_all` path, which is why this works at the
+/// `Row` level rather than by copying columns.
+///
+/// Cells present in only one input are carried through untouched, so a reduced
+/// client sweep still produces a usable merge.
+pub fn merge(client_csv: &str, host_csv: &str, out_csv: &str) {
+    assert_eq!(
+        AGG_LAYERS.len(),
+        1,
+        "csv carries one agg plan; merging a multi-layer run would silently drop the rest"
+    );
+
+    let client_rows = read_rows(client_csv).unwrap_or_else(|e| panic!("{e}"));
+    let host_rows = read_rows(host_csv).unwrap_or_else(|e| panic!("{e}"));
+
+    let mut merged: Vec<Row> = Vec::with_capacity(host_rows.len());
+    let mut spliced = 0usize;
+    let mut client_only: Vec<String> = Vec::new();
+    let mut host_only: Vec<String> = Vec::new();
+    // Per-phase (client, host) medians, captured before the splice overwrites the
+    // host's own client timings — after that the ratio is unrecoverable.
+    let mut overhead: Vec<(String, Vec<(f64, f64)>)> = Vec::new();
+
+    for mut host in host_rows {
+        let key = cell_key(&host);
+        match client_rows.iter().find(|c| cell_key(c) == key) {
+            None => {
+                host_only.push(key);
+                merged.push(host);
+            }
+            Some(client) => {
+                if client.threads != host.threads {
+                    panic!(
+                        "cell {key}: client run used {} threads, host run {} — \
+                         timings are not comparable",
+                        client.threads, host.threads
+                    );
+                }
+                // Sizes are exact arithmetic in both runs; a mismatch means these
+                // are not the same cell and the splice would be meaningless.
+                for (what, a, b) in [
+                    ("open_env_b", client.open_env_b, host.open_env_b),
+                    ("ctxt_client_b", client.ctxt_client_b, host.ctxt_client_b),
+                    ("agg_open_b", client.agg_open_b, host.agg_open_b),
+                ] {
+                    assert_eq!(a, b, "cell {key}: {what} differs between runs");
+                }
+                let mut pairs = Vec::new();
+                for p in PHASES {
+                    if p.owner == Owner::Client {
+                        let (c, h) = ((p.get)(client), (p.get)(&host));
+                        pairs.push((c.med, h.med));
+                        (p.set)(&mut host, c);
+                    }
+                }
+                // A host `rest`-only run has no client timings to compare against,
+                // so only record the ratio when the host row actually has them.
+                if pairs.iter().any(|(_, h)| *h > 0.0) {
+                    overhead.push((cell_key_short(&host), pairs));
+                }
+                host.env = format!("{}+host", client.env);
+                spliced += 1;
+                merged.push(host);
+            }
+        }
+    }
+    for client in &client_rows {
+        let key = cell_key(client);
+        if !merged.iter().any(|m| cell_key(m) == key) {
+            client_only.push(key);
+        }
+    }
+
+    println!(
+        "merged {spliced} cells; {} host-only, {} client-only (not in output)",
+        host_only.len(),
+        client_only.len()
+    );
+    for k in &host_only {
+        println!("  host-only, client timings absent: {k}");
+    }
+    for k in &client_only {
+        println!("  client-only, dropped (no host round to splice into): {k}");
+    }
+
+    if !overhead.is_empty() {
+        println!();
+        println!("── [M] client-side overhead (client run / host run, per phase) ──────────────");
+        let names: Vec<&str> = PHASES
+            .iter()
+            .filter(|p| p.owner == Owner::Client)
+            .map(|p| p.name)
+            .collect();
+        print!("{:<26}", "cell");
+        for n in &names {
+            print!("{:>12}", n);
+        }
+        println!("{:>12}", "total");
+        for (key, pairs) in &overhead {
+            print!("{:<26}", key);
+            for (c, h) in pairs {
+                print!("{:>12}", if *h > 0.0 { format!("{:.2}x", c / h) } else { "-".into() });
+            }
+            let (ct, ht): (f64, f64) = pairs
+                .iter()
+                .fold((0.0, 0.0), |(a, b), (c, h)| (a + c, b + h));
+            println!("{:>12}", if ht > 0.0 { format!("{:.2}x", ct / ht) } else { "-".into() });
+        }
+    }
+
+    print_tables(&merged);
+    // `write_csv` reads the destination from the environment.
+    std::env::set_var("BENCH_CSV", out_csv);
+    write_csv(&merged);
+    println!();
+    println!("csv: {} ({} cells)", out_csv, merged.len());
 }
 
 pub fn run() {
@@ -1753,6 +2719,32 @@ pub fn run() {
         poly_packed_len64(KAHE_MODULUS) * 8 / POLY_N,
         poly_packed_len64(KAHE_MODULUS),
         BITS_PER_SYMBOL,
+    );
+    let roles = Roles::from_env();
+    println!(
+        "env: {} | threads {} | cpus {}{}",
+        roles.env_tag(),
+        rayon::current_num_threads(),
+        affinity(),
+        if roles == Roles::all() {
+            String::new()
+        } else {
+            format!(
+                " | timing only: {}",
+                [
+                    ("client", roles.client),
+                    ("server", roles.server),
+                    ("verifier", roles.verifier),
+                    ("agg", roles.agg),
+                    ("rs", roles.rs),
+                ]
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(n, _)| *n)
+                .collect::<Vec<_>>()
+                .join(",")
+            )
+        }
     );
     println!("provenance: [M] measured   — median of {} one-party reps (spread in csv)", REPS);
     println!("            [D] derived    — exact byte arithmetic from packing formulas");
@@ -1788,6 +2780,7 @@ pub fn run() {
 
     let mut rows: Vec<Row> = Vec::new();
     let mut skipped = false;
+    let mut contended: Vec<(String, String)> = Vec::new();
 
     // Nesting is clients → servers → protocol, protocol innermost, so a budget
     // cut-off leaves *complete* protocol comparisons at every (client, server)
@@ -1803,9 +2796,28 @@ pub fn run() {
                     "running cell {}: clients={clients_total}x{clients_active} S={s} {desc}",
                     cell_id(rows.len())
                 );
-                rows.push(run_cell(s, clients_total, clients_active, cfg, codec));
+                let row = run_cell(s, clients_total, clients_active, cfg, codec, roles);
+                if let Some(w) = contention(&row) {
+                    eprintln!("  contended: {w}");
+                    contended.push((cell_id(rows.len()), w));
+                }
+                rows.push(row);
             }
         }
+    }
+    if !contended.is_empty() {
+        println!();
+        println!(
+            "── contention: {} of {} cells exceeded {CONTENTION_RATIO}x spread ──────────────",
+            contended.len(),
+            rows.len()
+        );
+        println!("    (a competing workload or cross-socket placement; medians are inflated,");
+        println!("     minima less so — pin with `taskset -c 0-7` and re-run these)");
+        for (id, w) in &contended {
+            println!("  {id}: {w}");
+        }
+        println!();
     }
     if skipped {
         println!("(budget exhausted; remaining cells skipped)");
@@ -1818,6 +2830,6 @@ pub fn run() {
     print_tables(&rows);
     write_csv(&rows);
     println!();
-    println!("csv: {} ({} cells)", CSV_PATH, rows.len());
+    println!("csv: {} ({} cells)", csv_path(), rows.len());
     println!("done in {:.1}s", start.elapsed().as_secs_f64());
 }
