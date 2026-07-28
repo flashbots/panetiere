@@ -10,7 +10,7 @@ use crate::rs::{Rs, Share};
 
 use super::{opening_aad, ClientId, NodeId, ServerId, SessionId};
 
-/// Open one client's ECIES envelope into its `Opening`; `None` on a bad seal, a
+/// Open one client's sealed envelope into its `Opening`; `None` on a bad seal, a
 /// malformed packed opening, or a `(sid, client_id, server_id)` other than the
 /// one it was sealed under.
 pub fn unseal_opening(

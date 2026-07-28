@@ -23,11 +23,11 @@ use super::{opening_aad, ClientId, ServerId, SessionId};
 pub struct ClientRound {
     pub client_id: ClientId,
     pub encrypted_message: ClientBulletinEntry,
-    /// Per-server ECIES envelope over the bit-packed `Opening`.
+    /// Per-server ML-KEM envelope over the bit-packed `Opening`.
     pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
 }
 
-/// Pack (fresh bounds) + ECIES-seal one per-server opening, bound to
+/// Pack (fresh bounds) + seal one per-server opening, bound to
 /// `(sid, client_id, server_id)`.
 pub fn seal_opening<R: CryptoRng + Rng>(
     rng: &mut R,

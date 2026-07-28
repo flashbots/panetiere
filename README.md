@@ -290,7 +290,7 @@ impl ProtocolParams {
 pub struct ClientRound {
     pub client_id: ClientId,
     pub encrypted_message: ClientBulletinEntry,
-    /// Per-server ECIES envelope (pke::encrypt) over the bit-packed Opening.
+    /// Per-server ML-KEM-768 envelope (pke::encrypt) over the bit-packed Opening.
     /// The Opening's s() is the κ_kahe-vector of Shamir shares for that server.
     pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
 }
@@ -311,8 +311,15 @@ pub struct ServerInbox {
 #[derive(Debug, PartialEq)]
 pub enum ServerRoundError { MissingClient(ClientId) }
 
-/// Open one client's sealed envelope into its Opening.
-pub fn unseal_opening(key: &pke::PrivateKey, sealed: &[u8]) -> Option<Opening>;
+/// Open one client's sealed envelope into its Opening; None on a bad seal, a
+/// malformed packed opening, or a context other than the sealed one.
+pub fn unseal_opening(
+    key: &pke::PrivateKey,
+    sid: &SessionId,
+    client_id: ClientId,
+    server_id: ServerId,
+    sealed: &[u8],
+) -> Option<Opening>;
 
 pub fn run_server_round(
     inbox: &ServerInbox,

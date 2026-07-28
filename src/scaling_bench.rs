@@ -371,7 +371,7 @@ struct Row {
     v_interp: Stat,
     v_kahe_dec: Stat,
     dec_app: Stat,
-    // [M] wire: real ECIES-sealed opening envelope (client → one server).
+    // [M] wire: real ML-KEM-sealed opening envelope (client → one server).
     open_env_b: usize,
     // [D] wire components (bytes).
     comm_client_b: usize,      // one commitment root
@@ -551,7 +551,7 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
 
     // Wire ledger. Ciphertext + commitment (root) are uniform-mod-q → tight at
     // ⌈log₂ q⌉. Openings are decomposed digits + small r/s, packed at
-    // per-region bit widths; the client→server form is the REAL ECIES-sealed
+    // per-region bit widths; the client→server form is the REAL ML-KEM-sealed
     // envelope, measured off the wire bytes.
     let open_env_b = sealed_inbox0[0].1.len();
     // Server-posted aggregate, at the same bounds the servers would pack with.

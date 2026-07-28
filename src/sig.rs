@@ -6,7 +6,10 @@
 //! [`crate::protocol::dispute`] mean anything: without it a server could
 //! attribute a fabricated digest to a client it wants excluded.
 //!
-//! Same curve as [`crate::pke`], so the dependency set is unchanged.
+//! Still classical, unlike the post-quantum [`crate::pke`]. Deliberate: forging a
+//! signature requires breaking P-256 *before* the post is made, whereas a
+//! recorded envelope stays attackable forever, so confidentiality is what had to
+//! migrate first.
 
 use p256::ecdsa::signature::{Signer, Verifier};
 use rand::{CryptoRng, RngCore};

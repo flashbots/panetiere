@@ -1,83 +1,113 @@
-//! ECIES (P-256 ECDH + AES-256-GCM) sealed envelopes.
+//! ML-KEM-768 + AES-256-GCM sealed envelopes.
 //!
 //! The canonical PKE for sealing per-server openings to a relay's long-lived
-//! exchange key. Wire form of a sealed envelope:
-//! `ephemeral_pubkey (65 B, SEC1 uncompressed) ‖ nonce (12 B) ‖ ciphertext+tag`.
-//! The AEAD associated data is `ephemeral_pubkey ‖ aad`, where the caller's
-//! `aad` binds the envelope to its protocol context — see
-//! [`crate::protocol::opening_aad`]. Decryption with a different context fails.
+//! encapsulation key. Wire form of a sealed envelope:
+//! `kem_ciphertext (1088 B) ‖ ciphertext+tag`.
+//!
+//! CCA2 comes from the KEM (FIPS 203's Fujisaki-Okamoto transform with implicit
+//! rejection), so the AEAD only has to be one-time secure. The KEM ciphertext is
+//! bound into the key schedule rather than passed as associated data — a mauled
+//! encapsulation yields a different key, not merely a failing tag. The AEAD
+//! associated data is the caller's `aad`, which binds the envelope to its
+//! protocol context — see [`crate::protocol::opening_aad`]. Decryption with a
+//! different context fails.
+//!
+//! Confidentiality here is post-quantum; [`crate::sig`] is still P-256. That
+//! asymmetry is deliberate: a sealed opening carries a Shamir share of a KAHE
+//! key, so recording envelopes now and breaking the KEM later would retroactively
+//! deanonymise past rounds, whereas breaking the signature later only forges
+//! future posts.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use p256::ecdh::diffie_hellman;
-use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use ml_kem::kem::Decapsulate;
+use ml_kem::{B32, KeyExport, Seed};
 use rand::{CryptoRng, RngCore};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha512};
 
-const PUBKEY_LEN: usize = 65;
+type Dk = ml_kem::ml_kem_768::DecapsulationKey;
+type Ek = ml_kem::ml_kem_768::EncapsulationKey;
+type KemCiphertext = ml_kem::ml_kem_768::Ciphertext;
+
+/// ML-KEM-768 encapsulation (KEM ciphertext) length.
+const ENCAPS_LEN: usize = 1088;
+/// ML-KEM-768 encapsulation key length.
+pub const PUBKEY_LEN: usize = 1184;
+/// Seed a [`PrivateKey`] serialises to.
+pub const PRIVKEY_LEN: usize = 64;
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
 /// Byte overhead of a sealed envelope over its plaintext.
-pub const SEAL_OVERHEAD: usize = PUBKEY_LEN + NONCE_LEN + TAG_LEN;
+pub const SEAL_OVERHEAD: usize = ENCAPS_LEN + TAG_LEN;
 
 #[derive(Clone)]
-pub struct PrivateKey(p256::SecretKey);
+pub struct PrivateKey(Dk);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublicKey(p256::PublicKey);
+#[derive(Clone, Debug)]
+pub struct PublicKey(Ek);
 
 impl PrivateKey {
     pub fn generate<R: CryptoRng + RngCore>(rng: &mut R) -> Self {
-        Self(p256::SecretKey::random(rng))
+        let mut seed = [0u8; PRIVKEY_LEN];
+        rng.fill_bytes(&mut seed);
+        Self(Dk::from_seed(Seed::from(seed)))
     }
 
     pub fn public(&self) -> PublicKey {
-        PublicKey(self.0.public_key())
+        PublicKey(self.0.encapsulation_key().clone())
     }
 
-    /// 32-byte big-endian scalar.
+    /// The 64-byte seed the key was derived from.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0
+            .to_seed()
+            .expect("every PrivateKey is built via from_seed")
+            .to_vec()
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<Self, PkeError> {
+        let seed: [u8; PRIVKEY_LEN] = b.try_into().map_err(|_| PkeError::BadKey)?;
+        Ok(Self(Dk::from_seed(Seed::from(seed))))
+    }
+}
+
+impl PublicKey {
     pub fn to_bytes(&self) -> Vec<u8> {
         self.0.to_bytes().to_vec()
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Self, PkeError> {
-        p256::SecretKey::from_slice(b)
-            .map(Self)
-            .map_err(|_| PkeError::BadKey)
+        let encoded = ml_kem::Key::<Ek>::try_from(b).map_err(|_| PkeError::BadKey)?;
+        Ek::new(&encoded).map(Self).map_err(|_| PkeError::BadKey)
     }
 }
 
-impl PublicKey {
-    /// Uncompressed SEC1 encoding (65 bytes).
-    pub fn to_sec1_bytes(&self) -> Vec<u8> {
-        self.0.to_encoded_point(false).as_bytes().to_vec()
-    }
-
-    pub fn from_sec1_bytes(b: &[u8]) -> Result<Self, PkeError> {
-        let ep = p256::EncodedPoint::from_bytes(b).map_err(|_| PkeError::BadKey)?;
-        Option::<p256::PublicKey>::from(p256::PublicKey::from_encoded_point(&ep))
-            .map(Self)
-            .ok_or(PkeError::BadKey)
+impl PartialEq for PublicKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bytes() == other.0.to_bytes()
     }
 }
 
-fn derive_aes_key(shared_secret: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"panetiere-ecies-v1");
+impl Eq for PublicKey {}
+
+/// Bind the encapsulation into the key schedule, then split off an AEAD key and
+/// nonce. The KEM ciphertext is unique per envelope, so the derived nonce is too.
+fn derive_key_nonce(kem_ct: &[u8], shared_secret: &[u8]) -> ([u8; 32], [u8; NONCE_LEN]) {
+    let mut h = Sha512::new();
+    h.update(b"panetiere-mlkem768-aesgcm-v1");
+    h.update(kem_ct);
     h.update(shared_secret);
-    h.finalize().into()
+    let out = h.finalize();
+
+    let mut key = [0u8; 32];
+    let mut nonce = [0u8; NONCE_LEN];
+    key.copy_from_slice(&out[..32]);
+    nonce.copy_from_slice(&out[32..32 + NONCE_LEN]);
+    (key, nonce)
 }
 
-/// Bind the envelope to its ephemeral key and the caller's context.
-fn full_aad(eph_pub: &[u8], aad: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(eph_pub.len() + aad.len());
-    out.extend_from_slice(eph_pub);
-    out.extend_from_slice(aad);
-    out
-}
-
-/// Seal `plaintext` to `recipient` under a fresh ephemeral key, bound to `aad`.
+/// Seal `plaintext` to `recipient` under a fresh encapsulation, bound to `aad`.
 /// [`decrypt`] must be given the identical `aad` or it returns [`PkeError::Aead`].
 pub fn encrypt<R: CryptoRng + RngCore>(
     rng: &mut R,
@@ -85,28 +115,26 @@ pub fn encrypt<R: CryptoRng + RngCore>(
     plaintext: &[u8],
     aad: &[u8],
 ) -> Vec<u8> {
-    let ephemeral = p256::SecretKey::random(rng);
-    let shared = diffie_hellman(ephemeral.to_nonzero_scalar(), recipient.0.as_affine());
-    let key = derive_aes_key(shared.raw_secret_bytes());
+    // Deterministic encapsulation over freshly drawn randomness, so the caller's
+    // RNG stays the single source of entropy (`seal_openings` forks seeds per
+    // server) and no rand_core version has to be bridged.
+    let mut m = [0u8; 32];
+    rng.fill_bytes(&mut m);
+    let (kem_ct, shared) = recipient.0.encapsulate_deterministic(&B32::from(m));
 
-    let eph_pub = ephemeral.public_key().to_encoded_point(false);
-    let mut nonce = [0u8; NONCE_LEN];
-    rng.fill_bytes(&mut nonce);
-
-    let cipher = Aes256Gcm::new((&key).into());
-    let ciphertext = cipher
+    let (key, nonce) = derive_key_nonce(&kem_ct, &shared);
+    let ciphertext = Aes256Gcm::new((&key).into())
         .encrypt(
-            Nonce::from_slice(&nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: plaintext,
-                aad: &full_aad(eph_pub.as_bytes(), aad),
+                aad,
             },
         )
         .expect("AES-GCM encrypt of an in-memory buffer");
 
-    let mut out = Vec::with_capacity(PUBKEY_LEN + NONCE_LEN + ciphertext.len());
-    out.extend_from_slice(eph_pub.as_bytes());
-    out.extend_from_slice(&nonce);
+    let mut out = Vec::with_capacity(ENCAPS_LEN + ciphertext.len());
+    out.extend_from_slice(&kem_ct);
     out.extend_from_slice(&ciphertext);
     out
 }
@@ -116,19 +144,19 @@ pub fn decrypt(recipient: &PrivateKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<
     if sealed.len() < SEAL_OVERHEAD {
         return Err(PkeError::TooShort);
     }
-    let (eph_bytes, rest) = sealed.split_at(PUBKEY_LEN);
-    let (nonce, ciphertext) = rest.split_at(NONCE_LEN);
-    let ephemeral = PublicKey::from_sec1_bytes(eph_bytes)?;
-    let shared = diffie_hellman(recipient.0.to_nonzero_scalar(), ephemeral.0.as_affine());
-    let key = derive_aes_key(shared.raw_secret_bytes());
+    let (kem_bytes, ciphertext) = sealed.split_at(ENCAPS_LEN);
+    let kem_ct = KemCiphertext::try_from(kem_bytes).map_err(|_| PkeError::BadKey)?;
+    // Implicit rejection: a mauled encapsulation decapsulates to an unrelated
+    // shared secret rather than failing, and the AEAD tag catches it below.
+    let shared = recipient.0.decapsulate(&kem_ct);
 
-    let cipher = Aes256Gcm::new((&key).into());
-    cipher
+    let (key, nonce) = derive_key_nonce(kem_bytes, &shared);
+    Aes256Gcm::new((&key).into())
         .decrypt(
-            Nonce::from_slice(nonce),
+            &Nonce::from(nonce),
             Payload {
                 msg: ciphertext,
-                aad: &full_aad(eph_bytes, aad),
+                aad,
             },
         )
         .map_err(|_| PkeError::Aead)
@@ -166,8 +194,28 @@ mod tests {
 
         let re = PrivateKey::from_bytes(&sk.to_bytes()).unwrap();
         assert_eq!(decrypt(&re, &sealed, b"ctx").unwrap(), b"hello panetiere");
-        let re_pk = PublicKey::from_sec1_bytes(&pk.to_sec1_bytes()).unwrap();
+        let re_pk = PublicKey::from_bytes(&pk.to_bytes()).unwrap();
         assert_eq!(re_pk, pk);
+    }
+
+    /// Mauling the encapsulation must not be distinguishable from any other
+    /// forgery — implicit rejection plus the key-schedule binding, not a
+    /// decapsulation error.
+    #[test]
+    fn tampered_encapsulation_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
+        let sk = PrivateKey::generate(&mut rng);
+        let sealed = encrypt(&mut rng, &sk.public(), b"opening bytes", b"ctx");
+
+        for i in [0usize, 17, ENCAPS_LEN - 1] {
+            let mut mauled = sealed.clone();
+            mauled[i] ^= 1;
+            assert_eq!(decrypt(&sk, &mauled, b"ctx"), Err(PkeError::Aead));
+        }
+        assert_eq!(
+            decrypt(&sk, &sealed[..SEAL_OVERHEAD - 1], b"ctx"),
+            Err(PkeError::TooShort)
+        );
     }
 
     /// Any change to the associated data makes the envelope unopenable — this is
@@ -192,5 +240,18 @@ mod tests {
         let bare = encrypt(&mut rng, &pk, b"opening bytes", b"");
         assert_eq!(decrypt(&sk, &bare, b"").unwrap(), b"opening bytes");
         assert_eq!(decrypt(&sk, &bare, aad), Err(PkeError::Aead));
+    }
+
+    /// The hardcoded lengths must track the parameter set.
+    #[test]
+    fn wire_lengths_match_parameter_set() {
+        let mut rng = ChaCha20Rng::from_seed([31u8; 32]);
+        let sk = PrivateKey::generate(&mut rng);
+        assert_eq!(sk.to_bytes().len(), PRIVKEY_LEN);
+        assert_eq!(sk.public().to_bytes().len(), PUBKEY_LEN);
+        assert_eq!(
+            encrypt(&mut rng, &sk.public(), b"", b"").len(),
+            SEAL_OVERHEAD
+        );
     }
 }
