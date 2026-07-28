@@ -140,13 +140,7 @@ impl CsParams {
     /// `PackedOpening::to_bytes` and `pack_cs_shares` without materialising them
     /// — for wire-budget planning.
     pub fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
-        let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(self, rho);
-        let data_polys = opening_data_polys(self.xi(), self.stored_path_len());
-        let body = ((self.kappa_cs * POLY_N) * bits_for_signed(r_b) as usize
-            + (self.mu_cs * POLY_N) * bits_for_signed(s_b) as usize
-            + (data_polys * POLY_N) * bits_for_signed(t_b) as usize)
-            .div_ceil(8);
-        PACKED_OPENING_HEADER_LEN + body + self.mu_cs * poly_packed_len(CS_MODULUS)
+        aggregated_server_crypto_len_for(self.n_servers, self.mu_cs, self.kappa_cs, rho)
     }
 }
 
@@ -265,12 +259,7 @@ impl HidingMerkleCommitment {
     ) -> CsParams {
         assert!(mu_cs >= 1, "μ_cs must be ≥ 1");
         assert!(kappa_cs >= 1, "κ_cs must be ≥ 1");
-        // β_cs = fresh randomness radius; β_agg = aggregate verify bound,
-        // sized so ρ ≤ β_agg/β_cs = 300 (covers the deployment's client count).
-        let beta_cs = 116;
-        let r_bound = 34800;
-        // ρ_max·η = 300·ZETA = 10200, the aggregated HVC digit bound.
-        let beta_agg_hvc = 300 * chipmunk_code::ZETA;
+        let (beta_cs, r_bound, beta_agg_hvc) = (BETA_CS, R_BOUND, beta_agg_hvc());
         let a_ntt: Vec<CsNTTPoly> = (0..kappa_cs)
             .map(|_| CsNTTPoly::from(&CsPoly::rand_poly(rng)))
             .collect();
@@ -1042,9 +1031,45 @@ pub fn fresh_opening_pack_bounds(p: &CsParams) -> (u32, u32, u32) {
 /// Pack bounds for a server's aggregated opening over `rho` summed openings,
 /// capped at the crate's verify bounds. Pass the actual canonical-set size.
 pub fn aggregated_opening_pack_bounds(p: &CsParams, rho: u32) -> (u32, u32, u32) {
-    let r = rho.saturating_mul(p.beta_cs).min(p.r_bound);
-    let tree = rho.saturating_mul(chipmunk_code::ZETA).min(p.beta_agg_hvc);
+    aggregated_opening_pack_bounds_raw(p.beta_cs, p.r_bound, p.beta_agg_hvc, rho)
+}
+
+fn aggregated_opening_pack_bounds_raw(
+    beta_cs: u32,
+    r_bound: u32,
+    beta_agg_hvc: u32,
+    rho: u32,
+) -> (u32, u32, u32) {
+    let r = rho.saturating_mul(beta_cs).min(r_bound);
+    let tree = rho.saturating_mul(chipmunk_code::ZETA).min(beta_agg_hvc);
     (r, CS_MODULUS as u32, tree)
+}
+
+/// Fresh per-opening randomness radius.
+pub const BETA_CS: u32 = 116;
+/// Aggregate verify bound: `ρ_max·β_cs` at `ρ_max = 300`.
+pub const R_BOUND: u32 = 34_800;
+/// Aggregated HVC digit bound: `ρ_max·ζ`.
+pub fn beta_agg_hvc() -> u32 {
+    300 * chipmunk_code::ZETA
+}
+
+/// [`CsParams::aggregated_server_crypto_len`] from dimensions alone, so a caller
+/// sizing a wire budget does not have to sample a CRS to ask.
+pub fn aggregated_server_crypto_len_for(
+    n_servers: usize,
+    mu_cs: usize,
+    kappa_cs: usize,
+    rho: u32,
+) -> usize {
+    let n_leaves = n_servers.next_power_of_two().max(2);
+    let (r_b, s_b, t_b) = aggregated_opening_pack_bounds_raw(BETA_CS, R_BOUND, beta_agg_hvc(), rho);
+    let data_polys = opening_data_polys(1 + mu_cs, n_leaves.trailing_zeros() as usize);
+    let body = ((kappa_cs * POLY_N) * bits_for_signed(r_b) as usize
+        + (mu_cs * POLY_N) * bits_for_signed(s_b) as usize
+        + (data_polys * POLY_N) * bits_for_signed(t_b) as usize)
+        .div_ceil(8);
+    PACKED_OPENING_HEADER_LEN + body + mu_cs * poly_packed_len(CS_MODULUS)
 }
 
 #[cfg(test)]

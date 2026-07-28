@@ -1,6 +1,7 @@
 pub mod aggregator;
 pub mod client;
 pub mod dispute;
+pub mod recipient;
 pub mod server;
 pub mod verify;
 
@@ -162,6 +163,26 @@ impl ProtocolParams {
             rs: Some(RsParams::new(k, n_nodes)),
             digest: Some(DigestParams::from_seed(digest_seed, payload_polys, rho_max)),
         }
+    }
+}
+
+/// Exact crypto bytes each role puts on the wire in one round. Framing and
+/// serialisation overhead are the transport's business and are not counted.
+pub struct RoundWireSizes {
+    /// One client's bulletin post: commitment plus its ciphertext.
+    pub client_post: usize,
+    /// One server's aggregated opening plus its share.
+    pub server_entry: usize,
+}
+
+/// Sizes without sampling a CRS — the lengths depend only on the server count,
+/// the ciphertext width and `ρ`.
+pub fn round_wire_sizes(n_servers: usize, ctxt_polys: usize, rho: u32) -> RoundWireSizes {
+    RoundWireSizes {
+        client_post: crate::bulletin::ClientBulletinEntry::packed_len(ctxt_polys),
+        server_entry: crate::cs::aggregated_server_crypto_len_for(
+            n_servers, MU_CS, KAPPA_CS, rho,
+        ),
     }
 }
 

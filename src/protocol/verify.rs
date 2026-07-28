@@ -95,7 +95,10 @@ fn recover_agg_key(
     Ok(lift_cs_to_kahe(&recovered_cs))
 }
 
-fn check_anonymity_floor(pp: &ProtocolParams, clients: &[ClientId]) -> Result<(), VerifyError> {
+pub(super) fn check_anonymity_floor(
+    pp: &ProtocolParams,
+    clients: &[ClientId],
+) -> Result<(), VerifyError> {
     let got = clients.iter().collect::<HashSet<_>>().len();
     if got < pp.min_clients {
         return Err(VerifyError::AnonymitySetTooSmall {

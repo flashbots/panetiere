@@ -18,7 +18,9 @@
 use chipmunk_code::{KahePoly, N};
 
 const BYTES_PER_COEFF: usize = 4;
-const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
+/// Bytes one `KahePoly` holds through [`encode_raw`]. Public so callers sizing a
+/// message vector use this definition rather than re-deriving `N · 4`.
+pub const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
 const HEADER_LEN: usize = 4;
 /// Per-coefficient symbol modulus (what fits in `BYTES_PER_COEFF` bytes).
 /// Strictly below t = 2^36, so legit slot data decrypts to non-negative

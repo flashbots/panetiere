@@ -1,4 +1,5 @@
 pub mod bulletin;
+pub mod channel;
 pub mod codec;
 pub mod cs;
 pub mod digest;
