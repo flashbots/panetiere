@@ -75,6 +75,7 @@ use panetiere::cs::{
 use panetiere::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use panetiere::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL};
 use panetiere::pke;
+use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use panetiere::protocol::aggregator::run_aggregator_round;
 use panetiere::protocol::client::{
     cs_commit, kahe_encrypt, kahe_keygen, run_client_round, seal_openings, shamir_share,
@@ -116,11 +117,20 @@ const REPS: usize = 5;
 /// One cell is one protocol execution.
 const SESSION: SessionId = SessionId([0x5C; 32]);
 
-/// `Mse` = single-round IBLT. `Scheduled` = one joint plaintext, reservation
-/// IBLT ‖ message vector of `message_bytes`, under one key (openings paid once).
+/// `Mse` = single-round IBLT. `Prony` = single-round Vandermonde sketch at the
+/// same element size, no coding blowup, run at `t = PRONY_PRIME`. `Scheduled`
+/// = one joint plaintext, reservation IBLT ‖ message vector of `message_bytes`,
+/// under one key (openings paid once).
 enum AppCodec {
     Mse,
+    Prony,
     Scheduled { message_bytes: usize },
+}
+
+/// `⌊log₂ PRONY_PRIME⌋ = 35`, one below MSE's 36, so ξ grows by that ratio at
+/// equal element bytes.
+fn prony_bits() -> usize {
+    PRONY_PRIME.ilog2() as usize
 }
 
 /// Scheduling token = (rand u16, size u16) → 2 MSE symbols.
@@ -342,6 +352,7 @@ fn cell_seed(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) 
     let (codec_tag, codec_arg) = match codec {
         AppCodec::Mse => (0u64, 0u64),
         AppCodec::Scheduled { message_bytes } => (1, *message_bytes as u64),
+        AppCodec::Prony => (2, 0),
     };
     let mut h = Sha256::new();
     h.update(b"panetiere-scaling-cell-v1");
@@ -366,10 +377,26 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     // packs a ξ-element into it; `Scheduled` packs a (rand,size) token and
     // appends a message vector — each active client an equal slot within it.
     let delta = (3 * active).div_ceil(GAMMA);
+    // Capacity = active; ξ re-derived so the element carries the same bytes as
+    // the MSE cell at 35 rather than 36 bits per coefficient.
+    let prony_params = match codec {
+        AppCodec::Prony => Some(PronyParams::new(
+            active,
+            (cfg.payload_symbols * BITS_PER_SYMBOL).div_ceil(prony_bits()),
+        )),
+        _ => None,
+    };
     let (mse_params, sched_polys, slot_bytes, msg_vector_bytes) = match codec {
         AppCodec::Mse => {
             let p = MseParams::new(GAMMA, delta, cfg.payload_symbols, [0xAA; 32]);
             let sp = MseEncoding::n_polys(&p);
+            (p, sp, 0, 0)
+        }
+        // No IBLT in this flow; `mse_params` stays only to keep the shared Row
+        // fields well-formed and is never encoded into.
+        AppCodec::Prony => {
+            let p = MseParams::new(GAMMA, delta, cfg.payload_symbols, [0xAA; 32]);
+            let sp = PronySketch::n_polys(prony_params.as_ref().unwrap());
             (p, sp, 0, 0)
         }
         AppCodec::Scheduled { message_bytes } => {
@@ -392,7 +419,10 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         l,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
-        T_MODULUS_DEFAULT,
+        match codec {
+            AppCodec::Prony => PRONY_PRIME,
+            _ => T_MODULUS_DEFAULT,
+        },
     );
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> =
@@ -409,6 +439,10 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         AppCodec::Mse => (0..active)
             .map(|i| (0..cfg.payload_symbols).map(|j| i as i64 + j as i64 + 1).collect())
             .collect(),
+        AppCodec::Prony => {
+            let xi = prony_params.as_ref().unwrap().payload_symbols;
+            (0..active).map(|i| (0..xi).map(|j| i as i64 + j as i64 + 1).collect()).collect()
+        }
         AppCodec::Scheduled { .. } => {
             (0..active).map(|i| vec![i as i64 + 1, slot_bytes as i64]).collect()
         }
@@ -418,12 +452,19 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
     let ranges: Vec<(usize, usize)> = (0..active).map(|i| (i * slot_bytes, slot_bytes)).collect();
     let client_polys: Vec<Vec<KahePoly>> = (0..n)
         .map(|i| {
-            let mut polys = if i < active {
-                let mut enc = MseEncoding::new(mse_params.clone());
-                enc.insert(&mut rng, &mse_payloads[i]);
-                enc.pack()
-            } else {
-                MseEncoding::cover(&mse_params)
+            let mut polys = match (&prony_params, i < active) {
+                (Some(pp), true) => {
+                    let mut sk = PronySketch::new(pp.clone());
+                    sk.insert(&mut rng, &mse_payloads[i]);
+                    sk.pack()
+                }
+                (Some(pp), false) => PronySketch::cover(pp),
+                (None, true) => {
+                    let mut enc = MseEncoding::new(mse_params.clone());
+                    enc.insert(&mut rng, &mse_payloads[i]);
+                    enc.pack()
+                }
+                (None, false) => MseEncoding::cover(&mse_params),
             };
             polys.resize(sched_polys, KahePoly::default());
             if matches!(codec, AppCodec::Scheduled { .. }) && i < active {
@@ -489,6 +530,11 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             enc.insert(&mut rng, &mse_payloads[0]);
             enc.pack()
         }),
+        AppCodec::Prony => measure(|| {
+            let mut sk = PronySketch::new(prony_params.as_ref().unwrap().clone());
+            sk.insert(&mut rng, &mse_payloads[0]);
+            sk.pack()
+        }),
         AppCodec::Scheduled { .. } => measure(|| {
             let mut enc = MseEncoding::new(mse_params.clone());
             enc.insert(&mut rng, &mse_payloads[0]);
@@ -539,22 +585,28 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         p
     };
     let check_decode = |rec: &[KahePoly]| -> bool {
+        if let Some(pp) = &prony_params {
+            return PronySketch::unpack(pp, &rec[..n_polys])
+                .decode()
+                .map(|d| d == expected_payloads)
+                .unwrap_or(false);
+        }
         let tokens = match codec {
-            AppCodec::Mse => &rec[..n_polys],
             AppCodec::Scheduled { .. } => &rec[..sched_polys],
+            _ => &rec[..n_polys],
         };
         let tokens_ok = MseEncoding::unpack(&mse_params, tokens)
             .decode()
             .map(|d| d == expected_payloads)
             .unwrap_or(false);
         match codec {
-            AppCodec::Mse => tokens_ok,
             AppCodec::Scheduled { .. } => {
                 tokens_ok
                     && codec::decode_ranges(&rec[sched_polys..n_polys], &ranges)
                         .map(|d| d == byte_payloads)
                         .unwrap_or(false)
             }
+            _ => tokens_ok,
         }
     };
     let recovered_ok = recovered.as_deref().map(check_decode).unwrap_or(false);
@@ -566,6 +618,13 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
             AppCodec::Mse => {
                 measure(|| {
                     let _ = MseEncoding::unpack(&mse_params, &rec[..n_polys]).decode();
+                })
+                .0
+            }
+            AppCodec::Prony => {
+                let pp = prony_params.as_ref().unwrap();
+                measure(|| {
+                    let _ = PronySketch::unpack(pp, &rec[..n_polys]).decode();
                 })
                 .0
             }
@@ -659,19 +718,32 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         n,
         active,
         cover,
-        iblt_cells: mse_params.total_cells(),
+        // For `prony` the structural width is the Vandermonde column count,
+        // reported in place of the IBLT's cell count.
+        iblt_cells: match &prony_params {
+            Some(pp) => pp.cols(),
+            None => mse_params.total_cells(),
+        },
         flow: match codec {
             AppCodec::Mse => "mse",
+            AppCodec::Prony => "prony",
             AppCodec::Scheduled { .. } => "sched",
         },
         payload_client_b: match codec {
             AppCodec::Mse => cfg.payload_symbols * BITS_PER_SYMBOL / 8,
+            AppCodec::Prony => {
+                prony_params.as_ref().unwrap().payload_symbols * prony_bits() / 8
+            }
             AppCodec::Scheduled { .. } => slot_bytes,
         },
         mu_kahe,
-        delta,
+        delta: match &prony_params {
+            Some(pp) => pp.cols(),
+            None => delta,
+        },
         xi: match codec {
             AppCodec::Mse => cfg.payload_symbols,
+            AppCodec::Prony => prony_params.as_ref().unwrap().payload_symbols,
             AppCodec::Scheduled { .. } => SCHED_TOKEN_SYMBOLS,
         },
         l,
@@ -697,6 +769,10 @@ fn run_cell(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -
         agg_share_b,
         useful_b: match codec {
             AppCodec::Mse => (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
+            AppCodec::Prony => {
+                (active * prony_params.as_ref().unwrap().payload_symbols * prony_bits()) as f64
+                    / 8.0
+            }
             AppCodec::Scheduled { .. } => (active * slot_bytes) as f64,
         },
         wire_ctxt_b: n as f64 * ctxt_client_b as f64,
@@ -1253,8 +1329,11 @@ fn main() {
             rows.push(run_cell(s, clients_total, clients_active, cfg, codec));
         }
     };
+    // MSE and Prony back-to-back per ξ, so the [P] sim compares the two
+    // single-round flows at the same element size under identical draws.
     for cfg in &configs {
         run(cfg, &AppCodec::Mse, format!("mse {}", cfg.label));
+        run(cfg, &AppCodec::Prony, format!("prony {}", cfg.label));
     }
     for &message_bytes in &sched_bytes {
         run(
