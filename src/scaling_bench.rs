@@ -471,6 +471,11 @@ struct Row {
 /// with something — another workload, or a rayon pool straddling both sockets.
 const CONTENTION_RATIO: f64 = 2.0;
 
+/// …but only once the absolute swing is large enough to move a conclusion. Short
+/// phases show wide ratios from timer granularity and first-rep cache warming, and
+/// a sub-millisecond swing cannot distort a wall measured in tens of ms.
+const CONTENTION_FLOOR_US: f64 = 1_000.0;
+
 /// The worst-spread phases of a cell, or `None` if every phase was stable.
 /// Catches a contaminated cell while the sweep is still running rather than
 /// during analysis afterwards.
@@ -480,7 +485,9 @@ fn contention(r: &Row) -> Option<String> {
         .filter_map(|p| {
             let st = (p.get)(r);
             // A phase this run does not own reads as zero, not as fast.
-            (st.min > 0.0 && st.max / st.min > CONTENTION_RATIO)
+            (st.min > 0.0
+                && st.max / st.min > CONTENTION_RATIO
+                && st.max - st.min > CONTENTION_FLOOR_US)
                 .then(|| (st.max / st.min, p.name))
         })
         .collect();
@@ -568,15 +575,13 @@ impl Roles {
         }
     }
 
-    /// Tag for the `env` column. A whole run is `host`; a client-only run is
-    /// where TDX measurements come from, so it is tagged as such.
-    fn env_tag(&self) -> &'static str {
-        match (*self == Self::all(), self.client) {
-            (true, _) => "host",
-            (false, true) => "tdx",
-            (false, false) => "host-rest",
-        }
-    }
+}
+
+/// Where this run is executing, for the `env` column. Cannot be inferred from the
+/// role set — a client-only run is equally plausible on the host as a baseline or
+/// in a VM as the real measurement — so the caller states it. Default `host`.
+fn env_tag() -> String {
+    std::env::var("BENCH_ENV").unwrap_or_else(|_| "host".into())
 }
 
 /// `Stat` only when this run owns the phase, otherwise zero — so a merge can tell
@@ -838,12 +843,23 @@ mod csv_tests {
         }
         assert!(contention(&r).is_none());
 
+        // Wide ratio but a swing of only 20us — timer noise on a short phase.
         (PHASES[0].set)(
             &mut r,
             Stat {
                 med: 20.0,
                 min: 10.0,
                 max: 30.0,
+            },
+        );
+        assert!(contention(&r).is_none(), "sub-ms swing must not flag");
+
+        (PHASES[0].set)(
+            &mut r,
+            Stat {
+                med: 8_000.0,
+                min: 5_000.0,
+                max: 20_000.0,
             },
         );
         assert!(contention(&r).unwrap().contains(PHASES[0].name));
@@ -865,9 +881,21 @@ fn recipient_us(r: &Row) -> f64 {
         + r.dec_app.med
 }
 
-/// Everything one client puts on the wire: bulletin post plus its S openings.
+/// The S sealed openings, addressed to the servers. Depends on S alone — not on
+/// the message.
+fn client_to_server_b(r: &Row) -> usize {
+    r.s * r.open_env_b
+}
+
+/// The bulletin post the recipient reads: commitment plus ciphertext. Depends on
+/// the plaintext width alone — not on S.
+fn client_to_recipient_b(r: &Row) -> usize {
+    r.comm_client_b + r.ctxt_client_b
+}
+
+/// Everything one client puts on the wire.
 fn client_post_b(r: &Row) -> usize {
-    r.comm_client_b + r.ctxt_client_b + r.s * r.open_env_b
+    client_to_server_b(r) + client_to_recipient_b(r)
 }
 
 fn server_entry_b(r: &Row) -> usize {
@@ -1450,7 +1478,7 @@ fn run_cell(
         },
         l,
         n_polys,
-        env: roles.env_tag().to_string(),
+        env: env_tag(),
         threads: rayon::current_num_threads(),
         affinity: affinity(),
         recovered_ok,
@@ -2225,7 +2253,8 @@ fn write_csv(rows: &[Row]) {
     header.push_str(
         ",m_open_env_b\
          ,d_comm_client_b,d_ctxt_client_b,d_agg_open_b,d_agg_share_b\
-         ,d_open_body_b,d_kahe_key_b,d_plaintext_b,d_client_post_b,d_server_entry_b,d_epsilon\
+         ,d_open_body_b,d_kahe_key_b,d_plaintext_b\
+         ,d_client_to_server_b,d_client_to_recipient_b,d_client_post_b,d_server_entry_b,d_epsilon\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
          ,d_rs_share_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
          ,c_client_us,c_server_us,c_recipient_us\
@@ -2283,7 +2312,7 @@ fn write_csv(rows: &[Row]) {
         }
         write!(
             out,
-            ",{},{},{},{},{},{},{},{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.0}",
+            ",{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.0}",
             r.open_env_b,
             r.comm_client_b,
             r.ctxt_client_b,
@@ -2292,6 +2321,8 @@ fn write_csv(rows: &[Row]) {
             r.open_env_b - pke::SEAL_OVERHEAD,
             r.kahe_key_b,
             r.plaintext_b,
+            client_to_server_b(r),
+            client_to_recipient_b(r),
             client_post_b(r),
             server_entry_b(r),
             r.eps_correct,
@@ -2644,7 +2675,8 @@ pub fn merge(client_csv: &str, host_csv: &str, out_csv: &str) {
                 if pairs.iter().any(|(_, h)| *h > 0.0) {
                     overhead.push((cell_key_short(&host), pairs));
                 }
-                host.env = format!("{}+host", client.env);
+                // Both halves named, so a host+host splice never reads as a TDX one.
+                host.env = format!("{}+{}", client.env, host.env);
                 spliced += 1;
                 merged.push(host);
             }
@@ -2723,7 +2755,7 @@ pub fn run() {
     let roles = Roles::from_env();
     println!(
         "env: {} | threads {} | cpus {}{}",
-        roles.env_tag(),
+        env_tag(),
         rayon::current_num_threads(),
         affinity(),
         if roles == Roles::all() {
