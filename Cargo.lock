@@ -125,7 +125,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "chipmunk_code"
 version = "0.1.0"
-source = "git+https://github.com/Ruteri/Chipmunk?branch=main#62542a58de1dc8e8c35e0934269135d9436b3155"
+source = "git+https://github.com/Ruteri/Chipmunk?branch=main#3b00f01e910b27b66cd6d98f0eb5767a20d518a3"
 dependencies = [
  "ark-std",
  "env_logger",
