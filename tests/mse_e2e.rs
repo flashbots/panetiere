@@ -4,7 +4,7 @@
 //! contributes them to the protocol. The verifier's recovered per-poly sums
 //! unpack into the multiset union, which decodes to all clients' elements.
 
-use chipmunk_code::{KahePoly, Polynomial};
+use chipmunk_code::KahePoly;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
