@@ -1,33 +1,11 @@
 //! Systematic Reed–Solomon over the digest ring, for sharding the ingress
 //! ciphertext across nodes.
-//!
-//! The `k` data blocks are the evaluations `f(1)..f(k)` of a degree-`(k−1)`
-//! polynomial over `R_{q_dgt}`; node `j` holds `f(j+1)`. Nodes `0..k−1`
-//! therefore hold the blocks verbatim — the client only computes the `n−k`
-//! parity evaluations — and recovery from any `k` shares is Lagrange
-//! interpolation back to the points `1..k`.
-//!
-//! `q_dgt` is prime, so every pairwise difference of the points `1..=n` is a
-//! unit and the Lagrange denominators invert; this is the same argument
-//! [`crate::sss::ShamirParams::new`] makes for `q_cs`.
-//!
-//! **Why the digest ring and not `q_kahe`.** Shares carry ciphertexts embedded
-//! as exact integers (`DgtNTTPoly::from_kahe`), so summing them across clients
-//! yields the *unreduced* `Σ ct_i` rather than a sum mod `q_kahe`. That is what
-//! [`crate::digest`] needs in order to bind anything: an Ajtai hash over
-//! `R_{q_kahe}` would have `β ≈ q` and be vacuous. The cost is 62-bit share
-//! coefficients against the 50-bit ones a plain `KahePoly` share would need.
-//!
-//! Coding, aggregation and the NTT are all linear, so they commute freely:
-//! shares are carried in the digest ring's NTT domain and summed there, and one
-//! inverse transform at the very end recovers the integer sum for decryption.
 
 use chipmunk_code::{DgtNTTPoly, DGT_MODULUS, N};
 use rayon::prelude::*;
 
 const Q: u64 = DGT_MODULUS;
 
-/// One node's coded slice: `block_len` digest-ring elements.
 pub type Share = Vec<DgtNTTPoly>;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -209,12 +187,6 @@ impl Rs {
 
     /// Node indices among `samples[k..]` whose share contradicts `ctxt`, the
     /// codeword already reconstructed from the first `k`.
-    ///
-    /// This is the redundancy doing double duty: the lane-sums are themselves a
-    /// codeword of the same code, because linearity survives summation, so
-    /// `n−k` spare lanes detect up to `n−k` lying lanes *algebraically*, before
-    /// the digest is even consulted. It does not say which lane lied when the
-    /// liar is among the `k` used; naming that needs Berlekamp–Welch.
     pub fn inconsistent_shares(
         params: &RsParams,
         ctxt: &[DgtNTTPoly],
@@ -234,9 +206,6 @@ impl Rs {
 
     /// Interpolate the `k` blocks back from any `k` `(node_index, share)`
     /// samples and flatten to `ctxt_len` polys. Extra samples are ignored.
-    ///
-    /// When the samples are exactly nodes `0..k` this is a concatenation: those
-    /// shares already *are* the blocks.
     pub fn reconstruct(
         params: &RsParams,
         ctxt_len: usize,
@@ -274,9 +243,6 @@ impl Rs {
     }
 
     /// Positional sum of one node's shares across clients — the lane round.
-    /// Exact over the integers while `ρ·q_kahe/2 < q_dgt/2`, which is what makes
-    /// the digest bindable; the verifier enforces that bound on the
-    /// reconstruction.
     pub fn sum_shares(shares: &[&[DgtNTTPoly]]) -> Share {
         if shares.is_empty() {
             return Vec::new();

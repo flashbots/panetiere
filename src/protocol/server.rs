@@ -10,9 +10,6 @@ use crate::rs::{Rs, Share};
 
 use super::{opening_aad, ClientId, NodeId, ServerId, SessionId};
 
-/// Open one client's sealed envelope into its `Opening`; `None` on a bad seal, a
-/// malformed packed opening, or a `(sid, client_id, server_id)` other than the
-/// one it was sealed under.
 pub fn unseal_opening(
     key: &pke::PrivateKey,
     sid: &SessionId,
@@ -25,8 +22,6 @@ pub fn unseal_opening(
     Opening::from_packed(&packed).ok()
 }
 
-/// Batch form of [`unseal_opening`] over a server's whole inbox, independent
-/// per item. Each entry carries its `ClientId`: it is part of the bound context.
 pub fn unseal_openings(
     key: &pke::PrivateKey,
     sid: &SessionId,
@@ -39,8 +34,6 @@ pub fn unseal_openings(
         .collect()
 }
 
-/// Per-server inbox: one `Opening` per client (its `s()[0]` is that client's
-/// Shamir share for this server).
 pub struct ServerInbox {
     pub server_id: ServerId,
     pub items: Vec<(ClientId, Opening)>,
@@ -51,22 +44,12 @@ pub enum ServerRoundError {
     MissingClient(ClientId),
 }
 
-/// One RS lane's inbox: the coded share each client sent to this node. Both
-/// threshold servers and share-only lanes use it — the two roles differ in
-/// whether they *also* run [`run_server_round`], not in how they sum shares.
 pub struct RsNodeInbox {
     pub node_id: NodeId,
     pub items: Vec<(ClientId, Share)>,
 }
 
-/// Positionally sum this node's coded shares over exactly `canonical`.
-///
-/// Summing in the digest ring keeps the result the *unreduced* integer sum, so
-/// lane `j`'s sum is share `j` of `Σ ct` over the integers — which is what the
-/// Ajtai digest binds. All-or-nothing over `canonical`, mirroring
-/// [`run_server_round`]: summing a different set would silently desync this lane
-/// from `Σ sk`.
-pub fn run_node_round(
+pub fn run_rs_node_round(
     inbox: &RsNodeInbox,
     canonical: &[ClientId],
 ) -> Result<RsNodeBulletinEntry, ServerRoundError> {
@@ -92,8 +75,6 @@ pub fn run_node_round(
     })
 }
 
-/// Sum the canonical clients' openings into a single aggregated `Opening` and
-/// extract the summed share.
 pub fn run_server_round(
     inbox: &ServerInbox,
     canonical: &[ClientId],
@@ -114,9 +95,6 @@ pub fn run_server_round(
         opening_refs.push(op);
     }
     let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs);
-    // For Shamir t-of-n with linear interpolation, summing per-server shares
-    // across canonical clients gives the share of `Σ sk_j` at this server's
-    // point. `agg_share` mirrors `agg_open.s()`.
     let agg_share: CsPoly = agg_open.s()[0];
 
     Ok(ServerBulletinEntry {

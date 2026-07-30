@@ -12,15 +12,11 @@ use chipmunk_code::{
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
-    /// KAHE ciphertext, one KAHE ring element per `μ_kahe` slot.
     pub ctxt: Vec<KahePoly>,
-    /// Single CS commitment (μ_cs = κ_kahe packs the share-vector).
     pub comm: Commitment,
 }
 
 impl ClientBulletinEntry {
-    /// Bit-packed wire form: a `u16` ciphertext-slot count, the ciphertext
-    /// polynomials packed against `KAHE_MODULUS`, then the commitment.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             2 + self.ctxt.len() * poly_packed_len64(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS),
@@ -33,14 +29,10 @@ impl ClientBulletinEntry {
         out
     }
 
-    /// Byte length of [`to_bytes`](Self::to_bytes) for `mu_kahe` ciphertext
-    /// slots, without building an entry — for wire-budget planning.
     pub fn packed_len(mu_kahe: usize) -> usize {
         2 + mu_kahe * poly_packed_len64(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS)
     }
 
-    /// Inverse of [`ClientBulletinEntry::to_bytes`]; `None` on any length
-    /// mismatch.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let n_ctxt = u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as usize;
         let kahe_len = poly_packed_len64(KAHE_MODULUS);
@@ -60,13 +52,6 @@ impl ClientBulletinEntry {
     }
 }
 
-/// RS-mode client post. The ciphertext is not here — it went to the nodes as
-/// coded shares — so what the bulletin carries is the commitment plus the
-/// Ajtai digest of that ciphertext, signed. Constant size in the message length.
-///
-/// The digest is **cleartext**: its input is the ciphertext, which the coded
-/// shares already publish, and `Enc(0)` is random-looking so a cover client's
-/// digest is not a distinguishable constant.
 #[derive(Clone)]
 pub struct RsClientBulletinEntry {
     pub comm: Commitment,
@@ -76,12 +61,6 @@ pub struct RsClientBulletinEntry {
     pub sig: [u8; sig::SIG_LEN],
 }
 
-/// Packed bytes of one digest-ring element.
-///
-/// Raw little-endian `u64` rather than bit-packed: `pack_bits64` caps symbols at
-/// 56 bits (`cs.rs`) and `q_dgt` needs 62, so tight packing would need a wider
-/// accumulator. The loss is `8 − 62/8 = 0.25` B/coeff — 3 % of the digest, which
-/// is itself ~0.1 % of a round — so it is not worth a second bit-packer.
 pub fn dgt_packed_len() -> usize {
     POLY_N * 8
 }
@@ -102,8 +81,6 @@ fn unpack_dgt(bytes: &[u8], start: usize) -> (DgtNTTPoly, usize) {
 }
 
 impl RsClientBulletinEntry {
-    /// What the client signs. Binds the post to the session and the client, so
-    /// an envelope cannot be replayed into another round or reattributed.
     pub fn signing_bytes(
         sid: &SessionId,
         client_id: ClientId,
@@ -168,8 +145,6 @@ impl RsClientBulletinEntry {
     }
 }
 
-/// One node's contribution in the RS mode: the positional sum of the coded
-/// shares it received, over exactly `clients`.
 #[derive(Clone)]
 pub struct RsNodeBulletinEntry {
     pub node_id: NodeId,
@@ -181,9 +156,7 @@ pub struct RsNodeBulletinEntry {
 pub struct ServerBulletinEntry {
     pub server_id: ServerId,
     pub clients: Vec<ClientId>,
-    /// Single aggregated `Opening` whose `s()[0]` is the summed share.
     pub agg_open: Opening,
-    /// Mirrors `agg_open.s()[0]` (sum of per-client shares at this server's point).
     pub agg_share: CsPoly,
 }
 

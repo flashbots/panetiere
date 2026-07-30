@@ -1,5 +1,5 @@
-//! The recipient over a real round: canonical-set choice, culprit exclusion and
-//! the rejection reasons it reports.
+//! The recipient over a real round: anchor admission, culprit exclusion and the
+//! rejection reasons it reports.
 
 use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
@@ -149,12 +149,11 @@ fn recover_direct_reports_exhausted_shares() {
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
-        Err(RecipientError::NoCandidate(rs)) => assert!(
-            matches!(rs[0].reason, RejectReason::ExhaustedShares { need: 3, .. }),
-            "got {:?}",
-            rs
+        Err(RecipientError::Rejected(reason)) => assert!(
+            matches!(reason, RejectReason::ExhaustedShares { need: 3, .. }),
+            "got {reason:?}"
         ),
-        other => panic!("expected NoCandidate, got {other:?}"),
+        other => panic!("expected Rejected, got {other:?}"),
     }
 }
 
@@ -174,87 +173,44 @@ fn below_share_threshold_is_its_own_error() {
 fn max_clients_rejects_an_oversized_anchor() {
     let r = round(6, 4, 6);
     let policy = SetPolicy::anchored(&r.canonical, 0, 4);
-    match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
-        Err(RecipientError::NoCandidate(rs)) => assert_eq!(
-            rs[0].reason,
-            RejectReason::AboveMaxClients { got: 6, max: 4 }
-        ),
-        other => panic!("expected NoCandidate, got {other:?}"),
-    }
+    assert_eq!(
+        recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::AboveMaxClients { got: 6, max: 4 })
+    );
 }
 
 #[test]
-fn missing_client_public_rejects_the_candidate() {
+fn missing_client_public_is_rejected() {
     let mut r = round(7, 4, 5);
     r.publics.remove(2);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
-        Err(RecipientError::NoCandidate(rs)) => assert_eq!(
-            rs[0].reason,
-            RejectReason::MissingClientPublics { have: 4, need: 5 }
-        ),
-        other => panic!("expected NoCandidate, got {other:?}"),
-    }
+    assert_eq!(
+        recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::MissingClientPublics { have: 4, need: 5 })
+    );
 }
 
-/// `Majority` takes the largest set with ≥ t agreement — and the same one every
-/// run, which the map-order selection it replaces did not guarantee.
+/// Servers that shared over a different set than the anchor do not count towards
+/// the threshold, however many of them there are.
 #[test]
-fn majority_picks_the_largest_agreed_set_deterministically() {
-    let r = round(8, 5, 5);
-    assert_eq!(r.pp.shamir.t, 3);
-
-    // Servers 0..2 share over all 5; servers 3,4 over a 4-client subset. Only the
-    // first group reaches t, and it is also the larger.
-    let subset: Vec<ClientId> = r.canonical[..4].to_vec();
-    let mut outputs = r.outputs.clone();
-    for sp in outputs.iter_mut().filter(|sp| sp.server_id.0 >= 3) {
-        sp.clients = subset.clone();
-    }
-
-    let first = recover_direct(&r.pp, &SetPolicy::majority(0, NO_CAP), r.lookup(), &outputs).unwrap();
-    assert_eq!(first.canonical, r.canonical);
-
-    // Same inputs in a different order must give the same answer.
-    let mut shuffled = outputs.clone();
-    shuffled.reverse();
-    let again =
-        recover_direct(&r.pp, &SetPolicy::majority(0, NO_CAP), r.lookup(), &shuffled).unwrap();
-    assert_eq!(again.canonical, first.canonical);
-    assert_eq!(again.plaintext, first.plaintext);
-}
-
-/// A smaller set that *does* reach the threshold is used when the larger one does
-/// not — the fallback the majority rule exists for.
-#[test]
-fn majority_falls_back_to_a_smaller_agreed_set() {
+fn servers_disagreeing_with_the_anchor_do_not_count() {
     let r = round(9, 5, 5);
+    assert_eq!(r.pp.shamir.t, 3);
     let subset: Vec<ClientId> = r.canonical[..4].to_vec();
 
-    // Only servers 0,1 keep the full set (below t=3); 2,3,4 agree on the subset.
+    // Only servers 0,1 keep the anchored set; 2,3,4 claim the subset.
     let mut outputs = r.outputs.clone();
     for sp in outputs.iter_mut().filter(|sp| sp.server_id.0 >= 2) {
         sp.clients = subset.clone();
     }
-    // Re-run those servers over the subset so their openings match what they claim.
-    let policy = SetPolicy::majority(0, NO_CAP);
-    match recover_direct(&r.pp, &policy, r.lookup(), &outputs) {
-        // The full set fails for too few agreeing servers; the subset is tried next
-        // and fails its opening check, since these openings cover all 5 clients.
-        Err(RecipientError::NoCandidate(rs)) => {
-            assert_eq!(rs.len(), 2, "both candidates tried: {rs:?}");
-            assert_eq!(
-                rs[0].reason,
-                RejectReason::TooFewAgreeingServers {
-                    agreeing: 2,
-                    need: 3
-                }
-            );
-            assert_eq!(rs[0].canonical_len, 5);
-            assert_eq!(rs[1].canonical_len, 4);
-        }
-        other => panic!("expected both candidates rejected, got {other:?}"),
-    }
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    assert_eq!(
+        recover_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::TooFewAgreeingServers {
+            agreeing: 2,
+            need: 3
+        })
+    );
 }
 
 #[test]
@@ -262,11 +218,8 @@ fn anonymity_floor_rejects_a_small_set() {
     let mut r = round(10, 4, 4);
     r.pp.min_clients = 5;
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
-        Err(RecipientError::NoCandidate(rs)) => assert_eq!(
-            rs[0].reason,
-            RejectReason::BelowAnonymityFloor { got: 4, min: 5 }
-        ),
-        other => panic!("expected NoCandidate, got {other:?}"),
-    }
+    assert_eq!(
+        recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::BelowAnonymityFloor { got: 4, min: 5 })
+    );
 }

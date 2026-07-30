@@ -56,7 +56,6 @@ fn main() {
     let pp = if mu > 0 && t_modulus > 0 {
         ProtocolParams::setup_with_kahe_dims_full(
             &mut rng, s, mu,
-            1,
             panetiere::kahe::SIGMA_S_DEFAULT,
             panetiere::kahe::SIGMA_E_DEFAULT,
             t_modulus,

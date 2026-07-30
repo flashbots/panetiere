@@ -7,9 +7,8 @@ use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBull
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use panetiere::protocol::client::{run_client_round_rs, RsClientRound};
-use panetiere::protocol::dispute::{bisect_digest_failure, DisputeOutcome};
 use panetiere::protocol::server::{
-    run_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerInbox,
+    run_rs_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerInbox,
 };
 use panetiere::protocol::verify::{aggregate_and_decrypt_rs, VerifyError};
 use panetiere::protocol::{ClientId, NodeId, ProtocolParams, ServerId, SessionId};
@@ -68,8 +67,8 @@ impl Round {
         Round { pp, canonical, entries, rounds, server_keys }
     }
 
-    /// Servers and lanes over an arbitrary subset — the same all-or-nothing
-    /// path a dispute re-run uses.
+    /// Servers and lanes over an arbitrary subset, exercising the all-or-nothing
+    /// canonical-set path.
     fn outputs(&self, subset: &[ClientId]) -> (Vec<ServerBulletinEntry>, Vec<RsNodeBulletinEntry>) {
         let servers = (0..S)
             .map(|j| {
@@ -102,7 +101,7 @@ impl Round {
                     .map(|r| (r.client_id, r.rs_shares[j].clone()))
                     .collect();
                 let inbox = RsNodeInbox { node_id: NodeId(j as u32), items };
-                run_node_round(&inbox, subset).unwrap()
+                run_rs_node_round(&inbox, subset).unwrap()
             })
             .collect();
 
@@ -359,15 +358,14 @@ fn roster_mismatch_between_lanes_and_servers_is_rejected() {
     );
 }
 
-/// A client whose digest does not match its payload is narrowed to a group.
+/// A digest that is not the hash of its ciphertext but *is* correctly signed
+/// clears the signature check, so only the aggregate digest check can catch it.
+/// The counterpart to `a_tampered_bulletin_post_is_rejected`, which stops at
+/// `BadSignature` and never reaches the digest.
 #[test]
-fn dispute_bisection_narrows_a_bad_digest_to_a_group() {
+fn a_signed_but_inconsistent_digest_is_rejected() {
     let (mut r, _, _) = mse_round(16, 8);
-    r.pp.min_clients = 4;
 
-    // Client 11 posts a digest that is not the hash of its ciphertext, and signs
-    // it properly — so the signature check passes and only the aggregate digest
-    // check fires. Exactly the case bisection exists to localise.
     let culprit = 11usize;
     {
         let mut rng = ChaCha20Rng::from_seed([0x34; 32]);
@@ -390,25 +388,4 @@ fn dispute_bisection_narrows_a_bad_digest_to_a_group() {
         aggregate_and_decrypt_rs(&r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes).err(),
         Some(VerifyError::DigestMismatch)
     );
-
-    let floor = r.pp.min_clients;
-    let outcome = bisect_digest_failure(
-        &r.pp,
-        &SESSION,
-        &r.entries,
-        &r.canonical,
-        floor,
-        |subset| Some(r.outputs(subset)),
-    );
-    match outcome {
-        DisputeOutcome::Culprits(group) => {
-            assert!(group.len() >= floor, "group {group:?} breached the floor");
-            assert!(group.len() < 2 * floor, "group {group:?} too wide");
-            assert!(
-                group.contains(&ClientId(culprit as u32)),
-                "group {group:?} missed the culprit"
-            );
-        }
-        other => panic!("expected a culprit group, got {other:?}"),
-    }
 }

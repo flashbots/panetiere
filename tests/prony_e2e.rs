@@ -33,7 +33,6 @@ fn round_trip(
         rng,
         n_servers,
         1,
-        1,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
         PRONY_PRIME,

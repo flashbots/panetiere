@@ -9,7 +9,7 @@
 //!                   same APIs the protocol uses; plus wire sizes read off
 //!                   real packed bytes (sealed opening envelope, server entry)
 //!   [D] derived   — exact byte arithmetic from packing formulas
-//!   [C] composed  — cost model `wall = fixed + l·chunk` over [M] medians;
+//!   [C] composed  — cost model `wall = fixed + payload` over [M] medians;
 //!                   one client → one server → verifier, summed as a serial
 //!                   pipeline (one party of each kind, not ρ of them)
 //!   [P] projected — synthetic network sim
@@ -45,10 +45,10 @@
 //! DERIVED FROM INPUTS (computed per cell — not knobs)
 //! ──────────────────────────────────────────────────────────────────────
 //!  δ              = ⌈3·active/γ⌉ IBLT buckets per MSE row
-//!  l              = ⌈n_polys/MU_KAHE⌉ KAHE chunks
+//!  μ_kahe         = n_polys — one key covers the whole plaintext
 //!  total_cells    = γ · δ
 //!  Shamir threshold, κ_cs, β, β_agg, block_size — chosen by
-//!  `ProtocolParams::setup_with_kahe_dims_full(s, μ_kahe, κ_kahe, l, …)`
+//!  `ProtocolParams::setup_with_kahe_dims_full(s, μ_kahe, κ_kahe, …)`
 //!
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
@@ -92,7 +92,7 @@ use crate::protocol::client::{
     shamir_share,
 };
 use crate::protocol::server::{
-    run_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
+    run_rs_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
 };
 use crate::protocol::verify::{
     aggregate_and_decrypt_rs, aggregate_and_decrypt_timed, decrypt_aggregate, RsVerifyTimings,
@@ -118,13 +118,6 @@ struct Config {
     label: String,
     payload_symbols: usize, // ξ: per-client element size = ξ·log₂t bits
 }
-
-// MU_KAHE — the KAHE encryption chunk size, in polys (µ from the KAHE param
-// table, sized so one key covers a 20 KiB-element IBLT at ρ=300). A larger
-// message's IBLT encoding spans l = ⌈n_polys/MU_KAHE⌉ chunks, each under its
-// own matrix A_i but the same key sk, so the Shamir+CS pass amortizes over
-// all l chunks.
-const MU_KAHE: usize = 2002;
 
 /// Codec bytes per poly (chipmunk `N` coefficients × 4 bytes), matching `codec`.
 const BYTES_PER_POLY: usize = POLY_N * 4;
@@ -418,8 +411,7 @@ struct Row {
     mu_kahe: usize,
     delta: usize,
     xi: usize,
-    l: usize,
-    n_polys: usize, // actual message length; ≤ μ·l (final chunk may be partial)
+    n_polys: usize, // actual message length; ≤ μ
     /// Where this row's timings were taken: `host`, `tdx`, `host-rest`, or
     /// `tdx+host` once merged.
     env: String,
@@ -428,7 +420,7 @@ struct Row {
     threads: usize,
     affinity: String,
     recovered_ok: bool,
-    // [M] CPU, per-round totals for one party (the ×l chunk work included).
+    // [M] CPU, per-round totals for one party.
     enc_app: Stat,
     kahe_enc: Stat,
     share: Stat,
@@ -688,10 +680,9 @@ mod csv_tests {
             iblt_cells: 300,
             flow: "mse",
             payload_client_b: 4099,
-            mu_kahe: 2002,
+            mu_kahe: 134,
             delta: 75,
             xi: 911,
-            l: 1,
             n_polys: 134,
             env: "host".into(),
             threads: 8,
@@ -973,15 +964,13 @@ fn run_cell(
     };
     let msg_polys = msg_vector_bytes.div_ceil(BYTES_PER_POLY);
     let n_polys = sched_polys + msg_polys;
-    // KAHE encrypts the whole joint plaintext in l chunks of the fixed MU_KAHE.
-    let mu_kahe = MU_KAHE;
-    let l = n_polys.div_ceil(mu_kahe);
+    // One key covers the whole joint plaintext.
+    let mu_kahe = n_polys;
 
     let pp = ProtocolParams::setup_with_kahe_dims_full(
         &mut rng,
         s,
         mu_kahe,
-        l,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
         match codec {
@@ -1035,8 +1024,6 @@ fn run_cell(
             if matches!(codec, AppCodec::Scheduled { .. }) && i < active {
                 polys.extend(codec::encode_at(ranges[i].0, msg_vector_bytes, &byte_payloads[i]));
             }
-            // Pad covers/short encodings to the joint plaintext width — NOT to
-            // the μ·l chunk boundary; the final KAHE chunk may be partial.
             polys.resize(n_polys, KahePoly::default());
             polys
         })
@@ -1111,7 +1098,7 @@ fn run_cell(
     };
     let key0 = kahe_keygen(&mut rng, &pp);
     let (kahe_enc, _ctxt0) = measure(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
-    let (share, shares0) = measure(|| shamir_share(&mut rng, &pp, &key0, s));
+    let (share, shares0) = measure(|| shamir_share(&mut rng, &pp, &key0));
     let (cs, (comm0, openings0)) = measure(|| cs_commit(&mut rng, &pp, &shares0));
     // One position of one commitment — the `VC.Vf` unit. `v_open` below times the
     // verifier's S-way parallel pass instead, so the two are not interchangeable.
@@ -1353,10 +1340,11 @@ fn run_cell(
                         .collect(),
                 })
                 .collect();
-            let (node_sum, _) = measure(|| run_node_round(&node_inboxes[0], &canonical).unwrap());
+            let (node_sum, _) =
+                measure(|| run_rs_node_round(&node_inboxes[0], &canonical).unwrap());
             let node_outputs: Vec<RsNodeBulletinEntry> = node_inboxes
                 .iter()
-                .map(|inb| run_node_round(inb, &canonical).unwrap())
+                .map(|inb| run_rs_node_round(inb, &canonical).unwrap())
                 .collect();
 
             // Embedding into the digest ring is n_polys forward NTTs; the Ajtai
@@ -1476,7 +1464,6 @@ fn run_cell(
             AppCodec::Prony => prony_params.as_ref().unwrap().payload_symbols,
             AppCodec::Scheduled { .. } => SCHED_TOKEN_SYMBOLS,
         },
-        l,
         n_polys,
         env: env_tag(),
         threads: rayon::current_num_threads(),
@@ -1586,18 +1573,19 @@ fn rs_seed(cell: &[u8; 32], k: usize, n_nodes: usize) -> [u8; 32] {
 
 struct Model {
     fixed_us: f64,
-    chunk_us: f64, // per single chunk
+    /// Payload-proportional work: everything that scales with the plaintext width.
+    payload_us: f64,
     wall_us: f64,
     wire_total_b: f64,
     efficiency: f64,
-    post_b: f64,        // one client bulletin post = comm + all l ctxt chunks
+    post_b: f64,        // one client bulletin post = comm + ctxt
     client_open_b: f64, // one client's S sealed openings
     agg_cpu_us: Vec<f64>, // per AggPlan
     rs_cpu_us: Vec<f64>,  // per RsPlan
 }
 
 fn model(r: &Row) -> Model {
-    // fixed = paid once per round (key-related); chunk_total = scales with l.
+    // fixed = paid once per round (key-related); payload = scales with the width.
     let fixed_us = r.share.med
         + r.cs.med
         + r.seal.med
@@ -1606,13 +1594,13 @@ fn model(r: &Row) -> Model {
         + r.v_open.med
         + r.v_interp.med
         + r.v_sum_comm.med;
-    let chunk_total_us =
+    let payload_us =
         r.enc_app.med + r.kahe_enc.med + r.v_agg_ctxt.med + r.v_kahe_dec.med + r.dec_app.med;
-    let wall_us = fixed_us + chunk_total_us;
+    let wall_us = fixed_us + payload_us;
     let wire_total_b = r.wire_ctxt_b + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
     // Aggregated flow replaces the leader's direct ingest phases with the tree.
     let cpu_base_agg_us = (fixed_us - r.v_open.med - r.v_interp.med - r.v_sum_comm.med)
-        + (chunk_total_us - r.v_agg_ctxt.med - r.v_kahe_dec.med);
+        + (payload_us - r.v_agg_ctxt.med - r.v_kahe_dec.med);
     let agg_cpu_us = r.agg_plans.iter().map(|p| cpu_base_agg_us + p.leader.med).collect();
     // RS flow: client pays app-encode + encrypt + RS-encode + key work; one
     // node sums its lane; the verifier no longer sums ciphertexts at all.
@@ -1644,10 +1632,7 @@ fn model(r: &Row) -> Model {
         .collect();
     Model {
         fixed_us,
-        // Mean cost of one actual chunk, so `fixed + l·chunk == wall` exactly.
-        // The final chunk may be partial — read `polys` vs `μ` in the cells
-        // table for how full it is.
-        chunk_us: chunk_total_us / r.l as f64,
+        payload_us,
         wall_us,
         wire_total_b,
         efficiency: r.useful_b / wire_total_b,
@@ -1786,13 +1771,13 @@ fn print_tables(rows: &[Row]) {
 
     println!("── cells ───────────────────────────────────────────────────────────────────");
     println!(
-        "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>4}{:>8}{:>7}{:>7}  {}",
-        "id", "S", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "l", "polys", "μ", "cells",
+        "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  {}",
+        "id", "S", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "polys", "μ", "cells",
         "recovered"
     );
     for (i, r) in rows.iter().enumerate() {
         println!(
-            "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>4}{:>8}{:>7}{:>7}  {}",
+            "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  {}",
             cell_id(i),
             r.s,
             r.n,
@@ -1802,14 +1787,12 @@ fn print_tables(rows: &[Row]) {
             fmt_bytes(r.payload_client_b as f64),
             r.delta,
             r.xi,
-            r.l,
             r.n_polys,
             r.mu_kahe,
             r.iblt_cells,
             if r.recovered_ok { "yes" } else { "NO" },
         );
     }
-    println!("    (polys < l·μ ⇒ the final KAHE chunk is partial)");
     println!();
 
     println!("── per role, one party of each kind ([M] cpu, [D] wire, eps = correctness) ──");
@@ -2043,7 +2026,7 @@ fn print_tables(rows: &[Row]) {
     println!("── [D] per-role wire, one round (← in / → out) ──────────────────────────────");
     println!(
         "{:<4}{:<44}{:<24}{:<24}{}",
-        "id", "client → (comm + l·ctxt + S·open)", "server ← / →", "L1-agg ← / →", "leader ← direct / agg-1"
+        "id", "client → (comm + ctxt + S·open)", "server ← / →", "L1-agg ← / →", "leader ← direct / agg-1"
     );
     for (i, r) in rows.iter().enumerate() {
         let m = &models[i];
@@ -2079,19 +2062,18 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
-    println!("── [C] model: wall = fixed + l·chunk (client → server → verifier, serial) ───");
+    println!("── [C] model: wall = fixed + payload (client → server → verifier, serial) ───");
     println!(
-        "{:<4}{:>10}{:>10}{:>4}{:>10}{:>12}{:>13}{:>10}{:>12}",
-        "id", "fixed", "chunk", "l", "wall", "useful", "wire/round", "eff", "agg1-wall"
+        "{:<4}{:>10}{:>10}{:>10}{:>12}{:>13}{:>10}{:>12}",
+        "id", "fixed", "payload", "wall", "useful", "wire/round", "eff", "agg1-wall"
     );
     for (i, r) in rows.iter().enumerate() {
         let m = &models[i];
         println!(
-            "{:<4}{:>10}{:>10}{:>4}{:>10}{:>12}{:>13}{:>10.2e}{:>12}",
+            "{:<4}{:>10}{:>10}{:>10}{:>12}{:>13}{:>10.2e}{:>12}",
             cell_id(i),
             fmt_us(m.fixed_us),
-            fmt_us(m.chunk_us),
-            r.l,
+            fmt_us(m.payload_us),
             fmt_us(m.wall_us),
             fmt_bytes(r.useful_b),
             fmt_bytes(m.wire_total_b),
@@ -2246,7 +2228,7 @@ fn write_csv(rows: &[Row]) {
     let phases = PHASES;
 
     let mut header = String::new();
-    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,l,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
+    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
     for p in phases {
         write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", p.name).unwrap();
     }
@@ -2258,7 +2240,7 @@ fn write_csv(rows: &[Row]) {
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
          ,d_rs_share_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
          ,c_client_us,c_server_us,c_recipient_us\
-         ,c_fixed_us,c_chunk_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
+         ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
     );
     for prof in NETWORKS {
         write!(
@@ -2273,7 +2255,7 @@ fn write_csv(rows: &[Row]) {
     // cross-run dedup in append mode. `env` is part of the key so a tdx row and a
     // host row for the same cell coexist instead of evicting each other.
     let param_key = |line: &str| -> String {
-        line.split(',').skip(1).take(13).collect::<Vec<_>>().join(",")
+        line.split(',').skip(1).take(12).collect::<Vec<_>>().join(",")
     };
 
     let mut out = String::new();
@@ -2281,7 +2263,7 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
             r.n,
@@ -2291,7 +2273,6 @@ fn write_csv(rows: &[Row]) {
             r.payload_client_b,
             r.delta,
             r.xi,
-            r.l,
             r.n_polys,
             r.mu_kahe,
             r.iblt_cells,
@@ -2362,7 +2343,7 @@ fn write_csv(rows: &[Row]) {
             out,
             ",{:.3},{:.3},{:.3},{:.6e},{:.3},{:.3}",
             m.fixed_us,
-            m.chunk_us,
+            m.payload_us,
             m.wall_us,
             m.efficiency,
             m.agg_cpu_us.first().copied().unwrap_or(0.0),
@@ -2526,7 +2507,6 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         mu_kahe: idx("mu_kahe")?,
         delta: idx("delta")?,
         xi: idx("xi")?,
-        l: idx("l")?,
         n_polys: idx("n_polys")?,
         env: at("env")?.to_string(),
         threads: idx("m_threads")?,
@@ -2577,7 +2557,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
 /// a `host` row for the same cell match each other.
 fn cell_key(r: &Row) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{}",
         r.s,
         r.n,
         r.active,
@@ -2586,7 +2566,6 @@ fn cell_key(r: &Row) -> String {
         r.payload_client_b,
         r.delta,
         r.xi,
-        r.l,
         r.n_polys,
         r.mu_kahe,
         r.iblt_cells
@@ -2780,7 +2759,7 @@ pub fn run() {
     );
     println!("provenance: [M] measured   — median of {} one-party reps (spread in csv)", REPS);
     println!("            [D] derived    — exact byte arithmetic from packing formulas");
-    println!("            [C] composed   — model wall = fixed + l·chunk over [M] medians");
+    println!("            [C] composed   — model wall = fixed + payload over [M] medians");
     println!("            [P] projected  — extrapolation / synthetic network sim");
     println!("useful = active · ξ · log₂(t) bits/round (only active clients carry payload)");
     println!();

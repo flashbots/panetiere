@@ -1,52 +1,12 @@
-//! Collision-resistant Ajtai digest of an aggregated KAHE ciphertext.
-//!
-//! `h = A · ct` over the digest ring `R_{q_dgt}` (`q_dgt ≈ 2^61`), with `A` a
-//! public `n_h × ℓ` matrix sampled in the NTT domain. Linear, hence additively
-//! homomorphic:
-//!
-//! ```text
-//!   Σ_i H(ct_i)  ==  H(Σ_i ct_i)
-//! ```
-//!
-//! **It hashes the ciphertext, not the plaintext, and that is what makes it
-//! work.** Three things follow, none of which hold for a plaintext digest:
-//!
-//! 1. *No encryption.* The input is already public — it is what the coded
-//!    shares carry — so `h` goes on the bulletin in the clear. A plaintext
-//!    digest could not: a cover client's plaintext is all-zero, so its digest
-//!    would be a known constant and would separate cover from active traffic on
-//!    sight. `Enc(0) = A·sk + t·e` is random-looking, so no such distinguisher
-//!    exists here.
-//! 2. *No decomposition.* Because nothing has to carry `h` inside a mod-`t`
-//!    plaintext slot, `q_dgt` is chosen freely above the collision bound. A
-//!    plaintext digest is stuck with `q_h = t` and `β ≈ t/2`, which is vacuous,
-//!    and escaping that costs a 3–36× wider plaintext to carry low-norm digits.
-//! 3. *Genuine collision resistance*, rather than the checksum a linear map on
-//!    full-range inputs would give.
-//!
-//! **What the security rests on.** Shares are embedded as exact integers, so
-//! the hashed object is the *unreduced* `Σ ct_i` and a collision has
-//! `‖·‖∞ ≤ ρ·q_kahe ≈ 2^56.5` at ρ = 300 — comfortably under `q_dgt` (ratio
-//! `2^4.5`). The verifier **must** range-check the reconstruction against
-//! `ρ·q_kahe/2`; without that bound the adversary is unconstrained and Ring-SIS
-//! says nothing. [`centered_within_bound`] does it.
-//!
-//! Output width is set by the optimal-sublattice attack, which finds kernel
-//! vectors of norm `≈ 2^(2√(O·log₂δ))` for an `O`-bit output — independent of
-//! `ℓ`, since an attacker can always restrict to a sublattice. At `β = 2^56.5`
-//! that needs `O ≥ 39 KiB`, i.e. `n_h = 3` ring elements. The same formula
-//! clears chipmunk's own HVC hash (6 digit-polys → 1 poly at `β = 68`) by 8×.
+//! Placeholder until HVC is implemented
 
 use chipmunk_code::{pointwise_dot_dgt, DgtNTTPoly, KahePoly, DGT_MODULUS, KAHE_MODULUS, N};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
-/// Ring elements of digest output. See the module note: sized by the SIS attack
-/// at `β = ρ·q_kahe`, not by the compression ratio.
 pub const DIGEST_POLYS: usize = 3;
 
-/// Public hash matrix, `DIGEST_POLYS × ell` in the NTT domain.
 #[derive(Clone)]
 pub struct DigestParams {
     rows: Vec<Vec<DgtNTTPoly>>,
@@ -55,8 +15,6 @@ pub struct DigestParams {
 }
 
 impl DigestParams {
-    /// Derive `A` from a seed, so every participant agrees without it going on
-    /// the wire. `rho_max` fixes the norm bound the verifier enforces.
     pub fn from_seed(seed: [u8; 32], ell: usize, rho_max: usize) -> Self {
         assert!(ell >= 1, "need at least one ciphertext poly");
         assert!(rho_max >= 1, "rho_max must be ≥ 1");

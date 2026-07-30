@@ -1,4 +1,4 @@
-//! Key-additive homomorphic encryption (Willow-style RLWE-based KAHE).
+//! Key-additive homomorphic encryption
 //!
 //! Lives on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, a 64-bit ring
 //! with q ≈ 2^48.3), decoupled from the chipmunk Ring-SIS CS ring.
@@ -18,23 +18,6 @@
 //! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 15.72).
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
-//!
-//! Correctness budget at ρ aggregations: need `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2`.
-//! At σ_e = 15.72, q_kahe = 347_280_875_347_969, t = 2^36: holds for ρ ≲ 349,
-//! covering the S=8, N=100 operating point.
-//!
-//! `KaheKey` (fresh, low-norm) feeds `Enc`; `KaheAggKey` (in `R_{q_kahe}`,
-//! recovered by Shamir interpolation over `R_{q_cs}` and lifted via
-//! [`lift_cs_to_kahe`] in `protocol::verify`) feeds `Dec`. Hiding-given-
-//! aggregate-key reduces to (Hint-)RLWE rather than to LHL.
-//!
-//! Bridge layer. KAHE secret keys are *small* (Gaussian σ_s = 15.72,
-//! `‖sk‖_∞ ≤ 8σ_s ≈ 126` w.o.p.). Shamir-recovered sums-of-keys are also small
-//! (`‖Σ sk‖_∞ ≤ N_clients · 8σ_s`). Both fit losslessly in both rings under
-//! centered representation, so we cross between `KahePoly` and `CsPoly` by
-//! coefficient-wise re-interpretation: see [`kahe_to_cs_centered`] (client
-//! side, KAHE→CS for Shamir input) and [`lift_cs_to_kahe`] (verifier side,
-//! CS→KAHE for decryption).
 
 use chipmunk_code::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, Polynomial, CS_MODULUS_OVER_TWO,
@@ -66,19 +49,9 @@ pub trait KaheScheme {
     fn agg_key(ks: &[Self::Key]) -> Self::AggKey;
 }
 
-/// Public parameters. `a_ntt[i]` is the length-`μ` (NTT-resident) public vector
-/// `a` for chunk `i ∈ [0, l)`. One Shamir+CS round amortizes its commit
-/// overhead across `l` ciphertexts that share the same `sk` but each use a
-/// different `a_i` — security reduces to standard multi-sample RLWE with the
-/// same secret. `t_modulus` is the plaintext modulus; both `sigma_s` (key) and
-/// `sigma_e` (error) are Gaussian standard deviations.
 pub struct KaheParams {
-    pub a_ntt: Vec<Vec<KaheNTTPoly>>,
+    pub a_ntt: Vec<KaheNTTPoly>,
     pub mu_kahe: usize,
-    /// Number of ciphertext chunks emitted per `enc` call (and consumed per
-    /// `dec`). Messages and ciphertexts are flat `Vec<KahePoly>` of length
-    /// `mu_kahe · l`.
-    pub l: usize,
     pub sigma_s: f64,
     pub sigma_e: f64,
     pub t_modulus: u64,
@@ -95,10 +68,7 @@ impl KaheKey {
     }
 }
 
-/// Aggregate KAHE key — element of `R_{q_kahe}`, output of
-/// [`KaheScheme::agg_key`] or constructed by the verifier via
-/// [`KaheAggKey::from_component`] after Shamir interpolation (and the
-/// CS→KAHE bridge). Only valid input to [`KaheScheme::dec`].
+/// Aggregate KAHE key — element of `R_{q_kahe}`
 #[derive(Clone)]
 pub struct KaheAggKey(KahePoly);
 
@@ -111,9 +81,6 @@ impl KaheAggKey {
     }
 }
 
-/// Sample a single discrete-Gaussian-rounded polynomial coefficient.
-/// Round-to-nearest-integer applied to a continuous Gaussian; clamped at the
-/// 8σ tail (Willow's convention).
 fn sample_dg<R: Rng>(rng: &mut R, sigma: f64) -> i64 {
     let normal = Normal::new(0.0, sigma).expect("σ > 0");
     let tail = (8.0 * sigma).ceil() as i64;
@@ -133,16 +100,9 @@ fn sample_dg_poly<R: Rng>(rng: &mut R, sigma: f64) -> KahePoly {
     KahePoly::from_coeffs(coeffs)
 }
 
-/// `(a_chunk[i] · sk)` where `sk` is already in NTT representation. Used by
-/// `enc`/`dec` to amortize the secret's single NTT across all `l·μ` rows.
-fn pad_poly(
-    a_ntt: &[Vec<KaheNTTPoly>],
-    sk_ntt: &KaheNTTPoly,
-    chunk: usize,
-    i: usize,
-) -> KahePoly {
+fn pad_poly(a_ntt: &[KaheNTTPoly], sk_ntt: &KaheNTTPoly, i: usize) -> KahePoly {
     KahePoly::from(&pointwise_dot_kahe(
-        std::slice::from_ref(&a_ntt[chunk][i]),
+        std::slice::from_ref(&a_ntt[i]),
         std::slice::from_ref(sk_ntt),
     ))
 }
@@ -166,7 +126,6 @@ fn accumulate_pos(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
     }
 }
 
-/// AVX2: accumulate 4-wide i64 lanes. `N` is a multiple of 4.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
@@ -266,29 +225,22 @@ pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
 pub struct Kahe;
 
 impl Kahe {
-    /// Setup with explicit dimensions and Gaussian widths. `sigma_s` = key std,
-    /// `sigma_e` = error std. Defaults `SIGMA_S_DEFAULT = SIGMA_E_DEFAULT =
-    /// 15.72` (single `D_σ`) target ~128-bit RLWE at N=2048.
     pub fn setup_with_dims<R: Rng>(
         rng: &mut R,
         mu_kahe: usize,
-        l: usize,
         sigma_s: f64,
         sigma_e: f64,
         t_modulus: u64,
     ) -> KaheParams {
         assert!(mu_kahe >= 1, "μ_kahe must be ≥ 1");
-        assert!(l >= 1, "l must be ≥ 1");
         assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
         // Sample directly NTT-resident — uniform-in-NTT slot is statistically
-        // equivalent to NTT(uniform coeff poly) and saves `l·μ` forward NTTs.
-        let a_ntt: Vec<Vec<KaheNTTPoly>> = (0..l)
-            .map(|_| (0..mu_kahe).map(|_| KaheNTTPoly::rand_ntt_poly(rng)).collect())
-            .collect();
+        // equivalent to NTT(uniform coeff poly) and saves `μ` forward NTTs.
+        let a_ntt: Vec<KaheNTTPoly> =
+            (0..mu_kahe).map(|_| KaheNTTPoly::rand_ntt_poly(rng)).collect();
         KaheParams {
             a_ntt,
             mu_kahe,
-            l,
             sigma_s,
             sigma_e,
             t_modulus,
@@ -296,13 +248,8 @@ impl Kahe {
     }
 }
 
-/// q_kahe = 347_280_875_347_969 (≈2^48.3) at N=2048. Single `D_σ` for key and
-/// error (Nils's spec), σ_s = σ_e = 15.72 — sized for ~128-bit RLWE at N=2048.
 pub const SIGMA_S_DEFAULT: f64 = 15.72;
 pub const SIGMA_E_DEFAULT: f64 = 15.72;
-/// 2^36. Per-coefficient noise budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` holds for
-/// ρ ≲ 349 at (t, σ, q) = (2^36, 15.72, 347_280_875_347_969); comfortably
-/// covers the S=8, N=100 operating point.
 pub const T_MODULUS_DEFAULT: u64 = 1 << 36;
 
 impl KaheScheme for Kahe {
@@ -312,60 +259,45 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `(μ, l) = (1, 1)`, σ_s=σ_e=15.72, `t = 2^36` at q_kahe ≈ 2^48.3.
+    /// `μ = 1`, σ_s=σ_e=15.72, `t = 2^36` at q_kahe ≈ 2^48.3.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
-        Self::setup_with_dims(
-            rng,
-            1,
-            1,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
-        )
+        Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }
 
     fn gen<R: Rng>(rng: &mut R, pp: &KaheParams) -> KaheKey {
         KaheKey(sample_dg_poly(rng, pp.sigma_s))
     }
 
-    /// Batch-encrypt up to `l` chunks of `μ` plaintext polys under one key
-    /// `sk`. For chunk `i ∈ [0, l)`: `c_i = m_i + a_i·sk + t·e_i`, with a
-    /// fresh `e_i ← D_{σ_e}^μ`. The NTT of `sk` is computed once and reused
-    /// across all chunks. The final chunk may be partial (`m.len() ≤ μ·l`):
-    /// unused entries of `a` are simply not used — fewer RLWE samples under
-    /// the same secret — so ciphertexts are not padded to chunk boundaries.
+    /// Encrypt up to `μ` plaintext polys under one key `sk`. For position
+    /// `i ∈ [0, μ)`: `c_i = m_i + a_i·sk + t·e_i`, with a fresh `e_i ← D_{σ_e}`.
     fn enc<R: Rng>(rng: &mut R, pp: &KaheParams, k: &KaheKey, m: &Vec<KahePoly>) -> Vec<KahePoly> {
-        debug_assert!(m.len() <= pp.mu_kahe * pp.l);
+        debug_assert!(m.len() <= pp.mu_kahe);
         let t = pp.t_modulus as i64;
         let sk_ntt = KaheNTTPoly::from(k.inner());
         let total = m.len();
         let seeds = crate::fork_seeds(rng, total);
         (0..total)
             .into_par_iter()
-            .map(|idx| {
-                let (chunk, i) = (idx / pp.mu_kahe, idx % pp.mu_kahe);
-                let pad = pad_poly(&pp.a_ntt, &sk_ntt, chunk, i);
-                let mut item_rng = ChaCha20Rng::from_seed(seeds[idx]);
+            .map(|i| {
+                let pad = pad_poly(&pp.a_ntt, &sk_ntt, i);
+                let mut item_rng = ChaCha20Rng::from_seed(seeds[i]);
                 let e = sample_dg_poly(&mut item_rng, pp.sigma_e);
                 let te = scale_poly(&e, t);
-                m[idx] + pad + te
+                m[i] + pad + te
             })
             .collect()
     }
 
-    /// `((c_i − a_i·sk_agg) mod q_kahe) reduced mod t`, per chunk. `sk_agg`'s
-    /// NTT is computed once and shared across all chunks. Accepts a partial
-    /// final chunk, mirroring `enc`.
+    /// `((c_i − a_i·sk_agg) mod q_kahe) reduced mod t`, per position.
     fn dec(pp: &KaheParams, c: &Vec<KahePoly>, k: &KaheAggKey) -> Vec<KahePoly> {
-        debug_assert!(c.len() <= pp.mu_kahe * pp.l);
+        debug_assert!(c.len() <= pp.mu_kahe);
         let sk_ntt = KaheNTTPoly::from(k.inner());
         let total = c.len();
         (0..total)
             .into_par_iter()
-            .map(|idx| {
-                let (chunk, i) = (idx / pp.mu_kahe, idx % pp.mu_kahe);
-                let pad = pad_poly(&pp.a_ntt, &sk_ntt, chunk, i);
-                let raw = c[idx] - pad;
+            .map(|i| {
+                let pad = pad_poly(&pp.a_ntt, &sk_ntt, i);
+                let raw = c[i] - pad;
                 poly_mod_t(&raw, pp.t_modulus)
             })
             .collect()
@@ -378,10 +310,6 @@ impl KaheScheme for Kahe {
         let len = cs[0].len();
         let q = chipmunk_code::KAHE_MODULUS as i64;
         let half = q / 2;
-        // Per ciphertext-poly position, sum across all clients in i64 (no
-        // overflow), then reduce mod q to a centered representative once. The
-        // result is ≡ Σ cᵢ (mod q), which is all `dec` (which subtracts the
-        // aggregate pad then reduces mod t) requires.
         (0..len)
             .into_par_iter()
             .map(|pos| {
@@ -531,33 +459,52 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_l4() {
+    fn round_trip_wide_mu() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
         let pp = Kahe::setup_with_dims(
             &mut rng,
-            5,
-            4,
+            20,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
             T_MODULUS_DEFAULT,
         );
         let k = Kahe::gen(&mut rng, &pp);
-        let m: Vec<KahePoly> = (0..pp.mu_kahe * pp.l)
+        let m: Vec<KahePoly> = (0..pp.mu_kahe)
             .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
             .collect();
         let c = Kahe::enc(&mut rng, &pp, &k, &m);
-        assert_eq!(c.len(), pp.mu_kahe * pp.l);
+        assert_eq!(c.len(), pp.mu_kahe);
+        let agg = Kahe::agg_key(std::slice::from_ref(&k));
+        assert_eq!(Kahe::dec(&pp, &c, &agg), m);
+    }
+
+    /// A message shorter than `μ` is legal — the trailing positions are unused.
+    #[test]
+    fn round_trip_partial_width() {
+        let mut rng = ChaCha20Rng::from_seed([19u8; 32]);
+        let pp = Kahe::setup_with_dims(
+            &mut rng,
+            20,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
+        let k = Kahe::gen(&mut rng, &pp);
+        let m: Vec<KahePoly> = (0..13)
+            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+            .collect();
+        let c = Kahe::enc(&mut rng, &pp, &k, &m);
+        assert_eq!(c.len(), 13);
         let agg = Kahe::agg_key(std::slice::from_ref(&k));
         assert_eq!(Kahe::dec(&pp, &c, &agg), m);
     }
 
     #[test]
-    fn additive_homomorphism_l4() {
+    fn additive_homomorphism_wide_mu() {
         let mut rng = ChaCha20Rng::from_seed([17u8; 32]);
         let pp = Kahe::setup_with_dims(
             &mut rng,
-            3,
-            4,
+            12,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
             T_MODULUS_DEFAULT,
@@ -566,7 +513,7 @@ mod tests {
         let keys: Vec<KaheKey> = (0..n).map(|_| Kahe::gen(&mut rng, &pp)).collect();
         let msgs: Vec<Vec<KahePoly>> = (0..n)
             .map(|_| {
-                (0..pp.mu_kahe * pp.l)
+                (0..pp.mu_kahe)
                     .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
                     .collect()
             })
@@ -578,7 +525,7 @@ mod tests {
             .collect();
         let agg_c = Kahe::agg_ctxt(&ctxts);
         let agg_k = Kahe::agg_key(&keys);
-        let agg_m_expected: Vec<KahePoly> = (0..pp.mu_kahe * pp.l)
+        let agg_m_expected: Vec<KahePoly> = (0..pp.mu_kahe)
             .map(|i| {
                 let summed = msgs.iter().fold(KahePoly::default(), |a, x| a + x[i]);
                 poly_mod_t(&summed, pp.t_modulus)

@@ -1,15 +1,4 @@
 //! P-256 ECDSA over bulletin posts.
-//!
-//! The RS mode moves the ciphertext off the bulletin, so what a client posts is
-//! a commitment plus an encrypted digest. Signing that binds the client to the
-//! digest it claims, which is what makes the dispute bisection in
-//! [`crate::protocol::dispute`] mean anything: without it a server could
-//! attribute a fabricated digest to a client it wants excluded.
-//!
-//! Still classical, unlike the post-quantum [`crate::pke`]. Deliberate: forging a
-//! signature requires breaking P-256 *before* the post is made, whereas a
-//! recorded envelope stays attackable forever, so confidentiality is what had to
-//! migrate first.
 
 use p256::ecdsa::signature::{Signer, Verifier};
 use rand::{CryptoRng, RngCore};

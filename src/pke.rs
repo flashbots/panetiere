@@ -3,20 +3,6 @@
 //! The canonical PKE for sealing per-server openings to a relay's long-lived
 //! encapsulation key. Wire form of a sealed envelope:
 //! `kem_ciphertext (1088 B) ‖ ciphertext+tag`.
-//!
-//! CCA2 comes from the KEM (FIPS 203's Fujisaki-Okamoto transform with implicit
-//! rejection), so the AEAD only has to be one-time secure. The KEM ciphertext is
-//! bound into the key schedule rather than passed as associated data — a mauled
-//! encapsulation yields a different key, not merely a failing tag. The AEAD
-//! associated data is the caller's `aad`, which binds the envelope to its
-//! protocol context — see [`crate::protocol::opening_aad`]. Decryption with a
-//! different context fails.
-//!
-//! Confidentiality here is post-quantum; [`crate::sig`] is still P-256. That
-//! asymmetry is deliberate: a sealed opening carries a Shamir share of a KAHE
-//! key, so recording envelopes now and breaking the KEM later would retroactively
-//! deanonymise past rounds, whereas breaking the signature later only forges
-//! future posts.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};

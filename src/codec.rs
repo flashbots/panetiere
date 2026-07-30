@@ -7,51 +7,26 @@
 //! coefficients. Coefficients land in `[0, 2^32) ⊂ [0, t = 2^36)` so a fresh
 //! single-client encode/decode is exact round-trip, with 2^4 per-coefficient
 //! headroom under mod-t summation.
-//!
-//! **Caveat on aggregation.** Decoding a *sum* of encoded messages is only
-//! meaningful for application-defined encodings (e.g. unique non-overlapping
-//! slots per client). Generic byte payloads from multiple clients will overflow
-//! the per-coefficient budget and the sum is not byte-recoverable. The protocol
-//! recovers `Σ m_i` as a polynomial; how to read meaning out of that is the
-//! application's choice.
 
 use chipmunk_code::{KahePoly, N};
 
 const BYTES_PER_COEFF: usize = 4;
-/// Bytes one `KahePoly` holds through [`encode_raw`]. Public so callers sizing a
-/// message vector use this definition rather than re-deriving `N · 4`.
 pub const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
 const HEADER_LEN: usize = 4;
 /// Per-coefficient symbol modulus (what fits in `BYTES_PER_COEFF` bytes).
-/// Strictly below t = 2^36, so legit slot data decrypts to non-negative
-/// centered residues `< 2^32` — anything else is overflow.
 const SYMBOL_MOD: i64 = 1 << 32;
 
 #[derive(Debug, PartialEq)]
 pub enum CodecError {
-    /// `polys` was empty so no header could be read.
     Empty,
-    /// Decoded length exceeds available payload bytes.
     LengthOverflow { claimed: u32, available: usize },
-    /// A coefficient lies outside `[0, 2^32)` after centering — typically caused
-    /// by decoding a sum of encoded messages whose per-coefficient sums
-    /// overflowed the symbol modulus.
     CoeffOutOfRange { index: usize, value: i64 },
 }
 
-/// Encode `bytes` into a sequence of polynomials, padding to a whole number of
-/// coefficients but **without** any length header. Used when caller pre-agrees
-/// on a fixed buffer size — typical for slot-mode aggregation, where one
-/// `decode_raw(sum_of_encoded)` returns the per-slot mixture without the
-/// header coefficients overflowing under summation.
 pub fn encode_raw(bytes: &[u8]) -> Vec<KahePoly> {
-    // `coeffs_from_bytes` zero-pads short groups internally, so the
-    // final under-filled chunk produces a correctly padded poly.
     bytes.chunks(BYTES_PER_POLY).map(coeffs_from_bytes).collect()
 }
 
-/// Decode polynomials produced by `encode_raw`. Returns `polys.len() *
-/// BYTES_PER_POLY` bytes (caller trims/parses).
 pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     if polys.is_empty() {
         return Err(CodecError::Empty);
@@ -83,7 +58,6 @@ fn coeffs_from_bytes(chunk: &[u8]) -> KahePoly {
     KahePoly::from_coeffs(coeffs)
 }
 
-/// Encode `bytes` into a sequence of polynomials. Always succeeds.
 pub fn encode(bytes: &[u8]) -> Vec<KahePoly> {
     let mut buf = Vec::with_capacity(HEADER_LEN + bytes.len());
     buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -100,8 +74,6 @@ pub fn encode(bytes: &[u8]) -> Vec<KahePoly> {
     polys
 }
 
-/// Decode a sequence of polynomials produced by `encode`. Each coefficient must
-/// lie in `[0, 2^32)` (after centering); otherwise `CoeffOutOfRange` is returned.
 pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     if polys.is_empty() {
         return Err(CodecError::Empty);
@@ -147,9 +119,6 @@ pub fn beacon(rands: &[u16]) -> u16 {
     u16::from_le_bytes([d[0], d[1]])
 }
 
-/// Byte offset for each `(rand, size)` reservation, packing in `rand` order from
-/// `beacon` (wrapping) into `vector_bytes`, 2-byte aligned. `None` if it would
-/// overflow or its `rand` ties another (ambiguous order — dropped).
 pub fn allocate(reservations: &[(u16, usize)], beacon: u16, vector_bytes: usize) -> Vec<Option<usize>> {
     let mut order: Vec<usize> = (0..reservations.len()).collect();
     order.sort_by_key(|&i| (reservations[i].0.wrapping_sub(beacon), reservations[i].1));
@@ -178,7 +147,6 @@ pub fn allocate(reservations: &[(u16, usize)], beacon: u16, vector_bytes: usize)
     out
 }
 
-/// `vector_bytes`-wide buffer, zero except `payload` at `offset`, via [`encode_raw`].
 pub fn encode_at(offset: usize, vector_bytes: usize, payload: &[u8]) -> Vec<KahePoly> {
     let mut buf = vec![0u8; vector_bytes];
     let end = (offset + payload.len()).min(vector_bytes);
@@ -186,7 +154,6 @@ pub fn encode_at(offset: usize, vector_bytes: usize, payload: &[u8]) -> Vec<Kahe
     encode_raw(&buf)
 }
 
-/// Slice each `(offset, size)` range out of a decoded full-width plaintext.
 pub fn decode_ranges(plain: &[KahePoly], ranges: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, CodecError> {
     let buf = decode_raw(plain)?;
     let mut out = Vec::with_capacity(ranges.len());

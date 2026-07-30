@@ -1,12 +1,4 @@
-//! Additive Multi-Set Encoding (paper §3, Fig. 1).
-//!
-//! Matrices `(C, K_0, … , K_{L-1}, V_0, … , V_{ξ-1})` of shape `γ × δ`
-//! over `Z_t`. The per-element randomness `r` lives in `Z_{t^L}` and is
-//! split into `L` base-`t` limbs; each element is a `ξ`-tuple
-//! `(x_0, … , x_{ξ-1})` with each symbol in `Z_t`, so a `payload_symbols
-//! · log₂ t`-bit message rides one MSE insert. C and K are shared
-//! across symbols — they're determined by `r` alone — so the overhead
-//! amortises over ξ.
+//! Additive Multi-Set Encoding
 //!
 //! ```text
 //!   r ← Z_{t^L}                            (per-element randomness)
@@ -16,31 +8,6 @@
 //!     C[i,j] += 1; K_ℓ[i,j] += r_ℓ
 //!     V_s[i,j] += x_s                      (s ∈ [ξ])
 //! ```
-//!
-//! `Decode` peels cells with `C[i*, j*] = 1`: it reads each limb
-//! `r_ℓ := K_ℓ[i*,j*]`, reconstructs `r = Σ r_ℓ · t^ℓ`, reads each
-//! payload symbol `x_s := V_s[i*, j*]`, emits the tuple
-//! `(x_0, … , x_{ξ-1})`, and subtracts that element's contribution
-//! from every row by re-running PRF. Theorem 3 correctness:
-//! `2^{-(γ-2) log ρ} + negl(λ)` — independent of ξ (peeling decisions
-//! live on C only).
-//!
-//! Widening L does not require growing C: C is a per-cell hit counter,
-//! bounded by `(n/δ)` independent of how `r` is sampled. K-limb cells
-//! store base-`t` digits, each accumulating in the same `Z_t` as the
-//! single-limb design. So L only multiplies the r-space cardinality,
-//! not per-cell magnitudes. Likewise widening ξ adds `ξ` extra `V`
-//! matrices but leaves C and K unchanged.
-//!
-//! `pack` / `unpack` flatten/restore the matrices as a sequence of
-//! `KahePoly` coefficient slots (`C, K_0…K_{L-1}, V_0…V_{ξ-1}`, each
-//! row-major) so the encoding rides over the Panetière protocol's KAHE
-//! ciphertext stream. Sum-of-encodings is pointwise add over the
-//! `KahePoly`s.
-//!
-//! MSE cell arithmetic runs in `Z_t` where `t = T_MODULUS_DEFAULT` is
-//! the KAHE plaintext modulus. With `t = 2^36` and `L = K_LIMBS = 2`,
-//! `r ∈ Z_{t^2} = Z_{2^72}`, so r-arithmetic runs in `u128`.
 
 use chipmunk_code::{KahePoly, N};
 use rand::Rng;
@@ -55,26 +22,12 @@ pub const K_LIMBS: usize = 2;
 /// Bits of payload carried per symbol.
 pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
 
-/// Per-row bucket-count layout. `Uniform` is the standard IBLT shape;
-/// `Geometric { shrink }` multiplies row `i`'s bucket count by
-/// `shrink^i` (rounded, floored at 1) for a smaller structure at the
-/// cost of some peeling margin in the later (denser) rows. `shrink =
-/// 1.0` reproduces `Uniform`; `shrink = 0.5` halves each row.
-#[derive(Clone, Debug, PartialEq)]
-pub enum RowLayout {
-    Uniform,
-    Geometric { shrink: f64 },
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
     pub gamma: usize,
-    /// Number of buckets in row 0. Subsequent rows follow `row_layout`.
+    /// Buckets per row.
     pub delta: usize,
-    /// Symbols per element. Each symbol is one `Z_t` value, so total
-    /// payload per element is `payload_symbols · BITS_PER_SYMBOL` bits.
     pub payload_symbols: usize,
-    pub row_layout: RowLayout,
     pub prf_key: [u8; 32],
 }
 
@@ -86,16 +39,6 @@ impl MseParams {
         payload_symbols: usize,
         prf_key: [u8; 32],
     ) -> Self {
-        Self::with_layout(gamma, delta, payload_symbols, RowLayout::Uniform, prf_key)
-    }
-
-    pub fn with_layout(
-        gamma: usize,
-        delta: usize,
-        payload_symbols: usize,
-        row_layout: RowLayout,
-        prf_key: [u8; 32],
-    ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
@@ -103,7 +46,6 @@ impl MseParams {
             gamma,
             delta,
             payload_symbols,
-            row_layout,
             prf_key,
         }
     }
@@ -114,23 +56,8 @@ impl MseParams {
         bits.div_ceil(BITS_PER_SYMBOL)
     }
 
-    /// Buckets in row `row`.
-    pub fn row_delta(&self, row: usize) -> usize {
-        match self.row_layout {
-            RowLayout::Uniform => self.delta,
-            RowLayout::Geometric { shrink } => {
-                ((self.delta as f64) * shrink.powi(row as i32)).round().max(1.0) as usize
-            }
-        }
-    }
-
-    /// Offset (in cells) of row `row` within a per-matrix flat layout.
-    pub fn row_offset(&self, row: usize) -> usize {
-        (0..row).map(|i| self.row_delta(i)).sum()
-    }
-
     pub fn total_cells(&self) -> usize {
-        (0..self.gamma).map(|i| self.row_delta(i)).sum()
+        self.gamma * self.delta
     }
 
     /// `(1 + K_LIMBS + payload_symbols)` scalars per cell: C, K_0…K_{L-1},
@@ -163,11 +90,8 @@ pub struct MseEncoding {
 
 #[derive(Debug, PartialEq)]
 pub enum MseError {
-    /// Peeling stalled: cells remain non-zero but no pure cell exists.
     PeelStalled,
-    /// `params` of two encodings disagree under `add_assign`.
     ParamsMismatch,
-    /// `payload` slice length disagrees with `params.payload_symbols`.
     PayloadArity,
 }
 
@@ -210,20 +134,15 @@ impl MseEncoding {
     }
 
     fn idx(&self, row: usize, col: usize) -> usize {
-        self.params.row_offset(row) + col
+        row * self.params.delta + col
     }
 
-    /// Insert one element. `payload.len()` must equal
-    /// `params.payload_symbols`; each entry is reduced mod `t`. Fresh
-    /// randomness `r ← Z_{t^L}` is drawn from `rng`.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i64]) {
         let r_space = self.params.r_space();
         let r: u128 = rng.gen::<u128>() % r_space;
         self.insert_with_r(payload, r);
     }
 
-    /// Insert with caller-supplied randomness — useful for deterministic
-    /// tests. `r` must be in `[0, t^K_LIMBS)`.
     pub fn insert_with_r(&mut self, payload: &[i64], r: u128) {
         assert_eq!(
             payload.len(),
@@ -240,7 +159,7 @@ impl MseEncoding {
         }
         let payload_reduced: Vec<i64> = payload.iter().map(|&x| reduce(x)).collect();
         for row in 0..self.params.gamma {
-            let col = prf_bucket(&self.params.prf_key, row, r, self.params.row_delta(row));
+            let col = prf_bucket(&self.params.prf_key, row, r, self.params.delta);
             let idx = self.idx(row, col);
             self.c[idx] = reduce(self.c[idx] + 1);
             for ell in 0..K_LIMBS {
@@ -252,7 +171,6 @@ impl MseEncoding {
         }
     }
 
-    /// Pointwise add another encoding into self. Both must share `params`.
     pub fn add_assign(&mut self, other: &Self) -> Result<(), MseError> {
         if self.params != other.params {
             return Err(MseError::ParamsMismatch);
@@ -269,11 +187,6 @@ impl MseEncoding {
         Ok(())
     }
 
-    /// Peel pure cells until exhausted. Returns the recovered multiset
-    /// as a `Vec` of payload tuples (each `Vec<i64>` has length
-    /// `params.payload_symbols`), sorted lexicographically. Returns
-    /// `Err(PeelStalled)` if any cell remains nonzero after no further
-    /// pure cell can be found.
     pub fn decode(&self) -> Result<Vec<Vec<i64>>, MseError> {
         let mut c = self.c.clone();
         let mut k = self.k.clone();
@@ -281,10 +194,8 @@ impl MseEncoding {
 
         let mut queue: Vec<(usize, usize)> = Vec::new();
         for row in 0..self.params.gamma {
-            let offset = self.params.row_offset(row);
-            for col in 0..self.params.row_delta(row) {
-                let idx = offset + col;
-                if c[idx] == 1 {
+            for col in 0..self.params.delta {
+                if c[row * self.params.delta + col] == 1 {
                     queue.push((row, col));
                 }
             }
@@ -294,17 +205,8 @@ impl MseEncoding {
         let mut limb_signed = [0i64; K_LIMBS];
         let mut x_star_buf = vec![0i64; self.params.payload_symbols];
         let t_u128 = T_MODULUS_DEFAULT as u128;
-        // Outer loop terminates because every iteration that hits the
-        // `c[idx] == 1` branch strictly reduces the multiset still
-        // encoded in the matrices: one element is emitted and subtracted
-        // from its γ rows. The queue can only grow with cells that just
-        // became pure as a side effect of that subtraction (`c[cell] ==
-        // 1` post-decrement), so it never re-enqueues the cell we just
-        // peeled. Stale `(row, col)` entries from earlier peels are
-        // discarded by the `c[idx] != 1` guard. Total pure-peel
-        // iterations ≤ initial multiset size, so progress is bounded.
         while let Some((row, col)) = queue.pop() {
-            let idx = self.params.row_offset(row) + col;
+            let idx = row * self.params.delta + col;
             if c[idx] != 1 {
                 continue;
             }
@@ -321,9 +223,8 @@ impl MseEncoding {
             }
             emitted.push(x_star_buf.clone());
             for i in 0..self.params.gamma {
-                let row_d = self.params.row_delta(i);
-                let j = prf_bucket(&self.params.prf_key, i, r_star, row_d);
-                let cell = self.params.row_offset(i) + j;
+                let j = prf_bucket(&self.params.prf_key, i, r_star, self.params.delta);
+                let cell = i * self.params.delta + j;
                 c[cell] = reduce(c[cell] - 1);
                 for ell in 0..K_LIMBS {
                     k[ell][cell] = reduce(k[ell][cell] - limb_signed[ell]);
@@ -347,20 +248,15 @@ impl MseEncoding {
         Ok(emitted)
     }
 
-    /// Number of `KahePoly`s required to pack this encoding.
     pub fn n_polys(params: &MseParams) -> usize {
         params.total_scalars().div_ceil(N)
     }
 
-    /// Cover-traffic message: zero polys, same count as `pack()`. Adds nothing
-    /// to the homomorphic sum, so it occupies no IBLT cell. NOT `insert(&[0,…])`
-    /// (that draws fresh `r` and peels back out as a real element).
+    /// Cover-traffic message: zero polys
     pub fn cover(params: &MseParams) -> Vec<KahePoly> {
         Self::new(params.clone()).pack()
     }
 
-    /// Flatten `(C, K_0…K_{L-1}, V_0…V_{ξ-1})` into KahePoly coefficient
-    /// slots in that order, each row-major.
     pub fn pack(&self) -> Vec<KahePoly> {
         let total = self.params.total_scalars();
         let n_polys = total.div_ceil(N);
@@ -395,7 +291,6 @@ impl MseEncoding {
         polys
     }
 
-    /// Inverse of `pack`. `polys.len()` must equal `n_polys(params)`.
     pub fn unpack(params: &MseParams, polys: &[KahePoly]) -> Self {
         let total = params.total_scalars();
         assert_eq!(polys.len(), total.div_ceil(N));
@@ -583,38 +478,6 @@ mod tests {
         messages.sort();
         recovered.sort();
         assert_eq!(recovered, messages);
-    }
-
-    #[test]
-    fn halving_layout_round_trip() {
-        let mut rng = ChaCha20Rng::from_seed([37u8; 32]);
-        let pp = MseParams::with_layout(
-            5,
-            128,
-            1,
-            RowLayout::Geometric { shrink: 0.5 },
-            [43u8; 32],
-        );
-        // Row sizes should be 128, 64, 32, 16, 8 → total 248.
-        assert_eq!(
-            (0..pp.gamma).map(|i| pp.row_delta(i)).collect::<Vec<_>>(),
-            vec![128, 64, 32, 16, 8],
-        );
-        assert_eq!(pp.total_cells(), 248);
-        let mut enc = MseEncoding::new(pp);
-        let mut elements: Vec<i64> = (0..20).map(|i| i * 7 + 1).collect();
-        for &x in &elements {
-            enc.insert(&mut rng, &[x]);
-        }
-        let mut recovered: Vec<i64> = enc
-            .decode()
-            .expect("decode")
-            .into_iter()
-            .map(|t| t[0])
-            .collect();
-        elements.sort();
-        recovered.sort();
-        assert_eq!(recovered, elements);
     }
 
     #[test]

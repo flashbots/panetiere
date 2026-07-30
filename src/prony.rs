@@ -25,37 +25,17 @@
 //!    solve: `x_{i,s} = (Σ_m b_{i,m} W[s][m]) / Λ'(z_i)` where
 //!    `Λ(X)/(X − z_i) = Σ_m b_{i,m} X^m`.
 //!
-//! Why bother: the Vandermonde is MDS, so *any* `k ≤ capacity` distinct points
-//! are independent and there is no collision/peeling slack to pay. The sketch
-//! is `(1 + ξ)·capacity + 1` scalars against the IBLT's `γδ·(1 + L + ξ)` with
-//! `γδ ≈ 3ρ` — a 3× smaller client plaintext, hence a 3× smaller ciphertext,
-//! which is the term the round is gated on (`notes/erasure-lanes.md`).
-//! `ρ·ξ` is the information-theoretic floor for recovering `ρ` payloads of `ξ`
-//! symbols, so this is within `1/ξ` of optimal.
-//!
 //! Cost of the swap: **`p` must be prime.** `T_MODULUS_DEFAULT = 2^36` is not,
 //! and Newton's identities divide by `1..k`. [`PRONY_PRIME`] is a 36-bit prime,
 //! so nothing in the KAHE budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` moves and the
 //! codec's 32-bit symbols still fit. `KaheParams::t_modulus` is already a free
 //! `u64`.
-//!
-//! Failure mode differs too. Peeling degrades gracefully and stalls visibly;
-//! this decodes all-or-nothing. Two contributors drawing the same `z` make `Λ`
-//! non-squarefree and the round is lost (birthday: `ρ²/2p ≈ 6.5e−7` at
-//! `ρ = 300`). `slack` extra columns are checked against the recovered
-//! solution, so corruption and capacity overflow are detected rather than
-//! returned as garbage.
 
 use chipmunk_code::{KahePoly, N};
 use rand::Rng;
 use rayon::prelude::*;
 
-/// Plaintext modulus, drop-in for `T_MODULUS_DEFAULT = 2^36`: `65535·2^20 + 1`,
-/// prime, 36 bits, so the KAHE budget is unchanged.
-///
-/// FFT-friendly in the sense Rabbit-Mix's root-finder needs — `q = M·2^m + 1`
-/// with the locator degree below `2^m` — here `m = 20`, so any capacity up to
-/// 2^20. `p − 1 = 2^20·3·5·17·257`.
+/// Plaintext modulus, FFT-friendly in the sense Rabbit-Mix's root-finder needs — `q = M·2^m + 1`
 pub const PRONY_PRIME: u64 = (65_535u64 << 20) + 1;
 
 // ---------------------------------------------------------------

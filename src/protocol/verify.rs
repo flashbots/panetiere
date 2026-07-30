@@ -41,15 +41,6 @@ pub enum VerifyError {
     CiphertextOutOfRange,
 }
 
-/// Public verifier (README step 9):
-/// 1. sum ciphertexts and commitments over the canonical client set
-/// 2. for each server, check `agg_open` opens the summed commitment
-/// 3. recover the aggregate KAHE key from any `t` per-server `agg_share`s
-///    via Shamir interpolation
-/// 4. decrypt the summed ciphertext with `Σ sk_j`
-/// Per-phase wall-time breakdown produced by [`aggregate_and_decrypt_timed`].
-/// `agg_ctxt_us` and `kahe_dec_us` scale with `pp.kahe.l` (per-chunk); the
-/// remaining fields are fixed per round.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VerifyTimings {
     pub agg_ctxt_us: f64,
@@ -59,9 +50,6 @@ pub struct VerifyTimings {
     pub kahe_dec_us: f64,
 }
 
-/// Check one server's `agg_open` against the summed commitment. Independent
-/// across servers, so callers run this via `par_iter` and scan the results
-/// serially to preserve the earliest-index error.
 fn verify_one_server(
     pp: &ProtocolParams,
     summed_comm: &Commitment,
@@ -80,7 +68,6 @@ fn verify_one_server(
     Ok(())
 }
 
-/// Interpolate `Σ sk_j` from the first `t` servers' shares, then lift to R_{q_kahe}.
 fn recover_agg_key(
     pp: &ProtocolParams,
     server_outputs: &[ServerBulletinEntry],
@@ -129,11 +116,9 @@ pub fn aggregate_and_decrypt_timed(
         return Err(VerifyError::NoServers);
     }
     check_anonymity_floor(pp, canonical)?;
-    let mu_kahe = pp.kahe.mu_kahe;
-    let l = pp.kahe.l;
-    // Ciphertexts may end with a partial chunk; all clients must agree on the
-    // exact length (agg_ctxt sums positionally), bounded by μ·l.
-    let max_ctxt_len = mu_kahe * l;
+    // A ciphertext may be shorter than μ; all clients must agree on the exact
+    // length, since agg_ctxt sums positionally.
+    let max_ctxt_len = pp.kahe.mu_kahe;
     let t = pp.shamir.t;
 
     if server_outputs.len() < t {
@@ -212,9 +197,6 @@ pub fn aggregate_and_decrypt_timed(
     Ok((m, tt))
 }
 
-/// Per-phase wall time for [`aggregate_and_decrypt_rs`]. `reconstruct_us`
-/// replaces the direct flow's `agg_ctxt_us`: the nodes already did the summing,
-/// so the verifier only interpolates.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct RsVerifyTimings {
     pub sig_verify_us: f64,
@@ -229,14 +211,6 @@ pub struct RsVerifyTimings {
     pub kahe_dec_us: f64,
 }
 
-/// RS-mode verifier.
-///
-/// The ciphertext never reaches here whole: `k` node share-sums are
-/// interpolated back into `Σ ct`, which is exact because coding and
-/// aggregation are both `Z_q`-linear. The digest slot is summed from the
-/// bulletin instead, decrypted alongside, and checked against the recovered
-/// plaintext — see [`crate::digest`] for what that check does and does not
-/// catch.
 pub fn aggregate_and_decrypt_rs(
     pp: &ProtocolParams,
     sid: &SessionId,
@@ -399,15 +373,13 @@ pub fn decrypt_aggregate(
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
-    let mu_kahe = pp.kahe.mu_kahe;
-    let l = pp.kahe.l;
     let t = pp.shamir.t;
 
     if server_outputs.len() < t {
         return Err(VerifyError::BadServerCoverage);
     }
-    // Partial final chunk allowed; μ·l bounds the length.
-    if summed_ctxt.is_empty() || summed_ctxt.len() > mu_kahe * l {
+    // Shorter than μ is allowed; μ bounds the length.
+    if summed_ctxt.is_empty() || summed_ctxt.len() > pp.kahe.mu_kahe {
         return Err(VerifyError::InconsistentCiphertextLen(
             server_outputs[0].server_id,
         ));

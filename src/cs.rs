@@ -1,4 +1,4 @@
-//! Commitment scheme: §5.3 hiding-vector-commitment composition.
+//! Hiding-vector-commitment composition.
 //!
 //! `BDLOP_Leaf(s; r) = (c¹, c²) = (a^T r,  B r + s)` is a hiding commitment
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
@@ -518,7 +518,7 @@ impl Cs for HidingMerkleCommitment {
             })
             .collect();
 
-        // --- HVC-ring data (block subtree + path): optimized SIMD path. ---
+        // --- HVC-ring data (leaf digits + path): optimized SIMD path. ---
         // Allocate the output Box up front and accumulate directly into its
         // coefficients (avoids acc → output transcription). Opening-major loop
         // preserves the HW prefetcher's stream over each opening's contiguous
