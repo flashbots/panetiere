@@ -73,7 +73,9 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use chipmunk_code::{DgtNTTPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
+use rayon::prelude::*;
+
+use chipmunk_code::{HVCPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
 use crate::codec;
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
@@ -85,7 +87,10 @@ use crate::pke;
 use crate::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::bulletin::dgt_packed_len;
-use crate::digest::{digest, embed, DIGEST_POLYS};
+use crate::digest::embed;
+use crate::share_commitment::{
+    commit_shares, fresh_path_packed_len, ingest_share, lane_post_packed_len, open_share,
+};
 use crate::protocol::aggregator::run_aggregator_round;
 use crate::protocol::client::{
     cs_commit, kahe_encrypt, kahe_keygen, run_client_round, run_client_round_rs, seal_openings,
@@ -382,21 +387,30 @@ struct RsPlan {
     k: usize,
     n_nodes: usize,
     share_b: usize,
+    /// One lane's Merkle path, sent alongside its share.
+    path_b: usize,
+    /// A lane's digit-domain post: the summed opening plus its path.
+    lane_post_b: usize,
     bulletin_b: usize,
     dgt_embed: Stat,
-    dgt_hash: Stat,
+    share_commit: Stat,
     rs_enc: Stat,
+    /// Full lane round: ρ opens, the digit-wise sum, one aggregate proof.
     node_sum: Stat,
+    /// Breakdown of `node_sum` — per-client decompose + bound checks.
+    lane_ingest: Stat,
+    /// Off the happy path: ρ per-client verifications to name a culprit.
+    lane_attribute: Stat,
     v_sig: Stat,
     v_open: Stat,
     v_interp: Stat,
+    v_lane_open: Stat,
+    v_crosscheck: Stat,
     v_reconstruct: Stat,
     v_reconstruct_lagrange: Stat,
-    v_syndrome: Stat,
     v_kahe_dec: Stat,
-    v_digest: Stat,
     recovered: bool,
-    /// Which mechanism rejected a single flipped coefficient in one lane's sum.
+    /// Which mechanism rejected a tampered lane post.
     lane_lie_caught: &'static str,
 }
 
@@ -727,21 +741,25 @@ mod csv_tests {
                 k: 14,
                 n_nodes: 16,
                 share_b: 1884160,
-                bulletin_b: 8192,
+                path_b: 86016,
+                lane_post_b: 4423680,
+                bulletin_b: 4194,
                 dgt_embed: Stat::default(),
-                dgt_hash: Stat::default(),
+                share_commit: Stat::default(),
                 rs_enc: Stat::default(),
                 node_sum: Stat::default(),
+                lane_ingest: Stat::default(),
+                lane_attribute: Stat::default(),
                 v_sig: Stat::default(),
                 v_open: Stat::default(),
                 v_interp: Stat::default(),
+                v_lane_open: Stat::default(),
+                v_crosscheck: Stat::default(),
                 v_reconstruct: Stat::default(),
                 v_reconstruct_lagrange: Stat::default(),
-                v_syndrome: Stat::default(),
                 v_kahe_dec: Stat::default(),
-                v_digest: Stat::default(),
                 recovered: true,
-                lane_lie_caught: "syndrome",
+                lane_lie_caught: "lane-proof",
             }],
         };
         for (i, p) in PHASES.iter().enumerate() {
@@ -785,7 +803,9 @@ mod csv_tests {
         assert_eq!(b.plaintext_b, row.plaintext_b);
         assert!((b.eps_correct - row.eps_correct).abs() < 0.01);
         assert_eq!(b.rs_plans[0].k, 14);
-        assert_eq!(b.rs_plans[0].lane_lie_caught, "syndrome");
+        assert_eq!(b.rs_plans[0].lane_lie_caught, "lane-proof");
+        assert_eq!(b.rs_plans[0].path_b, row.rs_plans[0].path_b);
+        assert_eq!(b.rs_plans[0].lane_post_b, row.rs_plans[0].lane_post_b);
         // Topology is recomputed, not stored — it must land on the same values.
         assert_eq!(b.agg_plans[0].group_size, row.agg_plans[0].group_size);
         assert_eq!(b.agg_plans[0].layer_counts, row.agg_plans[0].layer_counts);
@@ -1331,32 +1351,63 @@ fn run_cell(
                 })
                 .collect();
 
+            let scp = pp_rs.share_comm.as_ref().unwrap();
+            let roots: Vec<(ClientId, HVCPoly)> = entries
+                .iter()
+                .map(|(cid, e)| (*cid, e.share_root))
+                .collect();
             let node_inboxes: Vec<RsNodeInbox> = (0..n_nodes)
                 .map(|j| RsNodeInbox {
                     node_id: NodeId(j as u32),
                     items: rounds
                         .iter()
-                        .map(|r| (r.client_id, r.rs_shares[j].clone()))
+                        .map(|r| {
+                            (
+                                r.client_id,
+                                r.rs_shares[j].clone(),
+                                r.share_paths[j].clone(),
+                            )
+                        })
                         .collect(),
                 })
                 .collect();
-            let (node_sum, _) =
-                measure(|| run_rs_node_round(&node_inboxes[0], &canonical).unwrap());
+            let (node_sum, _) = measure(|| {
+                run_rs_node_round(scp, &node_inboxes[0], &canonical, &roots).unwrap()
+            });
+            // The per-client half of the lane round: decompose + bound-check,
+            // no hashing. Same rayon shape, so it is a breakdown of `node_sum`.
+            let (lane_ingest, _) = measure(|| {
+                node_inboxes[0]
+                    .items
+                    .par_iter()
+                    .filter(|(_, share, path)| open_share(scp, 0, share, path).is_none())
+                    .count()
+            });
+            // What naming a culprit costs, charged only when the aggregate fails.
+            let (lane_attribute, _) = measure(|| {
+                node_inboxes[0]
+                    .items
+                    .par_iter()
+                    .filter(|(cid, share, path)| {
+                        let root = roots.iter().find(|(c, _)| c == cid).unwrap().1;
+                        ingest_share(scp, &root, 0, share, path).is_none()
+                    })
+                    .count()
+            });
             let node_outputs: Vec<RsNodeBulletinEntry> = node_inboxes
                 .iter()
-                .map(|inb| run_rs_node_round(inb, &canonical).unwrap())
+                .map(|inb| run_rs_node_round(scp, inb, &canonical, &roots).unwrap())
                 .collect();
 
-            // Embedding into the digest ring is n_polys forward NTTs; the Ajtai
-            // hash is DIGEST_POLYS AVX2 dots over them; encoding is
-            // (n−k)·n_polys·N modmuls, since systematic shares are the blocks.
-            let dp = pp_rs.digest.as_ref().unwrap();
+            // Embedding into the digest ring is n_polys forward NTTs; encoding is
+            // (n−k)·n_polys·N modmuls, since systematic shares are the blocks; the
+            // commitment is n leaf hashes over block_len·DGT_WIDTH digits each.
             let key0 = kahe_keygen(&mut rrng, &pp_rs);
             let ctxt0 = kahe_encrypt(&mut rrng, &pp_rs, &key0, &client_polys[0]);
             let (dgt_embed, embedded0) = measure(|| embed(&ctxt0));
-            let (dgt_hash, _) = measure(|| digest(dp, &embedded0));
             let rs_params = pp_rs.rs.as_ref().unwrap();
             let (rs_enc, shares0) = measure(|| Rs::encode(rs_params, &embedded0));
+            let (share_commit, _) = measure(|| commit_shares(scp, &shares0));
             let share_b = shares0[0].len() * dgt_packed_len();
 
             let run_verify = |nodes: &[RsNodeBulletinEntry]| {
@@ -1388,18 +1439,13 @@ fn run_cell(
                 }
             }
 
-            // A single flipped coefficient in one lane's sum must not decode.
-            // A +1 coefficient-domain bump: stays inside the norm bound, so it
-            // reaches the algebraic checks rather than tripping the range check.
+            // A tampered lane post must be attributed, not just detected: a
+            // wrong share_sum no longer hashes to the labels its opening
+            // projects to, so the Ajtai check names the lane.
             let mut lying = node_outputs.clone();
-            let mut unit = [0i64; POLY_N];
-            unit[0] = 1;
-            lying[0].share_sum[0] =
-                lying[0].share_sum[0] + DgtNTTPoly::from_kahe(&KahePoly::from_coeffs(unit));
+            lying[0].share_sum[0] = lying[0].share_sum[0] + lying[0].share_sum[0];
             let lane_lie_caught = match run_verify(&lying) {
-                Err(VerifyError::LaneMismatch(_)) => "syndrome",
-                Err(VerifyError::DigestMismatch) => "digest",
-                Err(VerifyError::CiphertextOutOfRange) => "norm",
+                Err(VerifyError::LaneOpeningFailed(ref v)) if v == &[NodeId(0)] => "lane-proof",
                 Err(_) => "other",
                 Ok(_) => "MISSED",
             };
@@ -1408,23 +1454,27 @@ fn run_cell(
                 k,
                 n_nodes,
                 share_b,
-                bulletin_b: RsClientBulletinEntry::packed_len(DIGEST_POLYS),
+                path_b: fresh_path_packed_len(n_nodes),
+                lane_post_b: lane_post_packed_len(scp.block_len, n_nodes, RS_RHO_MAX),
+                bulletin_b: RsClientBulletinEntry::packed_len(),
                 dgt_embed,
-                dgt_hash,
+                share_commit,
                 rs_enc,
                 node_sum,
+                lane_ingest,
+                lane_attribute,
                 v_sig: rstat(|v| v.sig_verify_us),
                 v_open: rstat(|v| v.opening_verify_us),
                 v_interp: rstat(|v| v.interpolation_us),
+                v_lane_open: rstat(|v| v.lane_open_us),
+                v_crosscheck: rstat(|v| v.crosscheck_us),
                 v_reconstruct: rstat(|v| v.reconstruct_us),
                 v_reconstruct_lagrange: if lag.is_empty() {
                     Stat::default()
                 } else {
                     stat(lag)
                 },
-                v_syndrome: rstat(|v| v.syndrome_us),
                 v_kahe_dec: rstat(|v| v.kahe_dec_us),
-                v_digest: rstat(|v| v.digest_us),
                 recovered: rs_recovered.as_deref().map(check_decode).unwrap_or(false),
                 lane_lie_caught,
             }
@@ -1519,17 +1569,19 @@ fn run_cell(
             .map(|mut p| {
                 for st in [
                     &mut p.dgt_embed,
-                    &mut p.dgt_hash,
+                    &mut p.share_commit,
                     &mut p.rs_enc,
                     &mut p.node_sum,
+                    &mut p.lane_ingest,
+                    &mut p.lane_attribute,
                     &mut p.v_sig,
                     &mut p.v_open,
                     &mut p.v_interp,
+                    &mut p.v_lane_open,
+                    &mut p.v_crosscheck,
                     &mut p.v_reconstruct,
                     &mut p.v_reconstruct_lagrange,
-                    &mut p.v_syndrome,
                     &mut p.v_kahe_dec,
-                    &mut p.v_digest,
                 ] {
                     *st = owned(roles.rs, *st);
                 }
@@ -1611,8 +1663,8 @@ fn model(r: &Row) -> Model {
             r.enc_app.med
                 + r.kahe_enc.med
                 + p.dgt_embed.med
-                + p.dgt_hash.med
                 + p.rs_enc.med
+                + p.share_commit.med
                 + r.share.med
                 + r.cs.med
                 + r.seal.med
@@ -1623,10 +1675,10 @@ fn model(r: &Row) -> Model {
                 + r.v_sum_comm.med
                 + p.v_open.med
                 + p.v_interp.med
+                + p.v_lane_open.med
+                + p.v_crosscheck.med
                 + p.v_reconstruct.med
-                + p.v_syndrome.med
                 + p.v_kahe_dec.med
-                + p.v_digest.med
                 + r.dec_app.med
         })
         .collect();
@@ -1724,23 +1776,22 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
         .iter()
         .zip(&m.rs_cpu_us)
         .map(|(p, &rs_cpu_us)| {
-            let share_b = p.share_b as f64;
-            let client_shares_b = p.n_nodes as f64 * share_b;
-            let node_in_b = r.n as f64 * share_b;
+            // Each share travels with its Merkle path, so the lane can verify
+            // it against the client's signed root before summing.
+            let lane_item_b = (p.share_b + p.path_b) as f64;
+            let client_shares_b = p.n_nodes as f64 * lane_item_b;
+            let node_in_b = r.n as f64 * lane_item_b;
             let a = (maxlat(r.n) + xfer_cl(client_shares_b + p.bulletin_b as f64)) // client uplink
                 .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
                 .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
                 .max(maxlat(r.n) + xfer_srv(node_in_b)) // one lane's ingest
                 .max(maxlat(r.n) + xfer_bul(r.n as f64 * p.bulletin_b as f64)); // bulletin ingest
+            let lane_posts_b = p.n_nodes as f64 * p.lane_post_b as f64;
             let b = (maxlat(r.s) + xfer_bul(r.wire_server_b))
-                .max(maxlat(p.n_nodes) + xfer_srv(p.n_nodes as f64 * share_b));
-            // All n share-sums: k reconstruct, the rest are the syndrome.
+                .max(maxlat(p.n_nodes) + xfer_srv(lane_posts_b));
+            // Every lane post: k reconstruct, all of them carry a proof.
             let c = maxlat(1)
-                + xfer_bul(
-                    p.n_nodes as f64 * share_b
-                        + r.wire_server_b
-                        + r.n as f64 * p.bulletin_b as f64,
-                );
+                + xfer_bul(lane_posts_b + r.wire_server_b + r.n as f64 * p.bulletin_b as f64);
             let net_us = a + b + c;
             (net_us, rs_cpu_us + net_us)
         })
@@ -1910,27 +1961,30 @@ fn print_tables(rows: &[Row]) {
     println!();
 
     if rows.iter().any(|r| !r.rs_plans.is_empty()) {
-        println!("── [M] cpu — rs-sharded ingress (client rs_enc / node sum / verifier) ───────");
+        println!("── [M] cpu — rs-sharded ingress (client commit / lane round / verifier) ─────");
         println!(
-            "{:<4}{:>8}  {:>8}{:>8}{:>9}{:>10} {:>9}{:>9}{:>11}{:>10}{:>9}{:>10}  {:<10}{}",
-            "id", "k/n", "embed", "hash", "rs_enc", "node_sum", "sig", "open", "reconstruct",
-            "syndrome", "digest", "kahe_dec", "recovered", "lane lie"
+            "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}{}",
+            "id", "k/n", "embed", "rs_enc", "commit", "node_sum", "open+fold", "attribute",
+            "sig", "open", "lane_open", "crosscheck", "reconstruct", "kahe_dec", "recovered",
+            "lane lie"
         );
         for (i, r) in rows.iter().enumerate() {
             for p in &r.rs_plans {
                 println!(
-                    "{:<4}{:>8}  {:>8}{:>8}{:>9}{:>10} {:>9}{:>9}{:>11}{:>10}{:>9}{:>10}  {:<10}{}",
+                    "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}{}",
                     cell_id(i),
                     format!("{}/{}", p.k, p.n_nodes),
                     fmt_us(p.dgt_embed.med),
-                    fmt_us(p.dgt_hash.med),
                     fmt_us(p.rs_enc.med),
+                    fmt_us(p.share_commit.med),
                     fmt_us(p.node_sum.med),
+                    fmt_us(p.lane_ingest.med),
+                    fmt_us(p.lane_attribute.med),
                     fmt_us(p.v_sig.med),
                     fmt_us(p.v_open.med),
+                    fmt_us(p.v_lane_open.med),
+                    fmt_us(p.v_crosscheck.med),
                     fmt_us(p.v_reconstruct.med),
-                    fmt_us(p.v_syndrome.med),
-                    fmt_us(p.v_digest.med),
                     fmt_us(p.v_kahe_dec.med),
                     if p.recovered { "yes" } else { "NO" },
                     p.lane_lie_caught,
@@ -1949,9 +2003,9 @@ fn print_tables(rows: &[Row]) {
 
         println!("── [D] rs sizing — measured at the run k/n, priced across k at n = k+2 ──────");
         println!(
-            "{:<4}{:>5}{:>14}{:>12}{:>16}{:>15}{:>14}  {}",
-            "id", "k", "share = C/k", "bulletin", "client egress", "node ingress", "verifier in",
-            "gate"
+            "{:<4}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  {}",
+            "id", "k", "share = C/k", "path", "lane post", "bulletin", "client egress",
+            "node ingress", "verifier in", "gate"
         );
         for (i, r) in rows.iter().enumerate() {
             if r.rs_plans.is_empty() {
@@ -1962,13 +2016,15 @@ fn print_tables(rows: &[Row]) {
             let ctxt_b = r.ctxt_client_b as f64;
             for &k in RS_SIZING_K {
                 let n_nodes = (k + 2).max(r.s);
-                let share_b = (r.n_polys.div_ceil(k) * dgt_packed_len()) as f64;
-                let egress = n_nodes as f64 * share_b + open_b + bulletin_b;
-                let node_in = r.n as f64 * share_b;
-                // All n share-sums, not k: the verifier runs the spare-lane
-                // syndrome, which needs every share the bulletin carries.
+                let block_len = r.n_polys.div_ceil(k);
+                let share_b = (block_len * dgt_packed_len()) as f64;
+                // The path rides with the share; the lane's post is its proof.
+                let path_b = fresh_path_packed_len(n_nodes) as f64;
+                let lane_post_b = lane_post_packed_len(block_len, n_nodes, RS_RHO_MAX) as f64;
+                let egress = n_nodes as f64 * (share_b + path_b) + open_b + bulletin_b;
+                let node_in = r.n as f64 * (share_b + path_b);
                 let verifier_in =
-                    n_nodes as f64 * share_b + r.n as f64 * bulletin_b + r.wire_server_b;
+                    n_nodes as f64 * lane_post_b + r.n as f64 * bulletin_b + r.wire_server_b;
                 // 100 Mbit client uplink against a 1 Gbit lane downlink.
                 let gate = if egress / 12.5e6 > node_in / 125e6 {
                     "client NIC"
@@ -1976,10 +2032,12 @@ fn print_tables(rows: &[Row]) {
                     "node ingest"
                 };
                 println!(
-                    "{:<4}{:>5}{:>14}{:>12}{:>16}{:>15}{:>14}  {}",
+                    "{:<4}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  {}",
                     if k == RS_SIZING_K[0] { cell_id(i) } else { String::new() },
                     k,
                     fmt_bytes(share_b),
+                    fmt_bytes(path_b),
+                    fmt_bytes(lane_post_b),
                     fmt_bytes(bulletin_b),
                     fmt_bytes(egress),
                     fmt_bytes(node_in),
@@ -2211,17 +2269,19 @@ const PHASES: &[PhaseCol] = &[
         },
     },
     PhaseCol { name: "rs_dgt_embed", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.dgt_embed), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.dgt_embed = s } } },
-    PhaseCol { name: "rs_dgt_hash", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.dgt_hash), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.dgt_hash = s } } },
     PhaseCol { name: "rs_enc", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.rs_enc), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.rs_enc = s } } },
+    PhaseCol { name: "rs_share_commit", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.share_commit), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.share_commit = s } } },
     PhaseCol { name: "rs_node_sum", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.node_sum), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.node_sum = s } } },
+    PhaseCol { name: "rs_lane_ingest", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.lane_ingest), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.lane_ingest = s } } },
+    PhaseCol { name: "rs_lane_attribute", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.lane_attribute), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.lane_attribute = s } } },
     PhaseCol { name: "rs_verify_sig", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_sig), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_sig = s } } },
     PhaseCol { name: "rs_verify_open", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_open), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_open = s } } },
     PhaseCol { name: "rs_verify_interp", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_interp), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_interp = s } } },
     PhaseCol { name: "rs_reconstruct", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_reconstruct = s } } },
     PhaseCol { name: "rs_reconstruct_lagrange", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct_lagrange), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_reconstruct_lagrange = s } } },
     PhaseCol { name: "rs_verify_kahe_dec", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_kahe_dec), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_kahe_dec = s } } },
-    PhaseCol { name: "rs_syndrome", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_syndrome), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_syndrome = s } } },
-    PhaseCol { name: "rs_verify_digest", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_digest), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_digest = s } } },
+    PhaseCol { name: "rs_verify_lane_open", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_lane_open), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_lane_open = s } } },
+    PhaseCol { name: "rs_verify_crosscheck", owner: Owner::Rs, get: |r| rs0(r).map_or(Stat::default(), |p| p.v_crosscheck), set: |r, s| { if let Some(p) = r.rs_plans.first_mut() { p.v_crosscheck = s } } },
 ];
 
 fn write_csv(rows: &[Row]) {
@@ -2238,7 +2298,7 @@ fn write_csv(rows: &[Row]) {
          ,d_open_body_b,d_kahe_key_b,d_plaintext_b\
          ,d_client_to_server_b,d_client_to_recipient_b,d_client_post_b,d_server_entry_b,d_epsilon\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
-         ,d_rs_share_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
+         ,d_rs_share_b,d_rs_path_b,d_rs_lane_post_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
          ,c_client_us,c_server_us,c_recipient_us\
          ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
     );
@@ -2314,21 +2374,27 @@ fn write_csv(rows: &[Row]) {
             r.useful_b,
         )
         .unwrap();
-        let (rs_share_b, rs_bulletin_b, rs_egress_b, rs_node_in_b) = match rs0(r) {
-            None => (0.0, 0.0, 0.0, 0.0),
-            Some(p) => (
-                p.share_b as f64,
-                p.bulletin_b as f64,
-                p.n_nodes as f64 * p.share_b as f64
-                    + (r.open_env_b * r.s) as f64
-                    + p.bulletin_b as f64,
-                r.n as f64 * p.share_b as f64,
-            ),
-        };
+        let (rs_share_b, rs_path_b, rs_lane_post_b, rs_bulletin_b, rs_egress_b, rs_node_in_b) =
+            match rs0(r) {
+                None => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                Some(p) => {
+                    let item_b = (p.share_b + p.path_b) as f64;
+                    (
+                        p.share_b as f64,
+                        p.path_b as f64,
+                        p.lane_post_b as f64,
+                        p.bulletin_b as f64,
+                        p.n_nodes as f64 * item_b
+                            + (r.open_env_b * r.s) as f64
+                            + p.bulletin_b as f64,
+                        r.n as f64 * item_b,
+                    )
+                }
+            };
         write!(
             out,
-            ",{:.0},{:.0},{:.0},{:.0}",
-            rs_share_b, rs_bulletin_b, rs_egress_b, rs_node_in_b
+            ",{:.0},{:.0},{:.0},{:.0},{:.0},{:.0}",
+            rs_share_b, rs_path_b, rs_lane_post_b, rs_bulletin_b, rs_egress_b, rs_node_in_b
         )
         .unwrap();
         write!(
@@ -2471,24 +2537,26 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
             k: rs_k,
             n_nodes: idx("rs_n")?,
             share_b: num("d_rs_share_b")? as usize,
+            path_b: num("d_rs_path_b")? as usize,
+            lane_post_b: num("d_rs_lane_post_b")? as usize,
             bulletin_b: num("d_rs_bulletin_b")? as usize,
             dgt_embed: stat("rs_dgt_embed")?,
-            dgt_hash: stat("rs_dgt_hash")?,
+            share_commit: stat("rs_share_commit")?,
             rs_enc: stat("rs_enc")?,
             node_sum: stat("rs_node_sum")?,
+            lane_ingest: stat("rs_lane_ingest")?,
+            lane_attribute: stat("rs_lane_attribute")?,
             v_sig: stat("rs_verify_sig")?,
             v_open: stat("rs_verify_open")?,
             v_interp: stat("rs_verify_interp")?,
+            v_lane_open: stat("rs_verify_lane_open")?,
+            v_crosscheck: stat("rs_verify_crosscheck")?,
             v_reconstruct: stat("rs_reconstruct")?,
             v_reconstruct_lagrange: stat("rs_reconstruct_lagrange")?,
-            v_syndrome: stat("rs_syndrome")?,
             v_kahe_dec: stat("rs_verify_kahe_dec")?,
-            v_digest: stat("rs_verify_digest")?,
             recovered: flag("rs_recovered")?,
             lane_lie_caught: match at("rs_lane_lie")? {
-                "syndrome" => "syndrome",
-                "digest" => "digest",
-                "norm" => "norm",
+                "lane-proof" => "lane-proof",
                 "other" => "other",
                 "MISSED" => "MISSED",
                 _ => "-",

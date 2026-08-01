@@ -8,11 +8,11 @@ use chipmunk_code::KahePoly;
 use rand::Rng;
 
 use crate::cs::{Cs, HidingMerkleCommitment};
-use crate::digest::DigestParams;
 use crate::kahe::{
     Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT,
 };
 use crate::rs::RsParams;
+use crate::share_commitment::ShareCommitmentParams;
 use crate::sss::ShamirParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
@@ -58,7 +58,7 @@ pub struct ProtocolParams {
     pub min_clients: usize,
     /// Set only in the RS-sharded ingress mode; `None` is the broadcast flow.
     pub rs: Option<RsParams>,
-    pub digest: Option<DigestParams>,
+    pub share_comm: Option<ShareCommitmentParams>,
 }
 
 impl ProtocolParams {
@@ -78,7 +78,7 @@ impl ProtocolParams {
             shamir,
             min_clients: 1,
             rs: None,
-            digest: None,
+            share_comm: None,
         }
     }
 
@@ -111,7 +111,7 @@ impl ProtocolParams {
             shamir,
             min_clients: 1,
             rs: None,
-            digest: None,
+            share_comm: None,
         }
     }
 }
@@ -125,7 +125,7 @@ impl ProtocolParams {
         n_nodes: usize,
         t_modulus: u64,
         rho_max: usize,
-        digest_seed: [u8; 32],
+        crs_seed: [u8; 32],
     ) -> Self {
         assert!(payload_polys >= 1, "payload must be ≥ 1 poly");
         assert!(
@@ -135,13 +135,17 @@ impl ProtocolParams {
         let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
         let kahe =
             Kahe::setup_with_dims(rng, payload_polys, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, t_modulus);
+        let rs = RsParams::new(k, n_nodes);
+        let block_len = rs.block_len(payload_polys);
         Self {
             kahe,
             cs: HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS),
             shamir: ShamirParams::new(t, n_servers),
             min_clients: 1,
-            rs: Some(RsParams::new(k, n_nodes)),
-            digest: Some(DigestParams::from_seed(digest_seed, payload_polys, rho_max)),
+            rs: Some(rs),
+            share_comm: Some(ShareCommitmentParams::from_seed(
+                crs_seed, block_len, n_nodes, rho_max,
+            )),
         }
     }
 }

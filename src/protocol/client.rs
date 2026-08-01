@@ -6,10 +6,11 @@ use chipmunk_code::CsPoly;
 
 use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry};
 use crate::cs::{fresh_opening_pack_bounds, Commitment, Cs, HidingMerkleCommitment, Opening};
-use crate::digest::{digest, embed};
+use crate::digest::embed;
 use crate::kahe::{kahe_to_cs_centered, Kahe, KaheKey, KaheScheme};
 use crate::pke;
 use crate::rs::{Rs, Share};
+use crate::share_commitment::{commit_shares, SharePath};
 use crate::sig::SigningKey;
 use crate::sss::ShamirSharing;
 
@@ -134,6 +135,8 @@ pub struct RsClientRound {
     pub bulletin: RsClientBulletinEntry,
     pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
     pub rs_shares: Vec<Share>,
+    /// Index-aligned with `rs_shares`: lane `j` receives `(rs_shares[j], share_paths[j])`.
+    pub share_paths: Vec<SharePath>,
 }
 
 /// RS-sharded ingress round.
@@ -147,31 +150,35 @@ pub fn run_client_round_rs<R: CryptoRng + Rng>(
     signing_key: &SigningKey,
 ) -> RsClientRound {
     let rs = pp.rs.as_ref().expect("RS mode params");
-    let dp = pp.digest.as_ref().expect("digest params");
+    let scp = pp.share_comm.as_ref().expect("share-commitment params");
 
     let key = kahe_keygen(rng, pp);
     let ctxt = kahe_encrypt(rng, pp, &key, &message);
     let embedded = embed(&ctxt);
-    let h = digest(dp, &embedded);
     let rs_shares = Rs::encode(rs, &embedded);
+    let (share_root, share_paths) = commit_shares(scp, &rs_shares);
 
     let shares_per_server = shamir_share(rng, pp, &key);
     let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
     let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
 
     let sig = signing_key.sign(&RsClientBulletinEntry::signing_bytes(
-        sid, client_id, &comm, &h,
+        sid,
+        client_id,
+        &comm,
+        &share_root,
     ));
 
     RsClientRound {
         client_id,
         bulletin: RsClientBulletinEntry {
             comm,
-            digest: h,
+            share_root,
             pubkey: signing_key.verifying_key().to_sec1_bytes(),
             sig,
         },
         sealed_openings,
         rs_shares,
+        share_paths,
     }
 }

@@ -172,38 +172,6 @@ impl Rs {
         out
     }
 
-    /// The share node `j` should hold, given the `k` reconstructed blocks.
-    pub fn share_for(params: &RsParams, blocks: &[&[DgtNTTPoly]], j: usize) -> Share {
-        if j < params.k {
-            return blocks[j].to_vec();
-        }
-        let bl = blocks[0].len();
-        combine(
-            blocks,
-            &lagrange_at(&data_points(params.k), (j + 1) as u64),
-            bl,
-        )
-    }
-
-    /// Node indices among `samples[k..]` whose share contradicts `ctxt`, the
-    /// codeword already reconstructed from the first `k`.
-    pub fn inconsistent_shares(
-        params: &RsParams,
-        ctxt: &[DgtNTTPoly],
-        samples: &[(usize, &[DgtNTTPoly])],
-    ) -> Vec<usize> {
-        if samples.len() <= params.k {
-            return Vec::new();
-        }
-        let owned = Self::split_blocks(params, ctxt);
-        let blocks: Vec<&[DgtNTTPoly]> = owned.iter().map(Vec::as_slice).collect();
-        samples[params.k..]
-            .iter()
-            .filter(|(idx, share)| Self::share_for(params, &blocks, *idx) != *share)
-            .map(|(idx, _)| *idx)
-            .collect()
-    }
-
     /// Interpolate the `k` blocks back from any `k` `(node_index, share)`
     /// samples and flatten to `ctxt_len` polys. Extra samples are ignored.
     pub fn reconstruct(

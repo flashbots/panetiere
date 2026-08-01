@@ -45,6 +45,7 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `sss` | Shamir $t$-of-$n$ (and additive) sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
 | `rs` | systematic Reed–Solomon erasure coding over the wide ring |
+| `share_commitment` | commitment to the $n$ coded shares, one tree leaf per lane |
 | `pke` / `sig` | ML-KEM-768 + AES-GCM envelopes for the key shares / P-256 post signatures |
 | `bulletin` | published entry types and their byte encodings |
 | `protocol::*` | the round drivers, verifier, recipient policy |
@@ -66,7 +67,8 @@ one summed ciphertext and commitment for the whole group; it is untrusted, since
 anyone can re-sum the group and catch it. Erasure-coding lanes go further: the
 ciphertext never goes on the bulletin at all, but leaves the client as $n$ coded
 shares, and the recipient reconstructs $\sum ct$ from any $k$ lane sums — so what a
-client posts is a commitment plus a constant-size digest. Servers can double as
+client posts is constant size in the message: the key-share commitment, plus a
+second commitment covering the $n$ coded shares, signed. Servers can double as
 lanes; extra lanes hold no key material.
 
 Client crypto and the server round are the same in all three, and key shares
@@ -76,11 +78,11 @@ not change.
 | | **Direct** | **Aggregated** | **Erasure-coded** |
 |---|---|---|---|
 | Setup | `ProtocolParams::setup*` | `ProtocolParams::setup*` | `setup_rs_mode` |
-| Client posts | ciphertext + commitment | same, to its aggregator | commitment + signed digest — constant size in message length |
+| Client posts | ciphertext + commitment | same, to its aggregator | both commitments + signature — constant size in message length |
 | Ciphertext travels | on the bulletin | summed per group | as $n$ coded shares, one per lane |
 | Client fn | `run_client_round` | `run_client_round` | `run_client_round_rs` |
 | Recipient fn | `recover_direct` | `recover_aggregated` | `aggregate_and_decrypt_rs` |
-| Extra checks | — | — | signatures, RS syndrome over spare lanes |
+| Extra checks | — | — | signatures; each lane's sum opens the summed share commitments |
 
 ## Integration
 
@@ -145,12 +147,15 @@ pub fn run_client_round_rs<R: CryptoRng + Rng>(
     rng: &mut R, pp: &ProtocolParams, sid: &SessionId, client_id: ClientId,
     message: Vec<KahePoly>, servers: &[(ServerId, pke::PublicKey)],
     signing_key: &SigningKey,
-) -> RsClientRound;                   // { client_id, bulletin, sealed_openings, rs_shares }
+) -> RsClientRound;                   // { client_id, bulletin, sealed_openings,
+                                      //   rs_shares, share_paths }
 ```
 
 Publish `encrypted_message` / `bulletin`; send `sealed_openings[i]` to server
 `i` over any channel (already CCA2-sealed and context-bound); with erasure
-coding, send `rs_shares[j]` to lane `j`. Each envelope holds a commitment
+coding, send `(rs_shares[j], share_paths[j])` to lane `j` — the path is that
+lane's opening of the share commitment, 42 KiB at $n = 16$, and the lane
+recomputes everything else from the share. Each envelope holds a commitment
 `Opening` whose committed value is that server's Shamir share of the KAHE key —
 that share is the secret, the envelope only carries it. `servers` must be
 ordered by `ServerId`, and
@@ -173,9 +178,26 @@ clients or decryption yields noise. Extra inbox entries are ignored, so the same
 round can be re-run over any subset of what arrived. `unseal_openings` is the
 batch form.
 
-A server can double as an erasure-coding lane, in which case it also runs
-`run_rs_node_round(&RsNodeInbox { node_id, items }, canonical)` over the same set —
-same all-or-nothing contract, no key material involved.
+A server can double as an erasure-coding lane, in which case it also runs, over
+the same set and under the same all-or-nothing contract, with no key material
+involved:
+
+```rust
+pub fn run_rs_node_round(
+    scp: &ShareCommitmentParams,          // pp.share_comm.as_ref().unwrap()
+    inbox: &RsNodeInbox,                  // { node_id, items: Vec<(ClientId, Share, SharePath)> }
+    canonical: &[ClientId],
+    roots: &[(ClientId, HVCPoly)],        // each client's signed share_root, off the bulletin
+) -> Result<RsNodeBulletinEntry, ServerRoundError>;
+```
+
+The lane sums the shares and their openings and proves the pair in one shot, so
+the cost is one commitment check per round rather than one per client. If that
+check fails it re-checks per client and returns `BadShare(cid)`; if every client
+passes individually the roster exceeded $\rho_\mathrm{max}$ and it returns
+`AggregateOverCapacity` instead of blaming a client. The published
+`RsNodeBulletinEntry { node_id, clients, share_sum, agg_open }` carries its own
+proof, so nothing downstream trusts the lane.
 
 ### Recipient
 
@@ -205,19 +227,20 @@ goes straight back to the payload layer.
 and commitments; both are coefficient-wise, hence associative, so the recipient
 re-sums groups with the same operations and gets the direct round's value.
 
-In erasure-coded mode the RS syndrome over the spare lanes catches a bad round
-by naming a lane that contradicts the reconstruction
-(`VerifyError::LaneMismatch`).
-
-The RS post also carries a signed digest field, and the verifier still runs an
-aggregate check over it (`VerifyError::DigestMismatch`) — but **that check is not
-currently a sound guarantee and is pending adjustment.** Do not rely on it to
-detect a client whose coded shares disagree with what it committed to.
+In erasure-coded mode each lane's post is checked on its own: the opening must
+walk to the sum of the roots the clients signed, and the lane's share sum must
+hash to what that opening projects to. A lane whose sum is wrong is named in
+`VerifyError::LaneOpeningFailed(Vec<NodeId>)`, and the verifier re-encodes the
+reconstruction and compares every reporting lane, so a liar is named in any
+round that reconstructs at all. Nothing here needs an honest lane majority.
 
 ## Errors
 
 Two `VerifyError` variants are server-attributable and carry an index into
-`server_outputs`: `InvalidServerOpening(i)` and `ShareOpeningMismatch(i)`. The
+`server_outputs`: `InvalidServerOpening(i)` and `ShareOpeningMismatch(i)`. In RS
+mode `LaneOpeningFailed(Vec<NodeId>)` is lane-attributable and
+`BadSignature(ClientId)` client-attributable; the `recover_*` wrappers do not
+cover RS mode, so acting on those is the caller's. The
 `recover_*` functions act on exactly those, excluding and retrying until $t$
 remain; everything else fails the round. A rejected round comes back as
 `RecipientError::Rejected(RejectReason)`, so a caller can report *why* rather
@@ -238,7 +261,11 @@ retries and authenticated delivery are the caller's.
 
 - `ClientBulletinEntry::{to_bytes, from_bytes, packed_len}` and
   `RsClientBulletinEntry::{to_bytes, from_bytes, packed_len, signing_bytes}`
-  (the RS post's length is independent of the message).
+  (the RS post's length is independent of the message, so `packed_len()` takes
+  no argument — 8801 B: two packed roots, a P-256 point and a signature).
+- Lane traffic is sized by `share_commitment::{fresh_path_packed_len,
+  lane_post_packed_len}`; a `SharePath` is what the client sends with each
+  share, and a lane's post is its share sum plus the summed opening.
 - `Commitment::{to_bytes, from_bytes}`, `pack_cs_shares` / `unpack_cs_shares`.
 - Openings are bit-packed per region at the tightest width, so the bounds
   matter: `Opening::pack(r_bound, s_bound, tree_bound)` with
@@ -258,7 +285,7 @@ source of truth for the moduli and their NTT tables.
 
 | Ring | $q$ | Used by |
 |---|---|---|
-| HVC (`HVCPoly`) | $40{,}961$; $\zeta = 34$ (`ZETA`), `HVC_WIDTH = 3` | tree hash, leaf label, opening digits |
+| HVC (`HVCPoly`) | $40{,}961$; $\zeta = 34$ (`ZETA`), `HVC_WIDTH = 3` | tree hash, leaf labels, opening digits (both commitments) |
 | CS (`CsPoly`) | $139{,}301$ | commitment leaf, Shamir sharing, share sums |
 | KAHE (`KahePoly`) | $347{,}280{,}875{,}347{,}969 \approx 2^{48.3}$ | encryption, codec, encoding cells |
 | wide (`DgtNTTPoly`) | $\approx 2^{61}$ | RS coding, over exact integer sums |
@@ -271,7 +298,7 @@ source of truth for the moduli and their NTT tables.
 | `MU_CS`, `KAPPA_CS` | $\mu_\mathrm{cs} = 1$, $\kappa_\mathrm{cs} = 5$ |
 | `BETA_CS`, `R_BOUND`, `beta_agg_hvc()` | $\beta_\mathrm{cs} = 116$, $34{,}800 = 300 \beta_\mathrm{cs}$, $300 \zeta$ |
 | threshold | $\max(\lfloor S/2 \rfloor + 1, S - 2)$; override with `setup_with_threshold` |
-| `rho_max` (RS mode) | caller-supplied; `setup_rs_mode` asserts $\rho_\mathrm{max} \cdot q_\mathrm{kahe} < q_\mathrm{dgt}$ |
+| `rho_max` (RS mode) | caller-supplied; `setup_rs_mode` asserts $\rho_\mathrm{max} \cdot q_\mathrm{kahe} < q_\mathrm{dgt}$ and $\rho_\mathrm{max} \zeta < q_\mathrm{hvc}/2$ (so $\rho_\mathrm{max} \le 602$) |
 
 Exceeding the noise budget returns noise, not an error. `R_BOUND` and
 `beta_agg_hvc()` cap one round's aggregation at $\rho = 300$. $\mu_\mathrm{kahe}$ follows from
@@ -289,9 +316,9 @@ RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol     # per-stage micro-benc
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
 slot mode, $t$-of-$n$, replay/tamper/norm rejection, anonymity floor, thread
 invariance), `mse_e2e.rs` and `prony_e2e.rs` (each encoding carried end-to-end,
-with cover traffic), `rs_mode_e2e.rs` (lanes, constant-size posts, a lying
-lane), `recipient_e2e.rs` (anchor admission, culprit
-exclusion, every `RejectReason`).
+with cover traffic), `rs_mode_e2e.rs` (lanes, constant-size posts, a lying lane
+named, a bad share named at its lane, capacity faults not blamed on clients),
+`recipient_e2e.rs` (anchor admission, culprit exclusion, every `RejectReason`).
 
 The sweep binary takes its cells from the environment (`SWEEP_CLIENTS=300x300`,
 `SWEEP_PAYLOAD_SYMBOLS`, `SWEEP_RS`, `BENCH_BUDGET_SECS`) and writes one CSV row
@@ -343,5 +370,6 @@ and its per-server egress from 0.47 to 1.12 to 2.58 MB, against 300.6 → 303.5 
 latency, 10 ms jitter, 100 Mbit/s client uplink, 4 Gbit/s server and recipient
 links, 16 servers), that 4.8 MB broadcast takes \~25 s end to end — almost
 entirely the recipient pulling 6.15 GB. Erasure coding removes the fan-in and
-brings it to \~3.5 s; swapping peeling for the Prony sketch or slot reservation
-shrinks each client's plaintext \~3× and gets to \~1.6 s.
+brings it to \~4.0 s, share commitment included; swapping peeling for the Prony
+sketch or slot reservation shrinks each client's plaintext \~3× and gets to
+\~1.8 s.

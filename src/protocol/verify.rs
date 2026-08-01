@@ -8,7 +8,8 @@ use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry, RsNodeBulletin
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
 use crate::rs::{Rs, RsError};
-use chipmunk_code::DgtNTTPoly;
+use crate::share_commitment::verify_aggregated;
+use chipmunk_code::{pointwise_sum_polys, DgtNTTPoly, HVCPoly};
 use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
 
@@ -33,11 +34,10 @@ pub enum VerifyError {
     InconsistentNodeCanonical(NodeId),
     BadSignature(ClientId),
     Reconstruct(RsError),
-    /// Spare lanes contradict the reconstruction — these disagreed.
-    LaneMismatch(Vec<NodeId>),
-    DigestMismatch,
+    /// These lanes' posts do not open the summed signed roots.
+    LaneOpeningFailed(Vec<NodeId>),
     /// Reconstruction exceeded `ρ_max·q_kahe/2`, so it is not a sum of honest
-    /// ciphertexts and the digest would bind nothing.
+    /// ciphertexts.
     CiphertextOutOfRange,
 }
 
@@ -203,11 +203,11 @@ pub struct RsVerifyTimings {
     pub sum_comm_us: f64,
     pub opening_verify_us: f64,
     pub interpolation_us: f64,
+    /// Per-lane aggregated-opening verification against the summed roots.
+    pub lane_open_us: f64,
     pub reconstruct_us: f64,
-    /// Spare-lane syndrome check; zero when no lane beyond `k` reported.
-    pub syndrome_us: f64,
-    /// Ajtai digest check plus the norm bound it depends on.
-    pub digest_us: f64,
+    /// Re-encode the reconstruction and compare every reporting lane's post.
+    pub crosscheck_us: f64,
     pub kahe_dec_us: f64,
 }
 
@@ -220,7 +220,7 @@ pub fn aggregate_and_decrypt_rs(
     node_outputs: &[RsNodeBulletinEntry],
 ) -> Result<(Vec<KahePoly>, RsVerifyTimings), VerifyError> {
     let rs = pp.rs.as_ref().ok_or(VerifyError::NotRsMode)?;
-    let dp = pp.digest.as_ref().ok_or(VerifyError::NotRsMode)?;
+    let scp = pp.share_comm.as_ref().ok_or(VerifyError::NotRsMode)?;
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
@@ -278,7 +278,7 @@ pub fn aggregate_and_decrypt_rs(
             let vk = sig::VerifyingKey::from_sec1_bytes(&e.pubkey)
                 .map_err(|_| VerifyError::BadSignature(*cid))?;
             vk.verify(
-                &RsClientBulletinEntry::signing_bytes(sid, *cid, &e.comm, &e.digest),
+                &RsClientBulletinEntry::signing_bytes(sid, *cid, &e.comm, &e.share_root),
                 &e.sig,
             )
             .map_err(|_| VerifyError::BadSignature(*cid))
@@ -292,6 +292,8 @@ pub fn aggregate_and_decrypt_rs(
     let now = Instant::now();
     let comms: Vec<Commitment> = entries.iter().map(|e| e.comm.clone()).collect();
     let summed_comm = HidingMerkleCommitment::sum_commitments(&comms);
+    let root_refs: Vec<&HVCPoly> = entries.iter().map(|e| &e.share_root).collect();
+    let summed_root = pointwise_sum_polys(&root_refs);
     tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
@@ -309,50 +311,57 @@ pub fn aggregate_and_decrypt_rs(
     let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
     tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
+    // Each lane's post is its own proof: `A·share_sum` must open the summed
+    // signed roots at that lane's position. Systematic sums are additionally
+    // norm-gated — that shortness is what makes the Ajtai layer binding for
+    // them. Parity sums are full-range and get no gate; their binding comes
+    // from the reconstruction bound (an in-bound forgery is a short kernel
+    // vector of a rotated `A`, i.e. SIS) plus the re-encode check below.
+    let now = Instant::now();
+    let bad: Vec<NodeId> = node_outputs
+        .par_iter()
+        .filter(|np| {
+            let systematic_ok = (np.node_id.0 as usize) >= rs.k
+                || crate::digest::centered_within_bound(scp.rho_max, &np.share_sum).is_some();
+            np.agg_open.lane_index != np.node_id.0 as usize
+                || !systematic_ok
+                || !verify_aggregated(scp, &summed_root, &np.share_sum, &np.agg_open)
+        })
+        .map(|np| np.node_id)
+        .collect();
+    if !bad.is_empty() {
+        return Err(VerifyError::LaneOpeningFailed(bad));
+    }
+    tt.lane_open_us = now.elapsed().as_secs_f64() * 1e6;
+
+    // Reconstruct systematic-first: those sums are individually pinned, and a
+    // full systematic set makes reconstruction a concatenation.
     let ell = pp.kahe.mu_kahe;
     let now = Instant::now();
-    let samples: Vec<(usize, &[DgtNTTPoly])> = node_outputs
+    let mut ordered: Vec<&RsNodeBulletinEntry> = node_outputs.iter().collect();
+    ordered.sort_by_key(|np| ((np.node_id.0 as usize) >= rs.k, np.node_id.0));
+    let samples: Vec<(usize, &[DgtNTTPoly])> = ordered
         .iter()
         .map(|np| (np.node_id.0 as usize, np.share_sum.as_slice()))
         .collect();
-    let summed_ntt =
-        Rs::reconstruct(rs, ell, &samples).map_err(VerifyError::Reconstruct)?;
+    let summed_ntt = Rs::reconstruct(rs, ell, &samples).map_err(VerifyError::Reconstruct)?;
     tt.reconstruct_us = now.elapsed().as_secs_f64() * 1e6;
 
-    // Spare lanes are a syndrome: the lane-sums are a codeword of the same code,
-    // so any surplus share must agree with the reconstruction. Exact, and it
-    // fires before the digest.
     let now = Instant::now();
-    let bad = Rs::inconsistent_shares(rs, &summed_ntt, &samples);
-    if !bad.is_empty() {
-        return Err(VerifyError::LaneMismatch(
-            bad.into_iter().map(|i| NodeId(i as u32)).collect(),
-        ));
-    }
-    tt.syndrome_us = now.elapsed().as_secs_f64() * 1e6;
-
-    // The digest binds the *unreduced* integer sum, so the norm bound is not a
-    // sanity check — it is the premise the collision-resistance argument rests
-    // on. Check it before trusting the hash comparison.
-    let now = Instant::now();
-    let summed_h: Vec<DgtNTTPoly> = (0..crate::digest::DIGEST_POLYS)
-        .map(|i| {
-            entries
-                .iter()
-                .fold(DgtNTTPoly::default(), |acc, e| acc + e.digest[i])
-        })
-        .collect();
-    for e in &entries {
-        if e.digest.len() != crate::digest::DIGEST_POLYS {
-            return Err(VerifyError::DigestMismatch);
-        }
-    }
-    let centered = crate::digest::centered_within_bound(dp, &summed_ntt)
+    let centered = crate::digest::centered_within_bound(scp.rho_max, &summed_ntt)
         .ok_or(VerifyError::CiphertextOutOfRange)?;
-    if !crate::digest::check(dp, &summed_ntt, &summed_h) {
-        return Err(VerifyError::DigestMismatch);
+    // The reconstruction is in-bound, so it is the committed codeword; any
+    // reporting lane whose post disagrees with its re-encoding lied.
+    let expected = Rs::encode(rs, &summed_ntt);
+    let liars: Vec<NodeId> = node_outputs
+        .iter()
+        .filter(|np| expected[np.node_id.0 as usize] != np.share_sum)
+        .map(|np| np.node_id)
+        .collect();
+    if !liars.is_empty() {
+        return Err(VerifyError::LaneOpeningFailed(liars));
     }
-    tt.digest_us = now.elapsed().as_secs_f64() * 1e6;
+    tt.crosscheck_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
     let summed_ctxt = crate::digest::to_kahe(&centered);

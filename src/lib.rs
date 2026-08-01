@@ -10,6 +10,7 @@ pub mod prony;
 pub mod protocol;
 pub mod rs;
 pub mod scaling_bench;
+pub mod share_commitment;
 pub mod sig;
 pub mod sss;
 

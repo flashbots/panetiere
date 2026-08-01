@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 
-use chipmunk_code::CsPoly;
+use chipmunk_code::{pointwise_sum_polys, CsPoly, DgtNTTPoly, HVCPoly};
 use rayon::prelude::*;
 
 use crate::bulletin::{RsNodeBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
 use crate::pke;
-use crate::rs::{Rs, Share};
+use crate::rs::Share;
+use crate::share_commitment::{
+    ingest_share, open_share, verify_aggregated, ShareCommitmentParams, ShareOpeningAcc, SharePath,
+};
 
 use super::{opening_aad, ClientId, NodeId, ServerId, SessionId};
 
@@ -42,36 +45,121 @@ pub struct ServerInbox {
 #[derive(Debug, PartialEq)]
 pub enum ServerRoundError {
     MissingClient(ClientId),
+    /// Ingest rejection: `(share, path)` does not open the client's signed root.
+    BadShare(ClientId),
+    /// The lane's aggregate does not open although every client's share does —
+    /// the roster exceeds `ρ_max`, so the digit sums left the bound.
+    AggregateOverCapacity,
 }
 
 pub struct RsNodeInbox {
     pub node_id: NodeId,
-    pub items: Vec<(ClientId, Share)>,
+    /// As received from each client; the signed root comes off the bulletin.
+    pub items: Vec<(ClientId, Share, SharePath)>,
 }
 
+/// Fold the canonical set's shares digit-wise, then prove the sum opens
+/// `Σ roots` at this lane's position — one hash of the aggregate, not ρ of them,
+/// which linearity makes equivalent. The post carries its own proof either way,
+/// so a lane is trusted for nothing.
+///
+/// Only if the aggregate fails to open does the lane re-check per client, which
+/// is what names the culprit. That case requires a client that shipped a share
+/// disagreeing with its own signed root — excluded while clients run in TEEs,
+/// and paid for only when it happens.
 pub fn run_rs_node_round(
+    scp: &ShareCommitmentParams,
     inbox: &RsNodeInbox,
     canonical: &[ClientId],
+    roots: &[(ClientId, HVCPoly)],
 ) -> Result<RsNodeBulletinEntry, ServerRoundError> {
     let index: HashMap<ClientId, usize> = inbox
         .items
         .iter()
         .enumerate()
+        .map(|(i, (cid, _, _))| (*cid, i))
+        .collect();
+    let root_index: HashMap<ClientId, usize> = roots
+        .iter()
+        .enumerate()
         .map(|(i, (cid, _))| (*cid, i))
         .collect();
 
-    let mut selected: Vec<&[chipmunk_code::DgtNTTPoly]> = Vec::with_capacity(canonical.len());
+    let lane = inbox.node_id.0 as usize;
+    let mut selected: Vec<usize> = Vec::with_capacity(canonical.len());
     for cid in canonical {
         let i = *index
             .get(cid)
             .ok_or(ServerRoundError::MissingClient(*cid))?;
-        selected.push(inbox.items[i].1.as_slice());
+        let r = *root_index
+            .get(cid)
+            .ok_or(ServerRoundError::MissingClient(*cid))?;
+        selected.push(i);
+        debug_assert_eq!(roots[r].0, *cid);
+    }
+
+    let (agg, share_sum) = canonical
+        .par_iter()
+        .zip(selected.par_iter())
+        .try_fold(
+            || {
+                (
+                    ShareOpeningAcc::zero(scp, lane),
+                    vec![DgtNTTPoly::default(); scp.block_len],
+                )
+            },
+            |(mut acc, mut sum), (cid, &i)| {
+                let (_, share, path) = &inbox.items[i];
+                let o = open_share(scp, lane, share, path)
+                    .ok_or(ServerRoundError::BadShare(*cid))?;
+                acc.add(&o);
+                for (s, p) in sum.iter_mut().zip(share.iter()) {
+                    *s += *p;
+                }
+                Ok((acc, sum))
+            },
+        )
+        .try_reduce(
+            || {
+                (
+                    ShareOpeningAcc::zero(scp, lane),
+                    vec![DgtNTTPoly::default(); scp.block_len],
+                )
+            },
+            |(mut a, mut sa), (b, sb)| {
+                a.merge(&b);
+                for (s, p) in sa.iter_mut().zip(sb.iter()) {
+                    *s += *p;
+                }
+                Ok((a, sa))
+            },
+        )?;
+    let agg = agg.finish();
+
+    let root_refs: Vec<&HVCPoly> = canonical.iter().map(|cid| &roots[root_index[cid]].1).collect();
+    let summed_root = pointwise_sum_polys(&root_refs);
+    if !verify_aggregated(scp, &summed_root, &share_sum, &agg) {
+        // The aggregate does not open, so some client's share disagrees with
+        // its own signed root. Now — and only now — pay per client to name it.
+        let culprit = canonical
+            .par_iter()
+            .zip(selected.par_iter())
+            .find_map_first(|(cid, &i)| {
+                let root = &roots[root_index[cid]].1;
+                let (_, share, path) = &inbox.items[i];
+                ingest_share(scp, root, lane, share, path).is_none().then_some(*cid)
+            });
+        return Err(culprit.map_or(
+            ServerRoundError::AggregateOverCapacity,
+            ServerRoundError::BadShare,
+        ));
     }
 
     Ok(RsNodeBulletinEntry {
         node_id: inbox.node_id,
         clients: canonical.to_vec(),
-        share_sum: Rs::sum_shares(&selected),
+        share_sum,
+        agg_open: agg,
     })
 }
 

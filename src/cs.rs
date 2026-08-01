@@ -245,7 +245,7 @@ fn bridge_leaf(raw_leaves: &[CsPoly]) -> Vec<HVCPoly> {
         .collect()
 }
 
-fn position_list(index: usize, depth: usize) -> Vec<bool> {
+pub(crate) fn position_list(index: usize, depth: usize) -> Vec<bool> {
     (0..=depth).map(|i| ((index >> i) & 1) != 0).rev().collect()
 }
 
@@ -585,7 +585,7 @@ impl Cs for HidingMerkleCommitment {
 /// SIMD wrapping i32 add: `acc[i] = acc[i].wrapping_add(v[i])`. Dispatches to
 /// AVX2 when available (8 i32 lanes/iter); falls back to scalar otherwise.
 #[inline(always)]
-fn wrapping_add_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
+pub(crate) fn wrapping_add_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -631,7 +631,7 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 
 /// Number of bits to encode signed values in [-bound, bound].
 #[inline]
-fn bits_for_signed(bound: u32) -> u32 {
+pub(crate) fn bits_for_signed(bound: u32) -> u32 {
     let n = 2u64 * bound as u64 + 1;
     (64 - n.leading_zeros()).max(1)
 }
