@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 980" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+  <rect x="0" y="0" width="920" height="980" rx="8" fill="#fcfcfb" stroke="rgba(11,11,11,0.10)"/>
+
+  <text x="32" y="36" font-size="15" font-weight="600" fill="#0b0b0b">Bytes on the wire, one round — three ingress modes</text>
+  <text x="32" y="56" font-size="12.5" fill="#52514e">16 servers, 300 active clients, 16 KB messages, Prony sketch encoding, RS 14-of-16 — a round recovers 300 × 16 KB = 4.9 MB.</text>
+  <text x="32" y="74" font-size="12.5" fill="#52514e">e2e at 1 Gbit client, 4 Gbit server &amp; bulletin links.</text>
+
+  <text x="32" y="106" font-size="12.5" font-weight="600" fill="#0b0b0b">Direct — recipient ingress 2.12 GB · e2e 9.1 s</text>
+
+  <path d="M136,152 C280,152 280,132 424,132 L424,208 C280,208 280,228 136,228 Z" fill="#2a78d6"/>
+  <path d="M520,132 C640,132 640,134 760,134 L760,210 C640,210 640,208 520,208 Z" fill="#2a78d6"/>
+  <path d="M136,250 C280,250 280,318 424,318 L424,330 C280,330 280,262 136,262 Z" fill="#eb6834"/>
+  <path d="M520,323 C640,323 640,224 760,224 L760,226 C640,226 640,325 520,325 Z" fill="#1baf7a"/>
+
+  <text x="280" y="162" font-size="12.5" font-weight="600" fill="#ffffff" text-anchor="middle">ciphertext + commitment posts</text>
+  <text x="280" y="181" font-size="12.5" fill="#ffffff" text-anchor="middle">7.06 MB per client</text>
+  <text x="280" y="200" font-size="12.5" fill="#ffffff" text-anchor="middle">bulletin ingests 2.12 GB</text>
+  <text x="640" y="164" font-size="12.5" font-weight="600" fill="#ffffff" text-anchor="middle">recipient downloads every post</text>
+  <text x="640" y="183" font-size="12.5" fill="#ffffff" text-anchor="middle">300 × 7.06 MB = 2.12 GB</text>
+  <text x="280" y="244" font-size="12" fill="#52514e" text-anchor="middle">sealed envelopes · 70 KB × 16 per client</text>
+  <text x="280" y="278" font-size="12" fill="#52514e" text-anchor="middle">each server ingests 300 × 70 KB = 21 MB</text>
+  <text x="655" y="310" font-size="12" fill="#52514e" text-anchor="middle">147 KB per server · 2.35 MB at the recipient</text>
+
+  <rect x="40" y="112" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="40" y="120" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="40" y="128" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="88" y="198" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">client</text>
+  <text x="88" y="215" font-size="11" fill="#898781" text-anchor="middle">× 300</text>
+  <rect x="424" y="108" width="96" height="124" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="472" y="174" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">bulletin</text>
+  <rect x="424" y="280" width="96" height="56" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="424" y="288" width="96" height="56" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="424" y="296" width="96" height="56" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="472" y="320" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">server</text>
+  <text x="472" y="337" font-size="11" fill="#898781" text-anchor="middle">× 16</text>
+  <rect x="760" y="108" width="96" height="144" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="808" y="184" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">recipient</text>
+
+  <text x="32" y="390" font-size="12.5" font-weight="600" fill="#0b0b0b">Aggregated, 17 groups of ≤ 18 — recipient ingress 122 MB · e2e 2.9 s</text>
+
+  <path d="M136,436 C184,436 184,434 232,434 L232,510 C184,510 184,512 136,512 Z" fill="#2a78d6"/>
+  <path d="M328,470 C376,470 376,455 424,455 L424,459 C376,459 376,474 328,474 Z" fill="#2a78d6"/>
+  <path d="M520,455 C640,455 640,447 760,447 L760,451 C640,451 640,459 520,459 Z" fill="#2a78d6"/>
+  <path d="M136,526 C280,526 280,574 424,574 L424,586 C280,586 280,538 136,538 Z" fill="#eb6834"/>
+  <path d="M520,579 C640,579 640,465 760,465 L760,467 C640,467 640,581 520,581 Z" fill="#1baf7a"/>
+
+  <text x="184" y="466" font-size="12.5" font-weight="600" fill="#ffffff" text-anchor="middle">7.06 MB each</text>
+  <text x="184" y="485" font-size="12.5" fill="#ffffff" text-anchor="middle">2.12 GB total</text>
+  <text x="376" y="420" font-size="12" fill="#52514e" text-anchor="middle">summed post</text>
+  <text x="376" y="436" font-size="12" fill="#52514e" text-anchor="middle">7.06 MB each</text>
+  <text x="376" y="452" font-size="12" fill="#52514e" text-anchor="middle">120 MB total</text>
+  <text x="640" y="440" font-size="12" fill="#52514e" text-anchor="middle">recipient reads 17 × 7.06 MB = 120 MB total</text>
+  <text x="280" y="600" font-size="12" fill="#52514e" text-anchor="middle">sealed envelopes · 70 KB × 16 per client</text>
+  <text x="280" y="616" font-size="12" fill="#52514e" text-anchor="middle">each server ingests 300 × 70 KB = 21 MB</text>
+  <text x="655" y="614" font-size="12" fill="#52514e" text-anchor="middle">147 KB per server · 2.35 MB at the recipient</text>
+
+  <rect x="40" y="396" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="40" y="404" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="40" y="412" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="88" y="483" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">client</text>
+  <text x="88" y="500" font-size="11" fill="#898781" text-anchor="middle">× 300</text>
+  <rect x="232" y="396" width="96" height="120" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="232" y="404" width="96" height="120" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="232" y="412" width="96" height="120" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="280" y="468" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">aggregator</text>
+  <text x="280" y="485" font-size="11" fill="#898781" text-anchor="middle">× 17</text>
+  <rect x="424" y="422" width="96" height="70" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="472" y="461" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">bulletin</text>
+  <rect x="424" y="536" width="96" height="56" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="424" y="544" width="96" height="56" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="424" y="552" width="96" height="56" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="472" y="576" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">server</text>
+  <text x="472" y="593" font-size="11" fill="#898781" text-anchor="middle">× 16</text>
+  <rect x="760" y="412" width="96" height="90" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="808" y="461" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">recipient</text>
+
+  <text x="32" y="678" font-size="12.5" font-weight="600" fill="#0b0b0b">Erasure-coded, 14-of-16 over the servers — recipient ingress 19 MB · e2e 2.7 s</text>
+
+  <path d="M136,712 C280,712 280,715 424,715 L424,835 C280,835 280,832 136,832 Z" fill="#2a78d6"/>
+  <path d="M136,844 C280,844 280,838 424,838 L424,850 C280,850 280,856 136,856 Z" fill="#eb6834"/>
+  <path d="M136,872 C280,872 280,897 424,897 L424,899 C280,899 280,874 136,874 Z" fill="#2a78d6"/>
+  <path d="M520,774 C640,774 640,759 760,759 L760,761 C640,761 640,776 520,776 Z" fill="#1baf7a"/>
+  <path d="M520,897 C640,897 640,775 760,775 L760,777 C640,777 640,899 520,899 Z" fill="#2a78d6"/>
+
+  <text x="280" y="755" font-size="12.5" font-weight="600" fill="#ffffff" text-anchor="middle">coded shares + Merkle paths</text>
+  <text x="280" y="774" font-size="12.5" fill="#ffffff" text-anchor="middle">0.70 MB × 16 per client</text>
+  <text x="280" y="793" font-size="12.5" fill="#ffffff" text-anchor="middle">each lane ingests 300 × 0.70 MB = 210 MB</text>
+  <text x="280" y="866" font-size="12" fill="#52514e" text-anchor="middle">sealed envelopes · 70 KB × 16 per client</text>
+  <text x="250" y="918" font-size="12" fill="#52514e" text-anchor="middle">two commitment roots + signature · 8.8 KB per client</text>
+  <text x="640" y="752" font-size="12" fill="#52514e" text-anchor="middle">lane post · 0.86 MB each, 14 MB total</text>
+  <text x="660" y="884" font-size="12" fill="#52514e" text-anchor="middle">recipient reads 300 posts · 2.64 MB total</text>
+
+  <rect x="40" y="684" width="96" height="180" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="40" y="692" width="96" height="180" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="40" y="700" width="96" height="180" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="88" y="785" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">client</text>
+  <text x="88" y="802" font-size="11" fill="#898781" text-anchor="middle">× 300</text>
+  <rect x="424" y="684" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="424" y="692" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <rect x="424" y="700" width="96" height="150" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="472" y="771" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">server</text>
+  <text x="472" y="788" font-size="11" fill="#898781" text-anchor="middle">× 16, each a lane</text>
+  <rect x="424" y="876" width="96" height="45" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="472" y="903" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">bulletin</text>
+  <rect x="760" y="700" width="96" height="136" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
+  <text x="808" y="772" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">recipient</text>
+
+  <rect x="32" y="950" width="10" height="10" rx="2" fill="#2a78d6"/>
+  <text x="48" y="959" font-size="11.5" fill="#52514e">ciphertext (public)</text>
+  <rect x="180" y="950" width="10" height="10" rx="2" fill="#eb6834"/>
+  <text x="196" y="959" font-size="11.5" fill="#52514e">key shares (sealed, one per server)</text>
+  <rect x="420" y="950" width="10" height="10" rx="2" fill="#1baf7a"/>
+  <text x="436" y="959" font-size="11.5" fill="#52514e">server / lane posts</text>
+</svg>

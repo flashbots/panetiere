@@ -42,7 +42,7 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | Module | |
 |---|---|
 | `kahe` | key-additive homomorphic encryption, plus the CS↔KAHE bridge |
-| `sss` | Shamir $t$-of-$n$ (and additive) sharing over the CS ring |
+| `sss` | Shamir *t*-of-*n* (and additive) sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
 | `rs` | systematic Reed–Solomon erasure coding over the wide ring |
 | `share_commitment` | commitment to the $n$ coded shares, one tree leaf per lane |
@@ -75,6 +75,22 @@ Client crypto and the server round are the same in all three, and key shares
 stay per-server and sealed throughout, so the threshold and privacy model does
 not change.
 
+```mermaid
+flowchart TB
+    subgraph D[Direct]
+        direction LR
+        c1["client ×ρ"] -->|ciphertext + commitment| b1[(bulletin)] -->|ρ posts| r1[recipient]
+    end
+    subgraph A[Aggregated]
+        direction LR
+        c2["client ×ρ"] -->|ciphertext + commitment| a2[aggregator] -->|one sum per group| r2[recipient]
+    end
+    subgraph E[Erasure-coded]
+        direction LR
+        c3["client ×ρ"] -->|n coded shares| l3["lane ×n"] -->|k lane sums| r3[recipient]
+    end
+```
+
 | | **Direct** | **Aggregated** | **Erasure-coded** |
 |---|---|---|---|
 | Setup | `ProtocolParams::setup*` | `ProtocolParams::setup*` | `setup_rs_mode` |
@@ -85,6 +101,26 @@ not change.
 | Extra checks | — | — | signatures; each lane's sum opens the summed share commitments |
 
 ## Integration
+
+One direct round, end to end:
+
+```mermaid
+sequenceDiagram
+    participant C as Client (×ρ)
+    participant B as Bulletin
+    participant S as Server (×S)
+    participant R as Recipient
+
+    Note over C: channel::encode_message / cover<br/>run_client_round — fresh KAHE key
+    C->>B: ClientBulletinEntry (ciphertext + commitment)
+    C->>S: sealed opening — that server's Shamir share of the KAHE key
+    B-->>S: canonical client set
+    Note over S: unseal_opening, then run_server_round —<br/>all-or-nothing over the canonical set
+    S->>B: summed share + summed opening
+    B-->>R: all client posts + server entries
+    Note over R: recover_direct — verify each opening, drop culprits,<br/>interpolate Σsk from t shares, decrypt Σct
+    Note over R: channel::decode_messages — Σm mod t back to payloads
+```
 
 ### Setup
 
@@ -314,7 +350,7 @@ RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol     # per-stage micro-benc
 ```
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
-slot mode, $t$-of-$n$, replay/tamper/norm rejection, anonymity floor, thread
+slot mode, *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
 invariance), `mse_e2e.rs` and `prony_e2e.rs` (each encoding carried end-to-end,
 with cover traffic), `rs_mode_e2e.rs` (lanes, constant-size posts, a lying lane
 named, a bad share named at its lane, capacity faults not blamed on clients),
@@ -365,6 +401,47 @@ the 100-client ciphertext size. More servers cost the client and barely touch th
 recipient: 8 → 16 → 32 servers moves the client from 177.8 to 200.9 to 253.6 ms
 and its per-server egress from 0.47 to 1.12 to 2.58 MB, against 300.6 → 303.5 →
 322.7 ms at the recipient.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/traffic-dark.svg">
+  <img src="docs/traffic.svg" width="760" alt="Bytes on each connection of one round in the three ingress modes, at 16 servers and 300 clients of 16 KB with the Prony sketch encoding. Direct: each client posts 7.06 MB and the recipient downloads all 2.12 GB. Aggregated: 17 aggregators each forward one summed 7.06 MB post; the recipient reads 120 MB. Erasure-coded: each client sends a 0.70 MB coded share to each server, each lane ingests 210 MB, and the recipient reads 19 MB. Key-share envelopes are 70 KB per client per server in every mode.">
+</picture>
+
+Simulated round times at that same cell (16 servers, 300 × 16 KB, RS at
+14-of-16, one-way latency 60 ms + U[0, 10) ms per message): e2e is measured
+CPU wall plus simulated transfer, MB/s is the recovered payload (4.9 MB)
+over e2e.
+
+Prony sketch:
+
+| Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Aggregated | MB/s | Erasure-coded | MB/s |
+|---|---|---|---|---|---|---|
+| 100 / 1k / 1k | 34.5 s | 0.14 | 3.6 s | 1.36 | 2.8 s | 1.74 |
+| 100 / 4k / 4k | 9.1 s | 0.54 | 1.7 s | 2.87 | 1.9 s | 2.66 |
+| 100 / 1k / 8k | 4.8 s | 1.02 | 2.8 s | 1.78 | 2.7 s | 1.83 |
+| 100 / 1k / 20k | 2.3 s | 2.15 | 2.7 s | 1.83 | 2.7 s | 1.83 |
+| 1k / 1k / 4k | 9.1 s | 0.54 | 2.9 s | 1.71 | 2.7 s | 1.81 |
+| 1k / 1k / 8k | 4.8 s | 1.02 | 2.8 s | 1.78 | 2.7 s | 1.83 |
+| 1k / 1k / 20k | 2.3 s | 2.15 | 2.7 s | 1.83 | 2.7 s | 1.83 |
+
+Slot reservation:
+
+| Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Aggregated | MB/s | Erasure-coded | MB/s |
+|---|---|---|---|---|---|---|
+| 100 / 1k / 1k | 37.5 s | 0.13 | 3.7 s | 1.32 | 2.9 s | 1.72 |
+| 100 / 4k / 4k | 9.7 s | 0.51 | 1.6 s | 3.00 | 1.8 s | 2.74 |
+| 100 / 1k / 8k | 5.1 s | 0.97 | 2.8 s | 1.77 | 2.7 s | 1.81 |
+| 100 / 1k / 20k | 2.3 s | 2.16 | 2.7 s | 1.82 | 2.7 s | 1.81 |
+| 1k / 1k / 4k | 9.7 s | 0.51 | 2.9 s | 1.68 | 2.7 s | 1.79 |
+| 1k / 1k / 8k | 5.1 s | 0.97 | 2.8 s | 1.77 | 2.7 s | 1.81 |
+| 1k / 1k / 20k | 2.3 s | 2.16 | 2.7 s | 1.82 | 2.7 s | 1.81 |
+
+Direct is bound by the bulletin link — the full 2.12 GB goes through it, so
+it gains with every bulletin upgrade and from nothing else. Aggregated and
+erasure-coded are bound by each aggregator's 127 MB and each lane's 210 MB
+ingest at the server rate: the 4 Gbit column is the big win, and upgrading
+the client uplink alone barely moves them. Peeling carries ~3× these bytes
+(20.5 MB per post) and lands at roughly a third of these rates.
 
 **The round is bandwidth-bound, not CPU-bound.** Under simulated links (60 ms
 latency, 10 ms jitter, 100 Mbit/s client uplink, 4 Gbit/s server and recipient
