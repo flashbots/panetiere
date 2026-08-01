@@ -191,10 +191,14 @@ mod tests {
     fn client_bulletin_entry_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
         for mu_kahe in [1usize, 2, 4] {
-            let ctxt: Vec<KahePoly> = (0..mu_kahe).map(|_| KahePoly::rand_poly(&mut rng)).collect();
+            let ctxt: Vec<KahePoly> = (0..mu_kahe)
+                .map(|_| KahePoly::rand_poly(&mut rng))
+                .collect();
             let entry = ClientBulletinEntry {
                 ctxt,
-                comm: Commitment { root: HVCPoly::rand_poly(&mut rng) },
+                comm: Commitment {
+                    root: HVCPoly::rand_poly(&mut rng),
+                },
             };
             let bytes = entry.to_bytes();
             let back = ClientBulletinEntry::from_bytes(&bytes).unwrap();

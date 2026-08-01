@@ -443,8 +443,12 @@ fn solve_tile(d: &DualLimbs, ws: &[Vec<u64>], f: Fp) -> Vec<Vec<u64>> {
     for i in 0..k {
         let (d_lo, d_hi) = (&d.lo[i * k..(i + 1) * k], &d.hi[i * k..(i + 1) * k]);
         for s in 0..t {
-            let (a00, a01, a11) =
-                dot_limbs(d_lo, d_hi, &w_lo[s * k..(s + 1) * k], &w_hi[s * k..(s + 1) * k]);
+            let (a00, a01, a11) = dot_limbs(
+                d_lo,
+                d_hi,
+                &w_lo[s * k..(s + 1) * k],
+                &w_hi[s * k..(s + 1) * k],
+            );
             out[s][i] = recombine(a00, a01, a11, f);
         }
     }
@@ -533,7 +537,9 @@ pub enum PronyError {
 impl PronySketch {
     pub fn new(params: PronyParams) -> Self {
         let cols = params.cols();
-        let w = (0..params.payload_symbols).map(|_| vec![0i64; cols]).collect();
+        let w = (0..params.payload_symbols)
+            .map(|_| vec![0i64; cols])
+            .collect();
         Self {
             s: vec![0i64; cols + 1],
             w,
@@ -616,7 +622,11 @@ impl PronySketch {
         if k == 0 {
             let clean = self.s.iter().all(|&x| x == 0)
                 && self.w.iter().all(|sym| sym.iter().all(|&x| x == 0));
-            return if clean { Ok(Vec::new()) } else { Err(PronyError::CheckFailed) };
+            return if clean {
+                Ok(Vec::new())
+            } else {
+                Err(PronyError::CheckFailed)
+            };
         }
 
         // Newton's identities: e_m = (1/m) Σ_{i=1..m} (−1)^{i−1} e_{m−i} P_i.
@@ -645,7 +655,7 @@ impl PronySketch {
         }
 
         let z = roots_of_split(&lam, f).ok_or(PronyError::NotSplit)?;
-        if z.len() != k || z.iter().any(|&zi| zi == 0) {
+        if z.len() != k || z.contains(&0) {
             return Err(PronyError::NotSplit);
         }
 
@@ -698,7 +708,9 @@ impl PronySketch {
         // than per symbol.
         let zpow: Vec<Vec<u64>> = (k..cols)
             .scan(
-                z.iter().map(|&zi| f.pow(zi, k as u64)).collect::<Vec<u64>>(),
+                z.iter()
+                    .map(|&zi| f.pow(zi, k as u64))
+                    .collect::<Vec<u64>>(),
                 |cur, _| {
                     let this = cur.clone();
                     for (v, &zi) in cur.iter_mut().zip(z.iter()) {
@@ -721,8 +733,7 @@ impl PronySketch {
             return Err(PronyError::CheckFailed);
         }
 
-        Ok(z
-            .iter()
+        Ok(z.iter()
             .enumerate()
             .map(|(i, &zi)| (zi, xs.iter().map(|row| row[i] as i64).collect()))
             .collect())
@@ -761,7 +772,7 @@ impl PronySketch {
         let mut feed = |val: i64, polys: &mut Vec<KahePoly>| {
             buf[written % N] = val;
             written += 1;
-            if written % N == 0 {
+            if written.is_multiple_of(N) {
                 polys.push(KahePoly::from_coeffs(buf));
                 buf = [0i64; N];
             }
@@ -774,7 +785,7 @@ impl PronySketch {
                 feed(x, &mut polys);
             }
         }
-        if written % N != 0 {
+        if !written.is_multiple_of(N) {
             polys.push(KahePoly::from_coeffs(buf));
         }
         debug_assert_eq!(polys.len(), n_polys);
@@ -871,8 +882,9 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
         let f = Fp::new(PRONY_PRIME);
         for k in [1usize, 3, 4, 7, 8, 17, 64, 301] {
-            let dual: Vec<Vec<u64>> =
-                (0..k).map(|_| (0..k).map(|_| rng.gen_range(0..f.p)).collect()).collect();
+            let dual: Vec<Vec<u64>> = (0..k)
+                .map(|_| (0..k).map(|_| rng.gen_range(0..f.p)).collect())
+                .collect();
             let d = DualLimbs::new(&dual);
             let w: Vec<u64> = (0..k).map(|_| rng.gen_range(0..f.p)).collect();
             let (w_lo, w_hi): (Vec<u32>, Vec<u32>) = w
@@ -907,7 +919,11 @@ mod tests {
         let cap = 300;
         let mut sk = PronySketch::new(PronyParams::new(cap, 8));
         let mut msgs: Vec<Vec<i64>> = (0..cap)
-            .map(|i| (0..8).map(|s| ((i * 31 + s * 7) % 100_000) as i64).collect())
+            .map(|i| {
+                (0..8)
+                    .map(|s| ((i * 31 + s * 7) % 100_000) as i64)
+                    .collect()
+            })
             .collect();
         for m in &msgs {
             sk.insert(&mut rng, m);
@@ -987,7 +1003,10 @@ mod tests {
         let cover = PronySketch::unpack(&pp, &PronySketch::cover(&pp));
         a.add_assign(&cover).unwrap();
         assert_eq!(a.decode().unwrap(), vec![vec![5, 6]]);
-        assert_eq!(PronySketch::new(pp).decode().unwrap(), Vec::<Vec<i64>>::new());
+        assert_eq!(
+            PronySketch::new(pp).decode().unwrap(),
+            Vec::<Vec<i64>>::new()
+        );
     }
 
     #[test]

@@ -50,6 +50,9 @@ pub enum ServerRoundError {
     /// The lane's aggregate does not open although every client's share does —
     /// the roster exceeds `ρ_max`, so the digit sums left the bound.
     AggregateOverCapacity,
+    /// Some client's opening disagrees with the others on shape or position, so
+    /// the set cannot be summed.
+    MalformedOpening,
 }
 
 pub struct RsNodeInbox {
@@ -110,8 +113,8 @@ pub fn run_rs_node_round(
             },
             |(mut acc, mut sum), (cid, &i)| {
                 let (_, share, path) = &inbox.items[i];
-                let o = open_share(scp, lane, share, path)
-                    .ok_or(ServerRoundError::BadShare(*cid))?;
+                let o =
+                    open_share(scp, lane, share, path).ok_or(ServerRoundError::BadShare(*cid))?;
                 acc.add(&o);
                 for (s, p) in sum.iter_mut().zip(share.iter()) {
                     *s += *p;
@@ -136,7 +139,10 @@ pub fn run_rs_node_round(
         )?;
     let agg = agg.finish();
 
-    let root_refs: Vec<&HVCPoly> = canonical.iter().map(|cid| &roots[root_index[cid]].1).collect();
+    let root_refs: Vec<&HVCPoly> = canonical
+        .iter()
+        .map(|cid| &roots[root_index[cid]].1)
+        .collect();
     let summed_root = pointwise_sum_polys(&root_refs);
     if !verify_aggregated(scp, &summed_root, &share_sum, &agg) {
         // The aggregate does not open, so some client's share disagrees with
@@ -147,7 +153,9 @@ pub fn run_rs_node_round(
             .find_map_first(|(cid, &i)| {
                 let root = &roots[root_index[cid]].1;
                 let (_, share, path) = &inbox.items[i];
-                ingest_share(scp, root, lane, share, path).is_none().then_some(*cid)
+                ingest_share(scp, root, lane, share, path)
+                    .is_none()
+                    .then_some(*cid)
             });
         return Err(culprit.map_or(
             ServerRoundError::AggregateOverCapacity,
@@ -182,7 +190,8 @@ pub fn run_server_round(
         let (_, op) = &inbox.items[i];
         opening_refs.push(op);
     }
-    let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs);
+    let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs)
+        .ok_or(ServerRoundError::MalformedOpening)?;
     let agg_share: CsPoly = agg_open.s()[0];
 
     Ok(ServerBulletinEntry {

@@ -117,6 +117,7 @@ impl ProtocolParams {
 }
 
 impl ProtocolParams {
+    #[allow(clippy::too_many_arguments)]
     pub fn setup_rs_mode<R: Rng>(
         rng: &mut R,
         n_servers: usize,
@@ -133,8 +134,13 @@ impl ProtocolParams {
             "every threshold server is also a lane; n_nodes ≥ n_servers"
         );
         let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
-        let kahe =
-            Kahe::setup_with_dims(rng, payload_polys, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, t_modulus);
+        let kahe = Kahe::setup_with_dims(
+            rng,
+            payload_polys,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            t_modulus,
+        );
         let rs = RsParams::new(k, n_nodes);
         let block_len = rs.block_len(payload_polys);
         Self {

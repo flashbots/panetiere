@@ -8,7 +8,7 @@ use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use panetiere::protocol::client::{run_client_round_rs, RsClientRound};
 use panetiere::protocol::server::{
-    run_rs_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerRoundError, ServerInbox,
+    run_rs_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerInbox, ServerRoundError,
 };
 use panetiere::protocol::verify::{aggregate_and_decrypt_rs, VerifyError};
 use panetiere::protocol::{ClientId, NodeId, ProtocolParams, ServerId, SessionId};
@@ -48,8 +48,9 @@ impl Round {
             RHO_MAX,
             [0x42; 32],
         );
-        let server_keys: Vec<pke::PrivateKey> =
-            (0..S).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+        let server_keys: Vec<pke::PrivateKey> = (0..S)
+            .map(|_| pke::PrivateKey::generate(&mut rng))
+            .collect();
         let servers: Vec<(ServerId, pke::PublicKey)> = (0..S)
             .map(|i| (ServerId(i as u32), server_keys[i].public()))
             .collect();
@@ -64,7 +65,13 @@ impl Round {
             rounds.push(r);
         }
         let canonical: Vec<ClientId> = (0..rho as u32).map(ClientId).collect();
-        Round { pp, canonical, entries, rounds, server_keys }
+        Round {
+            pp,
+            canonical,
+            entries,
+            rounds,
+            server_keys,
+        }
     }
 
     /// The signed roots the lanes verify shares against.
@@ -93,13 +100,11 @@ impl Round {
                 )
             })
             .collect();
-        let inbox = RsNodeInbox { node_id: NodeId(j as u32), items };
-        run_rs_node_round(
-            self.pp.share_comm.as_ref().unwrap(),
-            &inbox,
-            subset,
-            roots,
-        )
+        let inbox = RsNodeInbox {
+            node_id: NodeId(j as u32),
+            items,
+        };
+        run_rs_node_round(self.pp.share_comm.as_ref().unwrap(), &inbox, subset, roots)
     }
 
     /// Servers and lanes over an arbitrary subset, exercising the all-or-nothing
@@ -123,7 +128,10 @@ impl Round {
                         (r.client_id, op)
                     })
                     .collect();
-                let inbox = ServerInbox { server_id: ServerId(j as u32), items };
+                let inbox = ServerInbox {
+                    server_id: ServerId(j as u32),
+                    items,
+                };
                 run_server_round(&inbox, subset).unwrap()
             })
             .collect();
@@ -211,7 +219,9 @@ fn prony_round_trip_through_rs_lanes() {
         aggregate_and_decrypt_rs(&r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes)
             .expect("rs verify");
 
-    let mut got = PronySketch::unpack(&params, &plain).decode().expect("prony decode");
+    let mut got = PronySketch::unpack(&params, &plain)
+        .decode()
+        .expect("prony decode");
     got.sort();
     let mut want = elements.clone();
     want.sort();
@@ -277,10 +287,8 @@ fn a_lying_lane_is_caught() {
         let (servers, mut nodes) = r.outputs(&r.canonical);
         bump(&mut nodes[3]);
         assert_eq!(
-            aggregate_and_decrypt_rs(
-                &r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes,
-            )
-            .err(),
+            aggregate_and_decrypt_rs(&r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes,)
+                .err(),
             Some(VerifyError::LaneOpeningFailed(vec![NodeId(3)]))
         );
     }
@@ -313,10 +321,8 @@ fn a_lying_lane_is_caught() {
         c[5] -= chipmunk_code::HVC_MODULUS;
         *d = HVCPoly::from_coeffs(c);
         assert_eq!(
-            aggregate_and_decrypt_rs(
-                &r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes,
-            )
-            .err(),
+            aggregate_and_decrypt_rs(&r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes,)
+                .err(),
             Some(VerifyError::LaneOpeningFailed(vec![NodeId(3)]))
         );
     }
@@ -442,9 +448,19 @@ fn the_lane_pays_for_attribution_only_on_failure() {
     // ρ beyond what the digit bound admits: every client's share opens its own
     // root, so the lane reports capacity rather than inventing a culprit.
     let mut rng = ChaCha20Rng::from_seed([0x51; 32]);
-    let tight =
-        ProtocolParams::setup_rs_mode(&mut rng, S, 20, K, N_NODES, T_MODULUS_DEFAULT, 1, [0x42; 32]);
-    let keys: Vec<pke::PrivateKey> = (0..S).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+    let tight = ProtocolParams::setup_rs_mode(
+        &mut rng,
+        S,
+        20,
+        K,
+        N_NODES,
+        T_MODULUS_DEFAULT,
+        1,
+        [0x42; 32],
+    );
+    let keys: Vec<pke::PrivateKey> = (0..S)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
     let servers: Vec<(ServerId, pke::PublicKey)> = (0..S)
         .map(|i| (ServerId(i as u32), keys[i].public()))
         .collect();

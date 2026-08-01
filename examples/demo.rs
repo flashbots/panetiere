@@ -101,8 +101,8 @@ fn main() {
         // The private half is one sealed envelope per server, each holding that
         // server's Shamir share of this client's KAHE key.
         for (idx, (sid, sealed)) in round.sealed_openings.iter().enumerate() {
-            let share = unseal_opening(&server_keys[idx], &session, cid, *sid, sealed)
-                .expect("unseal");
+            let share =
+                unseal_opening(&server_keys[idx], &session, cid, *sid, sealed).expect("unseal");
             inboxes[idx].items.push((cid, share));
         }
     }
@@ -128,8 +128,8 @@ fn main() {
     )
     .expect("recover");
 
-    let payloads = channel::decode_messages(&ch, &recovered.plaintext, Some(messages.len()))
-        .expect("peel");
+    let payloads =
+        channel::decode_messages(&ch, &recovered.plaintext, Some(messages.len())).expect("peel");
 
     println!(
         "\nanonymity set {}, servers excluded {:?}",
@@ -141,7 +141,10 @@ fn main() {
         payloads.len(),
     );
     for p in &payloads {
-        println!("  {:?}", std::str::from_utf8(unpad(p)).unwrap_or("<non-utf8>"));
+        println!(
+            "  {:?}",
+            std::str::from_utf8(unpad(p)).unwrap_or("<non-utf8>")
+        );
     }
 
     let mut got: Vec<&[u8]> = payloads.iter().map(|p| unpad(p)).collect();

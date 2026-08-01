@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # The workspace .cargo/config.toml is developer-local (target-cpu=native);
+  # CI builds portable.
+  RUSTFLAGS: ""
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: rustup component add rustfmt clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo test --release
+
+  # Unoptimized builds keep whole rings (16 KB per KahePoly) live on the stack,
+  # so the debug run needs a bigger one. Worth the wall time: it is the only run
+  # where the debug_assert range checks on the ring bridges execute.
+  test-debug-assertions:
+    runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: 33554432
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo test

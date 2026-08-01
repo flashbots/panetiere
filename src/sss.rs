@@ -24,7 +24,7 @@ impl Sss for AdditiveSharing {
         let mut acc = CsPoly::default();
         for _ in 0..n - 1 {
             let s = CsPoly::rand_poly(rng);
-            acc = acc + s;
+            acc += s;
             shares.push(s);
         }
         shares.push(*secret - acc);
@@ -32,10 +32,7 @@ impl Sss for AdditiveSharing {
     }
 
     fn recover(shares: &[Self::Share]) -> Self::Secret {
-        shares
-            .iter()
-            .copied()
-            .fold(CsPoly::default(), |a, x| a + x)
+        shares.iter().copied().fold(CsPoly::default(), |a, x| a + x)
     }
 }
 
@@ -64,10 +61,7 @@ pub struct ShamirParams {
 impl ShamirParams {
     pub fn new(t: usize, n: usize) -> Self {
         assert!(t >= 1 && t <= n, "require 1 ≤ t ≤ n");
-        assert!(
-            n < CS_MODULUS as usize,
-            "n must be < q for distinct points"
-        );
+        assert!(n < CS_MODULUS as usize, "n must be < q for distinct points");
         Self { t, n }
     }
 }
@@ -84,7 +78,7 @@ impl ShamirSharing {
                 let mut x_pow = x;
                 let mut acc = *secret;
                 for c in &coeffs {
-                    acc = acc + scalar_mul(c, x_pow);
+                    acc += scalar_mul(c, x_pow);
                     x_pow = mul_q(x_pow, x);
                 }
                 acc
@@ -95,10 +89,7 @@ impl ShamirSharing {
     /// Recover the secret from any `t` `(index, share)` samples (0-based
     /// indices into the original `share()` output). Extra samples beyond `t`
     /// are ignored.
-    pub fn recover(
-        params: &ShamirParams,
-        samples: &[(usize, CsPoly)],
-    ) -> Result<CsPoly, SssError> {
+    pub fn recover(params: &ShamirParams, samples: &[(usize, CsPoly)]) -> Result<CsPoly, SssError> {
         let t = params.t;
         if samples.len() < t {
             return Err(SssError::NotEnoughShares);
@@ -137,7 +128,7 @@ impl ShamirSharing {
             .collect();
         let mut acc = CsPoly::default();
         for (slot, (_, share)) in samples.iter().take(t).enumerate() {
-            acc = acc + scalar_mul(share, lagrange[slot]);
+            acc += scalar_mul(share, lagrange[slot]);
         }
         Ok(acc)
     }
@@ -254,11 +245,7 @@ mod tests {
         // sum the shares per index across clients
         let summed: Vec<CsPoly> = indices
             .iter()
-            .map(|&i| {
-                all_shares
-                    .iter()
-                    .fold(CsPoly::default(), |a, sh| a + sh[i])
-            })
+            .map(|&i| all_shares.iter().fold(CsPoly::default(), |a, sh| a + sh[i]))
             .collect();
         let samples: Vec<_> = indices
             .iter()

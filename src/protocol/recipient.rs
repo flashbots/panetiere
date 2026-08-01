@@ -13,9 +13,7 @@ use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Cs, HidingMerkleCommitment};
 use crate::kahe::{Kahe, KaheScheme};
 
-use super::verify::{
-    aggregate_and_decrypt, check_anonymity_floor, decrypt_aggregate, VerifyError,
-};
+use super::verify::{aggregate_and_decrypt, check_anonymity_floor, decrypt_aggregate, VerifyError};
 use super::{ClientId, ProtocolParams, ServerId};
 
 /// The canonical-set rule: decode strictly over the anchor the caller names.
@@ -61,12 +59,29 @@ pub enum RecipientError {
 
 #[derive(Debug, PartialEq)]
 pub enum RejectReason {
-    BelowAnonymityFloor { got: usize, min: usize },
-    AboveMaxClients { got: usize, max: usize },
-    TooFewAgreeingServers { agreeing: usize, need: usize },
-    MissingClientPublics { have: usize, need: usize },
-    GroupAggregateMissing { group_of: ClientId },
-    GroupMembershipMismatch { got: usize, expected: usize },
+    BelowAnonymityFloor {
+        got: usize,
+        min: usize,
+    },
+    AboveMaxClients {
+        got: usize,
+        max: usize,
+    },
+    TooFewAgreeingServers {
+        agreeing: usize,
+        need: usize,
+    },
+    MissingClientPublics {
+        have: usize,
+        need: usize,
+    },
+    GroupAggregateMissing {
+        group_of: ClientId,
+    },
+    GroupMembershipMismatch {
+        got: usize,
+        expected: usize,
+    },
     ExhaustedShares {
         remaining: usize,
         need: usize,
@@ -246,10 +261,17 @@ pub fn recover_aggregated(
         }));
     }
 
-    let total_ctxt =
-        Kahe::agg_ctxt(&groups.iter().map(|(_, e)| e.ctxt.clone()).collect::<Vec<_>>());
+    let total_ctxt = Kahe::agg_ctxt(
+        &groups
+            .iter()
+            .map(|(_, e)| e.ctxt.clone())
+            .collect::<Vec<_>>(),
+    );
     let total_comm = HidingMerkleCommitment::sum_commitments(
-        &groups.iter().map(|(_, e)| e.comm.clone()).collect::<Vec<_>>(),
+        &groups
+            .iter()
+            .map(|(_, e)| e.comm.clone())
+            .collect::<Vec<_>>(),
     );
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
         decrypt_aggregate(pp, &total_ctxt, &total_comm, outs)

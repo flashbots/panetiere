@@ -24,7 +24,10 @@ pub enum CodecError {
 }
 
 pub fn encode_raw(bytes: &[u8]) -> Vec<KahePoly> {
-    bytes.chunks(BYTES_PER_POLY).map(coeffs_from_bytes).collect()
+    bytes
+        .chunks(BYTES_PER_POLY)
+        .map(coeffs_from_bytes)
+        .collect()
 }
 
 pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
@@ -119,7 +122,11 @@ pub fn beacon(rands: &[u16]) -> u16 {
     u16::from_le_bytes([d[0], d[1]])
 }
 
-pub fn allocate(reservations: &[(u16, usize)], beacon: u16, vector_bytes: usize) -> Vec<Option<usize>> {
+pub fn allocate(
+    reservations: &[(u16, usize)],
+    beacon: u16,
+    vector_bytes: usize,
+) -> Vec<Option<usize>> {
     let mut order: Vec<usize> = (0..reservations.len()).collect();
     order.sort_by_key(|&i| (reservations[i].0.wrapping_sub(beacon), reservations[i].1));
 
@@ -154,13 +161,19 @@ pub fn encode_at(offset: usize, vector_bytes: usize, payload: &[u8]) -> Vec<Kahe
     encode_raw(&buf)
 }
 
-pub fn decode_ranges(plain: &[KahePoly], ranges: &[(usize, usize)]) -> Result<Vec<Vec<u8>>, CodecError> {
+pub fn decode_ranges(
+    plain: &[KahePoly],
+    ranges: &[(usize, usize)],
+) -> Result<Vec<Vec<u8>>, CodecError> {
     let buf = decode_raw(plain)?;
     let mut out = Vec::with_capacity(ranges.len());
     for &(offset, size) in ranges {
         let end = offset + size;
         if end > buf.len() {
-            return Err(CodecError::LengthOverflow { claimed: end as u32, available: buf.len() });
+            return Err(CodecError::LengthOverflow {
+                claimed: end as u32,
+                available: buf.len(),
+            });
         }
         out.push(buf[offset..end].to_vec());
     }
@@ -197,7 +210,9 @@ mod tests {
     #[test]
     fn round_trip_multi_poly() {
         // Span ≥4 polys regardless of BYTES_PER_POLY (4096 at N=2048).
-        let msg: Vec<u8> = (0..BYTES_PER_POLY * 3 + 500).map(|i| (i * 37) as u8).collect();
+        let msg: Vec<u8> = (0..BYTES_PER_POLY * 3 + 500)
+            .map(|i| (i * 37) as u8)
+            .collect();
         let polys = encode(&msg);
         assert!(polys.len() >= 4);
         assert_eq!(decode(&polys).unwrap(), msg);
@@ -231,11 +246,7 @@ mod tests {
 
         let pa = encode_raw(&buf_a);
         let pb = encode_raw(&buf_b);
-        let summed: Vec<KahePoly> = pa
-            .iter()
-            .zip(pb.iter())
-            .map(|(x, y)| *x + *y)
-            .collect();
+        let summed: Vec<KahePoly> = pa.iter().zip(pb.iter()).map(|(x, y)| *x + *y).collect();
         let out = decode_raw(&summed).unwrap();
         assert_eq!(&out[0..4], b"AAAA");
         assert_eq!(&out[100..104], b"BBBB");

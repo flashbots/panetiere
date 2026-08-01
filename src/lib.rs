@@ -1,3 +1,7 @@
+// Index arithmetic over parallel coefficient/limb arrays reads better than
+// iterator chains in the ring kernels.
+#![allow(clippy::needless_range_loop)]
+
 pub mod bulletin;
 pub mod channel;
 pub mod codec;

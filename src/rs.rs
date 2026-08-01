@@ -68,7 +68,7 @@ fn pow_q(base: u64, mut exp: u64) -> u64 {
 /// `q_dgt` is prime, so Fermat gives the inverse.
 #[inline]
 fn inv_q(x: u64) -> u64 {
-    debug_assert!(x % Q != 0, "inverse of zero");
+    debug_assert!(!x.is_multiple_of(Q), "inverse of zero");
     pow_q(x, Q - 2)
 }
 
@@ -165,7 +165,13 @@ impl Rs {
         let bl = params.block_len(ctxt.len());
         let refs: Vec<&[DgtNTTPoly]> = out.iter().map(Vec::as_slice).collect();
         let parity: Vec<Share> = (params.k..params.n)
-            .map(|j| combine(&refs, &lagrange_at(&data_points(params.k), (j + 1) as u64), bl))
+            .map(|j| {
+                combine(
+                    &refs,
+                    &lagrange_at(&data_points(params.k), (j + 1) as u64),
+                    bl,
+                )
+            })
             .collect();
         drop(refs);
         out.extend(parity);
@@ -320,13 +326,11 @@ mod tests {
             .iter()
             .map(|c| c.iter().map(DgtNTTPoly::from_kahe).collect())
             .collect();
-        let per_client: Vec<Vec<Share>> =
-            embedded.iter().map(|c| Rs::encode(&params, c)).collect();
+        let per_client: Vec<Vec<Share>> = embedded.iter().map(|c| Rs::encode(&params, c)).collect();
 
         let lane_sums: Vec<Share> = (0..params.n)
             .map(|j| {
-                let col: Vec<&[DgtNTTPoly]> =
-                    per_client.iter().map(|s| s[j].as_slice()).collect();
+                let col: Vec<&[DgtNTTPoly]> = per_client.iter().map(|s| s[j].as_slice()).collect();
                 Rs::sum_shares(&col)
             })
             .collect();

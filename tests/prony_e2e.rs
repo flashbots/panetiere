@@ -38,8 +38,9 @@ fn round_trip(
         PRONY_PRIME,
     );
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_keys: Vec<pke::PrivateKey> =
-        (0..n_servers).map(|_| pke::PrivateKey::generate(rng)).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(rng))
+        .collect();
     let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
         .iter()
         .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
@@ -56,7 +57,10 @@ fn round_trip(
             let mut client_entries = Vec::new();
             let mut inboxes: Vec<ServerInbox> = server_ids
                 .iter()
-                .map(|&sid| ServerInbox { server_id: sid, items: vec![] })
+                .map(|&sid| ServerInbox {
+                    server_id: sid,
+                    items: vec![],
+                })
                 .collect();
             for (i, &cid) in client_ids.iter().enumerate() {
                 let round =
@@ -86,8 +90,9 @@ fn prony_recovers_through_panetiere() {
     let n_clients = 6;
     let params = PronyParams::new(n_clients, 2);
 
-    let messages: Vec<Vec<i64>> =
-        (0..n_clients).map(|i| vec![1000 + i as i64, (i as i64 + 1) << 30]).collect();
+    let messages: Vec<Vec<i64>> = (0..n_clients)
+        .map(|i| vec![1000 + i as i64, (i as i64 + 1) << 30])
+        .collect();
     let client_polys: Vec<Vec<KahePoly>> = messages
         .iter()
         .map(|m| {
@@ -98,7 +103,9 @@ fn prony_recovers_through_panetiere() {
         .collect();
 
     let recovered = round_trip(&mut rng, 3, &client_polys);
-    let mut got = PronySketch::unpack(&params, &recovered).decode().expect("prony decode");
+    let mut got = PronySketch::unpack(&params, &recovered)
+        .decode()
+        .expect("prony decode");
     let mut want = messages;
     got.sort();
     want.sort();

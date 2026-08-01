@@ -4,17 +4,19 @@ use std::time::Instant;
 use chipmunk_code::{CsPoly, KahePoly};
 use rayon::prelude::*;
 
-use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
+use crate::bulletin::{
+    ClientBulletinEntry, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
+};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
 use crate::rs::{Rs, RsError};
 use crate::share_commitment::verify_aggregated;
-use chipmunk_code::{pointwise_sum_polys, DgtNTTPoly, HVCPoly};
 use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
+use chipmunk_code::{pointwise_sum_polys, DgtNTTPoly, HVCPoly};
 
-use super::{ClientId, NodeId, ServerId, SessionId};
 use super::ProtocolParams;
+use super::{ClientId, NodeId, ServerId, SessionId};
 
 #[derive(Debug, PartialEq)]
 pub enum VerifyError {
@@ -25,7 +27,10 @@ pub enum VerifyError {
     BadServerCoverage,
     InconsistentCanonical(ServerId),
     InconsistentCiphertextLen(ServerId),
-    AnonymitySetTooSmall { got: usize, min: usize },
+    AnonymitySetTooSmall {
+        got: usize,
+        min: usize,
+    },
     ShareRecovery(SssError),
     /// RS mode only.
     NotRsMode,
@@ -102,8 +107,7 @@ pub fn aggregate_and_decrypt(
     client_entries: &[(ClientId, ClientBulletinEntry)],
     server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
-    aggregate_and_decrypt_timed(pp, canonical, client_entries, server_outputs)
-        .map(|(m, _)| m)
+    aggregate_and_decrypt_timed(pp, canonical, client_entries, server_outputs).map(|(m, _)| m)
 }
 
 pub fn aggregate_and_decrypt_timed(
@@ -147,9 +151,7 @@ pub fn aggregate_and_decrypt_timed(
     let mut comms = Vec::with_capacity(canonical.len());
     let mut ctxt_len: Option<usize> = None;
     for cid in canonical {
-        let i = *pub_index
-            .get(cid)
-            .ok_or(VerifyError::MissingClient(*cid))?;
+        let i = *pub_index.get(cid).ok_or(VerifyError::MissingClient(*cid))?;
         let (_, p) = &client_entries[i];
         let expected = *ctxt_len.get_or_insert(p.ctxt.len());
         if p.ctxt.len() != expected || p.ctxt.len() > max_ctxt_len {

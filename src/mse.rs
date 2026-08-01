@@ -33,12 +33,7 @@ pub struct MseParams {
 
 impl MseParams {
     /// Uniform `γ × δ` layout (standard IBLT shape).
-    pub fn new(
-        gamma: usize,
-        delta: usize,
-        payload_symbols: usize,
-        prf_key: [u8; 32],
-    ) -> Self {
+    pub fn new(gamma: usize, delta: usize, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
@@ -266,7 +261,7 @@ impl MseEncoding {
         let mut feed = |val: i64, polys: &mut Vec<KahePoly>| {
             buf[written % N] = val;
             written += 1;
-            if written % N == 0 {
+            if written.is_multiple_of(N) {
                 polys.push(KahePoly::from_coeffs(buf));
                 buf = [0i64; N];
             }
@@ -284,7 +279,7 @@ impl MseEncoding {
                 feed(x, &mut polys);
             }
         }
-        if written % N != 0 {
+        if !written.is_multiple_of(N) {
             polys.push(KahePoly::from_coeffs(buf));
         }
         debug_assert_eq!(polys.len(), n_polys);
@@ -325,12 +320,7 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    fn params_for(
-        gamma: usize,
-        delta: usize,
-        payload_symbols: usize,
-        seed: u8,
-    ) -> MseParams {
+    fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> MseParams {
         MseParams::new(gamma, delta, payload_symbols, [seed; 32])
     }
 
@@ -423,11 +413,7 @@ mod tests {
         }
         let pa = a.pack();
         let pb = b.pack();
-        let summed: Vec<KahePoly> = pa
-            .iter()
-            .zip(pb.iter())
-            .map(|(x, y)| *x + *y)
-            .collect();
+        let summed: Vec<KahePoly> = pa.iter().zip(pb.iter()).map(|(x, y)| *x + *y).collect();
         let unioned = MseEncoding::unpack(&pp, &summed);
         let mut got: Vec<i64> = unioned
             .decode()

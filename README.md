@@ -44,7 +44,7 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `kahe` | key-additive homomorphic encryption, plus the CS↔KAHE bridge |
 | `sss` | Shamir *t*-of-*n* (and additive) sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
-| `rs` | systematic Reed–Solomon erasure coding over the wide ring |
+| `rs` | systematic Reed–Solomon erasure coding over the Dgt ring |
 | `share_commitment` | commitment to the $n$ coded shares, one tree leaf per lane |
 | `pke` / `sig` | ML-KEM-768 + AES-GCM envelopes for the key shares / P-256 post signatures |
 | `bulletin` | published entry types and their byte encodings |
@@ -290,6 +290,20 @@ NotSplit, CheckFailed})` — never as a successfully decoded empty round.
 modulus, i.e. the slot layout let two clients collide. A `None` from
 `unseal_opening` is wrong session, wrong client/server, or a tampered envelope.
 
+Nothing that arrives over the wire can panic a peer. Every remote input is
+validated and rejected by value: `PackedOpening::from_bytes` and
+`Opening::from_packed` bound the declared header before allocating,
+`Cs::sum_openings` returns `None` if the openings disagree on shape or position,
+`open_share` and `verify_aggregated` gate lane index and buffer lengths,
+`Rs::reconstruct` and `ShamirSharing::recover` check index range and
+distinctness, and the verifier rejects an out-of-range or duplicated
+`ServerId`/`NodeId` before using it. The `assert!`s that remain are on locally
+supplied arguments — parameter constructors (`setup_rs_mode`, `ShamirParams::new`,
+`MseParams::new`, `PronyParams::new`, `RsParams::new`) and payload arity in
+`MseEncoding::insert` / `PronyEncoding::insert_with_z` — where a violation is a
+caller bug, not an attack. Range checks on the ring bridges are `debug_assert!`,
+so they only run in the debug test profile.
+
 ## Wire formats
 
 The crate serialises the crypto objects and nothing else — framing, transport,
@@ -324,7 +338,7 @@ source of truth for the moduli and their NTT tables.
 | HVC (`HVCPoly`) | $40{,}961$; $\zeta = 34$ (`ZETA`), `HVC_WIDTH = 3` | tree hash, leaf labels, opening digits (both commitments) |
 | CS (`CsPoly`) | $139{,}301$ | commitment leaf, Shamir sharing, share sums |
 | KAHE (`KahePoly`) | $347{,}280{,}875{,}347{,}969 \approx 2^{48.3}$ | encryption, codec, encoding cells |
-| wide (`DgtNTTPoly`) | $\approx 2^{61}$ | RS coding, over exact integer sums |
+| Dgt (`DgtNTTPoly`) | $\approx 2^{61}$ | RS coding, over exact integer sums |
 
 | Knob | Value |
 |---|---|

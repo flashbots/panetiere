@@ -4,14 +4,16 @@
 //! contributes them to the protocol. The verifier's recovered per-poly sums
 //! unpack into the multiset union, which decodes to all clients' elements.
 
+#![allow(clippy::needless_range_loop)]
+
 use chipmunk_code::KahePoly;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -78,8 +80,8 @@ fn mse_recovers_through_panetiere() {
             let round = run_client_round(&mut rng, &pp, &session, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
             for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &session, cid, sid, &sealed)
-                    .expect("unseal");
+                let opening =
+                    unseal_opening(&server_keys[idx], &session, cid, sid, &sealed).expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -166,8 +168,8 @@ fn cover_clients_do_not_inflate_iblt() {
             let round = run_client_round(&mut rng, &pp, &session, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
             for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &session, cid, sid, &sealed)
-                    .expect("unseal");
+                let opening =
+                    unseal_opening(&server_keys[idx], &session, cid, sid, &sealed).expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -206,7 +208,11 @@ fn multi_symbol_cover_through_panetiere() {
     let mse_params = MseParams::new(4, (3 * n_active).div_ceil(4), xi, [0xAA; 32]);
 
     let payloads: Vec<Vec<i64>> = (0..n_active)
-        .map(|i| (0..xi).map(|s| ((i * 97 + s * 31) % 65535) as i64).collect())
+        .map(|i| {
+            (0..xi)
+                .map(|s| ((i * 97 + s * 31) % 65535) as i64)
+                .collect()
+        })
         .collect();
     let client_polys: Vec<Vec<KahePoly>> = (0..n_total)
         .map(|i| {
@@ -225,8 +231,9 @@ fn multi_symbol_cover_through_panetiere() {
 
     let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, n_polys);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_keys: Vec<pke::PrivateKey> =
-        (0..n_servers).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
     let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
         .iter()
         .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
@@ -240,15 +247,18 @@ fn multi_symbol_cover_through_panetiere() {
         let mut client_entries = Vec::new();
         let mut inboxes: Vec<ServerInbox> = server_ids
             .iter()
-            .map(|&sid| ServerInbox { server_id: sid, items: vec![] })
+            .map(|&sid| ServerInbox {
+                server_id: sid,
+                items: vec![],
+            })
             .collect();
         for (i, &cid) in client_ids.iter().enumerate() {
             let m = vec![client_polys[i][k]];
             let round = run_client_round(&mut rng, &pp, &session, cid, m, &servers);
             client_entries.push((round.client_id, round.encrypted_message));
             for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                let opening = unseal_opening(&server_keys[idx], &session, cid, sid, &sealed)
-                    .expect("unseal");
+                let opening =
+                    unseal_opening(&server_keys[idx], &session, cid, sid, &sealed).expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -267,7 +277,10 @@ fn multi_symbol_cover_through_panetiere() {
     let mut expected = payloads.clone();
     got.sort();
     expected.sort();
-    assert_eq!(got, expected, "every active multi-symbol message must peel out");
+    assert_eq!(
+        got, expected,
+        "every active multi-symbol message must peel out"
+    );
 }
 
 /// Guards the cover/insert distinction: `cover` adds nothing, but a
@@ -287,7 +300,9 @@ fn zero_payload_insert_is_not_cover() {
     assert_eq!(got, vec![0, 7]);
 
     // cover() leaves the matrices empty: nothing to peel.
-    assert!(MseEncoding::cover(&mse_params)
-        .iter()
-        .all(|p| { let mut q = *p; q.normalize(); q.coeffs().iter().all(|&c| c == 0) }));
+    assert!(MseEncoding::cover(&mse_params).iter().all(|p| {
+        let mut q = *p;
+        q.normalize();
+        q.coeffs().iter().all(|&c| c == 0)
+    }));
 }

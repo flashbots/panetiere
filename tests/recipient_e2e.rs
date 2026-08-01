@@ -105,7 +105,7 @@ fn recover_once_matches_aggregate_and_decrypt() {
 fn recover_once_names_the_faulty_server() {
     let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
     let mut r = round(2, 5, 4);
-    r.outputs[1].agg_share = r.outputs[1].agg_share + CsPoly::rand_poly(&mut rng);
+    r.outputs[1].agg_share += CsPoly::rand_poly(&mut rng);
     assert_eq!(
         recover_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
         Err(VerifyError::ShareOpeningMismatch(1))
@@ -120,7 +120,7 @@ fn recover_direct_excludes_culprits() {
     let mut r = round(3, 5, 4);
     assert_eq!(r.pp.shamir.t, 3);
     for i in [1usize, 3] {
-        r.outputs[i].agg_share = r.outputs[i].agg_share + CsPoly::rand_poly(&mut rng);
+        r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
     }
     let honest = recover_once(&r.pp, &r.canonical, &r.publics, &{
         let mut v = r.outputs.clone();
@@ -145,7 +145,7 @@ fn recover_direct_reports_exhausted_shares() {
     // t = 3 of 4, so two bad shares leave too few.
     assert_eq!(r.pp.shamir.t, 3);
     for i in [0usize, 2] {
-        r.outputs[i].agg_share = r.outputs[i].agg_share + CsPoly::rand_poly(&mut rng);
+        r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs) {

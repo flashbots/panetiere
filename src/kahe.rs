@@ -236,8 +236,9 @@ impl Kahe {
         assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
         // Sample directly NTT-resident — uniform-in-NTT slot is statistically
         // equivalent to NTT(uniform coeff poly) and saves `μ` forward NTTs.
-        let a_ntt: Vec<KaheNTTPoly> =
-            (0..mu_kahe).map(|_| KaheNTTPoly::rand_ntt_poly(rng)).collect();
+        let a_ntt: Vec<KaheNTTPoly> = (0..mu_kahe)
+            .map(|_| KaheNTTPoly::rand_ntt_poly(rng))
+            .collect();
         KaheParams {
             a_ntt,
             mu_kahe,
@@ -308,7 +309,7 @@ impl KaheScheme for Kahe {
             return Vec::new();
         }
         let len = cs[0].len();
-        let q = chipmunk_code::KAHE_MODULUS as i64;
+        let q = chipmunk_code::KAHE_MODULUS;
         let half = q / 2;
         (0..len)
             .into_par_iter()

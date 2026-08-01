@@ -246,7 +246,7 @@ mod tests {
         let mut acc = polys[0].clone();
         for p in &polys[1..] {
             for (a, b) in acc.iter_mut().zip(p) {
-                *a = *a + *b;
+                *a += *b;
             }
         }
         acc
@@ -259,7 +259,11 @@ mod tests {
             assert_eq!(p.max_payload_bytes(), 64);
 
             let payloads: Vec<Vec<u8>> = (0..8u8)
-                .map(|i| (0..64).map(|j| i.wrapping_mul(31).wrapping_add(j)).collect())
+                .map(|i| {
+                    (0..64)
+                        .map(|j| i.wrapping_mul(31).wrapping_add(j))
+                        .collect()
+                })
                 .collect();
             let contributions: Vec<Vec<KahePoly>> = payloads
                 .iter()

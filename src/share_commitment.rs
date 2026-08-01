@@ -56,7 +56,11 @@ pub fn decompose_share_poly(p: &DgtNTTPoly) -> [HVCPoly; DGT_WIDTH] {
     let coeffs = p.coeffs();
     for i in 0..POLY_N {
         let x = coeffs[i];
-        let mut v = if x > half { x as i64 - q as i64 } else { x as i64 };
+        let mut v = if x > half {
+            x as i64 - q as i64
+        } else {
+            x as i64
+        };
         for digit in out.iter_mut() {
             let mut d = v % BASE;
             if d > ZETA_I64 {
@@ -254,7 +258,11 @@ impl ShareOpening {
 pub fn commit_shares(pp: &ShareCommitmentParams, shares: &[Share]) -> (HVCPoly, Vec<SharePath>) {
     assert_eq!(shares.len(), pp.n_lanes);
     for s in shares {
-        assert_eq!(s.len(), pp.block_len, "each share must have block_len polys");
+        assert_eq!(
+            s.len(),
+            pp.block_len,
+            "each share must have block_len polys"
+        );
     }
     let lane_labels: Vec<HVCPoly> = shares
         .par_iter()
@@ -354,10 +362,13 @@ pub fn verify_aggregated(
     pp.hash_share(share_sum) == o.project_labels()
 }
 
-fn verify_walk(pp: &ShareCommitmentParams, root: &HVCPoly, o: &ShareOpening, digit_bound: u32) -> bool {
-    if o.lane_index >= pp.n_lanes
-        || o.path_len != pp.path_len()
-        || o.data.len() != pp.data_polys()
+fn verify_walk(
+    pp: &ShareCommitmentParams,
+    root: &HVCPoly,
+    o: &ShareOpening,
+    digit_bound: u32,
+) -> bool {
+    if o.lane_index >= pp.n_lanes || o.path_len != pp.path_len() || o.data.len() != pp.data_polys()
     {
         return false;
     }
@@ -545,16 +556,13 @@ mod tests {
         let mut digit_sum = [HVCPoly::default(); DGT_WIDTH];
         for p in &polys {
             for (acc, d) in digit_sum.iter_mut().zip(decompose_share_poly(p)) {
-                *acc = *acc + d;
+                *acc += d;
             }
         }
         assert!(digit_sum
             .iter()
             .all(|d| d.infinity_norm() <= rho as u32 * ZETA));
-        let want = polys
-            .iter()
-            .skip(1)
-            .fold(polys[0], |acc, p| acc + *p);
+        let want = polys.iter().skip(1).fold(polys[0], |acc, p| acc + *p);
         assert_eq!(project_share_poly(&digit_sum), want);
 
         // Adversarial magnitude: every digit at ±ρ_max·ζ. Wrong under i64.
@@ -590,7 +598,7 @@ mod tests {
             if n_lanes >= 2 {
                 assert!(ingest_share(&pp, &root, 1, &shares[0], &paths[0]).is_none());
                 let mut bad_share = shares[0].clone();
-                bad_share[0] = bad_share[0] + shares[1][0];
+                bad_share[0] += shares[1][0];
                 assert!(ingest_share(&pp, &root, 0, &bad_share, &paths[0]).is_none());
                 let mut bad_path = paths[0].clone();
                 let mut nodes = bad_path.nodes.to_vec();
@@ -639,7 +647,7 @@ mod tests {
             );
             // A tampered share sum no longer hashes to the projected labels.
             let mut bad = share_sum.clone();
-            bad[0] = bad[0] + share_sum[0];
+            bad[0] += share_sum[0];
             assert!(!verify_aggregated(&pp, &summed_root, &bad, &agg));
         }
     }

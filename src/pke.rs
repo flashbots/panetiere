@@ -7,7 +7,7 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use ml_kem::kem::Decapsulate;
-use ml_kem::{B32, KeyExport, Seed};
+use ml_kem::{KeyExport, Seed, B32};
 use rand::{CryptoRng, RngCore};
 use sha2::{Digest, Sha512};
 

@@ -1,11 +1,13 @@
+#![allow(clippy::needless_range_loop, clippy::type_complexity)]
+
 use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
 use panetiere::codec;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
+use panetiere::protocol::{ClientId, ServerId, SessionId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -20,12 +22,18 @@ fn run_full_round_bytes(
     seed: [u8; 32],
     n_servers: usize,
     n_clients: usize,
-) -> (Vec<Vec<KahePoly>>, Vec<Vec<u8>>, Vec<Vec<Vec<u8>>>, Vec<KahePoly>) {
+) -> (
+    Vec<Vec<KahePoly>>,
+    Vec<Vec<u8>>,
+    Vec<Vec<Vec<u8>>>,
+    Vec<KahePoly>,
+) {
     let mut rng = ChaCha20Rng::from_seed(seed);
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_keys: Vec<pke::PrivateKey> =
-        (0..n_servers).map(|_| pke::PrivateKey::generate(&mut rng)).collect();
+    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
     let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
         .iter()
         .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
@@ -52,8 +60,8 @@ fn run_full_round_bytes(
         let mut sealed_for_client = Vec::with_capacity(n_servers);
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             sealed_for_client.push(sealed);
             inboxes[idx].items.push((cid, opening));
         }
@@ -152,8 +160,8 @@ fn run<R: rand::Rng + rand::CryptoRng>(
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }
@@ -237,8 +245,8 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }
@@ -249,8 +257,8 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
-        .expect("verify failed");
+    let recovered =
+        aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).expect("verify failed");
     let recovered_bytes = codec::decode_raw(&recovered).expect("decode");
     assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
 
@@ -338,8 +346,8 @@ fn slot_mode_8kb_message_multi_poly() {
             client_entries.push((round.client_id, round.encrypted_message));
             for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
                 assert_eq!(sid, server_ids[idx]);
-                let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                    .expect("unseal");
+                let opening =
+                    unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
                 inboxes[idx].items.push((cid, opening));
             }
         }
@@ -403,7 +411,10 @@ fn aggregated_recovers_same_sum() {
     let mut client_entries = Vec::with_capacity(n_clients);
     let mut inboxes: Vec<ServerInbox> = server_ids
         .iter()
-        .map(|&sid| ServerInbox { server_id: sid, items: vec![] })
+        .map(|&sid| ServerInbox {
+            server_id: sid,
+            items: vec![],
+        })
         .collect();
 
     for &cid in &client_ids {
@@ -412,8 +423,8 @@ fn aggregated_recovers_same_sum() {
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }
@@ -524,8 +535,8 @@ fn tampered_agg_share_rejected() {
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }
@@ -535,7 +546,7 @@ fn tampered_agg_share_rejected() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    server_outputs[0].agg_share = server_outputs[0].agg_share + CsPoly::rand_poly(&mut rng);
+    server_outputs[0].agg_share += CsPoly::rand_poly(&mut rng);
     let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
@@ -578,8 +589,8 @@ fn below_floor_anonymity_set_rejected() {
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }
@@ -648,8 +659,8 @@ fn high_norm_r_rejected_in_protocol() {
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }
@@ -713,8 +724,8 @@ fn recovers_from_t_of_n_servers() {
         client_entries.push((round.client_id, round.encrypted_message));
         for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
             assert_eq!(sid, server_ids[idx]);
-            let opening = unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed)
-                .expect("unseal");
+            let opening =
+                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
             inboxes[idx].items.push((cid, opening));
         }
     }

@@ -19,13 +19,13 @@
 //! sampling, push ITERS to 100+ to dilute startup noise.
 
 use chipmunk_code::KahePoly;
-use rand::Rng;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
+use panetiere::protocol::{ClientId, ServerId, SessionId};
+use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -55,7 +55,9 @@ fn main() {
     let mut rng = ChaCha20Rng::from_seed([(s as u8).wrapping_mul(7) ^ n as u8; 32]);
     let pp = if mu > 0 && t_modulus > 0 {
         ProtocolParams::setup_with_kahe_dims_full(
-            &mut rng, s, mu,
+            &mut rng,
+            s,
+            mu,
             panetiere::kahe::SIGMA_S_DEFAULT,
             panetiere::kahe::SIGMA_E_DEFAULT,
             t_modulus,
