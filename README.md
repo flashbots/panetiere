@@ -90,6 +90,7 @@ flowchart TB
         direction LR
         c3["client ×ρ"] -->|n coded shares| l3["lane ×n"] -->|k lane sums| r3[recipient]
     end
+    D ~~~ A ~~~ E
 ```
 
 | | **Direct** | **Aggregated** | **Erasure-coded** |
