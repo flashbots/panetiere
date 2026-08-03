@@ -15,8 +15,9 @@
 //!   [P] projected — synthetic network sim
 //!
 //! Each cell runs ONE live round; every active client encodes a distinct
-//! (element, r). Recovery is attempted and reported, never asserted —
-//! irrecoverable parameter sets still yield timings.
+//! (element, r). Recovery is attempted and reported, never asserted — a decode
+//! to garbage still yields timings; a verify that Errs on every rep records
+//! zeros for the verifier phases and warns on stderr.
 //!
 //! ──────────────────────────────────────────────────────────────────────
 //! INPUTS (knobs — sweep via env, or edit the defaults below)
@@ -62,13 +63,14 @@
 //!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
 //!  src/mse.rs:   BITS_PER_SYMBOL = 36, K_LIMBS = 2
 //!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
-//!                  over (S, ρ, active, ξ, codec), so cells never share a stream
+//!                  over (S, ρ, active, ξ, flow, message_bytes), so cells never
+//!                  share a stream
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
 //!  asserted per cell: agg_open + agg_share == CsParams::aggregated_server_crypto_len
 //!
 //! Run with:
-//!   RAYON_NUM_THREADS=8 cargo bench -j 8 --bench scaling
-//!   BENCH_BUDGET_SECS=600 cargo bench --bench scaling
+//!   RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep
+//!   BENCH_BUDGET_SECS=600 cargo bench --bench protocol_sweep
 
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
@@ -77,16 +79,16 @@ use rayon::prelude::*;
 
 use crate::bulletin::dgt_packed_len;
 use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
-use crate::codec;
+use crate::channel::{self, ChannelParams};
+use crate::codec::{self, BYTES_PER_COEFF, BYTES_PER_POLY};
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
 };
 use crate::digest::embed;
-use crate::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
-use crate::mse::{MseEncoding, MseParams, BITS_PER_SYMBOL};
+use crate::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::mse::BITS_PER_SYMBOL;
 use crate::pke;
-use crate::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::aggregator::run_aggregator_round;
 use crate::protocol::client::{
     cs_commit, kahe_encrypt, kahe_keygen, run_client_round, run_client_round_rs, seal_openings,
@@ -106,7 +108,7 @@ use crate::share_commitment::{
     commit_shares, fresh_path_packed_len, ingest_share, lane_post_packed_len, open_share,
 };
 use crate::sig::SigningKey;
-use chipmunk_code::{HVCPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
+use chipmunk_code::{HVCPoly, KahePoly, HVC_MODULUS, HVC_WIDTH, KAHE_MODULUS, N as POLY_N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
@@ -116,38 +118,16 @@ const SERVERS: &[usize] = &[8, 16, 64];
 // (clients_total, clients_active): explicit pairs, not a cross product.
 const CLIENTS: &[(usize, usize)] = &[(100, 100), (300, 300), (300, 100)];
 
-// γ (MSE rows) is fixed, not swept.
-const GAMMA: usize = 4;
-
 struct Config {
     label: String,
     payload_symbols: usize, // ξ: per-client element size = ξ·log₂t bits
 }
-
-/// Codec bytes per poly (chipmunk `N` coefficients × 4 bytes), matching `codec`.
-const BYTES_PER_POLY: usize = POLY_N * 4;
 
 /// Repetitions per measured phase; tables show the median, CSV keeps min/max.
 const REPS: usize = 5;
 
 /// One cell is one protocol execution.
 const SESSION: SessionId = SessionId([0x5C; 32]);
-
-/// `Mse` = single-round IBLT. `Prony` = single-round Vandermonde sketch at the
-/// same element size, no coding blowup, run at `t = PRONY_PRIME`. `Scheduled`
-/// = one joint plaintext, reservation IBLT ‖ message vector of `message_bytes`,
-/// under one key (openings paid once).
-enum AppCodec {
-    Mse,
-    Prony,
-    Scheduled { message_bytes: usize },
-}
-
-/// `⌊log₂ PRONY_PRIME⌋ = 35`, one below MSE's 36, so ξ grows by that ratio at
-/// equal element bytes.
-fn prony_bits() -> usize {
-    PRONY_PRIME.ilog2() as usize
-}
 
 /// Scheduling token = (rand u16, size u16) → 2 MSE symbols.
 const SCHED_TOKEN_SYMBOLS: usize = 2;
@@ -169,13 +149,8 @@ const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
 /// Aggregation ceiling the digest ring is sized for (see `digest::DigestParams`).
 const RS_RHO_MAX: usize = 300;
 
-// Aggregation depths to evaluate. Group size per depth is balanced so the
-// largest per-hop fan-in is ρ^{1/(layers+1)} (see `AggPlan`): 1-layer → ⌈√ρ⌉,
-// 2-layer → ⌈∛ρ⌉.
-const AGG_LAYERS: &[usize] = &[1];
-
-// Per-client element size = ξ symbols · 36 bits: 911 ⇒ 4 KiB, 4552 ⇒ 20 KiB.
-const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[911, 4552];
+// Per-client element size = ξ symbols · 36 bits: 911 ⇒ 4 KiB, 3641 ⇒ 16 KiB.
+const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[911, 3641];
 
 // ── env sweep knobs (fall back to the consts above) ─────────────────────────
 
@@ -374,11 +349,10 @@ fn cell_id(i: usize) -> String {
     }
 }
 
-// `layer_counts`: aggregator count per level bottom-up; leader ingests the last.
+// One aggregation layer: `n_l1` groups of `group_size`, leader sums the rest.
 struct AggPlan {
-    layers: usize,
     group_size: usize,
-    layer_counts: Vec<usize>,
+    n_l1: usize,
     agg_cpu: Stat,
     leader: Stat,
     recovered: bool,
@@ -399,6 +373,7 @@ struct RsPlan {
     dgt_embed: Stat,
     share_commit: Stat,
     rs_enc: Stat,
+    client_sign: Stat,
     /// Full lane round: ρ opens, the digit-wise sum, one aggregate proof.
     node_sum: Stat,
     /// Breakdown of `node_sum` — per-client decompose + bound checks.
@@ -424,7 +399,7 @@ struct Row {
     active: usize,
     cover: usize,
     iblt_cells: usize,
-    flow: &'static str,      // "mse" | "sched"
+    flow: &'static str,      // "mse" | "prony" | "sched"
     payload_client_b: usize, // per-client useful bytes (element / msg slot)
     mu_kahe: usize,
     delta: usize,
@@ -440,6 +415,7 @@ struct Row {
     recovered_ok: bool,
     // [M] CPU, per-round totals for one party.
     enc_app: Stat,
+    kahe_keygen: Stat,
     kahe_enc: Stat,
     share: Stat,
     cs: Stat,
@@ -473,58 +449,14 @@ struct Row {
     wire_comm_b: f64,
     wire_opening_b: f64,
     wire_server_b: f64,
-    agg_plans: Vec<AggPlan>,
+    agg: AggPlan,
     rs_plans: Vec<RsPlan>,
 }
 
-/// A phase whose slowest rep exceeds its fastest by more than this was competing
-/// with something — another workload, or a rayon pool straddling both sockets.
-const CONTENTION_RATIO: f64 = 2.0;
-
-/// …but only once the absolute swing is large enough to move a conclusion. Short
-/// phases show wide ratios from timer granularity and first-rep cache warming, and
-/// a sub-millisecond swing cannot distort a wall measured in tens of ms.
-const CONTENTION_FLOOR_US: f64 = 1_000.0;
-
-/// The worst-spread phases of a cell, or `None` if every phase was stable.
-/// Catches a contaminated cell while the sweep is still running rather than
-/// during analysis afterwards.
-fn contention(r: &Row) -> Option<String> {
-    let mut worst: Vec<(f64, &str)> = PHASES
-        .iter()
-        .filter_map(|p| {
-            let st = (p.get)(r);
-            // A phase this run does not own reads as zero, not as fast.
-            (st.min > 0.0
-                && st.max / st.min > CONTENTION_RATIO
-                && st.max - st.min > CONTENTION_FLOOR_US)
-                .then(|| (st.max / st.min, p.name))
-        })
-        .collect();
-    if worst.is_empty() {
-        return None;
-    }
-    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
-    Some(
-        worst
-            .iter()
-            .take(3)
-            .map(|(ratio, name)| format!("{name} {ratio:.1}x"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
-}
-
-/// Group size balancing the largest per-hop fan-in at `ρ^{1/(layers+1)}`. Pure in
-/// `(n, layers)`, so a row rebuilt from CSV reproduces the same topology as the
-/// run that wrote it.
-fn agg_group_size(n: usize, layers: usize) -> usize {
-    let g = match layers {
-        1 => (n as f64).sqrt(),
-        _ => (n as f64).powf(1.0 / (layers as f64 + 1.0)),
-    }
-    .ceil() as usize;
-    g.max(2)
+/// Group size balancing both fan-ins at ⌈√ρ⌉. Pure in `n`, so a row rebuilt
+/// from CSV reproduces the same topology as the run that wrote it.
+fn agg_group_size(n: usize) -> usize {
+    ((n as f64).sqrt().ceil() as usize).max(2)
 }
 
 /// Which phases a run's timings are authoritative for. Setup and the live round
@@ -622,9 +554,9 @@ fn affinity() -> String {
 /// Inverts `q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))`. Returns 0 when the
 /// modulus leaves no room for noise at all, and `∞` when every coefficient fits
 /// deterministically.
-fn correctness_epsilon(rho: usize, mu: usize) -> f64 {
+fn correctness_epsilon(rho: usize, mu: usize, t_modulus: u64) -> f64 {
     let q = KAHE_MODULUS as f64;
-    let t = T_MODULUS_DEFAULT as f64;
+    let t = t_modulus as f64;
     let sigma = SIGMA_E_DEFAULT;
     let (rho_f, nmu) = (rho as f64, (POLY_N * mu) as f64);
     // Headroom left for the error term once the ρ plaintexts have their share.
@@ -644,42 +576,6 @@ fn correctness_epsilon(rho: usize, mu: usize) -> f64 {
         return f64::INFINITY;
     }
     -p_fail.log2()
-}
-
-#[cfg(test)]
-mod eps_tests {
-    use super::correctness_epsilon;
-
-    /// Hand-worked against the condition: at ρ=300 over a 1602-poly ciphertext
-    /// the slack q/t − ρ = 4753.4 gives L = 38.1, and the union bound over
-    /// n·μ = 3.28M coefficients leaves ≈ 2^−32.
-    #[test]
-    fn matches_hand_computation() {
-        let eps = correctness_epsilon(300, 1602);
-        assert!((eps - 32.2).abs() < 0.2, "got {eps}");
-    }
-
-    /// ρ enters as √ρ and μ only as log(nμ), so widening the ciphertext costs
-    /// far less correctness than adding clients.
-    #[test]
-    fn rho_dominates_mu() {
-        let base = correctness_epsilon(300, 1602);
-        assert!(correctness_epsilon(300, 1602 * 4) > base - 3.0);
-        assert!(correctness_epsilon(600, 1602) < base - 15.0);
-    }
-
-    /// Past the point where ρ plaintexts alone fill the modulus there is no
-    /// bound left to report.
-    #[test]
-    fn no_headroom_reports_zero() {
-        assert_eq!(correctness_epsilon(6000, 16), 0.0);
-    }
-
-    /// Few enough aggregations and the tail vanishes outright.
-    #[test]
-    fn small_round_is_exact() {
-        assert!(correctness_epsilon(16, 2).is_infinite());
-    }
 }
 
 #[cfg(test)]
@@ -706,6 +602,7 @@ mod csv_tests {
             affinity: "0-7".into(),
             recovered_ok: true,
             enc_app: Stat::default(),
+            kahe_keygen: Stat::default(),
             kahe_enc: Stat::default(),
             share: Stat::default(),
             cs: Stat::default(),
@@ -732,14 +629,13 @@ mod csv_tests {
             wire_comm_b: 1.3e6,
             wire_opening_b: 1.4e8,
             wire_server_b: 8.9e5,
-            agg_plans: vec![AggPlan {
-                layers: AGG_LAYERS[0],
-                group_size: agg_group_size(300, AGG_LAYERS[0]),
-                layer_counts: vec![300usize.div_ceil(agg_group_size(300, AGG_LAYERS[0]))],
+            agg: AggPlan {
+                group_size: agg_group_size(300),
+                n_l1: 300usize.div_ceil(agg_group_size(300)),
                 agg_cpu: Stat::default(),
                 leader: Stat::default(),
                 recovered: true,
-            }],
+            },
             rs_plans: vec![RsPlan {
                 k: 14,
                 n_nodes: 16,
@@ -750,6 +646,7 @@ mod csv_tests {
                 dgt_embed: Stat::default(),
                 share_commit: Stat::default(),
                 rs_enc: Stat::default(),
+                client_sign: Stat::default(),
                 node_sum: Stat::default(),
                 lane_ingest: Stat::default(),
                 lane_attribute: Stat::default(),
@@ -813,8 +710,8 @@ mod csv_tests {
         assert_eq!(b.rs_plans[0].path_b, row.rs_plans[0].path_b);
         assert_eq!(b.rs_plans[0].lane_post_b, row.rs_plans[0].lane_post_b);
         // Topology is recomputed, not stored — it must land on the same values.
-        assert_eq!(b.agg_plans[0].group_size, row.agg_plans[0].group_size);
-        assert_eq!(b.agg_plans[0].layer_counts, row.agg_plans[0].layer_counts);
+        assert_eq!(b.agg.group_size, row.agg.group_size);
+        assert_eq!(b.agg.n_l1, row.agg.n_l1);
 
         for p in PHASES {
             let (want, got) = ((p.get)(&row), (p.get)(b));
@@ -850,43 +747,12 @@ mod csv_tests {
         assert!(PHASES.iter().any(|p| p.owner == Owner::Client));
         assert!(!client_only.server && !client_only.verifier);
     }
-
-    #[test]
-    fn contention_flags_a_wide_spread_and_ignores_unmeasured() {
-        let mut r = sample_row();
-        // Un-owned phases read as all-zero; that must not look like contention.
-        for p in PHASES {
-            (p.set)(&mut r, Stat::default());
-        }
-        assert!(contention(&r).is_none());
-
-        // Wide ratio but a swing of only 20us — timer noise on a short phase.
-        (PHASES[0].set)(
-            &mut r,
-            Stat {
-                med: 20.0,
-                min: 10.0,
-                max: 30.0,
-            },
-        );
-        assert!(contention(&r).is_none(), "sub-ms swing must not flag");
-
-        (PHASES[0].set)(
-            &mut r,
-            Stat {
-                med: 8_000.0,
-                min: 5_000.0,
-                max: 20_000.0,
-            },
-        );
-        assert!(contention(&r).unwrap().contains(PHASES[0].name));
-    }
 }
 
 /// Paper-table role totals: the phases a single party of each kind runs per
 /// round. The three sum to the `[C]` serial wall.
 fn client_us(r: &Row) -> f64 {
-    r.enc_app.med + r.kahe_enc.med + r.share.med + r.cs.med + r.seal.med
+    r.enc_app.med + r.kahe_keygen.med + r.kahe_enc.med + r.share.med + r.cs.med + r.seal.med
 }
 
 fn server_us(r: &Row) -> f64 {
@@ -924,26 +790,28 @@ fn server_entry_b(r: &Row) -> usize {
 }
 
 /// Per-cell RNG seed: domain-separated hash over every parameter that defines
-/// the cell, including the codec. Hashing (not byte-packing) keeps distinct
+/// the cell, including the flow. Hashing (not byte-packing) keeps distinct
 /// cells on distinct streams regardless of magnitude.
-fn cell_seed(s: usize, n: usize, active: usize, cfg: &Config, codec: &AppCodec) -> [u8; 32] {
-    let (codec_tag, codec_arg) = match codec {
-        AppCodec::Mse => (0u64, 0u64),
-        AppCodec::Scheduled { message_bytes } => (1, *message_bytes as u64),
-        AppCodec::Prony => (2, 0),
-    };
+fn cell_seed(
+    s: usize,
+    n: usize,
+    active: usize,
+    xi: usize,
+    flow: &str,
+    message_bytes: usize,
+) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"panetiere-scaling-cell-v1");
+    h.update(b"panetiere-scaling-cell");
     for v in [
         s as u64,
         n as u64,
         active as u64,
-        cfg.payload_symbols as u64,
-        codec_tag,
-        codec_arg,
+        xi as u64,
+        message_bytes as u64,
     ] {
         h.update(v.to_le_bytes());
     }
+    h.update(flow.as_bytes());
     h.finalize().into()
 }
 
@@ -952,50 +820,47 @@ fn run_cell(
     n: usize,
     active: usize,
     cfg: &Config,
-    codec: &AppCodec,
+    flow: &'static str,
+    message_bytes: usize,
     roles: Roles,
 ) -> Row {
     let cover = n - active;
-    let seed = cell_seed(s, n, active, cfg, codec);
+    let seed = cell_seed(s, n, active, cfg.payload_symbols, flow, message_bytes);
     let mut rng = ChaCha20Rng::from_seed(seed);
+    let sched = flow == "sched";
 
-    // IBLT sized to active (cover adds nothing), ~3 buckets/insertion. `Mse`
-    // packs a ξ-element into it; `Scheduled` packs a (rand,size) token and
-    // appends a message vector — each active client an equal slot within it.
-    let delta = (3 * active).div_ceil(GAMMA);
-    // Capacity = active; ξ re-derived so the element carries the same bytes as
-    // the MSE cell at 35 rather than 36 bits per coefficient.
-    let prony_params = match codec {
-        AppCodec::Prony => Some(PronyParams::new(
-            active,
-            (cfg.payload_symbols * BITS_PER_SYMBOL).div_ceil(prony_bits()),
-        )),
-        _ => None,
+    // Channel sized to active (cover adds nothing). `mse` inserts the ξ-element;
+    // `prony` re-derives ξ so its element carries the same bytes at 35 rather
+    // than 36 bits per symbol; `sched` inserts a (rand,size) reservation
+    // token and appends a message vector to the same plaintext.
+    let ch = match flow {
+        "mse" => ChannelParams::for_symbols(active as u32, cfg.payload_symbols, [0xAA; 32]),
+        "prony" => {
+            ChannelParams::prony_for_bits(active as u32, cfg.payload_symbols * BITS_PER_SYMBOL)
+        }
+        "sched" => ChannelParams::for_symbols(active as u32, SCHED_TOKEN_SYMBOLS, [0xAA; 32]),
+        other => panic!("unknown flow {other:?}"),
     };
-    let (mse_params, sched_polys, slot_bytes, msg_vector_bytes) = match codec {
-        AppCodec::Mse => {
-            let p = MseParams::new(GAMMA, delta, cfg.payload_symbols, [0xAA; 32]);
-            let sp = MseEncoding::n_polys(&p);
-            (p, sp, 0, 0)
-        }
-        // No IBLT in this flow; `mse_params` stays only to keep the shared Row
-        // fields well-formed and is never encoded into.
-        AppCodec::Prony => {
-            let p = MseParams::new(GAMMA, delta, cfg.payload_symbols, [0xAA; 32]);
-            let sp = PronySketch::n_polys(prony_params.as_ref().unwrap());
-            (p, sp, 0, 0)
-        }
-        AppCodec::Scheduled { message_bytes } => {
-            let p = MseParams::new(GAMMA, delta, SCHED_TOKEN_SYMBOLS, [0xAA; 32]);
-            let sp = MseEncoding::n_polys(&p);
-            let slot = (message_bytes / active.max(1)).next_multiple_of(2);
-            (p, sp, slot, active * slot)
-        }
+    let ch_polys = ch.n_polys();
+    // For `prony` the structural width is the Vandermonde column count, reported
+    // in place of the IBLT's cell count.
+    let (iblt_cells, delta) = match &ch {
+        ChannelParams::Mse(p) => (p.total_cells(), p.delta),
+        ChannelParams::Prony(p) => (p.cols(), p.cols()),
     };
+    // Slot alignment matches the codec's packing width, so `active` slots fill
+    // the vector exactly and `allocate` never rounds one past the end.
+    let slot_bytes = if sched {
+        (message_bytes / active.max(1)).next_multiple_of(BYTES_PER_COEFF)
+    } else {
+        0
+    };
+    let msg_vector_bytes = active * slot_bytes;
     let msg_polys = msg_vector_bytes.div_ceil(BYTES_PER_POLY);
-    let n_polys = sched_polys + msg_polys;
+    let n_polys = ch_polys + msg_polys;
     // One key covers the whole joint plaintext.
     let mu_kahe = n_polys;
+    let t_modulus = ch.plaintext_modulus();
 
     let pp = ProtocolParams::setup_with_kahe_dims_full(
         &mut rng,
@@ -1003,10 +868,7 @@ fn run_cell(
         mu_kahe,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
-        match codec {
-            AppCodec::Prony => PRONY_PRIME,
-            _ => T_MODULUS_DEFAULT,
-        },
+        t_modulus,
     );
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..s)
@@ -1019,52 +881,63 @@ fn run_cell(
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
 
     // Active clients carry a distinct payload; cover clients contribute zero.
-    // Mse: a ξ-element. Scheduled: a (rand,size) token, then the client's slot.
-    let mse_payloads: Vec<Vec<i64>> = match codec {
-        AppCodec::Mse => (0..active)
+    // Mse/Prony: a ξ-symbol element. Scheduled: the (rand, size) reservation
+    // token each client posts, then the slot the allocator gives it.
+    let reservations: Vec<(u16, usize)> = if sched {
+        (0..active)
+            .map(|_| (rng.gen::<u16>(), slot_bytes))
+            .collect()
+    } else {
+        vec![]
+    };
+    let symbol_payloads: Vec<Vec<i64>> = if sched {
+        reservations
+            .iter()
+            .map(|&(rand, size)| vec![rand as i64, size as i64])
+            .collect()
+    } else {
+        (0..active)
             .map(|i| {
-                (0..cfg.payload_symbols)
+                (0..ch.payload_symbols())
                     .map(|j| i as i64 + j as i64 + 1)
                     .collect()
             })
-            .collect(),
-        AppCodec::Prony => {
-            let xi = prony_params.as_ref().unwrap().payload_symbols;
-            (0..active)
-                .map(|i| (0..xi).map(|j| i as i64 + j as i64 + 1).collect())
-                .collect()
-        }
-        AppCodec::Scheduled { .. } => (0..active)
-            .map(|i| vec![i as i64 + 1, slot_bytes as i64])
-            .collect(),
+            .collect()
     };
+    // The allocation the recipient actually performs: peel the tokens, derive
+    // the beacon from their rands, assign offsets. Two clients that drew the
+    // same rand both lose their slot, so what a round delivers is `allocated`,
+    // not `active`.
+    let rands: Vec<u16> = reservations.iter().map(|&(r, _)| r).collect();
+    let offsets = codec::allocate(&reservations, codec::beacon(&rands), msg_vector_bytes);
+    let allocated: Vec<(usize, usize)> = offsets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, off)| off.map(|o| (i, o)))
+        .collect();
     let byte_payloads: Vec<Vec<u8>> = (0..active)
         .map(|i| vec![(i as u8).wrapping_add(1); slot_bytes])
         .collect();
-    let ranges: Vec<(usize, usize)> = (0..active).map(|i| (i * slot_bytes, slot_bytes)).collect();
+    let ranges: Vec<(usize, usize)> = allocated.iter().map(|&(_, o)| (o, slot_bytes)).collect();
+    let range_payloads: Vec<Vec<u8>> = allocated
+        .iter()
+        .map(|&(i, _)| byte_payloads[i].clone())
+        .collect();
+    let (payload_bits, delivered) = if sched {
+        (slot_bytes * 8, allocated.len())
+    } else {
+        (ch.payload_symbols() * ch.bits_per_symbol(), active)
+    };
     let client_polys: Vec<Vec<KahePoly>> = (0..n)
         .map(|i| {
-            let mut polys = match (&prony_params, i < active) {
-                (Some(pp), true) => {
-                    let mut sk = PronySketch::new(pp.clone());
-                    sk.insert(&mut rng, &mse_payloads[i]);
-                    sk.pack()
-                }
-                (Some(pp), false) => PronySketch::cover(pp),
-                (None, true) => {
-                    let mut enc = MseEncoding::new(mse_params.clone());
-                    enc.insert(&mut rng, &mse_payloads[i]);
-                    enc.pack()
-                }
-                (None, false) => MseEncoding::cover(&mse_params),
+            let mut polys = if i < active {
+                channel::encode_symbols(&mut rng, &ch, &symbol_payloads[i])
+            } else {
+                channel::cover(&ch)
             };
-            polys.resize(sched_polys, KahePoly::default());
-            if matches!(codec, AppCodec::Scheduled { .. }) && i < active {
-                polys.extend(codec::encode_at(
-                    ranges[i].0,
-                    msg_vector_bytes,
-                    &byte_payloads[i],
-                ));
+            polys.resize(ch_polys, KahePoly::default());
+            if let Some(off) = offsets.get(i).copied().flatten() {
+                polys.extend(codec::encode_at(off, msg_vector_bytes, &byte_payloads[i]));
             }
             polys.resize(n_polys, KahePoly::default());
             polys
@@ -1124,31 +997,14 @@ fn run_cell(
     let ctxt_client_b = n_polys * poly_packed_len64(KAHE_MODULUS);
 
     // [M] per-phase CPU, median of REPS one-party runs each.
-    let (enc_app, _) = match codec {
-        AppCodec::Mse => measure(|| {
-            let mut enc = MseEncoding::new(mse_params.clone());
-            enc.insert(&mut rng, &mse_payloads[0]);
-            enc.pack()
-        }),
-        AppCodec::Prony => measure(|| {
-            let mut sk = PronySketch::new(prony_params.as_ref().unwrap().clone());
-            sk.insert(&mut rng, &mse_payloads[0]);
-            sk.pack()
-        }),
-        AppCodec::Scheduled { .. } => measure(|| {
-            let mut enc = MseEncoding::new(mse_params.clone());
-            enc.insert(&mut rng, &mse_payloads[0]);
-            let mut p = enc.pack();
-            p.resize(sched_polys, KahePoly::default());
-            p.extend(codec::encode_at(
-                ranges[0].0,
-                msg_vector_bytes,
-                &byte_payloads[0],
-            ));
-            p
-        }),
-    };
-    let key0 = kahe_keygen(&mut rng, &pp);
+    let (enc_app, _) = measure(|| {
+        let mut p = channel::encode_symbols(&mut rng, &ch, &symbol_payloads[0]);
+        if let Some(&(_, off)) = allocated.first() {
+            p.extend(codec::encode_at(off, msg_vector_bytes, &byte_payloads[0]));
+        }
+        p
+    });
+    let (kahe_keygen_t, key0) = measure(|| kahe_keygen(&mut rng, &pp));
     let (kahe_enc, _ctxt0) = measure(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
     let (share, shares0) = measure(|| shamir_share(&mut rng, &pp, &key0));
     let (cs, (comm0, openings0)) = measure(|| cs_commit(&mut rng, &pp, &shares0));
@@ -1164,8 +1020,8 @@ fn run_cell(
     let (server, _) = measure(|| run_server_round(&inboxes[0], &canonical).unwrap());
 
     // Verify: REPS full runs, field-wise medians over the returned timings.
-    // Recovery is ATTEMPTED, not asserted: at irrecoverable parameter sets
-    // aggregation decodes to garbage (or Errs). We still report every timing.
+    // Recovery is ATTEMPTED, not asserted: a decode to garbage still yields
+    // timings; an Err on every rep leaves the verifier phases at zero.
     let mut vts: Vec<VerifyTimings> = Vec::with_capacity(REPS);
     let mut recovered: Option<Vec<KahePoly>> = None;
     for _ in 0..REPS {
@@ -1175,6 +1031,9 @@ fn run_cell(
             vts.push(vt);
             recovered = Some(rec);
         }
+    }
+    if vts.is_empty() {
+        eprintln!("  verify errored on all {REPS} reps; verifier phases recorded as zero");
     }
     let vstat = |f: fn(&VerifyTimings) -> f64| {
         if vts.is_empty() {
@@ -1192,33 +1051,21 @@ fn run_cell(
     // `decode` returns the multiset sorted lexicographically; compare against
     // the inserted payloads by value, not just by count.
     let expected_payloads = {
-        let mut p = mse_payloads.clone();
+        let mut p = symbol_payloads.clone();
         p.sort();
         p
     };
     let check_decode = |rec: &[KahePoly]| -> bool {
-        if let Some(pp) = &prony_params {
-            return PronySketch::unpack(pp, &rec[..n_polys])
-                .decode()
-                .map(|d| d == expected_payloads)
-                .unwrap_or(false);
-        }
-        let tokens = match codec {
-            AppCodec::Scheduled { .. } => &rec[..sched_polys],
-            _ => &rec[..n_polys],
-        };
-        let tokens_ok = MseEncoding::unpack(&mse_params, tokens)
-            .decode()
+        let elements_ok = channel::decode_symbols(&ch, &rec[..ch_polys], None)
             .map(|d| d == expected_payloads)
             .unwrap_or(false);
-        match codec {
-            AppCodec::Scheduled { .. } => {
-                tokens_ok
-                    && codec::decode_ranges(&rec[sched_polys..n_polys], &ranges)
-                        .map(|d| d == byte_payloads)
-                        .unwrap_or(false)
-            }
-            _ => tokens_ok,
+        if sched {
+            elements_ok
+                && codec::decode_ranges(&rec[ch_polys..n_polys], &ranges)
+                    .map(|d| d == range_payloads)
+                    .unwrap_or(false)
+        } else {
+            elements_ok
         }
     };
     let recovered_ok = recovered.as_deref().map(check_decode).unwrap_or(false);
@@ -1226,109 +1073,66 @@ fn run_cell(
     let dec_app = match &recovered {
         None => Stat::default(),
         // May Err (PeelStalled) on unrecoverable params — we time the attempt.
-        Some(rec) => match codec {
-            AppCodec::Mse => {
-                measure(|| {
-                    let _ = MseEncoding::unpack(&mse_params, &rec[..n_polys]).decode();
-                })
-                .0
-            }
-            AppCodec::Prony => {
-                let pp = prony_params.as_ref().unwrap();
-                measure(|| {
-                    let _ = PronySketch::unpack(pp, &rec[..n_polys]).decode();
-                })
-                .0
-            }
-            AppCodec::Scheduled { .. } => {
-                measure(|| {
-                    let _ = MseEncoding::unpack(&mse_params, &rec[..sched_polys]).decode();
-                    let _ = codec::decode_ranges(&rec[sched_polys..n_polys], &ranges);
-                })
-                .0
-            }
-        },
+        Some(rec) => {
+            measure(|| {
+                let _ = channel::decode_symbols(&ch, &rec[..ch_polys], None);
+                if sched {
+                    let _ = codec::decode_ranges(&rec[ch_polys..n_polys], &ranges);
+                }
+            })
+            .0
+        }
     };
 
-    // Aggregated flow at each depth in AGG_LAYERS, measured live. Group size is
-    // balanced so the largest per-hop fan-in is ρ^{1/(layers+1)}: 1-layer ⌈√ρ⌉,
-    // 2-layer ⌈∛ρ⌉. Recovery is re-checked end-to-end through the tree.
-    let agg_plans: Vec<AggPlan> = AGG_LAYERS
-        .iter()
-        .map(|&layers| {
-            let g = agg_group_size(n, layers);
-            let a1 = n.div_ceil(g);
-            let l1_groups: Vec<Vec<_>> = (0..a1)
-                .map(|grp| {
-                    client_entries
-                        .iter()
-                        .filter(|(cid, _)| cid.0 as usize % a1 == grp)
-                        .cloned()
-                        .collect()
-                })
-                .collect();
-            let (agg_cpu, _) = measure(|| run_aggregator_round(&l1_groups[0]));
-            let l1: Vec<_> = l1_groups.iter().map(|g| run_aggregator_round(g)).collect();
+    // Aggregated flow, measured live: one layer of ⌈√ρ⌉-sized groups, then the
+    // leader sums the group aggregates and decrypts. Recovery is re-checked
+    // end-to-end through the tree.
+    let agg = {
+        let g = agg_group_size(n);
+        let n_l1 = n.div_ceil(g);
+        let l1_groups: Vec<Vec<_>> = (0..n_l1)
+            .map(|grp| {
+                client_entries
+                    .iter()
+                    .filter(|(cid, _)| cid.0 as usize % n_l1 == grp)
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        let (agg_cpu, _) = measure(|| run_aggregator_round(&l1_groups[0]));
+        let l1: Vec<_> = l1_groups.iter().map(|g| run_aggregator_round(g)).collect();
+        let ctxts: Vec<Vec<KahePoly>> = l1.iter().map(|a| a.summed_ctxt.clone()).collect();
+        let comms: Vec<Commitment> = l1.iter().map(|a| a.summed_comm.clone()).collect();
 
-            // Fold up the tree: each higher level sums g aggregates at a time.
-            let mut layer_counts = vec![a1];
-            let mut ctxts: Vec<Vec<KahePoly>> = l1.iter().map(|a| a.summed_ctxt.clone()).collect();
-            let mut comms: Vec<Commitment> = l1.iter().map(|a| a.summed_comm.clone()).collect();
-            for _ in 1..layers {
-                let groups = ctxts.len().div_ceil(g);
-                ctxts = (0..groups)
-                    .map(|grp| {
-                        let cs: Vec<_> = ctxts
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| i % groups == grp)
-                            .map(|(_, c)| c.clone())
-                            .collect();
-                        Kahe::agg_ctxt(&cs)
-                    })
-                    .collect();
-                comms = (0..groups)
-                    .map(|grp| {
-                        let ms: Vec<_> = comms
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| i % groups == grp)
-                            .map(|(_, m)| m.clone())
-                            .collect();
-                        HidingMerkleCommitment::sum_commitments(&ms)
-                    })
-                    .collect();
-                layer_counts.push(ctxts.len());
-            }
+        let (leader, res) = measure(|| {
+            let total_ctxt = Kahe::agg_ctxt(&ctxts);
+            let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
+            decrypt_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
+        });
+        let recovered = res.map(|rec| check_decode(&rec)).unwrap_or(false);
 
-            let (leader, res) = measure(|| {
-                let total_ctxt = Kahe::agg_ctxt(&ctxts);
-                let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
-                decrypt_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
-            });
-            let recovered = res.map(|rec| check_decode(&rec)).unwrap_or(false);
-
-            AggPlan {
-                layers,
-                group_size: g,
-                layer_counts,
-                agg_cpu,
-                leader,
-                recovered,
-            }
-        })
-        .collect();
+        AggPlan {
+            group_size: g,
+            n_l1,
+            agg_cpu,
+            leader,
+            recovered,
+        }
+    };
 
     // RS-sharded ingress, measured live: its own `pp` (μ = n_polys + 1, the
     // extra slot holding Enc(H(m))), its own client rounds, one node round per
     // lane, and the full verify. The ciphertext never reaches the bulletin, so
     // the comparison against the direct/aggregated flows is per-role wire, not
     // just CPU.
-    let t_modulus = match codec {
-        AppCodec::Prony => PRONY_PRIME,
-        _ => T_MODULUS_DEFAULT,
-    };
-    let rs_plans: Vec<RsPlan> = rs_specs()
+    let rs_specs = rs_specs();
+    if !rs_specs.is_empty() {
+        assert!(
+            n <= RS_RHO_MAX,
+            "RS lane posts and digest params are budgeted for rho <= {RS_RHO_MAX}, got {n}"
+        );
+    }
+    let rs_plans: Vec<RsPlan> = rs_specs
         .iter()
         .map(|&(spec_k, spec_n)| {
             // Every threshold server is also a lane, so n ≥ S; the pair fixes
@@ -1367,6 +1171,21 @@ fn run_cell(
                 .iter()
                 .map(|r| (r.client_id, r.bulletin.clone()))
                 .collect();
+            // Pin the [D] RS wire formulas to the real objects.
+            assert_eq!(
+                entries[0].1.to_bytes().len(),
+                RsClientBulletinEntry::packed_len()
+            );
+
+            let sign_key = SigningKey::generate(&mut rrng);
+            let (client_sign, _) = measure(|| {
+                sign_key.sign(&RsClientBulletinEntry::signing_bytes(
+                    &SESSION,
+                    client_ids[0],
+                    &entries[0].1.comm,
+                    &entries[0].1.share_root,
+                ))
+            });
 
             let rs_outputs: Vec<_> = (0..s)
                 .map(|j| {
@@ -1437,6 +1256,11 @@ fn run_cell(
                 .iter()
                 .map(|inb| run_rs_node_round(scp, inb, &canonical, &roots).unwrap())
                 .collect();
+            assert_eq!(node_outputs[0].share_sum.len(), scp.block_len);
+            assert_eq!(
+                rounds[0].share_paths[0].nodes.len(),
+                scp.path_len() * 2 * HVC_WIDTH
+            );
 
             // Embedding into the digest ring is n_polys forward NTTs; encoding is
             // (n−k)·n_polys·N modmuls, since systematic shares are the blocks; the
@@ -1459,6 +1283,12 @@ fn run_cell(
                     rvts.push(vt);
                     rs_recovered = Some(rec);
                 }
+            }
+            if rvts.is_empty() {
+                eprintln!(
+                    "  rs verify (k={k}/n={n_nodes}) errored on all {REPS} reps; \
+                     verifier phases recorded as zero"
+                );
             }
             let rstat = |f: fn(&RsVerifyTimings) -> f64| {
                 if rvts.is_empty() {
@@ -1499,6 +1329,7 @@ fn run_cell(
                 dgt_embed,
                 share_commit,
                 rs_enc,
+                client_sign,
                 node_sum,
                 lane_ingest,
                 lane_attribute,
@@ -1525,32 +1356,12 @@ fn run_cell(
         n,
         active,
         cover,
-        // For `prony` the structural width is the Vandermonde column count,
-        // reported in place of the IBLT's cell count.
-        iblt_cells: match &prony_params {
-            Some(pp) => pp.cols(),
-            None => mse_params.total_cells(),
-        },
-        flow: match codec {
-            AppCodec::Mse => "mse",
-            AppCodec::Prony => "prony",
-            AppCodec::Scheduled { .. } => "sched",
-        },
-        payload_client_b: match codec {
-            AppCodec::Mse => cfg.payload_symbols * BITS_PER_SYMBOL / 8,
-            AppCodec::Prony => prony_params.as_ref().unwrap().payload_symbols * prony_bits() / 8,
-            AppCodec::Scheduled { .. } => slot_bytes,
-        },
+        iblt_cells,
+        flow,
+        payload_client_b: payload_bits / 8,
         mu_kahe,
-        delta: match &prony_params {
-            Some(pp) => pp.cols(),
-            None => delta,
-        },
-        xi: match codec {
-            AppCodec::Mse => cfg.payload_symbols,
-            AppCodec::Prony => prony_params.as_ref().unwrap().payload_symbols,
-            AppCodec::Scheduled { .. } => SCHED_TOKEN_SYMBOLS,
-        },
+        delta,
+        xi: ch.payload_symbols(),
         n_polys,
         env: env_tag(),
         threads: rayon::current_num_threads(),
@@ -1559,6 +1370,7 @@ fn run_cell(
         // Every phase is measured; only the ones this run owns are recorded, so a
         // split run and a whole run execute identical code.
         enc_app: owned(roles.client, enc_app),
+        kahe_keygen: owned(roles.client, kahe_keygen_t),
         kahe_enc: owned(roles.client, kahe_enc),
         share: owned(roles.client, share),
         cs: owned(roles.client, cs),
@@ -1580,27 +1392,17 @@ fn run_cell(
         agg_open_b,
         agg_share_b,
         // ρ = every client's ciphertext is summed, cover included.
-        eps_correct: correctness_epsilon(n, n_polys),
-        useful_b: match codec {
-            AppCodec::Mse => (active * cfg.payload_symbols * BITS_PER_SYMBOL) as f64 / 8.0,
-            AppCodec::Prony => {
-                (active * prony_params.as_ref().unwrap().payload_symbols * prony_bits()) as f64
-                    / 8.0
-            }
-            AppCodec::Scheduled { .. } => (active * slot_bytes) as f64,
-        },
+        eps_correct: correctness_epsilon(n, n_polys, t_modulus),
+        useful_b: (delivered * payload_bits) as f64 / 8.0,
         wire_ctxt_b: n as f64 * ctxt_client_b as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
-        agg_plans: agg_plans
-            .into_iter()
-            .map(|mut p| {
-                p.agg_cpu = owned(roles.agg, p.agg_cpu);
-                p.leader = owned(roles.agg, p.leader);
-                p
-            })
-            .collect(),
+        agg: AggPlan {
+            agg_cpu: owned(roles.agg, agg.agg_cpu),
+            leader: owned(roles.agg, agg.leader),
+            ..agg
+        },
         rs_plans: rs_plans
             .into_iter()
             .map(|mut p| {
@@ -1608,6 +1410,7 @@ fn run_cell(
                     &mut p.dgt_embed,
                     &mut p.share_commit,
                     &mut p.rs_enc,
+                    &mut p.client_sign,
                     &mut p.node_sum,
                     &mut p.lane_ingest,
                     &mut p.lane_attribute,
@@ -1651,7 +1454,7 @@ fn rs_specs() -> Vec<(usize, usize)> {
 
 fn rs_seed(cell: &[u8; 32], k: usize, n_nodes: usize) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"panetiere/bench/rs/v1");
+    h.update(b"panetiere/bench/rs");
     h.update(cell);
     h.update((k as u64).to_le_bytes());
     h.update((n_nodes as u64).to_le_bytes());
@@ -1667,15 +1470,16 @@ struct Model {
     wall_us: f64,
     wire_total_b: f64,
     efficiency: f64,
-    post_b: f64,          // one client bulletin post = comm + ctxt
-    client_open_b: f64,   // one client's S sealed openings
-    agg_cpu_us: Vec<f64>, // per AggPlan
-    rs_cpu_us: Vec<f64>,  // per RsPlan
+    post_b: f64,        // one client bulletin post = comm + ctxt
+    client_open_b: f64, // one client's S sealed openings
+    agg_cpu_us: f64,
+    rs_cpu_us: Vec<f64>, // per RsPlan
 }
 
 fn model(r: &Row) -> Model {
     // fixed = paid once per round (key-related); payload = scales with the width.
-    let fixed_us = r.share.med
+    let fixed_us = r.kahe_keygen.med
+        + r.share.med
         + r.cs.med
         + r.seal.med
         + r.unseal.med
@@ -1690,11 +1494,7 @@ fn model(r: &Row) -> Model {
     // Aggregated flow replaces the leader's direct ingest phases with the tree.
     let cpu_base_agg_us = (fixed_us - r.v_open.med - r.v_interp.med - r.v_sum_comm.med)
         + (payload_us - r.v_agg_ctxt.med - r.v_kahe_dec.med);
-    let agg_cpu_us = r
-        .agg_plans
-        .iter()
-        .map(|p| cpu_base_agg_us + p.leader.med)
-        .collect();
+    let agg_cpu_us = cpu_base_agg_us + r.agg.leader.med;
     // RS flow: client pays app-encode + encrypt + RS-encode + key work; one
     // node sums its lane; the verifier no longer sums ciphertexts at all.
     let rs_cpu_us = r
@@ -1702,10 +1502,12 @@ fn model(r: &Row) -> Model {
         .iter()
         .map(|p| {
             r.enc_app.med
+                + r.kahe_keygen.med
                 + r.kahe_enc.med
                 + p.dgt_embed.med
                 + p.rs_enc.med
                 + p.share_commit.med
+                + p.client_sign.med
                 + r.share.med
                 + r.cs.med
                 + r.seal.med
@@ -1738,12 +1540,12 @@ fn model(r: &Row) -> Model {
 
 // ── [P] network sim ─────────────────────────────────────────────────────────
 // Three sequential wire phases per round, kept separate from CPU wall:
-//   A  client upload — N parallel uplinks; each client streams its bulletin
-//      post and its S openings as parallel flows. Gated by the slowest of:
-//      a client→bulletin flow, a client→servers flow, a server downlink
-//      (ingesting N openings), the bulletin ingest (N posts). Every phase is
-//      gated by both ends of each flow.
-//   B  server post — S entries onto the bulletin.
+//   A  client upload — N parallel uplinks; each endpoint serializes its own
+//      bytes at its class rate (a client's post and openings share its NIC).
+//      Gated by the slowest of: a client uplink, a server downlink (ingesting
+//      N openings), the bulletin ingest (N posts).
+//   B  server post — S entries onto the bulletin; gated by the slower of a
+//      server's uplink and the bulletin ingest.
 //   C  verifier read — the full bulletin over the verifier's downlink.
 // No compute/transfer overlap is modelled, so e2e = CPU wall + net is the
 // conservative end of pipelined reality. Deterministic jitter seed per row.
@@ -1751,8 +1553,8 @@ fn model(r: &Row) -> Model {
 struct NetPoint {
     direct_net_us: f64,
     direct_e2e_us: f64,
-    agg: Vec<(f64, f64)>, // (net_us, e2e_us) per AggPlan
-    rs: Vec<(f64, f64)>,  // (net_us, e2e_us) per RsPlan
+    agg: (f64, f64),     // (net_us, e2e_us)
+    rs: Vec<(f64, f64)>, // (net_us, e2e_us) per RsPlan
 }
 
 fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> NetPoint {
@@ -1767,51 +1569,37 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
             * 1e3
     };
 
-    let a = (maxlat(r.n) + xfer_cl(m.post_b)) // client→bulletin flow
-        .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
+    let a = (maxlat(r.n) + xfer_cl(m.post_b + m.client_open_b)) // client uplink
         .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
         .max(maxlat(r.n) + xfer_bul(r.n as f64 * m.post_b)); // bulletin ingest
-    let b = maxlat(r.s) + xfer_bul(r.wire_server_b);
+    let b = (maxlat(r.s) + xfer_srv(r.wire_server_b / r.s as f64)) // server uplink
+        .max(maxlat(r.s) + xfer_bul(r.wire_server_b)); // bulletin ingest
     let c = maxlat(1) + xfer_bul(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b);
     let direct_net_us = a + b + c;
 
-    // Aggregated flow: ctxt+comm go to aggregators (not broadcast); each level
-    // sums g and forwards one aggregate up the tree. Openings→servers and the
-    // server post are unchanged. Agg phase = Σ over levels of (one aggregator's
-    // CPU + one hop's transfer). Conservative (no overlap).
-    let agg = r
-        .agg_plans
-        .iter()
-        .zip(&m.agg_cpu_us)
-        .map(|(p, &agg_cpu_us)| {
-            let g = p.group_size as f64;
-            let a = (maxlat(r.n) + xfer_cl(m.post_b)) // client→aggregator flow
-                .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
-                .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
-                .max(maxlat(p.layer_counts[0]) + xfer_srv(g * m.post_b)); // L1 ingest
-            let mut counts = p.layer_counts.clone();
-            counts.push(1); // leader
-            let mut agg_us = 0.0;
-            for h in 0..p.layers {
-                let (senders, receivers) = (counts[h], counts[h + 1]);
-                let fan_in = if receivers == 1 { senders as f64 } else { g };
-                agg_us += p.agg_cpu.med
-                    + (maxlat(senders) + xfer_srv(m.post_b)) // sender uplink
-                        .max(maxlat(receivers) + xfer_srv(fan_in * m.post_b)); // receiver ingest
-            }
-            let b = maxlat(r.s) + xfer_bul(r.wire_server_b);
-            let leader_in = *p.layer_counts.last().unwrap();
-            let c = maxlat(1) + xfer_bul(r.wire_server_b + leader_in as f64 * m.post_b);
-            let net_us = a + agg_us + b + c;
-            (net_us, agg_cpu_us + net_us)
-        })
-        .collect();
+    // Aggregated flow: ctxt+comm go to aggregators (not broadcast), which sum g
+    // posts each and forward one aggregate to the leader. Openings→servers and
+    // the server post are unchanged. Conservative (no overlap).
+    let agg = {
+        let g = r.agg.group_size as f64;
+        let a = (maxlat(r.n) + xfer_cl(m.post_b + m.client_open_b)) // client uplink
+            .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
+            .max(maxlat(r.agg.n_l1) + xfer_srv(g * m.post_b)); // aggregator ingest
+        let hop = r.agg.agg_cpu.med
+            + (maxlat(r.agg.n_l1) + xfer_srv(m.post_b)) // aggregator uplink
+                .max(maxlat(1) + xfer_bul(r.agg.n_l1 as f64 * m.post_b)); // leader ingest
+        let b = (maxlat(r.s) + xfer_srv(r.wire_server_b / r.s as f64)) // server uplink
+            .max(maxlat(r.s) + xfer_bul(r.wire_server_b)); // bulletin ingest
+        let c = maxlat(1) + xfer_bul(r.wire_server_b);
+        let net_us = a + hop + b + c;
+        (net_us, m.agg_cpu_us + net_us)
+    };
 
     // RS flow: the client uplinks n coded shares (total (n/k)·C) plus its S
     // openings; the bulletin only ever sees the constant-size post. A node
-    // ingests ρ shares of C/k. The verifier reads k lane sums, the server
-    // entries, the node posts and every client's bulletin post (it must check
-    // the signatures and sum the digests).
+    // ingests ρ shares of C/k. The verifier reads every lane post (k
+    // reconstruct, all carry a proof), the server entries and every client's
+    // bulletin post (it must check the signatures and sum the digests).
     let rs = r
         .rs_plans
         .iter()
@@ -1822,15 +1610,15 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
             let lane_item_b = (p.share_b + p.path_b) as f64;
             let client_shares_b = p.n_nodes as f64 * lane_item_b;
             let node_in_b = r.n as f64 * lane_item_b;
-            let a = (maxlat(r.n) + xfer_cl(client_shares_b + p.bulletin_b as f64)) // client uplink
-                .max(maxlat(r.n) + xfer_cl(m.client_open_b)) // client→servers flow
+            let client_out_b = client_shares_b + p.bulletin_b as f64 + m.client_open_b;
+            let a = (maxlat(r.n) + xfer_cl(client_out_b)) // client uplink
                 .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
                 .max(maxlat(r.n) + xfer_srv(node_in_b)) // one lane's ingest
                 .max(maxlat(r.n) + xfer_bul(r.n as f64 * p.bulletin_b as f64)); // bulletin ingest
             let lane_posts_b = p.n_nodes as f64 * p.lane_post_b as f64;
-            let b = (maxlat(r.s) + xfer_bul(r.wire_server_b))
-                .max(maxlat(p.n_nodes) + xfer_srv(lane_posts_b));
-            // Every lane post: k reconstruct, all of them carry a proof.
+            let b = (maxlat(r.s) + xfer_srv(r.wire_server_b / r.s as f64)) // server uplink
+                .max(maxlat(p.n_nodes) + xfer_srv(p.lane_post_b as f64)) // lane uplink
+                .max(maxlat(p.n_nodes) + xfer_bul(lane_posts_b + r.wire_server_b)); // bulletin ingest
             let c = maxlat(1)
                 + xfer_bul(lane_posts_b + r.wire_server_b + r.n as f64 * p.bulletin_b as f64);
             let net_us = a + b + c;
@@ -1956,13 +1744,14 @@ fn print_tables(rows: &[Row]) {
         REPS
     );
     println!(
-        "{:4}{:─^50} {:─^20} {:─^60}",
+        "{:4}{:─^60} {:─^20} {:─^60}",
         "", " client ", " server ", " verifier "
     );
     println!(
-        "{:<4}{:>10}{:>10}{:>10}{:>10}{:>10} {:>10}{:>10} {:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
+        "{:<4}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10} {:>10}{:>10} {:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
         "id",
         "enc_app",
+        "keygen",
         "kahe_enc",
         "share",
         "cs",
@@ -1978,9 +1767,10 @@ fn print_tables(rows: &[Row]) {
     );
     for (i, r) in rows.iter().enumerate() {
         println!(
-            "{:<4}{:>10}{:>10}{:>10}{:>10}{:>10} {:>10}{:>10} {:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
+            "{:<4}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10} {:>10}{:>10} {:>10}{:>10}{:>10}{:>10}{:>10}{:>10}",
             cell_id(i),
             fmt_us(r.enc_app.med),
+            fmt_us(r.kahe_keygen.med),
             fmt_us(r.kahe_enc.med),
             fmt_us(r.share.med),
             fmt_us(r.cs.med),
@@ -1997,48 +1787,42 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
-    println!("── [M] cpu — aggregated flow (per level / leader) ───────────────────────────");
+    println!("── [M] cpu — aggregated flow (per aggregator / leader) ──────────────────────");
     println!(
-        "{:<4}{:>3}{:>4}  {:<16}{:>11}{:>13}  recovered",
-        "id", "L", "g", "fan-in", "agg/level", "leader"
+        "{:<4}{:>4}  {:<16}{:>11}{:>13}  recovered",
+        "id", "g", "fan-in", "agg", "leader"
     );
     for (i, r) in rows.iter().enumerate() {
-        for p in &r.agg_plans {
-            let tree: Vec<String> = std::iter::once(r.n)
-                .chain(p.layer_counts.iter().copied())
-                .chain(std::iter::once(1))
-                .map(|c| c.to_string())
-                .collect();
-            println!(
-                "{:<4}{:>3}{:>4}  {:<16}{:>11}{:>13}  {}",
-                cell_id(i),
-                p.layers,
-                p.group_size,
-                tree.join("→"),
-                fmt_us(p.agg_cpu.med),
-                fmt_us(p.leader.med),
-                if p.recovered { "yes" } else { "NO" },
-            );
-        }
+        let p = &r.agg;
+        println!(
+            "{:<4}{:>4}  {:<16}{:>11}{:>13}  {}",
+            cell_id(i),
+            p.group_size,
+            format!("{}→{}→1", r.n, p.n_l1),
+            fmt_us(p.agg_cpu.med),
+            fmt_us(p.leader.med),
+            if p.recovered { "yes" } else { "NO" },
+        );
     }
     println!();
 
     if rows.iter().any(|r| !r.rs_plans.is_empty()) {
         println!("── [M] cpu — rs-sharded ingress (client commit / lane round / verifier) ─────");
         println!(
-            "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}lane lie",
-            "id", "k/n", "embed", "rs_enc", "commit", "node_sum", "open+fold", "attribute",
+            "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>10}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}lane lie",
+            "id", "k/n", "embed", "rs_enc", "commit", "sign", "node_sum", "open+fold", "attribute",
             "sig", "open", "lane_open", "crosscheck", "reconstruct", "kahe_dec", "recovered"
         );
         for (i, r) in rows.iter().enumerate() {
             for p in &r.rs_plans {
                 println!(
-                    "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}{}",
+                    "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>10}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}{}",
                     cell_id(i),
                     format!("{}/{}", p.k, p.n_nodes),
                     fmt_us(p.dgt_embed.med),
                     fmt_us(p.rs_enc.med),
                     fmt_us(p.share_commit.med),
+                    fmt_us(p.client_sign.med),
                     fmt_us(p.node_sum.med),
                     fmt_us(p.lane_ingest.med),
                     fmt_us(p.lane_attribute.med),
@@ -2063,11 +1847,13 @@ fn print_tables(rows: &[Row]) {
         );
         println!();
 
-        println!("── [D] rs sizing — measured at the run k/n, priced across k at n = k+2 ──────");
+        println!("── [D] rs sizing — measured at the run k/n, priced across k at n − k = 2 ────");
+        println!("    (k clamped to ≥ S−2: every threshold server is a lane, so n ≥ S)");
         println!(
-            "{:<4}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  gate",
+            "{:<4}{:>5}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  gate",
             "id",
             "k",
+            "n",
             "share = C/k",
             "path",
             "lane post",
@@ -2083,8 +1869,13 @@ fn print_tables(rows: &[Row]) {
             let bulletin_b = r.rs_plans[0].bulletin_b as f64;
             let open_b = (r.open_env_b * r.s) as f64;
             let ctxt_b = r.ctxt_client_b as f64;
-            for &k in RS_SIZING_K {
-                let n_nodes = (k + 2).max(r.s);
+            let mut priced: Vec<usize> = Vec::new();
+            for &k_req in RS_SIZING_K {
+                let n_nodes = (k_req + 2).max(r.s);
+                let k = n_nodes - 2;
+                if priced.contains(&k) {
+                    continue;
+                }
                 let block_len = r.n_polys.div_ceil(k);
                 let share_b = (block_len * dgt_packed_len()) as f64;
                 // The path rides with the share; the lane's post is its proof.
@@ -2094,20 +1885,20 @@ fn print_tables(rows: &[Row]) {
                 let node_in = r.n as f64 * (share_b + path_b);
                 let verifier_in =
                     n_nodes as f64 * lane_post_b + r.n as f64 * bulletin_b + r.wire_server_b;
-                // 100 Mbit client uplink against a 1 Gbit lane downlink.
-                let gate = if egress / 12.5e6 > node_in / 125e6 {
+                let gate = if egress / NETWORKS[0].client_mbps > node_in / NETWORKS[0].server_mbps {
                     "client NIC"
                 } else {
                     "node ingest"
                 };
                 println!(
-                    "{:<4}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  {}",
-                    if k == RS_SIZING_K[0] {
+                    "{:<4}{:>5}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  {}",
+                    if priced.is_empty() {
                         cell_id(i)
                     } else {
                         String::new()
                     },
                     k,
+                    n_nodes,
                     fmt_bytes(share_b),
                     fmt_bytes(path_b),
                     fmt_bytes(lane_post_b),
@@ -2117,6 +1908,7 @@ fn print_tables(rows: &[Row]) {
                     fmt_bytes(verifier_in),
                     gate,
                 );
+                priced.push(k);
             }
             println!(
                 "    (broadcast baseline: client egress {}, per-node ingress {})",
@@ -2163,11 +1955,8 @@ fn print_tables(rows: &[Row]) {
         let m = &models[i];
         let client_ctxt = r.wire_ctxt_b / r.n as f64;
         let client_out = r.comm_client_b as f64 + client_ctxt + m.client_open_b;
-        let l1 = r.agg_plans.first();
-        let l1_in = l1.map_or(0.0, |p| p.group_size as f64 * m.post_b);
-        let leader_agg = l1.map_or(0.0, |p| {
-            r.wire_server_b + *p.layer_counts.last().unwrap() as f64 * m.post_b
-        });
+        let l1_in = r.agg.group_size as f64 * m.post_b;
+        let leader_agg = r.wire_server_b + r.agg.n_l1 as f64 * m.post_b;
         println!(
             "{:<4}{:<44}{:<24}{:<24}{}",
             cell_id(i),
@@ -2209,7 +1998,7 @@ fn print_tables(rows: &[Row]) {
             fmt_bytes(r.useful_b),
             fmt_bytes(m.wire_total_b),
             m.efficiency,
-            m.agg_cpu_us.first().map_or("-".into(), |&us| fmt_us(us)),
+            fmt_us(m.agg_cpu_us),
         );
     }
     println!();
@@ -2232,13 +2021,7 @@ fn print_tables(rows: &[Row]) {
     for (i, r) in rows.iter().enumerate() {
         let nets = net_all(r, &models[i]);
         for (prof, np) in NETWORKS.iter().zip(&nets) {
-            let (agg_e2e, agg_mbps) =
-                np.agg.first().map_or(("-".into(), "-".into()), |(_, e2e)| {
-                    (
-                        fmt_us(*e2e),
-                        format!("{:.3}", r.useful_b / (e2e / 1e6) / 1e6),
-                    )
-                });
+            let (_, agg_e2e) = np.agg;
             let rs = np.rs.first().map_or(String::new(), |(_, e2e)| {
                 format!(
                     "{:>12}{:>12.3}",
@@ -2247,13 +2030,13 @@ fn print_tables(rows: &[Row]) {
                 )
             });
             println!(
-                "{:<4}{:<9}{:>12}{:>13.3}{:>12}{:>12}{}",
+                "{:<4}{:<9}{:>12}{:>13.3}{:>12}{:>12.3}{}",
                 cell_id(i),
                 prof.label,
                 fmt_us(np.direct_e2e_us),
                 r.useful_b / (np.direct_e2e_us / 1e6) / 1e6,
-                agg_e2e,
-                agg_mbps,
+                fmt_us(agg_e2e),
+                r.useful_b / (agg_e2e / 1e6) / 1e6,
                 rs,
             );
         }
@@ -2316,6 +2099,12 @@ const PHASES: &[PhaseCol] = &[
         owner: Owner::Client,
         get: |r| r.enc_app,
         set: |r, s| r.enc_app = s,
+    },
+    PhaseCol {
+        name: "kahe_keygen",
+        owner: Owner::Client,
+        get: |r| r.kahe_keygen,
+        set: |r, s| r.kahe_keygen = s,
     },
     PhaseCol {
         name: "kahe_enc",
@@ -2398,22 +2187,14 @@ const PHASES: &[PhaseCol] = &[
     PhaseCol {
         name: "agg1_level",
         owner: Owner::Agg,
-        get: |r| r.agg_plans.first().map_or(Stat::default(), |p| p.agg_cpu),
-        set: |r, s| {
-            if let Some(p) = r.agg_plans.first_mut() {
-                p.agg_cpu = s
-            }
-        },
+        get: |r| r.agg.agg_cpu,
+        set: |r, s| r.agg.agg_cpu = s,
     },
     PhaseCol {
         name: "agg1_leader",
         owner: Owner::Agg,
-        get: |r| r.agg_plans.first().map_or(Stat::default(), |p| p.leader),
-        set: |r, s| {
-            if let Some(p) = r.agg_plans.first_mut() {
-                p.leader = s
-            }
-        },
+        get: |r| r.agg.leader,
+        set: |r, s| r.agg.leader = s,
     },
     PhaseCol {
         name: "rs_dgt_embed",
@@ -2432,6 +2213,16 @@ const PHASES: &[PhaseCol] = &[
         set: |r, s| {
             if let Some(p) = r.rs_plans.first_mut() {
                 p.rs_enc = s
+            }
+        },
+    },
+    PhaseCol {
+        name: "rs_client_sign",
+        owner: Owner::Rs,
+        get: |r| rs0(r).map_or(Stat::default(), |p| p.client_sign),
+        set: |r, s| {
+            if let Some(p) = r.rs_plans.first_mut() {
+                p.client_sign = s
             }
         },
     },
@@ -2617,7 +2408,7 @@ fn write_csv(rows: &[Row]) {
             r.threads,
             r.affinity,
             r.recovered_ok,
-            r.agg_plans.first().is_some_and(|p| p.recovered),
+            r.agg.recovered,
             rs0(r).map_or(0, |p| p.k),
             rs0(r).map_or(0, |p| p.n_nodes),
             rs0(r).is_some_and(|p| p.recovered),
@@ -2689,13 +2480,19 @@ fn write_csv(rows: &[Row]) {
             m.payload_us,
             m.wall_us,
             m.efficiency,
-            m.agg_cpu_us.first().copied().unwrap_or(0.0),
+            m.agg_cpu_us,
             m.rs_cpu_us.first().copied().unwrap_or(0.0),
         )
         .unwrap();
-        let mbps = |e2e_us: f64| r.useful_b / (e2e_us / 1e6) / 1e6;
+        let mbps = |e2e_us: f64| {
+            if e2e_us > 0.0 {
+                r.useful_b / (e2e_us / 1e6) / 1e6
+            } else {
+                0.0
+            }
+        };
         for np in net_all(r, &m) {
-            let (agg_net, agg_e2e) = np.agg.first().copied().unwrap_or((0.0, 0.0));
+            let (agg_net, agg_e2e) = np.agg;
             let (rs_net, rs_e2e) = np.rs.first().copied().unwrap_or((0.0, 0.0));
             write!(
                 out,
@@ -2792,18 +2589,14 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         other => return Err(format!("unknown flow {other:?}")),
     };
 
-    // One agg plan and one RS plan is what the CSV can express; the layer count
-    // is implied by AGG_LAYERS, which `merge` checks is a single entry.
-    let layers = AGG_LAYERS[0];
-    let g = agg_group_size(n, layers);
-    let agg_plans = vec![AggPlan {
-        layers,
+    let g = agg_group_size(n);
+    let agg = AggPlan {
         group_size: g,
-        layer_counts: vec![n.div_ceil(g)],
+        n_l1: n.div_ceil(g),
         agg_cpu: stat("agg1_level")?,
         leader: stat("agg1_leader")?,
         recovered: flag("agg1_recovered")?,
-    }];
+    };
 
     let rs_k = idx("rs_k")?;
     let rs_plans = if rs_k == 0 {
@@ -2819,6 +2612,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
             dgt_embed: stat("rs_dgt_embed")?,
             share_commit: stat("rs_share_commit")?,
             rs_enc: stat("rs_enc")?,
+            client_sign: stat("rs_client_sign")?,
             node_sum: stat("rs_node_sum")?,
             lane_ingest: stat("rs_lane_ingest")?,
             lane_attribute: stat("rs_lane_attribute")?,
@@ -2857,6 +2651,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         affinity: at("m_affinity")?.to_string(),
         recovered_ok: flag("recovered")?,
         enc_app: Stat::default(),
+        kahe_keygen: Stat::default(),
         kahe_enc: Stat::default(),
         share: Stat::default(),
         cs: Stat::default(),
@@ -2883,7 +2678,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         wire_comm_b: num("d_wire_comm_b")?,
         wire_opening_b: num("d_wire_opening_b")?,
         wire_server_b: num("d_wire_server_b")?,
-        agg_plans,
+        agg,
         rs_plans,
     };
     // Plain phases go through the same table the writer used, so the two cannot
@@ -2948,12 +2743,6 @@ fn read_rows(path: &str) -> Result<Vec<Row>, String> {
 /// Cells present in only one input are carried through untouched, so a reduced
 /// client sweep still produces a usable merge.
 pub fn merge(client_csv: &str, host_csv: &str, out_csv: &str) {
-    assert_eq!(
-        AGG_LAYERS.len(),
-        1,
-        "csv carries one agg plan; merging a multi-layer run would silently drop the rest"
-    );
-
     let client_rows = read_rows(client_csv).unwrap_or_else(|e| panic!("{e}"));
     let host_rows = read_rows(host_csv).unwrap_or_else(|e| panic!("{e}"));
 
@@ -3075,6 +2864,17 @@ pub fn merge(client_csv: &str, host_csv: &str, out_csv: &str) {
     println!("csv: {} ({} cells)", out_csv, merged.len());
 }
 
+/// Re-derive the composed and projected columns of an existing CSV from its
+/// measured/derived ones. After a model or net-sim change the [M]/[D] numbers
+/// stay valid; only `c_*`/`p_*` need recomputing.
+pub fn recompute(in_csv: &str, out_csv: &str) {
+    let rows = read_rows(in_csv).unwrap_or_else(|e| panic!("{e}"));
+    std::env::set_var("BENCH_CSV", out_csv);
+    std::env::remove_var("SWEEP_APPEND");
+    write_csv(&rows);
+    println!("csv: {} ({} cells)", out_csv, rows.len());
+}
+
 pub fn run() {
     let budget = Duration::from_secs(
         std::env::var("BENCH_BUDGET_SECS")
@@ -3130,7 +2930,8 @@ pub fn run() {
     println!("            [D] derived    — exact byte arithmetic from packing formulas");
     println!("            [C] composed   — model wall = fixed + payload over [M] medians");
     println!("            [P] projected  — extrapolation / synthetic network sim");
-    println!("useful = active · ξ · log₂(t) bits/round (only active clients carry payload)");
+    println!("useful = delivered · ξ · log₂(t) bits/round (cover clients carry no payload, and");
+    println!("         nor does a scheduled client whose reservation lost a rand collision)");
     println!();
 
     let servers = env_list::<usize>("SWEEP_SERVERS").unwrap_or_else(|| SERVERS.to_vec());
@@ -3141,33 +2942,39 @@ pub fn run() {
 
     // The protocol sweep, flattened once. Scheduled ignores ξ (its token IBLT
     // is fixed at 2 symbols), so it varies over sched_bytes with configs[0].
-    let variants: Vec<(&Config, AppCodec, String)> = configs
+    let mut variants: Vec<(&Config, &'static str, usize, String)> = configs
         .iter()
         .flat_map(|cfg| {
             [
-                (cfg, AppCodec::Mse, format!("mse {}", cfg.label)),
-                (cfg, AppCodec::Prony, format!("prony {}", cfg.label)),
+                (cfg, "mse", 0, format!("mse {}", cfg.label)),
+                (cfg, "prony", 0, format!("prony {}", cfg.label)),
             ]
         })
-        .chain(sched_bytes.iter().map(|&mb| {
+        .collect();
+    match configs.first() {
+        Some(cfg0) => variants.extend(sched_bytes.iter().map(|&mb| {
             (
-                &configs[0],
-                AppCodec::Scheduled { message_bytes: mb },
+                cfg0,
+                "sched",
+                mb,
                 format!("sched msg={}", fmt_bytes(mb as f64)),
             )
-        }))
-        .collect();
+        })),
+        None if !sched_bytes.is_empty() => {
+            eprintln!("(no payload configs; scheduled section skipped)")
+        }
+        None => {}
+    }
 
     let mut rows: Vec<Row> = Vec::new();
     let mut skipped = false;
-    let mut contended: Vec<(String, String)> = Vec::new();
 
     // Nesting is clients → servers → protocol, protocol innermost, so a budget
     // cut-off leaves *complete* protocol comparisons at every (client, server)
     // point it reached rather than one protocol across all of them.
     'sweep: for &(clients_total, clients_active) in &clients {
         for &s in &servers {
-            for (cfg, codec, desc) in &variants {
+            for (cfg, flow, message_bytes, desc) in &variants {
                 if start.elapsed() >= budget {
                     skipped = true;
                     break 'sweep;
@@ -3176,28 +2983,17 @@ pub fn run() {
                     "running cell {}: clients={clients_total}x{clients_active} S={s} {desc}",
                     cell_id(rows.len())
                 );
-                let row = run_cell(s, clients_total, clients_active, cfg, codec, roles);
-                if let Some(w) = contention(&row) {
-                    eprintln!("  contended: {w}");
-                    contended.push((cell_id(rows.len()), w));
-                }
-                rows.push(row);
+                rows.push(run_cell(
+                    s,
+                    clients_total,
+                    clients_active,
+                    cfg,
+                    flow,
+                    *message_bytes,
+                    roles,
+                ));
             }
         }
-    }
-    if !contended.is_empty() {
-        println!();
-        println!(
-            "── contention: {} of {} cells exceeded {CONTENTION_RATIO}x spread ──────────────",
-            contended.len(),
-            rows.len()
-        );
-        println!("    (a competing workload or cross-socket placement; medians are inflated,");
-        println!("     minima less so — pin with `taskset -c 0-7` and re-run these)");
-        for (id, w) in &contended {
-            println!("  {id}: {w}");
-        }
-        println!();
     }
     if skipped {
         println!("(budget exhausted; remaining cells skipped)");

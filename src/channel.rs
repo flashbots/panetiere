@@ -3,7 +3,7 @@
 use chipmunk_code::KahePoly;
 use rand::Rng;
 
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::ProtocolParams;
@@ -72,6 +72,12 @@ impl ChannelParams {
         Self::prony_for_symbols(rho, payload_symbols(message_bytes))
     }
 
+    /// Sketch channel carrying `payload_bits` per element, sized at the
+    /// sketch's own symbol width rather than the peeling structure's.
+    pub fn prony_for_bits(rho: u32, payload_bits: usize) -> Self {
+        Self::prony_for_symbols(rho, payload_bits.div_ceil(PRONY_PRIME.ilog2() as usize))
+    }
+
     pub fn prony_for_symbols(rho: u32, payload_symbols: usize) -> Self {
         Self::from_prony(PronyParams::new(
             rho.max(1) as usize,
@@ -115,31 +121,45 @@ impl ChannelParams {
         }
     }
 
-    /// Largest payload [`encode_message`] accepts.
-    pub fn max_payload_bytes(&self) -> usize {
-        let symbols = match self {
+    pub fn payload_symbols(&self) -> usize {
+        match self {
             ChannelParams::Mse(p) => p.payload_symbols,
             ChannelParams::Prony(p) => p.payload_symbols,
-        };
-        symbols * BYTES_PER_SYMBOL
+        }
     }
 
-    /// Protocol parameters whose KAHE width is exactly one packed encoding. The
-    /// sketch needs a prime plaintext modulus, so the two variants differ.
-    pub fn protocol_params<R: Rng>(&self, rng: &mut R, n_servers: usize) -> ProtocolParams {
+    /// Payload bits one symbol carries: `⌊log₂ t⌋` in the peeling structure's
+    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — 36 against 35.
+    pub fn bits_per_symbol(&self) -> usize {
         match self {
-            ChannelParams::Mse(_) => {
-                ProtocolParams::setup_with_kahe_dims(rng, n_servers, self.n_polys())
-            }
-            ChannelParams::Prony(_) => ProtocolParams::setup_with_kahe_dims_full(
-                rng,
-                n_servers,
-                self.n_polys(),
-                SIGMA_S_DEFAULT,
-                SIGMA_E_DEFAULT,
-                PRONY_PRIME,
-            ),
+            ChannelParams::Mse(_) => mse::BITS_PER_SYMBOL,
+            ChannelParams::Prony(p) => p.bits_per_symbol(),
         }
+    }
+
+    /// KAHE plaintext modulus the symbols live in. The sketch needs a prime.
+    pub fn plaintext_modulus(&self) -> u64 {
+        match self {
+            ChannelParams::Mse(_) => T_MODULUS_DEFAULT,
+            ChannelParams::Prony(p) => p.p,
+        }
+    }
+
+    /// Largest payload [`encode_message`] accepts.
+    pub fn max_payload_bytes(&self) -> usize {
+        self.payload_symbols() * BYTES_PER_SYMBOL
+    }
+
+    /// Protocol parameters whose KAHE width is exactly one packed encoding.
+    pub fn protocol_params<R: Rng>(&self, rng: &mut R, n_servers: usize) -> ProtocolParams {
+        ProtocolParams::setup_with_kahe_dims_full(
+            rng,
+            n_servers,
+            self.n_polys(),
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            self.plaintext_modulus(),
+        )
     }
 }
 
@@ -175,18 +195,26 @@ pub fn encode_message<R: Rng>(
             max,
         });
     }
-    Ok(match p {
+    Ok(encode_symbols(
+        rng,
+        p,
+        &bytes_to_symbols(payload, p.payload_symbols()),
+    ))
+}
+
+pub fn encode_symbols<R: Rng>(rng: &mut R, p: &ChannelParams, payload: &[i64]) -> Vec<KahePoly> {
+    match p {
         ChannelParams::Mse(params) => {
             let mut enc = MseEncoding::new(params.clone());
-            enc.insert(rng, &bytes_to_symbols(payload, params.payload_symbols));
+            enc.insert(rng, payload);
             enc.pack()
         }
         ChannelParams::Prony(params) => {
             let mut sketch = PronySketch::new(params.clone());
-            sketch.insert(rng, &bytes_to_symbols(payload, params.payload_symbols));
+            sketch.insert(rng, payload);
             sketch.pack()
         }
-    })
+    }
 }
 
 pub fn cover(p: &ChannelParams) -> Vec<KahePoly> {
@@ -201,6 +229,17 @@ pub fn decode_messages(
     plaintext: &[KahePoly],
     expect: Option<usize>,
 ) -> Result<Vec<Vec<u8>>, ChannelError> {
+    Ok(decode_symbols(p, plaintext, expect)?
+        .iter()
+        .map(|s| symbols_to_bytes(s))
+        .collect())
+}
+
+pub fn decode_symbols(
+    p: &ChannelParams,
+    plaintext: &[KahePoly],
+    expect: Option<usize>,
+) -> Result<Vec<Vec<i64>>, ChannelError> {
     let need = p.n_polys();
     if plaintext.len() < need {
         return Err(ChannelError::ShortPlaintext {
@@ -224,7 +263,7 @@ pub fn decode_messages(
             });
         }
     }
-    Ok(elements.iter().map(|s| symbols_to_bytes(s)).collect())
+    Ok(elements)
 }
 
 #[cfg(test)]
@@ -360,6 +399,44 @@ mod tests {
             let pp = p.protocol_params(&mut rng, 4);
             assert_eq!(crate::protocol::message_polys(&pp), p.n_polys(), "{p:?}");
         }
+    }
+
+    /// The symbol path carries the channel's full `bits_per_symbol`, so values
+    /// above the `BYTES_PER_SYMBOL` byte packing round-trip through it.
+    #[test]
+    fn wide_symbols_round_trip() {
+        for p in [
+            ChannelParams::for_symbols(4, 3, [0x77; 32]),
+            ChannelParams::prony_for_symbols(4, 3),
+        ] {
+            let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
+            let wide = (1i64 << 34) + 12_345;
+            assert!(wide > (1 << (BYTES_PER_SYMBOL * 8)));
+            let payloads: Vec<Vec<i64>> = (0..4)
+                .map(|i| vec![wide - i, i + 1, wide / (i + 2)])
+                .collect();
+            let contributions: Vec<Vec<KahePoly>> = payloads
+                .iter()
+                .map(|m| encode_symbols(&mut rng, &p, m))
+                .collect();
+
+            let mut got = decode_symbols(&p, &sum(&contributions), Some(4)).unwrap();
+            let mut want = payloads;
+            got.sort();
+            want.sort();
+            assert_eq!(got, want, "{p:?}");
+        }
+    }
+
+    /// Same element bits either way, so the sketch needs the extra symbol its
+    /// narrower field costs.
+    #[test]
+    fn prony_for_bits_sizes_at_the_sketch_width() {
+        let bits = 911 * mse::BITS_PER_SYMBOL;
+        let p = ChannelParams::prony_for_bits(300, bits);
+        assert_eq!(p.bits_per_symbol(), 35);
+        assert_eq!(p.payload_symbols(), bits.div_ceil(35));
+        assert!(p.payload_symbols() * p.bits_per_symbol() >= bits);
     }
 
     /// The sketch is the reason to pick it: same payload, far fewer polys.

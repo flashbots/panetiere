@@ -58,8 +58,9 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 
 **Direct** is the protocol itself: each client posts its ciphertext and
 commitment, and the recipient downloads all of them. That download is the
-bottleneck — at the reference cell below it is 6.15 GB per round (300 clients ×
-20.5 MB of ciphertext) against 0.14 GB of key-share envelopes.
+bottleneck — at the reference cell below it is 2.12 GB per round (300 clients ×
+7.06 MB of ciphertext) against 0.14 GB of key-share envelopes, and 6.15 GB with
+the peeling encoding in place of the sketch.
 
 **Aggregators** and **erasure-coding lanes** are two practical improvements that
 attack exactly that term. An aggregator serves a group of clients and publishes
@@ -328,39 +329,11 @@ retries and authenticated delivery are the caller's.
 `bulletin::InMemoryBulletin` is a `Mutex`-backed vector for tests and the demo —
 no persistence, ordering or authentication. It is not a bulletin board.
 
-## Parameters
-
-Four rings, all $\mathbb{Z}_q[x]/(x^N+1)$ at $N = 2048$; chipmunk's `param.rs` is the
-source of truth for the moduli and their NTT tables.
-
-| Ring | $q$ | Used by |
-|---|---|---|
-| HVC (`HVCPoly`) | $40{,}961$; $\zeta = 34$ (`ZETA`), `HVC_WIDTH = 3` | tree hash, leaf labels, opening digits (both commitments) |
-| CS (`CsPoly`) | $139{,}301$ | commitment leaf, Shamir sharing, share sums |
-| KAHE (`KahePoly`) | $347{,}280{,}875{,}347{,}969 \approx 2^{48.3}$ | encryption, codec, encoding cells |
-| Dgt (`DgtNTTPoly`) | $\approx 2^{61}$ | RS coding, over exact integer sums |
-
-| Knob | Value |
-|---|---|
-| `T_MODULUS_DEFAULT` | $t = 2^{36}$ (use `PRONY_PRIME` when the payload layer needs a field) |
-| `SIGMA_S_DEFAULT`, `SIGMA_E_DEFAULT` | $\sigma_s = \sigma_e = 15.72$ |
-| noise budget | $t \cdot 8 \sigma_e \sqrt{\rho} + \rho t / 2 < q_\mathrm{kahe} / 2$ — holds for $\rho \lesssim 349$ |
-| `MU_CS`, `KAPPA_CS` | $\mu_\mathrm{cs} = 1$, $\kappa_\mathrm{cs} = 5$ |
-| `BETA_CS`, `R_BOUND`, `beta_agg_hvc()` | $\beta_\mathrm{cs} = 116$, $34{,}800 = 300 \beta_\mathrm{cs}$, $300 \zeta$ |
-| threshold | $\max(\lfloor S/2 \rfloor + 1, S - 2)$; override with `setup_with_threshold` |
-| `rho_max` (RS mode) | caller-supplied; `setup_rs_mode` asserts $\rho_\mathrm{max} \cdot q_\mathrm{kahe} < q_\mathrm{dgt}$ and $\rho_\mathrm{max} \zeta < q_\mathrm{hvc}/2$ (so $\rho_\mathrm{max} \le 602$) |
-
-Exceeding the noise budget returns noise, not an error. `R_BOUND` and
-`beta_agg_hvc()` cap one round's aggregation at $\rho = 300$. $\mu_\mathrm{kahe}$ follows from
-the payload layer. Changing a modulus, $N$, `KAPPA_CS` or $t$ invalidates the
-measurements below.
-
 ## Tests and benches
 
 ```sh
 RAYON_NUM_THREADS=8 cargo test -j 8
-RAYON_NUM_THREADS=8 cargo bench -j 8 --bench scaling      # (S, ρ) × encoding sweep
-RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol     # per-stage micro-benches
+RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep   # (S, ρ) × encoding sweep
 ```
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
@@ -395,72 +368,56 @@ Ubuntu 26.04 / kernel 7.0.0-22, TDX enabled. The client runs in an 8-vCPU,
 64 GB TDX VM under QEMU on the same host; every workload is core-pinned,
 including the VM's vCPUs, and everything uses 8 threads.
 
-CPU per role and bytes on each link, peeling encoding (`channel` / `mse`),
-8 servers. "300 / 100" is cover traffic: 300 clients in the anonymity set, 100
-of them actually sending.
+### CPU and bytes per round
+
+Prony sketch encoding (`channel` / `prony`), 8 servers, direct mode. "300 / 100"
+is cover traffic: 300 clients in the anonymity set, 100 of them sending.
 
 | Message | Clients | Client | Server | Recipient | Cl→Srv | Cl→Rec | Srv→Rec | Rec. ingress |
 |---|---|---|---|---|---|---|---|---|
-| 4 KB | 100 | 33.4 ms | 15.4 ms | 19.5 ms | 0.47 MB | 1.72 MB | 109 KB | 0.17 GB |
-| 4 KB | 300 / 100 | 34.6 ms | 42.8 ms | 28.0 ms | 0.47 MB | 1.72 MB | 124 KB | 0.52 GB |
-| 4 KB | 300 | 60.1 ms | 43.8 ms | 76.7 ms | 0.47 MB | 5.15 MB | 124 KB | 1.55 GB |
-| 16 KB | 100 | 73.7 ms | 15.4 ms | 64.6 ms | 0.47 MB | 6.84 MB | 109 KB | 0.69 GB |
-| 16 KB | 300 / 100 | 73.3 ms | 42.9 ms | 93.9 ms | 0.47 MB | 6.84 MB | 124 KB | 2.05 GB |
-| 16 KB | 300 | 177.8 ms | 42.6 ms | 300.6 ms | 0.47 MB | 20.5 MB | 124 KB | 6.15 GB |
+| 4 KB | 100 | 35.2 ms | 15.7 ms | 30.5 ms | 0.47 MB | 0.61 MB | 109 KB | 0.06 GB |
+| 4 KB | 300 / 100 | 25.5 ms | 43.7 ms | 32.5 ms | 0.47 MB | 0.61 MB | 124 KB | 0.18 GB |
+| 4 KB | 300 | 51.4 ms | 48.0 ms | 154.7 ms | 0.47 MB | 1.78 MB | 124 KB | 0.54 GB |
+| 16 KB | 100 | 52.8 ms | 17.8 ms | 49.4 ms | 0.47 MB | 2.37 MB | 109 KB | 0.24 GB |
+| 16 KB | 300 / 100 | 40.6 ms | 44.8 ms | 61.1 ms | 0.47 MB | 2.37 MB | 124 KB | 0.71 GB |
+| 16 KB | 300 | 85.3 ms | 50.4 ms | 265.8 ms | 0.47 MB | 7.06 MB | 124 KB | 2.12 GB |
 
-CPU is cheap even for the largest channel here — 300 clients × 16 KB is a 4.8 MB
-broadcast — while the bytes are not. Cover traffic is the lever: the encoding is
-sized for the *sending* clients, so the 300 / 100 rows buy a 3× anonymity set at
-the 100-client ciphertext size. More servers cost the client and barely touch the
-recipient: 8 → 16 → 32 servers moves the client from 177.8 to 200.9 to 253.6 ms
-and its per-server egress from 0.47 to 1.12 to 2.58 MB, against 300.6 → 303.5 →
-322.7 ms at the recipient.
+### Simulated network throughput
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/traffic-dark.svg">
-  <img src="docs/traffic.svg" width="760" alt="Bytes on each connection of one round in the three ingress modes, at 16 servers and 300 clients of 16 KB with the Prony sketch encoding. Direct: each client posts 7.06 MB and the recipient downloads all 2.12 GB. Aggregated: 17 aggregators each forward one summed 7.06 MB post; the recipient reads 120 MB. Erasure-coded: each client sends a 0.70 MB coded share to each server, each lane ingests 210 MB, and the recipient reads 19 MB. Key-share envelopes are 70 KB per client per server in every mode.">
-</picture>
-
-Simulated round times at that same cell (16 servers, 300 × 16 KB, RS at
-14-of-16, one-way latency 60 ms + U[0, 10) ms per message): e2e is measured
-CPU wall plus simulated transfer, MB/s is the recovered payload (4.9 MB)
-over e2e.
+16 servers, 300 × 16 KB, RS at 14-of-16, one-way latency 60 ms + U[0, 10) ms per
+message. e2e is measured CPU wall plus simulated transfer; MB/s is the recovered
+payload (4.9 MB) over e2e. Peeling carries \~3× these bytes and lands at roughly
+a third of these rates.
 
 Prony sketch:
 
 | Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Aggregated | MB/s | Erasure-coded | MB/s |
 |---|---|---|---|---|---|---|
-| 100 / 1k / 1k | 34.5 s | 0.14 | 3.6 s | 1.36 | 2.8 s | 1.74 |
-| 100 / 4k / 4k | 9.1 s | 0.54 | 1.7 s | 2.87 | 1.9 s | 2.66 |
-| 100 / 1k / 8k | 4.8 s | 1.02 | 2.8 s | 1.78 | 2.7 s | 1.83 |
-| 100 / 1k / 20k | 2.3 s | 2.15 | 2.7 s | 1.83 | 2.7 s | 1.83 |
-| 1k / 1k / 4k | 9.1 s | 0.54 | 2.9 s | 1.71 | 2.7 s | 1.81 |
-| 1k / 1k / 8k | 4.8 s | 1.02 | 2.8 s | 1.78 | 2.7 s | 1.83 |
-| 1k / 1k / 20k | 2.3 s | 2.15 | 2.7 s | 1.83 | 2.7 s | 1.83 |
+| 100 / 1k / 1k | 34.5 s | 0.14 | 2.7 s | 1.81 | 2.9 s | 1.70 |
+| 100 / 4k / 4k | 9.1 s | 0.54 | 1.6 s | 3.06 | 2.0 s | 2.47 |
+| 100 / 1k / 8k | 4.9 s | 1.01 | 1.8 s | 2.67 | 2.6 s | 1.86 |
+| 100 / 1k / 20k | 2.3 s | 2.12 | 1.8 s | 2.76 | 2.6 s | 1.87 |
+| 1k / 1k / 4k | 9.1 s | 0.54 | 2.0 s | 2.50 | 2.7 s | 1.83 |
+| 1k / 1k / 8k | 4.9 s | 1.01 | 1.8 s | 2.67 | 2.6 s | 1.86 |
+| 1k / 1k / 20k | 2.3 s | 2.12 | 1.8 s | 2.76 | 2.6 s | 1.87 |
 
 Slot reservation:
 
 | Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Aggregated | MB/s | Erasure-coded | MB/s |
 |---|---|---|---|---|---|---|
-| 100 / 1k / 1k | 37.5 s | 0.13 | 3.7 s | 1.32 | 2.9 s | 1.72 |
-| 100 / 4k / 4k | 9.7 s | 0.51 | 1.6 s | 3.00 | 1.8 s | 2.74 |
-| 100 / 1k / 8k | 5.1 s | 0.97 | 2.8 s | 1.77 | 2.7 s | 1.81 |
-| 100 / 1k / 20k | 2.3 s | 2.16 | 2.7 s | 1.82 | 2.7 s | 1.81 |
-| 1k / 1k / 4k | 9.7 s | 0.51 | 2.9 s | 1.68 | 2.7 s | 1.79 |
-| 1k / 1k / 8k | 5.1 s | 0.97 | 2.8 s | 1.77 | 2.7 s | 1.81 |
-| 1k / 1k / 20k | 2.3 s | 2.16 | 2.7 s | 1.82 | 2.7 s | 1.81 |
+| 100 / 1k / 1k | 37.6 s | 0.13 | 2.7 s | 1.79 | 2.9 s | 1.68 |
+| 100 / 4k / 4k | 9.8 s | 0.50 | 1.5 s | 3.22 | 1.9 s | 2.52 |
+| 100 / 1k / 8k | 5.1 s | 0.96 | 1.8 s | 2.74 | 2.7 s | 1.84 |
+| 100 / 1k / 20k | 2.3 s | 2.11 | 1.7 s | 2.85 | 2.7 s | 1.85 |
+| 1k / 1k / 4k | 9.8 s | 0.50 | 1.9 s | 2.55 | 2.7 s | 1.81 |
+| 1k / 1k / 8k | 5.1 s | 0.96 | 1.8 s | 2.74 | 2.7 s | 1.84 |
+| 1k / 1k / 20k | 2.3 s | 2.11 | 1.7 s | 2.85 | 2.7 s | 1.85 |
 
-Direct is bound by the bulletin link — the full 2.12 GB goes through it, so
-it gains with every bulletin upgrade and from nothing else. Aggregated and
-erasure-coded are bound by each aggregator's 127 MB and each lane's 210 MB
-ingest at the server rate: the 4 Gbit column is the big win, and upgrading
-the client uplink alone barely moves them. Peeling carries ~3× these bytes
-(20.5 MB per post) and lands at roughly a third of these rates.
+### Bytes on each link
 
-**The round is bandwidth-bound, not CPU-bound.** Under simulated links (60 ms
-latency, 10 ms jitter, 100 Mbit/s client uplink, 4 Gbit/s server and recipient
-links, 16 servers), that 4.8 MB broadcast takes \~25 s end to end — almost
-entirely the recipient pulling 6.15 GB. Erasure coding removes the fan-in and
-brings it to \~4.0 s, share commitment included; swapping peeling for the Prony
-sketch or slot reservation shrinks each client's plaintext \~3× and gets to
-\~1.8 s.
+Same cell (Prony), per ingress mode.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/traffic-dark.svg">
+  <img src="docs/traffic.svg" width="760" alt="Bytes on each connection of one round in the three ingress modes, at 16 servers and 300 clients of 16 KB with the Prony sketch encoding. Direct: each client posts 7.06 MB and the recipient downloads all 2.12 GB. Aggregated: 17 aggregators each forward one summed 7.06 MB post; the recipient reads 120 MB. Erasure-coded: each client sends a 0.70 MB coded share to each server, each lane ingests 210 MB, and the recipient reads 19 MB. Key-share envelopes are 70 KB per client per server in every mode.">
+</picture>

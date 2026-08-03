@@ -10,7 +10,7 @@
 
 use chipmunk_code::{KahePoly, N};
 
-const BYTES_PER_COEFF: usize = 4;
+pub const BYTES_PER_COEFF: usize = 4;
 pub const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
 const HEADER_LEN: usize = 4;
 /// Per-coefficient symbol modulus (what fits in `BYTES_PER_COEFF` bytes).

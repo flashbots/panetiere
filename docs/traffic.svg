@@ -36,7 +36,7 @@
   <rect x="760" y="108" width="96" height="144" rx="6" fill="#e1e0d9" stroke="rgba(11,11,11,0.10)"/>
   <text x="808" y="184" font-size="13" font-weight="600" fill="#0b0b0b" text-anchor="middle">recipient</text>
 
-  <text x="32" y="390" font-size="12.5" font-weight="600" fill="#0b0b0b">Aggregated, 17 groups of ≤ 18 — recipient ingress 122 MB · e2e 2.9 s</text>
+  <text x="32" y="390" font-size="12.5" font-weight="600" fill="#0b0b0b">Aggregated, 17 groups of ≤ 18 — recipient ingress 122 MB · e2e 2.0 s</text>
 
   <path d="M136,436 C184,436 184,434 232,434 L232,510 C184,510 184,512 136,512 Z" fill="#2a78d6"/>
   <path d="M328,470 C376,470 376,455 424,455 L424,459 C376,459 376,474 328,474 Z" fill="#2a78d6"/>
