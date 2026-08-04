@@ -35,7 +35,10 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
-use crate::cs::{bits_for_signed, position_list, wrapping_add_avx2};
+use crate::bulletin::dgt_packed_len;
+use crate::cs::{
+    digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2,
+};
 use crate::rs::Share;
 
 /// `69^10 ≈ 2^61.1 > q_dgt ≈ 2^61`: ten balanced base-69 digits are injective.
@@ -50,9 +53,17 @@ const ZETA_I64: i64 = ZETA as i64;
 /// Balanced base-69 digits of the canonical NTT-domain coefficients, centered
 /// first. Digit coefficients ∈ [−ζ, ζ], little-endian.
 pub fn decompose_share_poly(p: &DgtNTTPoly) -> [HVCPoly; DGT_WIDTH] {
+    let mut out = [HVCPoly::default(); DGT_WIDTH];
+    decompose_into(p, &mut out);
+    out
+}
+
+/// [`decompose_share_poly`] into caller-owned storage. The array is 80 KB, so
+/// digit vectors are filled in place rather than moved out by value.
+fn decompose_into(p: &DgtNTTPoly, out: &mut [HVCPoly]) {
+    debug_assert_eq!(out.len(), DGT_WIDTH);
     let q = DGT_MODULUS;
     let half = q / 2;
-    let mut out = [HVCPoly::default(); DGT_WIDTH];
     let coeffs = p.coeffs();
     for i in 0..POLY_N {
         let x = coeffs[i];
@@ -73,7 +84,6 @@ pub fn decompose_share_poly(p: &DgtNTTPoly) -> [HVCPoly; DGT_WIDTH] {
         }
         debug_assert_eq!(v, 0);
     }
-    out
 }
 
 /// Left-inverse of [`decompose_share_poly`], linear in the digits. i128
@@ -206,7 +216,11 @@ impl ShareCommitmentParams {
 }
 
 fn label_digits(label: &[DgtNTTPoly]) -> Vec<HVCPoly> {
-    label.iter().flat_map(decompose_share_poly).collect()
+    let mut out = zeroed_polys(label.len() * DGT_WIDTH);
+    for (p, digits) in label.iter().zip(out.chunks_exact_mut(DGT_WIDTH)) {
+        decompose_into(p, digits);
+    }
+    out
 }
 
 /// What travels with each share: the decomposed Merkle path. The label and its
@@ -216,6 +230,28 @@ pub struct SharePath {
     pub lane_index: usize,
     /// `path_len` levels × `dec(l) ‖ dec(r)`, level 0 = the root's children.
     pub nodes: Box<[HVCPoly]>,
+}
+
+impl SharePath {
+    /// Only the digits travel — the lane index rides the sender's slot.
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        pack_digits(&self.nodes, ZETA)
+    }
+
+    pub fn from_bytes(
+        pp: &ShareCommitmentParams,
+        lane_index: usize,
+        bytes: &[u8],
+    ) -> Option<Self> {
+        if lane_index >= pp.n_lanes {
+            return None;
+        }
+        let nodes = unpack_digits(bytes, pp.path_len() * 2 * HVC_WIDTH, ZETA)?;
+        Some(SharePath {
+            lane_index,
+            nodes: nodes.into_boxed_slice(),
+        })
+    }
 }
 
 /// A lane's materialized (fresh) or aggregated opening:
@@ -242,6 +278,32 @@ impl ShareOpening {
 
     pub fn data_mut(&mut self) -> &mut [HVCPoly] {
         &mut self.data
+    }
+
+    /// Packed at the aggregated bound `ρ_max·ζ`, the gate
+    /// [`verify_aggregated`] applies — a post that will not pack could not have
+    /// verified, so a lane learns it locally instead of broadcasting junk.
+    pub fn to_bytes(&self, pp: &ShareCommitmentParams) -> Option<Vec<u8>> {
+        if self.path_len != pp.path_len() || self.data.len() != pp.data_polys() {
+            return None;
+        }
+        pack_digits(&self.data, pp.beta_agg())
+    }
+
+    pub fn from_bytes(
+        pp: &ShareCommitmentParams,
+        lane_index: usize,
+        bytes: &[u8],
+    ) -> Option<Self> {
+        if lane_index >= pp.n_lanes {
+            return None;
+        }
+        let data = unpack_digits(bytes, pp.data_polys(), pp.beta_agg())?;
+        Some(ShareOpening {
+            lane_index,
+            path_len: pp.path_len(),
+            data: data.into_boxed_slice(),
+        })
     }
 
     /// Project the digit sums back to `Σ labels` mod q_dgt.
@@ -503,8 +565,7 @@ pub fn sum_openings(os: &[&ShareOpening]) -> ShareOpening {
 /// Wire size of a fresh per-lane path at 7 bits/coeff (digits ζ-bounded).
 pub fn fresh_path_packed_len(n_lanes: usize) -> usize {
     let path_len = n_lanes.next_power_of_two().max(2).trailing_zeros() as usize;
-    let polys = path_len * 2 * HVC_WIDTH;
-    (polys * POLY_N * bits_for_signed(ZETA) as usize).div_ceil(8)
+    digits_packed_len(path_len * 2 * HVC_WIDTH, ZETA)
 }
 
 /// Wire size of a lane's post: the share-domain sum (flat 8 B/coeff, the RS
@@ -512,8 +573,7 @@ pub fn fresh_path_packed_len(n_lanes: usize) -> usize {
 pub fn lane_post_packed_len(block_len: usize, n_lanes: usize, rho_max: usize) -> usize {
     let path_len = n_lanes.next_power_of_two().max(2).trailing_zeros() as usize;
     let polys = LABEL_POLYS * DGT_WIDTH + path_len * 2 * HVC_WIDTH;
-    block_len * POLY_N * 8
-        + (polys * POLY_N * bits_for_signed(rho_max as u32 * ZETA) as usize).div_ceil(8)
+    block_len * dgt_packed_len() + digits_packed_len(polys, rho_max as u32 * ZETA)
 }
 
 #[cfg(test)]
@@ -594,6 +654,12 @@ mod tests {
                     ingest_share(&pp, &root, j, &shares[j], &paths[j]).is_some(),
                     "n_lanes={n_lanes} lane={j}"
                 );
+                let bytes = paths[j].to_bytes().expect("fresh digits are ζ-bounded");
+                assert_eq!(bytes.len(), fresh_path_packed_len(n_lanes));
+                let back = SharePath::from_bytes(&pp, j, &bytes).expect("round trip");
+                assert!(ingest_share(&pp, &root, j, &shares[j], &back).is_some());
+                assert!(SharePath::from_bytes(&pp, j, &bytes[..bytes.len() - 1]).is_none());
+                assert!(SharePath::from_bytes(&pp, n_lanes, &bytes).is_none());
             }
             if n_lanes >= 2 {
                 assert!(ingest_share(&pp, &root, 1, &shares[0], &paths[0]).is_none());
@@ -645,6 +711,18 @@ mod tests {
                 verify_aggregated(&pp, &summed_root, &share_sum, &agg),
                 "lane {j}"
             );
+
+            let open_bytes = agg.to_bytes(&pp).expect("ρ openings stay under β_agg");
+            let mut post = Vec::new();
+            crate::rs::pack_share(&share_sum, &mut post);
+            assert_eq!(
+                post.len() + open_bytes.len(),
+                lane_post_packed_len(block_len, n_lanes, pp.rho_max)
+            );
+            let back = ShareOpening::from_bytes(&pp, j, &open_bytes).expect("round trip");
+            let share_back = crate::rs::unpack_share(&post, block_len).expect("round trip");
+            assert!(verify_aggregated(&pp, &summed_root, &share_back, &back));
+            assert!(ShareOpening::from_bytes(&pp, j, &open_bytes[1..]).is_none());
             // A tampered share sum no longer hashes to the projected labels.
             let mut bad = share_sum.clone();
             bad[0] += share_sum[0];
@@ -674,6 +752,8 @@ mod tests {
         *d = HVCPoly::from_coeffs(c);
         assert!(!verify_aggregated(&pp, &root, &shares[0], &o));
         assert_ne!(o.project_labels(), before);
+        // The wire form is the same gate: the smuggled digit does not fit.
+        assert!(o.to_bytes(&pp).is_none());
     }
 
     #[test]

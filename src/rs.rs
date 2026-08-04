@@ -4,9 +4,38 @@
 use chipmunk_code::{DgtNTTPoly, DGT_MODULUS, N};
 use rayon::prelude::*;
 
+use crate::bulletin::dgt_packed_len;
+
 const Q: u64 = DGT_MODULUS;
 
 pub type Share = Vec<DgtNTTPoly>;
+
+/// Append a share's NTT-domain coefficients, little-endian, [`dgt_packed_len`]
+/// per poly.
+pub fn pack_share(share: &[DgtNTTPoly], out: &mut Vec<u8>) {
+    out.reserve(share.len() * dgt_packed_len());
+    for p in share {
+        for c in p.coeffs() {
+            out.extend_from_slice(&c.to_le_bytes());
+        }
+    }
+}
+
+/// Inverse of [`pack_share`], requiring the exact length for `n_polys`.
+pub fn unpack_share(bytes: &[u8], n_polys: usize) -> Option<Share> {
+    if bytes.len() != n_polys * dgt_packed_len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n_polys);
+    for chunk in bytes.chunks_exact(dgt_packed_len()) {
+        let mut coeffs = [0u64; N];
+        for (c, b) in coeffs.iter_mut().zip(chunk.chunks_exact(8)) {
+            *c = u64::from_le_bytes(b.try_into().ok()?);
+        }
+        out.push(DgtNTTPoly::from_raw(&coeffs));
+    }
+    Some(out)
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RsError {
@@ -308,6 +337,18 @@ mod tests {
             Rs::reconstruct(&params, 7, &short),
             Err(RsError::ShareLenMismatch)
         );
+    }
+
+    #[test]
+    fn share_wire_round_trip() {
+        let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
+        let share = rand_ctxt(&mut rng, 4);
+        let mut bytes = Vec::new();
+        pack_share(&share, &mut bytes);
+        assert_eq!(bytes.len(), 4 * dgt_packed_len());
+        assert_eq!(unpack_share(&bytes, 4).unwrap(), share);
+        assert!(unpack_share(&bytes, 3).is_none());
+        assert!(unpack_share(&bytes[..bytes.len() - 1], 4).is_none());
     }
 
     /// The property the whole mode rests on: coding commutes with aggregation,
