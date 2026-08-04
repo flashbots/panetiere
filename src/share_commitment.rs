@@ -36,9 +36,7 @@ use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
 use crate::bulletin::dgt_packed_len;
-use crate::cs::{
-    digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2,
-};
+use crate::cs::{digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2};
 use crate::rs::Share;
 
 /// `69^10 ≈ 2^61.1 > q_dgt ≈ 2^61`: ten balanced base-69 digits are injective.
@@ -238,11 +236,7 @@ impl SharePath {
         pack_digits(&self.nodes, ZETA)
     }
 
-    pub fn from_bytes(
-        pp: &ShareCommitmentParams,
-        lane_index: usize,
-        bytes: &[u8],
-    ) -> Option<Self> {
+    pub fn from_bytes(pp: &ShareCommitmentParams, lane_index: usize, bytes: &[u8]) -> Option<Self> {
         if lane_index >= pp.n_lanes {
             return None;
         }
@@ -290,11 +284,7 @@ impl ShareOpening {
         pack_digits(&self.data, pp.beta_agg())
     }
 
-    pub fn from_bytes(
-        pp: &ShareCommitmentParams,
-        lane_index: usize,
-        bytes: &[u8],
-    ) -> Option<Self> {
+    pub fn from_bytes(pp: &ShareCommitmentParams, lane_index: usize, bytes: &[u8]) -> Option<Self> {
         if lane_index >= pp.n_lanes {
             return None;
         }
