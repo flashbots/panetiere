@@ -10,7 +10,8 @@ use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
 use crate::rs::Share;
 use crate::share_commitment::ShareOpening;
 use crate::sig;
-use chipmunk_code::{CsPoly, HVCPoly, KahePoly, HVC_MODULUS, KAHE_MODULUS, N as POLY_N};
+use crate::{CsPoly, KahePoly, KAHE_MODULUS, N as POLY_N};
+use chipmunk_code::{HVCPoly, HVC_MODULUS};
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
@@ -183,7 +184,7 @@ impl InMemoryBulletin {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chipmunk_code::{HVCPoly, Polynomial};
+    use chipmunk_code::HVCPoly;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 

@@ -1,9 +1,7 @@
 //! Key-additive homomorphic encryption
 //!
-//! Lives on its own ring `R_{q_kahe}` (chipmunk's `KahePoly`, a 64-bit ring
-//! with q ≈ 2^48.3), decoupled from the chipmunk Ring-SIS CS ring.
-//! The KAHE q is chosen for headroom in the noise budget — chipmunk's q is
-//! tied to its multi-signature size optimization and would be wasteful here.
+//! Lives on its own ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^48.3, or ≈ 2^47.995
+//! under `rns`). The modulus is chosen for headroom in the noise budget.
 //!
 //! Per-poly form:
 //!
@@ -19,9 +17,9 @@
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
-use chipmunk_code::{
-    pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, Polynomial, CS_MODULUS_OVER_TWO,
-    KAHE_MODULUS_OVER_TWO, N,
+use crate::{
+    pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
+    N,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -108,8 +106,10 @@ fn pad_poly(a_ntt: &[KaheNTTPoly], sk_ntt: &KaheNTTPoly, i: usize) -> KahePoly {
 }
 
 /// Accumulate `Σ_client cs[client][pos]` into an `i64[N]` accumulator. Summing
-/// ρ centered coefficients (each `≤ q/2 < 2^49`) reaches `ρ·2^49 < 2^63` for
+/// ρ centered coefficients (each `≤ q/2 < 2^48`) reaches `ρ·2^48 < 2^63` for
 /// any realistic ρ, so plain i64 accumulation with one final reduction is safe.
+/// The AVX2 specialization is x86-only by design; other targets use the scalar
+/// fallback and should not treat this loop as part of the portable NTT backend.
 fn accumulate_pos(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -144,10 +144,11 @@ unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usi
     }
 }
 
-/// `poly[i] · scale` mod q. Products reach `q/2 · t ≈ 2^86`, so i128.
+/// `poly[i] · scale` mod q. Products reach `q/2 · t ≈ 2^84` (2^83 under `rns`),
+/// so i128.
 fn scale_poly(poly: &KahePoly, scale: i64) -> KahePoly {
     let mut coeffs = [0i64; N];
-    let q = chipmunk_code::KAHE_MODULUS as i128;
+    let q = crate::KAHE_MODULUS as i128;
     for (out, &c) in coeffs.iter_mut().zip(poly.coeffs().iter()) {
         *out = ((c as i128) * (scale as i128) % q) as i64;
     }
@@ -251,7 +252,11 @@ impl Kahe {
 
 pub const SIGMA_S_DEFAULT: f64 = 15.72;
 pub const SIGMA_E_DEFAULT: f64 = 15.72;
+/// Largest power of two satisfying `t·(8σ_e·√ρ + ρ/2) < q_kahe/2` at ρ = 300.
+#[cfg(not(feature = "rns"))]
 pub const T_MODULUS_DEFAULT: u64 = 1 << 36;
+#[cfg(feature = "rns")]
+pub const T_MODULUS_DEFAULT: u64 = 1 << 35;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -309,7 +314,7 @@ impl KaheScheme for Kahe {
             return Vec::new();
         }
         let len = cs[0].len();
-        let q = chipmunk_code::KAHE_MODULUS;
+        let q = crate::KAHE_MODULUS;
         let half = q / 2;
         (0..len)
             .into_par_iter()

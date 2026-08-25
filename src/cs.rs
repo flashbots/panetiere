@@ -4,7 +4,7 @@
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
 //! `r ∈ B^{κ_cs}_{β_cs,q_cs}`. `a` is a length-`κ_cs` row vector, `B` is a
 //! `μ_cs × κ_cs` matrix. All BDLOP arithmetic lives on the **CS ring**
-//! `R_{q_cs}` (chipmunk's `CsPoly`, q_cs = 139301), decoupled from the HVC
+//! `R_{q_cs}` (`CsPoly`, q_cs = 139301), decoupled from the HVC
 //! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 40961).
 //!
 //! **CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span
@@ -35,10 +35,10 @@
 //! projections are linear, so summing stored digits pointwise keeps
 //! `sum_openings` correct.
 
+use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
 use chipmunk_code::{
-    pointwise_dot as pointwise_dot_hvc, pointwise_dot_cs, pointwise_sum_polys, CsNTTPoly, CsPoly,
-    HVCHash, HVCNTTPoly, HVCPoly, Polynomial, Tree, CS_MODULUS, HVC_MODULUS, HVC_WIDTH,
-    N as POLY_N,
+    pointwise_dot as pointwise_dot_hvc, pointwise_sum_polys, HVCHash, HVCNTTPoly, HVCPoly, Tree,
+    HVC_MODULUS, HVC_WIDTH,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -357,7 +357,7 @@ impl Cs for HidingMerkleCommitment {
         }
 
         // Step 2: chipmunk tree over the leaf labels.
-        let tree = Tree::<HVCHash>::new_with_leaf_nodes(&labels, &pp.hasher);
+        let tree = Tree::new_with_leaf_nodes(&labels, &pp.hasher);
         let root = tree.root();
 
         // Step 3: pack openings (leaf digits already built; append the path).
@@ -591,6 +591,8 @@ impl Cs for HidingMerkleCommitment {
 
 /// SIMD wrapping i32 add: `acc[i] = acc[i].wrapping_add(v[i])`. Dispatches to
 /// AVX2 when available (8 i32 lanes/iter); falls back to scalar otherwise.
+/// The AVX2 specialization is x86-only by design; other targets use the scalar
+/// fallback and should not treat this loop as part of the portable NTT backend.
 #[inline(always)]
 pub(crate) fn wrapping_add_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
     #[cfg(target_arch = "x86_64")]

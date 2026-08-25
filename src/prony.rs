@@ -25,18 +25,23 @@
 //!    solve: `x_{i,s} = (Σ_m b_{i,m} W[s][m]) / Λ'(z_i)` where
 //!    `Λ(X)/(X − z_i) = Σ_m b_{i,m} X^m`.
 //!
-//! Cost of the swap: **`p` must be prime.** `T_MODULUS_DEFAULT = 2^36` is not,
-//! and Newton's identities divide by `1..k`. [`PRONY_PRIME`] is a 36-bit prime,
-//! so nothing in the KAHE budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` moves and the
-//! codec's 32-bit symbols still fit. `KaheParams::t_modulus` is already a free
-//! `u64`.
+//! Cost of the swap: **`p` must be prime.** `T_MODULUS_DEFAULT` is a power of
+//! two, and Newton's identities divide by `1..k`. [`PRONY_PRIME`] matches the
+//! plaintext width instead — 36-bit by default, 35-bit under `rns` where a
+//! 36-bit `p` would break the KAHE budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` — so
+//! the budget is unchanged and the codec's 32-bit symbols still fit.
+//! `KaheParams::t_modulus` is already a free `u64`.
 
-use chipmunk_code::{KahePoly, N};
+use crate::{KahePoly, N};
 use rand::Rng;
 use rayon::prelude::*;
 
 /// Plaintext modulus, FFT-friendly in the sense Rabbit-Mix's root-finder needs — `q = M·2^m + 1`
+#[cfg(not(feature = "rns"))]
 pub const PRONY_PRIME: u64 = (65_535u64 << 20) + 1;
+/// 35-bit: a 36-bit `p` exceeds the KAHE budget at q = 2^47.995.
+#[cfg(feature = "rns")]
+pub const PRONY_PRIME: u64 = (32_788u64 << 20) + 1;
 
 // ---------------------------------------------------------------
 // F_p scalars
@@ -409,6 +414,53 @@ unsafe fn dot_limbs_avx2(
     (a00, a01, a11)
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_limbs_neon(
+    d_lo: &[u32],
+    d_hi: &[u32],
+    w_lo: &[u32],
+    w_hi: &[u32],
+) -> (u64, u64, u64) {
+    use std::arch::aarch64::*;
+    let n = d_lo.len();
+    let (mut v00, mut v01, mut v11) = (vdupq_n_u64(0), vdupq_n_u64(0), vdupq_n_u64(0));
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let dl = vld1q_u32(d_lo.as_ptr().add(i));
+        let dh = vld1q_u32(d_hi.as_ptr().add(i));
+        let wl = vld1q_u32(w_lo.as_ptr().add(i));
+        let wh = vld1q_u32(w_hi.as_ptr().add(i));
+
+        for (dl, dh, wl, wh) in [
+            (
+                vget_low_u32(dl),
+                vget_low_u32(dh),
+                vget_low_u32(wl),
+                vget_low_u32(wh),
+            ),
+            (
+                vget_high_u32(dl),
+                vget_high_u32(dh),
+                vget_high_u32(wl),
+                vget_high_u32(wh),
+            ),
+        ] {
+            v00 = vaddq_u64(v00, vmull_u32(dl, wl));
+            v01 = vaddq_u64(v01, vaddq_u64(vmull_u32(dl, wh), vmull_u32(dh, wl)));
+            v11 = vaddq_u64(v11, vmull_u32(dh, wh));
+        }
+        i += 4;
+    }
+
+    let (mut a00, mut a01, mut a11) = (vaddvq_u64(v00), vaddvq_u64(v01), vaddvq_u64(v11));
+    let (t00, t01, t11) = dot_limbs_scalar(&d_lo[i..], &d_hi[i..], &w_lo[i..], &w_hi[i..]);
+    a00 += t00;
+    a01 += t01;
+    a11 += t11;
+    (a00, a01, a11)
+}
+
 #[inline]
 fn dot_limbs(d_lo: &[u32], d_hi: &[u32], w_lo: &[u32], w_hi: &[u32]) -> (u64, u64, u64) {
     #[cfg(target_arch = "x86_64")]
@@ -417,6 +469,9 @@ fn dot_limbs(d_lo: &[u32], d_hi: &[u32], w_lo: &[u32], w_hi: &[u32]) -> (u64, u6
             return unsafe { dot_limbs_avx2(d_lo, d_hi, w_lo, w_hi) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    return unsafe { dot_limbs_neon(d_lo, d_hi, w_lo, w_hi) };
+    #[cfg(not(target_arch = "aarch64"))]
     dot_limbs_scalar(d_lo, d_hi, w_lo, w_hi)
 }
 
@@ -875,10 +930,9 @@ mod tests {
         }
     }
 
-    /// The vector kernel must be bit-identical to the scalar one — nothing
-    /// else distinguishes a correct AVX2 path from a silently wrong one.
+    /// The vector kernels must be bit-identical to the scalar one.
     #[test]
-    fn solve_kernel_avx2_matches_scalar() {
+    fn solve_kernel_matches_scalar() {
         let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
         let f = Fp::new(PRONY_PRIME);
         for k in [1usize, 3, 4, 7, 8, 17, 64, 301] {
@@ -907,6 +961,11 @@ mod tests {
                 if is_x86_feature_detected!("avx2") {
                     let v = unsafe { dot_limbs_avx2(d_lo, d_hi, &w_lo, &w_hi) };
                     assert_eq!(v, s, "avx2 limb sums k={k} row={i}");
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let v = unsafe { dot_limbs_neon(d_lo, d_hi, &w_lo, &w_hi) };
+                    assert_eq!(v, s, "neon limb sums k={k} row={i}");
                 }
             }
         }

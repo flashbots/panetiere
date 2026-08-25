@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
-use chipmunk_code::{CsPoly, KahePoly};
+use crate::{CsPoly, KahePoly};
 use rayon::prelude::*;
 
 use crate::bulletin::{
@@ -13,7 +13,8 @@ use crate::rs::{Rs, RsError};
 use crate::share_commitment::verify_aggregated;
 use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
-use chipmunk_code::{pointwise_sum_polys, DgtNTTPoly, HVCPoly};
+use crate::DgtNTTPoly;
+use chipmunk_code::{pointwise_sum_polys, HVCPoly};
 
 use super::ProtocolParams;
 use super::{ClientId, NodeId, ServerId, SessionId};

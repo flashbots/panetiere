@@ -1,7 +1,6 @@
 //! The recipient over a real round: anchor admission, culprit exclusion and the
 //! rejection reasons it reports.
 
-use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
@@ -11,6 +10,7 @@ use panetiere::protocol::recipient::{
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
+use panetiere::{CsPoly, KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 

@@ -2,7 +2,7 @@
 //! `k`-of-`n` lane sums reconstruct `Σ ct`, and every lane's post opens the
 //! summed client-signed roots — so a lying lane is named, not merely detected.
 
-use chipmunk_code::{DgtNTTPoly, HVCPoly, KahePoly};
+use chipmunk_code::HVCPoly;
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
@@ -16,6 +16,7 @@ use panetiere::rs::Share;
 use panetiere::share_commitment::SharePath;
 use panetiere::sig::SigningKey;
 use panetiere::{kahe::T_MODULUS_DEFAULT, pke};
+use panetiere::{DgtNTTPoly, KahePoly};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 

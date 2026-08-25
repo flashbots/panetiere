@@ -12,6 +12,7 @@ pub mod mse;
 pub mod pke;
 pub mod prony;
 pub mod protocol;
+pub mod rings;
 pub mod rs;
 pub mod scaling_bench;
 pub mod share_commitment;
@@ -19,7 +20,12 @@ pub mod sig;
 pub mod sss;
 
 pub use chipmunk_code::path::Path;
-pub use chipmunk_code::{HVCHash, HVCPoly, LinearHash, Polynomial, Tree};
+pub use chipmunk_code::{HVCHash, HVCPoly, Tree};
+pub use rings::{
+    pointwise_dot_cs, pointwise_dot_dgt, pointwise_dot_kahe, CsNTTPoly, CsPoly, DgtNTTPoly,
+    KaheNTTPoly, KahePoly, CS_MODULUS, CS_MODULUS_OVER_TWO, DGT_MODULUS, KAHE_MODULUS,
+    KAHE_MODULUS_OVER_TWO, N,
+};
 
 /// Draw `n` independent 256-bit seeds from `rng`, serially and in order
 pub(crate) fn fork_seeds<R: rand::Rng>(rng: &mut R, n: usize) -> Vec<[u8; 32]> {

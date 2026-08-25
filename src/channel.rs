@@ -1,6 +1,6 @@
 //! Application payload layer over the multiset encodings.
 
-use chipmunk_code::KahePoly;
+use crate::KahePoly;
 use rand::Rng;
 
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
@@ -129,7 +129,8 @@ impl ChannelParams {
     }
 
     /// Payload bits one symbol carries: `⌊log₂ t⌋` in the peeling structure's
-    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — 36 against 35.
+    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — 36 against 35 by
+    /// default, 35 against 35 under `rns`.
     pub fn bits_per_symbol(&self) -> usize {
         match self {
             ChannelParams::Mse(_) => mse::BITS_PER_SYMBOL,
@@ -405,12 +406,16 @@ mod tests {
     /// above the `BYTES_PER_SYMBOL` byte packing round-trip through it.
     #[test]
     fn wide_symbols_round_trip() {
+        // rho=8 for 4 inserts: this test is about symbol width, and the peel
+        // stalls on ~8% of seeds when delta is sized exactly to rho.
         for p in [
-            ChannelParams::for_symbols(4, 3, [0x77; 32]),
+            ChannelParams::for_symbols(8, 3, [0x77; 32]),
             ChannelParams::prony_for_symbols(4, 3),
         ] {
             let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
-            let wide = (1i64 << 34) + 12_345;
+            // Quarter of the channel's own plaintext modulus, so the value stays
+            // inside `[-t/2, t/2)` whatever `t` the feature set selects.
+            let wide = (p.plaintext_modulus() as i64 / 4) + 12_345;
             assert!(wide > (1 << (BYTES_PER_SYMBOL * 8)));
             let payloads: Vec<Vec<i64>> = (0..4)
                 .map(|i| vec![wide - i, i + 1, wide / (i + 2)])

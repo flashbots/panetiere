@@ -7,8 +7,9 @@ encoding turns that sum back into the individual messages. Not audited — do no
 
 This file is the integration guide: architecture, roles, and the call sequence.
 
-Lattice primitives come from [github.com/Ruteri/Chipmunk](https://github.com/Ruteri/Chipmunk): Ring-SIS hash,
-Merkle tree, and NTT arithmetic over the four rings below.
+Ring arithmetic comes from [negacyclic-rings](https://github.com/Ruteri/negacyclic-rings).
+[Chipmunk](https://github.com/Ruteri/Chipmunk) supplies the Ring-SIS hash and
+Merkle tree used by the commitment layer.
 
 ## Roles
 
@@ -33,8 +34,9 @@ only checks that the servers it counts agree on it. `ProtocolParams::min_clients
 
 Everything over the ring arithmetic is linear in the payload — encryption,
 commitment, erasure coding and the payload encodings all commute with summation,
-which is what makes the round work. Ring arithmetic is chipmunk's; the layers
-above it are, bottom-up, the schemes (`kahe`, `sss`, `cs`, `rs`, `pke`,
+which is what makes the round work. Panetière owns its ring parameters and thin
+semantic types in `src/rings.rs`; `negacyclic-rings` provides the arithmetic.
+The layers above are, bottom-up, the schemes (`kahe`, `sss`, `cs`, `rs`, `pke`,
 `sig`), the round drivers under `protocol::`, and the payload encodings a caller
 picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consume
 `Vec<KahePoly>`.
@@ -334,8 +336,13 @@ no persistence, ordering or authentication. It is not a bulletin board.
 
 ```sh
 RAYON_NUM_THREADS=8 cargo test -j 8
+RAYON_NUM_THREADS=8 cargo test -j 8 --features rns
 RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep   # (S, ρ) × encoding sweep
 ```
+
+`rns` selects the two-prime KAHE and CS auxiliary parameter sets from
+`src/rings.rs`. It is the mobile/AArch64 backend: those 32-bit NTT channels use
+NEON. It does not change the prime CS, Prony, or RS/digest moduli.
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
 slot mode, *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread

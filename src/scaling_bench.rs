@@ -54,8 +54,8 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
 //! ──────────────────────────────────────────────────────────────────────
-//!  chipmunk param.rs: N = 2048, q_hvc = 40_961, q_cs = 139_301,
-//!                     q_kahe = 347_280_875_347_969, HVC_WIDTH = 3
+//!  src/rings.rs: N = 2048, q_cs = 139_301, q_kahe = 347_280_875_347_969
+//!  chipmunk param.rs: q_hvc = 40_961, HVC_WIDTH = 3
 //!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^36, σ_s = σ_e = 15.72
 //!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
 //!                — reported per cell as `eps`, the exponent that condition
@@ -108,7 +108,8 @@ use crate::share_commitment::{
     commit_shares, fresh_path_packed_len, ingest_share, lane_post_packed_len, open_share,
 };
 use crate::sig::SigningKey;
-use chipmunk_code::{HVCPoly, KahePoly, HVC_MODULUS, HVC_WIDTH, KAHE_MODULUS, N as POLY_N};
+use crate::{KahePoly, KAHE_MODULUS, N as POLY_N};
+use chipmunk_code::{HVCPoly, HVC_MODULUS, HVC_WIDTH};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};

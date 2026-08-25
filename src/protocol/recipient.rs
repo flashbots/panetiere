@@ -7,7 +7,7 @@
 //!   honest ones remain. Threshold decryption tolerates that; the excluded
 //!   servers come back in [`Recovered::culprits`] for the caller to attribute.
 
-use chipmunk_code::KahePoly;
+use crate::KahePoly;
 
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Cs, HidingMerkleCommitment};

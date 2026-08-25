@@ -2,7 +2,7 @@
 //! into the wide ring where coding and commitment happen, and recovering the
 //! exact integer sum on the way back out.
 
-use chipmunk_code::{DgtNTTPoly, KahePoly, KAHE_MODULUS, N};
+use crate::{DgtNTTPoly, KahePoly, KAHE_MODULUS, N};
 use rayon::prelude::*;
 
 /// Embed a KAHE ciphertext into the digest ring. One forward NTT per poly; the

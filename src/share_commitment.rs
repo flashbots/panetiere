@@ -27,8 +27,7 @@
 //! values (a bijection; `Rs::*` is untouched).
 
 use chipmunk_code::{
-    pointwise_dot as pointwise_dot_hvc, pointwise_dot_dgt, DgtNTTPoly, HVCHash, HVCNTTPoly,
-    HVCPoly, Polynomial, Tree, DGT_MODULUS, HVC_MODULUS, HVC_WIDTH, KAHE_MODULUS, N as POLY_N,
+    pointwise_dot as pointwise_dot_hvc, HVCHash, HVCNTTPoly, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH,
     TWO_ZETA_PLUS_ONE, ZETA,
 };
 use rand::{Rng, SeedableRng};
@@ -38,6 +37,7 @@ use rayon::prelude::*;
 use crate::bulletin::dgt_packed_len;
 use crate::cs::{digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2};
 use crate::rs::Share;
+use crate::{pointwise_dot_dgt, DgtNTTPoly, DGT_MODULUS, KAHE_MODULUS, N as POLY_N};
 
 /// `69^10 ≈ 2^61.1 > q_dgt ≈ 2^61`: ten balanced base-69 digits are injective.
 pub const DGT_WIDTH: usize = 10;
@@ -119,14 +119,7 @@ impl ShareLeafHash {
 
     fn hash(&self, u: &[HVCPoly]) -> HVCPoly {
         assert_eq!(u.len(), self.g.len());
-        let u_ntt: Vec<HVCNTTPoly> = u
-            .iter()
-            .map(|x| {
-                let mut x = *x;
-                x.lift();
-                HVCNTTPoly::from(&x)
-            })
-            .collect();
+        let u_ntt: Vec<HVCNTTPoly> = u.iter().map(HVCNTTPoly::from).collect();
         HVCPoly::from(&pointwise_dot_hvc(&self.g, &u_ntt))
     }
 }
@@ -323,7 +316,7 @@ pub fn commit_shares(pp: &ShareCommitmentParams, shares: &[Share]) -> (HVCPoly, 
     let mut labels = vec![HVCPoly::default(); pp.n_leaves];
     labels[..pp.n_lanes].copy_from_slice(&lane_labels);
 
-    let tree = Tree::<HVCHash>::new_with_leaf_nodes(&labels, &pp.hasher);
+    let tree = Tree::new_with_leaf_nodes(&labels, &pp.hasher);
     let root = tree.root();
 
     let path_len = pp.path_len();
@@ -570,8 +563,7 @@ pub fn lane_post_packed_len(block_len: usize, n_lanes: usize, rho_max: usize) ->
 mod tests {
     use super::*;
     use crate::rs::{Rs, RsParams};
-    use chipmunk_code::KahePoly;
-
+    use crate::KahePoly;
     fn rand_share(rng: &mut ChaCha20Rng, len: usize) -> Share {
         (0..len).map(|_| DgtNTTPoly::rand_ntt_poly(rng)).collect()
     }

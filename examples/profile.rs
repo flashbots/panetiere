@@ -18,20 +18,20 @@
 //! Tip: keep ITERS low under callgrind (it adds ~50× overhead). For perf
 //! sampling, push ITERS to 100+ to dilute startup noise.
 
-use chipmunk_code::KahePoly;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::KahePoly;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
 fn rand_message_poly<R: Rng>(rng: &mut R, t: u64) -> KahePoly {
     let half = t as i64 / 2;
-    let mut coeffs = [0i64; chipmunk_code::N];
+    let mut coeffs = [0i64; panetiere::N];
     for c in coeffs.iter_mut() {
         *c = rng.gen_range(0..t) as i64 - half;
     }

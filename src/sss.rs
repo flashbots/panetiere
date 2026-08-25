@@ -1,6 +1,6 @@
 //! Secret sharing.
 
-use chipmunk_code::{CsPoly, Polynomial, CS_MODULUS, CS_MODULUS_OVER_TWO, N};
+use crate::{CsPoly, CS_MODULUS, CS_MODULUS_OVER_TWO, N};
 use rand::Rng;
 
 pub trait Sss {

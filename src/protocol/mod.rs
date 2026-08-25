@@ -4,7 +4,7 @@ pub mod recipient;
 pub mod server;
 pub mod verify;
 
-use chipmunk_code::KahePoly;
+use crate::KahePoly;
 use rand::Rng;
 
 use crate::cs::{Cs, HidingMerkleCommitment};

@@ -125,11 +125,12 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "chipmunk_code"
 version = "0.1.0"
-source = "git+https://github.com/Ruteri/Chipmunk?branch=main#f6b73ef6796fd5ecdd7a6c048c00b710ea132a2a"
+source = "git+https://github.com/Ruteri/Chipmunk?branch=main#e347068a0134a95c73d47933916feeb3ab312b28"
 dependencies = [
  "ark-std",
  "env_logger",
  "log",
+ "negacyclic-rings",
  "rand",
  "rand_chacha",
  "rayon",
@@ -686,6 +687,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "negacyclic-rings"
+version = "0.1.0"
+source = "git+https://github.com/Ruteri/negacyclic-rings?branch=main#57a39cfa1ebe4850b743bc282489dcfc761e227e"
+dependencies = [
+ "rand",
+ "rand_chacha",
+ "sha2",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -733,6 +744,7 @@ dependencies = [
  "chipmunk_code",
  "criterion",
  "ml-kem",
+ "negacyclic-rings",
  "p256",
  "rand",
  "rand_chacha",

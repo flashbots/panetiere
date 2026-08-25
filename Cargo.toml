@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
+negacyclic-rings = { git = "https://github.com/Ruteri/negacyclic-rings", branch = "main" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ml-kem = "0.3"
 aes-gcm = "0.10"
@@ -14,6 +15,11 @@ rand_distr = "0.4"
 sha2 = "0.10"
 rayon = "1.10"
 
+[features]
+default = []
+# Panetière's RNS chains: KAHE q = 2^47.995 (so t = 2^35), CS aux P = 2^60.
+rns = []
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
@@ -22,6 +28,9 @@ name = "protocol_sweep"
 harness = false
 
 [profile.dev.package.chipmunk_code]
+opt-level = 2
+
+[profile.dev.package.negacyclic-rings]
 opt-level = 2
 
 [profile.profiling]

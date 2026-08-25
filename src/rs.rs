@@ -1,7 +1,7 @@
 //! Systematic Reed–Solomon over the digest ring, for sharding the ingress
 //! ciphertext across nodes.
 
-use chipmunk_code::{DgtNTTPoly, DGT_MODULUS, N};
+use crate::{DgtNTTPoly, DGT_MODULUS, N};
 use rayon::prelude::*;
 
 use crate::bulletin::dgt_packed_len;
@@ -267,7 +267,7 @@ impl Rs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chipmunk_code::KahePoly;
+    use crate::KahePoly;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 

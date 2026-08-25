@@ -2,7 +2,7 @@ use rand::{CryptoRng, Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
-use chipmunk_code::CsPoly;
+use crate::CsPoly;
 
 use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry};
 use crate::cs::{fresh_opening_pack_bounds, Commitment, Cs, HidingMerkleCommitment, Opening};

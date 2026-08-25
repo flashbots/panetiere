@@ -6,7 +6,6 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use chipmunk_code::KahePoly;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
@@ -14,6 +13,7 @@ use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox}
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::KahePoly;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 

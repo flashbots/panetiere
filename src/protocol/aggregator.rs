@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use chipmunk_code::KahePoly;
+use crate::KahePoly;
 
 use crate::bulletin::ClientBulletinEntry;
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};

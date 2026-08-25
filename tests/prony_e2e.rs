@@ -7,7 +7,6 @@
 //! — KAHE, Shamir, CS, the verifier's per-poly sum — is untouched, which is the
 //! point: the sketch is just another additively homomorphic plaintext.
 
-use chipmunk_code::KahePoly;
 use panetiere::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use panetiere::pke;
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
@@ -16,6 +15,7 @@ use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox}
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::KahePoly;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 

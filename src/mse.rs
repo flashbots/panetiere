@@ -9,7 +9,7 @@
 //!     V_s[i,j] += x_s                      (s ∈ [ξ])
 //! ```
 
-use chipmunk_code::{KahePoly, N};
+use crate::{KahePoly, N};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 

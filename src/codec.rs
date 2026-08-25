@@ -4,11 +4,11 @@
 //! padded with zeros up to the next 4-byte boundary, then packed four bytes per
 //! coefficient (little-endian `u32`). Each `KahePoly` carries `N = 2048`
 //! coefficients = `8192` bytes; the final poly is zero-padded to fill `N`
-//! coefficients. Coefficients land in `[0, 2^32) ⊂ [0, t = 2^36)` so a fresh
-//! single-client encode/decode is exact round-trip, with 2^4 per-coefficient
-//! headroom under mod-t summation.
+//! coefficients. Coefficients land in `[0, 2^32) ⊂ [0, t)` so a fresh
+//! single-client encode/decode is exact round-trip. Per-coefficient headroom
+//! under mod-t summation is `t/2^32`: 2^4 at t = 2^36, 2^3 under `rns`.
 
-use chipmunk_code::{KahePoly, N};
+use crate::{KahePoly, N};
 
 pub const BYTES_PER_COEFF: usize = 4;
 pub const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
@@ -40,8 +40,8 @@ pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
         p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
             // Symbols are `[0, 2^32)` both raw (direct encode) and after KAHE
-            // dec (`poly_mod_t` centers mod t = 2^36, which leaves values
-            // < 2^35 untouched). Anything else is genuine overflow.
+            // dec (`poly_mod_t` centers mod t, which leaves values < t/2
+            // untouched, and t/2 ≥ 2^34). Anything else is genuine overflow.
             if !(0..SYMBOL_MOD).contains(&c) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }

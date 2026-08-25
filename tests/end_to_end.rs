@@ -1,6 +1,5 @@
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
-use chipmunk_code::{CsPoly, KahePoly, Polynomial, N};
 use panetiere::codec;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
@@ -8,6 +7,7 @@ use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox}
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::{CsPoly, KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 

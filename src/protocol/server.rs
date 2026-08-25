@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
-use chipmunk_code::{pointwise_sum_polys, CsPoly, DgtNTTPoly, HVCPoly};
+use crate::{CsPoly, DgtNTTPoly};
+use chipmunk_code::{pointwise_sum_polys, HVCPoly};
 use rayon::prelude::*;
 
 use crate::bulletin::{RsNodeBulletinEntry, ServerBulletinEntry};
