@@ -27,6 +27,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 name = "protocol_sweep"
 harness = false
 
+[[bench]]
+name = "ring_kernels"
+harness = false
+
 [profile.dev.package.chipmunk_code]
 opt-level = 2
 

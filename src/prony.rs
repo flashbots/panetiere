@@ -32,6 +32,7 @@
 //! the budget is unchanged and the codec's 32-bit symbols still fit.
 //! `KaheParams::t_modulus` is already a free `u64`.
 
+use crate::rings::center_canonical_half_open_i64;
 use crate::{KahePoly, N};
 use rand::Rng;
 use rayon::prelude::*;
@@ -156,11 +157,7 @@ impl Fp {
 /// pack → encrypt → decrypt → unpack is the identity on `F_p`.
 #[inline]
 fn center(x: u64, p: u64) -> i64 {
-    if x >= p / 2 {
-        x as i64 - p as i64
-    } else {
-        x as i64
-    }
+    center_canonical_half_open_i64(x as i64, p as i64)
 }
 
 #[inline]
@@ -321,16 +318,10 @@ fn roots_of_split(lam: &[u64], f: Fp) -> Option<Vec<u64>> {
 //     `_mm256_mul_epu32` (32×32→64, the widest AVX2 integer multiply) can run
 //     the inner loop with no shifts, masks, or corrections.
 //
-// `D` is stored pre-split as limb planes so the inner loop does no masking,
-// and symbols are processed in tiles so `D` is streamed once per tile rather
-// than once per symbol.
+// `D` is stored pre-split as limb planes so the inner loop does no masking.
 
 const LIMB_BITS: u32 = 18;
 const LIMB_MASK: u64 = (1 << LIMB_BITS) - 1;
-/// Symbols per tile. `D` is k²·8 B (720 KB at k=300) and is re-read per tile,
-/// so the tile wants to be wide enough to amortise that against L2.
-const TILE: usize = 24;
-
 /// `D` as two 18-bit limb planes, row-major, `k` columns per row.
 struct DualLimbs {
     lo: Vec<u32>,
@@ -480,34 +471,21 @@ fn recombine(a00: u64, a01: u64, a11: u64, f: Fp) -> u64 {
     f.reduce_wide(a00 as u128 + ((a01 as u128) << LIMB_BITS) + ((a11 as u128) << (2 * LIMB_BITS)))
 }
 
-/// Payloads for a tile of symbols: `x[s][i] = Σ_m D[i][m]·W[s][m] mod p`.
-///
-/// Row-outer / symbol-inner, so each row of `D` is read once per tile instead
-/// of once per symbol.
-fn solve_tile(d: &DualLimbs, ws: &[Vec<u64>], f: Fp) -> Vec<Vec<u64>> {
-    let (t, k) = (ws.len(), d.k);
-    let mut w_lo = vec![0u32; t * k];
-    let mut w_hi = vec![0u32; t * k];
-    for (s, w) in ws.iter().enumerate() {
-        for (m, &c) in w.iter().enumerate() {
-            w_lo[s * k + m] = (c & LIMB_MASK) as u32;
-            w_hi[s * k + m] = (c >> LIMB_BITS) as u32;
-        }
-    }
-    let mut out = vec![vec![0u64; k]; t];
-    for i in 0..k {
-        let (d_lo, d_hi) = (&d.lo[i * k..(i + 1) * k], &d.hi[i * k..(i + 1) * k]);
-        for s in 0..t {
-            let (a00, a01, a11) = dot_limbs(
-                d_lo,
-                d_hi,
-                &w_lo[s * k..(s + 1) * k],
-                &w_hi[s * k..(s + 1) * k],
-            );
-            out[s][i] = recombine(a00, a01, a11, f);
-        }
-    }
-    out
+fn solve_symbol(d: &DualLimbs, w: &[i64], p: u64, f: Fp) -> Vec<u64> {
+    let (w_lo, w_hi): (Vec<u32>, Vec<u32>) = w
+        .iter()
+        .map(|&c| {
+            let c = canon(c, p);
+            ((c & LIMB_MASK) as u32, (c >> LIMB_BITS) as u32)
+        })
+        .unzip();
+    (0..d.k)
+        .map(|i| {
+            let row = i * d.k..(i + 1) * d.k;
+            let (a00, a01, a11) = dot_limbs(&d.lo[row.clone()], &d.hi[row], &w_lo, &w_hi);
+            recombine(a00, a01, a11, f)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------
@@ -748,14 +726,8 @@ impl PronySketch {
 
         let xs: Vec<Vec<u64>> = self
             .w
-            .par_chunks(TILE)
-            .flat_map_iter(|tile| {
-                let ws: Vec<Vec<u64>> = tile
-                    .iter()
-                    .map(|sym| sym[..k].iter().map(|&v| canon(v, p)).collect())
-                    .collect();
-                solve_tile(&dual_limbs, &ws, f)
-            })
+            .par_iter()
+            .map(|sym| solve_symbol(&dual_limbs, &sym[..k], p, f))
             .collect();
 
         // Unused payload columns must match the recovered payloads. The power

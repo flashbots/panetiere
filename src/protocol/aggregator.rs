@@ -15,8 +15,8 @@ use std::collections::HashSet;
 use crate::KahePoly;
 
 use crate::bulletin::ClientBulletinEntry;
-use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
-use crate::kahe::{Kahe, KaheScheme};
+use crate::cs::{Commitment, HidingMerkleCommitment};
+use crate::kahe::Kahe;
 
 use super::ClientId;
 
@@ -36,21 +36,21 @@ pub struct AggregatedPublic {
 pub fn run_aggregator_round(entries: &[(ClientId, ClientBulletinEntry)]) -> AggregatedPublic {
     let mut seen: HashSet<ClientId> = HashSet::with_capacity(entries.len());
     let mut clients: Vec<ClientId> = Vec::with_capacity(entries.len());
-    let mut ctxts: Vec<Vec<KahePoly>> = Vec::with_capacity(entries.len());
-    let mut comms: Vec<Commitment> = Vec::with_capacity(entries.len());
+    let mut ctxts: Vec<&[KahePoly]> = Vec::with_capacity(entries.len());
+    let mut comms: Vec<&Commitment> = Vec::with_capacity(entries.len());
     for (cid, entry) in entries {
         if !seen.insert(*cid) {
             continue;
         }
         clients.push(*cid);
-        ctxts.push(entry.ctxt.clone());
-        comms.push(entry.comm.clone());
+        ctxts.push(&entry.ctxt);
+        comms.push(&entry.comm);
     }
     clients.sort_unstable();
 
     AggregatedPublic {
         clients,
-        summed_ctxt: Kahe::agg_ctxt(&ctxts),
-        summed_comm: HidingMerkleCommitment::sum_commitments(&comms),
+        summed_ctxt: Kahe::agg_ctxt_refs(&ctxts),
+        summed_comm: HidingMerkleCommitment::sum_commitment_refs(&comms),
     }
 }

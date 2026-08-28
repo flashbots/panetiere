@@ -689,7 +689,7 @@ dependencies = [
 [[package]]
 name = "negacyclic-rings"
 version = "0.1.0"
-source = "git+https://github.com/Ruteri/negacyclic-rings?branch=main#57a39cfa1ebe4850b743bc282489dcfc761e227e"
+source = "git+https://github.com/Ruteri/negacyclic-rings?branch=main#b2f5cfb0d329d24a90b8905504485d192b53b035"
 dependencies = [
  "rand",
  "rand_chacha",

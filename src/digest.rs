@@ -2,6 +2,7 @@
 //! into the wide ring where coding and commitment happen, and recovering the
 //! exact integer sum on the way back out.
 
+use crate::rings::center_i64;
 use crate::{DgtNTTPoly, KahePoly, KAHE_MODULUS, N};
 use rayon::prelude::*;
 
@@ -39,14 +40,7 @@ pub fn to_kahe(centered: &[[i64; N]]) -> Vec<KahePoly> {
         .map(|c| {
             let mut out = [0i64; N];
             for (o, &x) in out.iter_mut().zip(c.iter()) {
-                let mut r = x % KAHE_MODULUS;
-                if r > KAHE_MODULUS / 2 {
-                    r -= KAHE_MODULUS;
-                }
-                if r < -(KAHE_MODULUS / 2) {
-                    r += KAHE_MODULUS;
-                }
-                *o = r;
+                *o = center_i64(x, KAHE_MODULUS);
             }
             KahePoly::from_coeffs(out)
         })

@@ -35,11 +35,11 @@
 //! projections are linear, so summing stored digits pointwise keeps
 //! `sum_openings` correct.
 
+use crate::hvc_stream::StreamingHvcDot;
+use crate::hvc_sum::sum_hvc_polys;
+use crate::rings::center_i32;
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
-use chipmunk_code::{
-    pointwise_dot as pointwise_dot_hvc, pointwise_sum_polys, HVCHash, HVCNTTPoly, HVCPoly, Tree,
-    HVC_MODULUS, HVC_WIDTH,
-};
+use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
@@ -66,15 +66,13 @@ pub trait Cs {
 /// `g ∈ R_{q_hvc}^{ξ·HVC_WIDTH}`: the Ajtai hash labelling one vector-commitment
 /// leaf, over `ξ = 1 + μ_cs` elements of `HVC_WIDTH` digits each.
 pub struct LeafHash {
-    g: Vec<HVCNTTPoly>,
+    dot: StreamingHvcDot,
 }
 
 impl LeafHash {
     fn init<R: Rng>(rng: &mut R, xi: usize) -> Self {
         LeafHash {
-            g: (0..xi * HVC_WIDTH)
-                .map(|_| HVCNTTPoly::from(&HVCPoly::rand_poly(rng)))
-                .collect(),
+            dot: StreamingHvcDot::init(rng, xi * HVC_WIDTH),
         }
     }
 
@@ -82,16 +80,7 @@ impl LeafHash {
     /// stored digits pointwise. Defer to SIMD `pointwise_dot`; a hand-rolled
     /// mul/add loop costs ~2×.
     fn hash(&self, u: &[HVCPoly]) -> HVCPoly {
-        assert_eq!(u.len(), self.g.len());
-        let u_ntt: Vec<HVCNTTPoly> = u
-            .iter()
-            .map(|x| {
-                let mut x = *x;
-                x.lift();
-                HVCNTTPoly::from(&x)
-            })
-            .collect();
-        HVCPoly::from(&pointwise_dot_hvc(&self.g, &u_ntt))
+        self.dot.hash(u)
     }
 }
 
@@ -251,6 +240,13 @@ pub(crate) fn position_list(index: usize, depth: usize) -> Vec<bool> {
 }
 
 impl HidingMerkleCommitment {
+    pub fn sum_commitment_refs(cs: &[&Commitment]) -> Commitment {
+        let roots: Vec<&HVCPoly> = cs.iter().map(|c| &c.root).collect();
+        Commitment {
+            root: sum_hvc_polys(&roots),
+        }
+    }
+
     /// Inherent variant accepting `μ_cs` and `κ_cs` directly.
     pub fn setup_with_dims<R: Rng>(
         rng: &mut R,
@@ -467,10 +463,8 @@ impl Cs for HidingMerkleCommitment {
     }
 
     fn sum_commitments(cs: &[Commitment]) -> Commitment {
-        let refs: Vec<&HVCPoly> = cs.iter().map(|c| &c.root).collect();
-        Commitment {
-            root: pointwise_sum_polys(&refs),
-        }
+        let refs: Vec<&Commitment> = cs.iter().collect();
+        Self::sum_commitment_refs(&refs)
     }
 
     /// `None` if the set is empty or the openings disagree on shape or
@@ -508,18 +502,11 @@ impl Cs for HidingMerkleCommitment {
                 }
             }
         }
-        let cs_half = CS_MODULUS / 2;
         let rs: Vec<CsPoly> = rs_acc
             .into_iter()
             .map(|mut c| {
                 for x in c.iter_mut() {
-                    let mut v = *x % CS_MODULUS;
-                    if v > cs_half {
-                        v -= CS_MODULUS;
-                    } else if v < -cs_half {
-                        v += CS_MODULUS;
-                    }
-                    *x = v;
+                    *x = center_i32(*x, CS_MODULUS);
                 }
                 CsPoly::from_coeffs(c)
             })
@@ -562,18 +549,10 @@ impl Cs for HidingMerkleCommitment {
         }
 
         // In-place mod-q centering pass on the output buffer.
-        let q = HVC_MODULUS;
-        let half = q / 2;
         for poly in data.iter_mut() {
             let coeffs = poly.coeffs_mut();
             for k in 0..POLY_N {
-                let mut x = coeffs[k] % q;
-                if x > half {
-                    x -= q;
-                } else if x < -half {
-                    x += q;
-                }
-                coeffs[k] = x;
+                coeffs[k] = center_i32(coeffs[k], HVC_MODULUS);
             }
         }
 

@@ -26,16 +26,15 @@
 //! dots, and the committed label coefficients are the NTT-domain canonical
 //! values (a bijection; `Rs::*` is untouched).
 
-use chipmunk_code::{
-    pointwise_dot as pointwise_dot_hvc, HVCHash, HVCNTTPoly, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH,
-    TWO_ZETA_PLUS_ONE, ZETA,
-};
+use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE, ZETA};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
 use crate::bulletin::dgt_packed_len;
 use crate::cs::{digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2};
+use crate::hvc_stream::StreamingHvcDot;
+use crate::rings::{center_canonical_i64, center_i32};
 use crate::rs::Share;
 use crate::{pointwise_dot_dgt, DgtNTTPoly, DGT_MODULUS, KAHE_MODULUS, N as POLY_N};
 
@@ -61,15 +60,10 @@ pub fn decompose_share_poly(p: &DgtNTTPoly) -> [HVCPoly; DGT_WIDTH] {
 fn decompose_into(p: &DgtNTTPoly, out: &mut [HVCPoly]) {
     debug_assert_eq!(out.len(), DGT_WIDTH);
     let q = DGT_MODULUS;
-    let half = q / 2;
     let coeffs = p.coeffs();
     for i in 0..POLY_N {
         let x = coeffs[i];
-        let mut v = if x > half {
-            x as i64 - q as i64
-        } else {
-            x as i64
-        };
+        let mut v = center_canonical_i64(x as i64, q as i64);
         for digit in out.iter_mut() {
             let mut d = v % BASE;
             if d > ZETA_I64 {
@@ -105,22 +99,18 @@ pub fn project_share_poly(digits: &[HVCPoly]) -> DgtNTTPoly {
 /// `u`, so summed digits hash to summed tree labels.
 #[derive(Clone)]
 struct ShareLeafHash {
-    g: Vec<HVCNTTPoly>,
+    dot: StreamingHvcDot,
 }
 
 impl ShareLeafHash {
     fn init<R: Rng>(rng: &mut R, len: usize) -> Self {
         ShareLeafHash {
-            g: (0..len)
-                .map(|_| HVCNTTPoly::from(&HVCPoly::rand_poly(rng)))
-                .collect(),
+            dot: StreamingHvcDot::init(rng, len),
         }
     }
 
     fn hash(&self, u: &[HVCPoly]) -> HVCPoly {
-        assert_eq!(u.len(), self.g.len());
-        let u_ntt: Vec<HVCNTTPoly> = u.iter().map(HVCNTTPoly::from).collect();
-        HVCPoly::from(&pointwise_dot_hvc(&self.g, &u_ntt))
+        self.dot.hash(u)
     }
 }
 
@@ -508,18 +498,10 @@ impl ShareOpeningAcc {
     }
 
     pub fn finish(mut self) -> ShareOpening {
-        let q = HVC_MODULUS;
-        let half = q / 2;
         for poly in self.data.iter_mut() {
             let coeffs = poly.coeffs_mut();
             for k in 0..POLY_N {
-                let mut x = coeffs[k] % q;
-                if x > half {
-                    x -= q;
-                } else if x < -half {
-                    x += q;
-                }
-                coeffs[k] = x;
+                coeffs[k] = center_i32(coeffs[k], HVC_MODULUS);
             }
         }
         ShareOpening {

@@ -17,6 +17,7 @@
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
+use crate::rings::{center_half_open_i64, center_i64};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
@@ -110,7 +111,7 @@ fn pad_poly(a_ntt: &[KaheNTTPoly], sk_ntt: &KaheNTTPoly, i: usize) -> KahePoly {
 /// any realistic ρ, so plain i64 accumulation with one final reduction is safe.
 /// The AVX2 specialization is x86-only by design; other targets use the scalar
 /// fallback and should not treat this loop as part of the portable NTT backend.
-fn accumulate_pos(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
+fn accumulate_pos(acc: &mut [i64; N], cs: &[&[KahePoly]], pos: usize) {
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -128,7 +129,7 @@ fn accumulate_pos(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[Vec<KahePoly>], pos: usize) {
+unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[&[KahePoly]], pos: usize) {
     use std::arch::x86_64::*;
     debug_assert_eq!(N % 4, 0);
     for client in cs {
@@ -160,13 +161,7 @@ fn scale_poly(poly: &KahePoly, scale: i64) -> KahePoly {
 /// Reduce one (centered) integer coefficient mod `t` to centered range
 /// `[-t/2, t/2)`.
 fn reduce_centered(x: i64, t: i64) -> i64 {
-    let r = x.rem_euclid(t);
-    let half = t / 2;
-    if r >= half {
-        r - t
-    } else {
-        r
-    }
+    center_half_open_i64(x, t)
 }
 
 /// Reduce a polynomial coefficient-wise mod `t` (centered).
@@ -248,6 +243,27 @@ impl Kahe {
             t_modulus,
         }
     }
+
+    pub fn agg_ctxt_refs(cs: &[&[KahePoly]]) -> Vec<KahePoly> {
+        if cs.is_empty() {
+            return Vec::new();
+        }
+        let len = cs[0].len();
+        debug_assert!(cs.iter().all(|c| c.len() == len));
+        let q = crate::KAHE_MODULUS;
+        (0..len)
+            .into_par_iter()
+            .map(|pos| {
+                let mut acc = [0i64; N];
+                accumulate_pos(&mut acc, cs, pos);
+                let mut coeffs = [0i64; N];
+                for (out, &a) in coeffs.iter_mut().zip(acc.iter()) {
+                    *out = center_i64(a, q);
+                }
+                KahePoly::from_coeffs(coeffs)
+            })
+            .collect()
+    }
 }
 
 pub const SIGMA_S_DEFAULT: f64 = 15.72;
@@ -310,28 +326,8 @@ impl KaheScheme for Kahe {
     }
 
     fn agg_ctxt(cs: &[Vec<KahePoly>]) -> Vec<KahePoly> {
-        if cs.is_empty() {
-            return Vec::new();
-        }
-        let len = cs[0].len();
-        let q = crate::KAHE_MODULUS;
-        let half = q / 2;
-        (0..len)
-            .into_par_iter()
-            .map(|pos| {
-                let mut acc = [0i64; N];
-                accumulate_pos(&mut acc, cs, pos);
-                let mut coeffs = [0i64; N];
-                for (out, &a) in coeffs.iter_mut().zip(acc.iter()) {
-                    let mut r = a.rem_euclid(q);
-                    if r > half {
-                        r -= q;
-                    }
-                    *out = r;
-                }
-                KahePoly::from_coeffs(coeffs)
-            })
-            .collect()
+        let refs: Vec<&[KahePoly]> = cs.iter().map(Vec::as_slice).collect();
+        Self::agg_ctxt_refs(&refs)
     }
 
     fn agg_key(ks: &[KaheKey]) -> KaheAggKey {

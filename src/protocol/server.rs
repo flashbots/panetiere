@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
 use crate::{CsPoly, DgtNTTPoly};
-use chipmunk_code::{pointwise_sum_polys, HVCPoly};
+use chipmunk_code::HVCPoly;
 use rayon::prelude::*;
 
 use crate::bulletin::{RsNodeBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
+use crate::hvc_sum::sum_hvc_polys;
 use crate::pke;
 use crate::rs::Share;
 use crate::share_commitment::{
@@ -144,7 +145,7 @@ pub fn run_rs_node_round(
         .iter()
         .map(|cid| &roots[root_index[cid]].1)
         .collect();
-    let summed_root = pointwise_sum_polys(&root_refs);
+    let summed_root = sum_hvc_polys(&root_refs);
     if !verify_aggregated(scp, &summed_root, &share_sum, &agg) {
         // The aggregate does not open, so some client's share disagrees with
         // its own signed root. Now — and only now — pay per client to name it.

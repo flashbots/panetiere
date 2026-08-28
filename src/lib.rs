@@ -7,6 +7,10 @@ pub mod channel;
 pub mod codec;
 pub mod cs;
 pub mod digest;
+#[doc(hidden)]
+pub mod hvc_stream;
+#[doc(hidden)]
+pub mod hvc_sum;
 pub mod kahe;
 pub mod mse;
 pub mod pke;

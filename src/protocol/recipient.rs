@@ -10,8 +10,8 @@
 use crate::KahePoly;
 
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use crate::cs::{Cs, HidingMerkleCommitment};
-use crate::kahe::{Kahe, KaheScheme};
+use crate::cs::{Commitment, HidingMerkleCommitment};
+use crate::kahe::Kahe;
 
 use super::verify::{aggregate_and_decrypt, check_anonymity_floor, decrypt_aggregate, VerifyError};
 use super::{ClientId, ProtocolParams, ServerId};
@@ -261,18 +261,10 @@ pub fn recover_aggregated(
         }));
     }
 
-    let total_ctxt = Kahe::agg_ctxt(
-        &groups
-            .iter()
-            .map(|(_, e)| e.ctxt.clone())
-            .collect::<Vec<_>>(),
-    );
-    let total_comm = HidingMerkleCommitment::sum_commitments(
-        &groups
-            .iter()
-            .map(|(_, e)| e.comm.clone())
-            .collect::<Vec<_>>(),
-    );
+    let ctxts: Vec<&[KahePoly]> = groups.iter().map(|(_, e)| e.ctxt.as_slice()).collect();
+    let comms: Vec<&Commitment> = groups.iter().map(|(_, e)| &e.comm).collect();
+    let total_ctxt = Kahe::agg_ctxt_refs(&ctxts);
+    let total_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
         decrypt_aggregate(pp, &total_ctxt, &total_comm, outs)
     })

@@ -8,13 +8,14 @@ use crate::bulletin::{
     ClientBulletinEntry, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
 };
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
+use crate::hvc_sum::sum_hvc_polys;
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
 use crate::rs::{Rs, RsError};
 use crate::share_commitment::verify_aggregated;
 use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
 use crate::DgtNTTPoly;
-use chipmunk_code::{pointwise_sum_polys, HVCPoly};
+use chipmunk_code::HVCPoly;
 
 use super::ProtocolParams;
 use super::{ClientId, NodeId, ServerId, SessionId};
@@ -148,8 +149,9 @@ pub fn aggregate_and_decrypt_timed(
         .map(|(i, (cid, _))| (*cid, i))
         .collect();
 
-    let mut ctxts: Vec<Vec<KahePoly>> = Vec::with_capacity(canonical.len());
-    let mut comms = Vec::with_capacity(canonical.len());
+    let mut tt = VerifyTimings::default();
+    let now = Instant::now();
+    let mut ctxts: Vec<&[KahePoly]> = Vec::with_capacity(canonical.len());
     let mut ctxt_len: Option<usize> = None;
     for cid in canonical {
         let i = *pub_index.get(cid).ok_or(VerifyError::MissingClient(*cid))?;
@@ -160,18 +162,20 @@ pub fn aggregate_and_decrypt_timed(
                 server_outputs[0].server_id,
             ));
         }
-        ctxts.push(p.ctxt.clone());
-        comms.push(p.comm.clone());
+        ctxts.push(&p.ctxt);
     }
-
-    let mut tt = VerifyTimings::default();
-
-    let now = Instant::now();
-    let summed_ctxt = Kahe::agg_ctxt(&ctxts);
+    let summed_ctxt = Kahe::agg_ctxt_refs(&ctxts);
     tt.agg_ctxt_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
-    let summed_comm = HidingMerkleCommitment::sum_commitments(&comms);
+    let comms: Vec<&Commitment> = canonical
+        .iter()
+        .map(|cid| {
+            let i = pub_index[cid];
+            &client_entries[i].1.comm
+        })
+        .collect();
+    let summed_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
     tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Single CS verification per server (μ_cs = κ_kahe packs all components).
@@ -296,7 +300,7 @@ pub fn aggregate_and_decrypt_rs(
     let comms: Vec<Commitment> = entries.iter().map(|e| e.comm.clone()).collect();
     let summed_comm = HidingMerkleCommitment::sum_commitments(&comms);
     let root_refs: Vec<&HVCPoly> = entries.iter().map(|e| &e.share_root).collect();
-    let summed_root = pointwise_sum_polys(&root_refs);
+    let summed_root = sum_hvc_polys(&root_refs);
     tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();

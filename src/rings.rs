@@ -63,21 +63,104 @@ fn cs_aux_rns() -> &'static Rns<N, 2> {
     RING.get_or_init(|| Rns::new(CS_AUX_RNS_MODULI.map(|q| generate_ring32(q, find_psi32::<N>(q)))))
 }
 
+#[cfg(feature = "rns")]
+fn boxed_residues() -> Box<Residues<N, 2>> {
+    let mut value = Box::<Residues<N, 2>>::new_uninit();
+    unsafe {
+        value.as_mut_ptr().write_bytes(0, 1);
+        value.assume_init()
+    }
+}
+
+#[cfg(feature = "rns")]
+fn boxed_i64_coeffs() -> Box<[i64; N]> {
+    let mut value = Box::<[i64; N]>::new_uninit();
+    unsafe {
+        value.as_mut_ptr().write_bytes(0, 1);
+        value.assume_init()
+    }
+}
+
 #[inline]
 fn lift64(a: i64, modulus: i64) -> i64 {
     a.rem_euclid(modulus)
 }
 
 #[inline]
-fn normalize64(mut a: i64, modulus: i64) -> i64 {
-    a %= modulus;
-    if a > modulus / 2 {
-        a -= modulus;
+pub(crate) fn center_canonical_i64(value: i64, modulus: i64) -> i64 {
+    debug_assert!((0..modulus).contains(&value));
+    value - (modulus & -((value > modulus / 2) as i64))
+}
+
+#[inline]
+pub(crate) fn center_i64(value: i64, modulus: i64) -> i64 {
+    center_canonical_i64(value.rem_euclid(modulus), modulus)
+}
+
+#[inline]
+pub(crate) fn center_i32(value: i32, modulus: i32) -> i32 {
+    let reduced = value.rem_euclid(modulus);
+    reduced - (modulus & -((reduced > modulus / 2) as i32))
+}
+
+#[inline]
+pub(crate) fn center_half_open_i64(value: i64, modulus: i64) -> i64 {
+    center_canonical_half_open_i64(value.rem_euclid(modulus), modulus)
+}
+
+#[inline]
+pub(crate) fn center_canonical_half_open_i64(value: i64, modulus: i64) -> i64 {
+    debug_assert!((0..modulus).contains(&value));
+    value - (modulus & -((value >= modulus / 2) as i64))
+}
+
+#[inline]
+fn normalize64(value: i64, modulus: i64) -> i64 {
+    center_i64(value, modulus)
+}
+
+#[cfg(all(feature = "rns", test))]
+#[inline]
+fn reduce_i64_rns2<const Q0: u32, const Q1: u32>(value: i64) -> [u32; 2] {
+    #[inline]
+    fn reduce<const Q: u32>(value: i64) -> u32 {
+        let remainder = value % Q as i64;
+        (remainder + ((remainder >> 63) & Q as i64)) as u32
     }
-    if a < -modulus / 2 {
-        a += modulus;
-    }
-    a
+    [reduce::<Q0>(value), reduce::<Q1>(value)]
+}
+
+#[cfg(all(feature = "rns", test))]
+#[inline]
+fn reduce_small_i32_rns2<const Q0: u32, const Q1: u32>(value: i32) -> [u32; 2] {
+    debug_assert!(value.unsigned_abs() < Q0);
+    debug_assert!(value.unsigned_abs() < Q1);
+    let negative = 0u32.wrapping_sub((value < 0) as u32);
+    let positive = value as u32;
+    let magnitude = value.unsigned_abs();
+    [
+        (positive & !negative) | ((Q0 - magnitude) & negative),
+        (positive & !negative) | ((Q1 - magnitude) & negative),
+    ]
+}
+
+#[cfg(all(feature = "rns", test))]
+#[inline]
+fn lift_centered_rns2<const Q0: u32, const Q1: u32>(
+    prefix_inverse: u32,
+    residues: [u32; 2],
+) -> i64 {
+    const { assert!(Q0 < 2 * Q1) };
+    let reduce_r0 = 0u32.wrapping_sub((residues[0] >= Q1) as u32);
+    let r0_mod_q1 = residues[0] - (Q1 & reduce_r0);
+    let add_q1 = 0u32.wrapping_sub((residues[1] < r0_mod_q1) as u32);
+    let delta = residues[1]
+        .wrapping_sub(r0_mod_q1)
+        .wrapping_add(Q1 & add_q1);
+    let digit = (delta as u64 * prefix_inverse as u64) % Q1 as u64;
+    let value = residues[0] as u64 + Q0 as u64 * digit;
+    let product = Q0 as u64 * Q1 as u64;
+    value as i64 - (value > product / 2) as i64 * product as i64
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -251,14 +334,10 @@ impl From<&KahePoly> for KaheNTTPoly {
         #[cfg(feature = "rns")]
         {
             let ring = kahe_rns();
-            let mut coeffs = [[0u32; N]; 2];
-            for (i, &x) in poly.coeffs.iter().enumerate() {
-                let residues = ring.reduce_coeff(x as i128);
-                coeffs[0][i] = residues[0];
-                coeffs[1][i] = residues[1];
-            }
+            let mut coeffs = boxed_residues();
+            ring.reduce_i64_into(&poly.coeffs, &mut coeffs);
             ring.forward(&mut coeffs);
-            Self { coeffs }
+            Self { coeffs: *coeffs }
         }
     }
 }
@@ -282,13 +361,13 @@ impl From<&KaheNTTPoly> for KahePoly {
         #[cfg(feature = "rns")]
         {
             let ring = kahe_rns();
-            let mut residues = poly.coeffs;
+            let mut residues = boxed_residues();
+            residues[0].copy_from_slice(&poly.coeffs[0]);
+            residues[1].copy_from_slice(&poly.coeffs[1]);
             ring.inverse(&mut residues);
-            Self {
-                coeffs: core::array::from_fn(|i| {
-                    ring.lift_centered([residues[0][i], residues[1][i]]) as i64
-                }),
-            }
+            let mut output = Self::default();
+            ring.lift_centered_i64_into(&residues, &mut output.coeffs);
+            output
         }
     }
 }
@@ -582,15 +661,12 @@ impl From<&CsPoly> for CsNTTPoly {
         #[cfg(feature = "rns")]
         {
             let ring = cs_aux_rns();
-            let mut coeffs = [[0u32; N]; 2];
-            for (i, &input) in poly.coeffs.iter().enumerate() {
-                let residues =
-                    ring.reduce_coeff(arithmetic::normalize_i32(input, CS_MODULUS) as i128);
-                coeffs[0][i] = residues[0];
-                coeffs[1][i] = residues[1];
-            }
+            let mut coeffs = boxed_residues();
+            let mut centered = poly.coeffs;
+            arithmetic::normalize_assign_i32(&mut centered, CS_MODULUS);
+            ring.reduce_centered_i32_into(&centered, &mut coeffs);
             ring.forward(&mut coeffs);
-            Self { coeffs }
+            Self { coeffs: *coeffs }
         }
     }
 }
@@ -604,29 +680,28 @@ impl From<CsPoly> for CsNTTPoly {
 impl From<&CsNTTPoly> for CsPoly {
     fn from(poly: &CsNTTPoly) -> Self {
         #[cfg(not(feature = "rns"))]
-        let exact: [i128; N] = {
+        let exact: [i64; N] = {
             let mut coeffs = poly.coeffs;
             ntt64::inv_ntt(cs_aux_ring64(), &mut coeffs);
-            coeffs.map(|value| {
-                if value > CS_AUX_MODULUS / 2 {
-                    value as i128 - CS_AUX_MODULUS as i128
-                } else {
-                    value as i128
-                }
-            })
+            coeffs.map(|value| center_canonical_i64(value as i64, CS_AUX_MODULUS as i64))
         };
         #[cfg(feature = "rns")]
-        let exact: [i128; N] = {
+        let exact: [i64; N] = {
             let ring = cs_aux_rns();
-            let mut coeffs = poly.coeffs;
+            let mut coeffs = boxed_residues();
+            coeffs[0].copy_from_slice(&poly.coeffs[0]);
+            coeffs[1].copy_from_slice(&poly.coeffs[1]);
             ring.inverse(&mut coeffs);
-            core::array::from_fn(|i| ring.lift_centered([coeffs[0][i], coeffs[1][i]]))
+            let mut lifted = boxed_i64_coeffs();
+            ring.lift_centered_i64_into(&coeffs, &mut lifted);
+            *lifted
         };
-        Self {
-            coeffs: exact
-                .map(|value| value.rem_euclid(CS_MODULUS as i128) as i32)
-                .map(|value| arithmetic::normalize_i32(value, CS_MODULUS)),
+        let mut output = Self::default();
+        for (coefficient, value) in output.coeffs.iter_mut().zip(exact) {
+            *coefficient =
+                arithmetic::normalize_i32(value.rem_euclid(CS_MODULUS as i64) as i32, CS_MODULUS);
         }
+        output
     }
 }
 
@@ -738,13 +813,7 @@ impl DgtNTTPoly {
     pub fn to_centered_coeffs(&self) -> [i64; N] {
         let mut coeffs = self.coeffs;
         ntt64::inv_ntt(dgt_ring64(), &mut coeffs);
-        coeffs.map(|value| {
-            if value > DGT_MODULUS / 2 {
-                value as i64 - DGT_MODULUS as i64
-            } else {
-                value as i64
-            }
-        })
+        coeffs.map(|value| center_canonical_i64(value as i64, DGT_MODULUS as i64))
     }
 
     pub fn coeffs(&self) -> &[u64; N] {
@@ -789,4 +858,88 @@ pub fn pointwise_dot_dgt(a: &[DgtNTTPoly], b: &[DgtNTTPoly]) -> DgtNTTPoly {
     let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
     ntt64::pointwise_mac(dgt_ring64(), &mut result.coeffs, &a, &b);
     result
+}
+
+#[cfg(all(test, feature = "rns"))]
+mod rns_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn specialized_kahe_conversion_matches_generic_rns() {
+        let ring = kahe_rns();
+        let values = [
+            -KAHE_MODULUS / 2,
+            -1,
+            0,
+            1,
+            KAHE_MODULUS / 2,
+            KAHE_MODULUS - 1,
+        ];
+        for value in values {
+            let residues = reduce_i64_rns2::<{ KAHE_RNS_MODULI[0] }, { KAHE_RNS_MODULI[1] }>(value);
+            assert_eq!(residues, ring.reduce_coeff(value as i128));
+            assert_eq!(
+                lift_centered_rns2::<{ KAHE_RNS_MODULI[0] }, { KAHE_RNS_MODULI[1] }>(
+                    ring.prefix_inverses[1],
+                    residues
+                ) as i128,
+                ring.lift_centered(residues)
+            );
+        }
+    }
+
+    #[test]
+    fn specialized_cs_conversion_matches_generic_rns() {
+        let ring = cs_aux_rns();
+        for value in [-CS_MODULUS_OVER_TWO, -1, 0, 1, CS_MODULUS_OVER_TWO] {
+            let residues =
+                reduce_small_i32_rns2::<{ CS_AUX_RNS_MODULI[0] }, { CS_AUX_RNS_MODULI[1] }>(value);
+            assert_eq!(residues, ring.reduce_coeff(value as i128));
+            assert_eq!(
+                lift_centered_rns2::<{ CS_AUX_RNS_MODULI[0] }, { CS_AUX_RNS_MODULI[1] }>(
+                    ring.prefix_inverses[1],
+                    residues
+                ) as i128,
+                ring.lift_centered(residues)
+            );
+        }
+    }
+
+    #[test]
+    fn array_conversions_match_generic_rns() {
+        let kahe = kahe_rns();
+        let kahe_values = [
+            -KAHE_MODULUS / 2,
+            -KAHE_MODULUS / 3,
+            -1,
+            0,
+            1,
+            KAHE_MODULUS / 3,
+            KAHE_MODULUS / 2,
+            KAHE_MODULUS - 1,
+        ];
+        let input = core::array::from_fn(|i| kahe_values[i % kahe_values.len()]);
+        let mut residues = [[0u32; N]; 2];
+        kahe.reduce_i64_into(&input, &mut residues);
+        let mut lifted = [0i64; N];
+        kahe.lift_centered_i64_into(&residues, &mut lifted);
+        for i in 0..N {
+            let expected_residues = kahe.reduce_coeff(input[i] as i128);
+            assert_eq!([residues[0][i], residues[1][i]], expected_residues);
+            assert_eq!(lifted[i] as i128, kahe.lift_centered(expected_residues));
+        }
+
+        let cs = cs_aux_rns();
+        let cs_values = [-CS_MODULUS_OVER_TWO, -1, 0, 1, CS_MODULUS_OVER_TWO];
+        let input = core::array::from_fn(|i| cs_values[i % cs_values.len()]);
+        let mut residues = [[0u32; N]; 2];
+        cs.reduce_centered_i32_into(&input, &mut residues);
+        let mut lifted = [0i64; N];
+        cs.lift_centered_i64_into(&residues, &mut lifted);
+        for i in 0..N {
+            let expected_residues = cs.reduce_coeff(input[i] as i128);
+            assert_eq!([residues[0][i], residues[1][i]], expected_residues);
+            assert_eq!(lifted[i] as i128, cs.lift_centered(expected_residues));
+        }
+    }
 }
