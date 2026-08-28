@@ -6,7 +6,7 @@
 //! coefficients = `8192` bytes; the final poly is zero-padded to fill `N`
 //! coefficients. Coefficients land in `[0, 2^32) ⊂ [0, t)` so a fresh
 //! single-client encode/decode is exact round-trip. Per-coefficient headroom
-//! under mod-t summation is `t/2^32`: 2^4 at t = 2^36, 2^3 under `rns`.
+//! under mod-t summation is `t/2^32 = 2^3`.
 
 use crate::{KahePoly, N};
 

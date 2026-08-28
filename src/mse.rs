@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → 15 symbols at BITS_PER_SYMBOL=36 (t=2^36). Smaller
+    /// 512-bit message → 15 symbols at BITS_PER_SYMBOL=35 (t=2^35). Smaller
     /// multiset but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {

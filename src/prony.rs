@@ -27,8 +27,8 @@
 //!
 //! Cost of the swap: **`p` must be prime.** `T_MODULUS_DEFAULT` is a power of
 //! two, and Newton's identities divide by `1..k`. [`PRONY_PRIME`] matches the
-//! plaintext width instead — 36-bit by default, 35-bit under `rns` where a
-//! 36-bit `p` would break the KAHE budget `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2` — so
+//! plaintext width instead. A 36-bit `p` would break the KAHE budget
+//! `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2`, so
 //! the budget is unchanged and the codec's 32-bit symbols still fit.
 //! `KaheParams::t_modulus` is already a free `u64`.
 
@@ -37,11 +37,7 @@ use crate::{KahePoly, N};
 use rand::Rng;
 use rayon::prelude::*;
 
-/// Plaintext modulus, FFT-friendly in the sense Rabbit-Mix's root-finder needs — `q = M·2^m + 1`
-#[cfg(not(feature = "rns"))]
-pub const PRONY_PRIME: u64 = (65_535u64 << 20) + 1;
 /// 35-bit: a 36-bit `p` exceeds the KAHE budget at q = 2^47.995.
-#[cfg(feature = "rns")]
 pub const PRONY_PRIME: u64 = (32_788u64 << 20) + 1;
 
 // ---------------------------------------------------------------

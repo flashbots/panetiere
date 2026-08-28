@@ -6,7 +6,6 @@ pub mod bulletin;
 pub mod channel;
 pub mod codec;
 pub mod cs;
-pub mod digest;
 #[doc(hidden)]
 pub mod hvc_stream;
 #[doc(hidden)]
@@ -26,9 +25,8 @@ pub mod sss;
 pub use chipmunk_code::path::Path;
 pub use chipmunk_code::{HVCHash, HVCPoly, Tree};
 pub use rings::{
-    pointwise_dot_cs, pointwise_dot_dgt, pointwise_dot_kahe, CsNTTPoly, CsPoly, DgtNTTPoly,
-    KaheNTTPoly, KahePoly, CS_MODULUS, CS_MODULUS_OVER_TWO, DGT_MODULUS, KAHE_MODULUS,
-    KAHE_MODULUS_OVER_TWO, N,
+    pointwise_dot_cs, pointwise_dot_kahe, pointwise_dot_rs, CsNTTPoly, CsPoly, KaheNTTPoly,
+    KahePoly, RsNTTPoly, CS_MODULUS, CS_MODULUS_OVER_TWO, KAHE_MODULUS, KAHE_MODULUS_OVER_TWO, N,
 };
 
 /// Draw `n` independent 256-bit seeds from `rng`, serially and in order

@@ -6,7 +6,6 @@ use crate::CsPoly;
 
 use crate::bulletin::{ClientBulletinEntry, RsClientBulletinEntry};
 use crate::cs::{fresh_opening_pack_bounds, Commitment, Cs, HidingMerkleCommitment, Opening};
-use crate::digest::embed;
 use crate::kahe::{kahe_to_cs_centered, Kahe, KaheKey, KaheScheme};
 use crate::pke;
 use crate::rs::{Rs, Share};
@@ -153,8 +152,7 @@ pub fn run_client_round_rs<R: CryptoRng + Rng>(
     let scp = pp.share_comm.as_ref().expect("share-commitment params");
 
     let key = kahe_keygen(rng, pp);
-    let ctxt = kahe_encrypt(rng, pp, &key, &message);
-    let embedded = embed(&ctxt);
+    let embedded = Kahe::enc_ntt(rng, &pp.kahe, &key, &message);
     let rs_shares = Rs::encode(rs, &embedded);
     let (share_root, share_paths) = commit_shares(scp, &rs_shares);
 

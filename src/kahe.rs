@@ -1,7 +1,7 @@
 //! Key-additive homomorphic encryption
 //!
-//! Lives on its own ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^48.3, or ≈ 2^47.995
-//! under `rns`). The modulus is chosen for headroom in the noise budget.
+//! Lives on its own two-limb RNS ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^47.995).
+//! The modulus is chosen for headroom in the noise budget.
 //!
 //! Per-poly form:
 //!
@@ -17,6 +17,7 @@
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
+use crate::rings::boxed_i64_coeffs;
 use crate::rings::{center_half_open_i64, center_i64};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
@@ -145,7 +146,7 @@ unsafe fn accumulate_pos_avx2(acc: &mut [i64; N], cs: &[&[KahePoly]], pos: usize
     }
 }
 
-/// `poly[i] · scale` mod q. Products reach `q/2 · t ≈ 2^84` (2^83 under `rns`),
+/// `poly[i] · scale` mod q. Products reach `q/2 · t ≈ 2^83`,
 /// so i128.
 fn scale_poly(poly: &KahePoly, scale: i64) -> KahePoly {
     let mut coeffs = [0i64; N];
@@ -232,9 +233,15 @@ impl Kahe {
         assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
         // Sample directly NTT-resident — uniform-in-NTT slot is statistically
         // equivalent to NTT(uniform coeff poly) and saves `μ` forward NTTs.
-        let a_ntt: Vec<KaheNTTPoly> = (0..mu_kahe)
-            .map(|_| KaheNTTPoly::rand_ntt_poly(rng))
-            .collect();
+        let a_ntt: Vec<KaheNTTPoly> = {
+            let mut values: Vec<_> = std::iter::repeat_with(KaheNTTPoly::default)
+                .take(mu_kahe)
+                .collect();
+            for value in &mut values {
+                value.fill_random(rng);
+            }
+            values
+        };
         KaheParams {
             a_ntt,
             mu_kahe,
@@ -264,14 +271,53 @@ impl Kahe {
             })
             .collect()
     }
+
+    pub fn enc_ntt<R: Rng>(
+        rng: &mut R,
+        pp: &KaheParams,
+        k: &KaheKey,
+        m: &[KahePoly],
+    ) -> Vec<KaheNTTPoly> {
+        debug_assert!(m.len() <= pp.mu_kahe);
+        let t = pp.t_modulus as i64;
+        let sk_ntt = KaheNTTPoly::from(k.inner());
+        let seeds = crate::fork_seeds(rng, m.len());
+        let mut result: Vec<_> = std::iter::repeat_with(KaheNTTPoly::default)
+            .take(m.len())
+            .collect();
+        result.par_iter_mut().enumerate().for_each(|(i, output)| {
+            let mut item_rng = ChaCha20Rng::from_seed(seeds[i]);
+            let mut noisy_message = boxed_i64_coeffs();
+            for (coefficient, &message) in noisy_message.iter_mut().zip(m[i].coeffs()) {
+                *coefficient = (message + t * sample_dg(&mut item_rng, pp.sigma_e))
+                    .rem_euclid(crate::KAHE_MODULUS);
+            }
+            output.set_from_coeffs(&noisy_message);
+            output.add_product_assign(&pp.a_ntt[i], &sk_ntt);
+        });
+        result
+    }
+
+    pub fn dec_ntt(pp: &KaheParams, c: &[KaheNTTPoly], k: &KaheAggKey) -> Vec<KahePoly> {
+        debug_assert!(c.len() <= pp.mu_kahe);
+        let sk_ntt = KaheNTTPoly::from(k.inner());
+        (0..c.len())
+            .into_par_iter()
+            .map(|i| {
+                let pad = pointwise_dot_kahe(
+                    std::slice::from_ref(&pp.a_ntt[i]),
+                    std::slice::from_ref(&sk_ntt),
+                );
+                let raw = KahePoly::from(c[i] - pad);
+                poly_mod_t(&raw, pp.t_modulus)
+            })
+            .collect()
+    }
 }
 
 pub const SIGMA_S_DEFAULT: f64 = 15.72;
 pub const SIGMA_E_DEFAULT: f64 = 15.72;
 /// Largest power of two satisfying `t·(8σ_e·√ρ + ρ/2) < q_kahe/2` at ρ = 300.
-#[cfg(not(feature = "rns"))]
-pub const T_MODULUS_DEFAULT: u64 = 1 << 36;
-#[cfg(feature = "rns")]
 pub const T_MODULUS_DEFAULT: u64 = 1 << 35;
 
 impl KaheScheme for Kahe {
@@ -281,7 +327,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=15.72, `t = 2^36` at q_kahe ≈ 2^48.3.
+    /// `μ = 1`, σ_s=σ_e=15.72, `t = 2^35` at q_kahe ≈ 2^48.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }

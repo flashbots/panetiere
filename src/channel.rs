@@ -129,8 +129,7 @@ impl ChannelParams {
     }
 
     /// Payload bits one symbol carries: `⌊log₂ t⌋` in the peeling structure's
-    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — 36 against 35 by
-    /// default, 35 against 35 under `rns`.
+    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — both are 35.
     pub fn bits_per_symbol(&self) -> usize {
         match self {
             ChannelParams::Mse(_) => mse::BITS_PER_SYMBOL,

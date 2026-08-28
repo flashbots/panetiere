@@ -7,49 +7,50 @@
 //! the client-signed roots: the post is its own correctness proof.
 //!
 //! **Hash, then decompose the hash.** Leaf `j` is not the share but the
-//! base-69 digits of its Ajtai hash `A·s_j` over the digest ring — 3 label
-//! polys → 30 digit polys, instead of `block_len·10`. Two binding layers:
+//! base-69 digits of its Ajtai hash `A·s_j` over the share ring, four digits for
+//! each of its two 24-bit channels. Two binding layers:
 //!
 //! - The HVC tree binds `Σ labels` (digits short by construction, sums
 //!   `ρ_max·ζ = 10 200 < q_hvc/2`-bounded, asserted at setup).
-//! - `A` binds a lane's posted sum to `Σ labels` **together with shortness**:
-//!   systematic sums are gated at `ρ_max·q_kahe/2` (the SIS instance the old
-//!   whole-ct digest stood on). Parity sums are full-range and cannot be
-//!   gated per lane; a forged parity post that keeps the reconstruction
-//!   inside `centered_within_bound` needs `κ` with `A·κ = 0` and `μ·κ` short
-//!   for full-range Lagrange `μ` — a short kernel vector of the rotated
-//!   matrix `A·μ⁻¹`, i.e. SIS. Out-of-bound forgeries fail reconstruction;
-//!   lanes that lie in rounds that still reconstruct are named by re-encoding
-//!   the result.
+//! - `A` binds a lane's posted sum to `Σ labels` in both prime channels.
+//!   Re-encoding names any inconsistent lane.
 //!
-//! Everything is NTT-domain: shares arrive as `DgtNTTPoly`, `A·s` is pointwise
+//! Everything is NTT-domain: shares arrive as `RsNTTPoly`, `A·s` is pointwise
 //! dots, and the committed label coefficients are the NTT-domain canonical
-//! values (a bijection; `Rs::*` is untouched).
+//! values. RS and commitment arithmetic never leave the two KAHE channels.
 
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE, ZETA};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
-use crate::bulletin::dgt_packed_len;
+use crate::bulletin::rs_poly_packed_len;
 use crate::cs::{digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2};
 use crate::hvc_stream::StreamingHvcDot;
+use crate::rings::KAHE_RNS_MODULI;
 use crate::rings::{center_canonical_i64, center_i32};
 use crate::rs::Share;
-use crate::{pointwise_dot_dgt, DgtNTTPoly, DGT_MODULUS, KAHE_MODULUS, N as POLY_N};
+use crate::{pointwise_dot_rs, RsNTTPoly, N as POLY_N};
+/// Four base-69 digits cover each 24-bit KAHE-RNS channel.
+pub const DGT_WIDTH: usize = 8;
 
-/// `69^10 ≈ 2^61.1 > q_dgt ≈ 2^61`: ten balanced base-69 digits are injective.
-pub const DGT_WIDTH: usize = 10;
-
-/// Ajtai-hash output width, sized by the digest ring's SIS argument.
+/// Ajtai-hash output width.
 pub const LABEL_POLYS: usize = 3;
 
 const BASE: i64 = TWO_ZETA_PLUS_ONE as i64;
 const ZETA_I64: i64 = ZETA as i64;
 
+#[inline(always)]
+fn decompose_step(value: i64) -> (i32, i64) {
+    let sign = value >> 63;
+    let bias = (ZETA_I64 ^ sign) - sign;
+    let next = (value + bias) / BASE;
+    ((value - next * BASE) as i32, next)
+}
+
 /// Balanced base-69 digits of the canonical NTT-domain coefficients, centered
 /// first. Digit coefficients ∈ [−ζ, ζ], little-endian.
-pub fn decompose_share_poly(p: &DgtNTTPoly) -> [HVCPoly; DGT_WIDTH] {
+pub fn decompose_share_poly(p: &RsNTTPoly) -> [HVCPoly; DGT_WIDTH] {
     let mut out = [HVCPoly::default(); DGT_WIDTH];
     decompose_into(p, &mut out);
     out
@@ -57,42 +58,41 @@ pub fn decompose_share_poly(p: &DgtNTTPoly) -> [HVCPoly; DGT_WIDTH] {
 
 /// [`decompose_share_poly`] into caller-owned storage. The array is 80 KB, so
 /// digit vectors are filled in place rather than moved out by value.
-fn decompose_into(p: &DgtNTTPoly, out: &mut [HVCPoly]) {
+fn decompose_into(p: &RsNTTPoly, out: &mut [HVCPoly]) {
     debug_assert_eq!(out.len(), DGT_WIDTH);
-    let q = DGT_MODULUS;
-    let coeffs = p.coeffs();
-    for i in 0..POLY_N {
-        let x = coeffs[i];
-        let mut v = center_canonical_i64(x as i64, q as i64);
-        for digit in out.iter_mut() {
-            let mut d = v % BASE;
-            if d > ZETA_I64 {
-                d -= BASE;
-            } else if d < -ZETA_I64 {
-                d += BASE;
+    const LIMB_WIDTH: usize = 4;
+    for limb in 0..2 {
+        let q = KAHE_RNS_MODULI[limb];
+        for i in 0..POLY_N {
+            let mut v = center_canonical_i64(p.residues()[limb][i] as i64, q as i64);
+            for digit in &mut out[limb * LIMB_WIDTH..(limb + 1) * LIMB_WIDTH] {
+                let (d, next) = decompose_step(v);
+                digit.coeffs_mut()[i] = d;
+                v = next;
             }
-            digit.coeffs_mut()[i] = d as i32;
-            v = (v - d) / BASE;
+            debug_assert_eq!(v, 0);
         }
-        debug_assert_eq!(v, 0);
     }
 }
 
 /// Left-inverse of [`decompose_share_poly`], linear in the digits. i128
 /// Horner: aggregated digits reach `ρ_max·ζ = 10 200`, and `10 200·69⁹ ≈ 2^68`
-/// overflows i64. Reduced to canonical mod `q_dgt` — the wire invariant
-/// `Rs::*` relies on.
-pub fn project_share_poly(digits: &[HVCPoly]) -> DgtNTTPoly {
+/// overflows i64. Reduced independently in each RNS channel.
+pub fn project_share_poly(digits: &[HVCPoly]) -> RsNTTPoly {
     debug_assert_eq!(digits.len(), DGT_WIDTH);
-    let mut raw = [0u64; POLY_N];
-    for (i, r) in raw.iter_mut().enumerate() {
-        let mut acc: i128 = digits[DGT_WIDTH - 1].coeffs()[i] as i128;
-        for digit in digits.iter().rev().skip(1) {
-            acc = acc * BASE as i128 + digit.coeffs()[i] as i128;
+    const LIMB_WIDTH: usize = 4;
+    let mut residues = [[0u32; POLY_N]; 2];
+    for limb in 0..2 {
+        let ds = &digits[limb * LIMB_WIDTH..(limb + 1) * LIMB_WIDTH];
+        for i in 0..POLY_N {
+            let mut acc = ds[LIMB_WIDTH - 1].coeffs()[i] as i64;
+            for digit in ds.iter().rev().skip(1) {
+                acc = acc * BASE + digit.coeffs()[i] as i64;
+            }
+            residues[limb][i] = acc.rem_euclid(KAHE_RNS_MODULI[limb] as i64) as u32;
         }
-        *r = acc.rem_euclid(DGT_MODULUS as i128) as u64;
     }
-    DgtNTTPoly::from_raw(&raw)
+    RsNTTPoly::from_residues(residues).unwrap()
 }
 
 /// `g^T · u` over the `LABEL_POLYS·DGT_WIDTH` label-digit polys. Linear in
@@ -121,8 +121,8 @@ pub struct ShareCommitmentParams {
     pub n_lanes: usize,
     pub n_leaves: usize,
     pub rho_max: usize,
-    /// The Ajtai rows `A ∈ R_{q_dgt}^{LABEL_POLYS × block_len}`.
-    a_rows: Vec<Vec<DgtNTTPoly>>,
+    /// Ajtai rows over the channel-wise RNS share ring.
+    a_rows: Vec<Vec<RsNTTPoly>>,
     leaf_hash: ShareLeafHash,
     hasher: HVCHash,
 }
@@ -133,16 +133,6 @@ impl ShareCommitmentParams {
         assert!(block_len >= 1, "need at least one poly per share");
         assert!(n_lanes >= 1, "need at least one lane");
         assert!(rho_max >= 1, "rho_max must be ≥ 1");
-        // The exactness condition reconstruction rests on, and the shortness
-        // premise binding the systematic lanes.
-        let bound = (rho_max as u128) * (KAHE_MODULUS as u128);
-        assert!(
-            bound < DGT_MODULUS as u128,
-            "rho_max = {rho_max} exceeds the digest ring: rho*q_kahe = 2^{:.1} \
-             must stay under q_dgt = 2^{:.1}; regenerate the ring with a larger prime",
-            (bound as f64).log2(),
-            (DGT_MODULUS as f64).log2(),
-        );
         // The binding condition of the tree layer: aggregated label digits
         // must not wrap mod q_hvc.
         assert!(
@@ -155,7 +145,7 @@ impl ShareCommitmentParams {
         let a_rows = (0..LABEL_POLYS)
             .map(|_| {
                 (0..block_len)
-                    .map(|_| DgtNTTPoly::rand_ntt_poly(&mut rng))
+                    .map(|_| RsNTTPoly::rand_ntt_poly(&mut rng))
                     .collect()
             })
             .collect();
@@ -187,16 +177,16 @@ impl ShareCommitmentParams {
     }
 
     /// `A·s` — pointwise dots over the NTT-resident share.
-    pub fn hash_share(&self, share: &[DgtNTTPoly]) -> Vec<DgtNTTPoly> {
+    pub fn hash_share(&self, share: &[RsNTTPoly]) -> Vec<RsNTTPoly> {
         assert_eq!(share.len(), self.block_len);
         self.a_rows
             .iter()
-            .map(|row| pointwise_dot_dgt(row, share))
+            .map(|row| pointwise_dot_rs(row, share))
             .collect()
     }
 }
 
-fn label_digits(label: &[DgtNTTPoly]) -> Vec<HVCPoly> {
+fn label_digits(label: &[RsNTTPoly]) -> Vec<HVCPoly> {
     let mut out = zeroed_polys(label.len() * DGT_WIDTH);
     for (p, digits) in label.iter().zip(out.chunks_exact_mut(DGT_WIDTH)) {
         decompose_into(p, digits);
@@ -279,8 +269,8 @@ impl ShareOpening {
         })
     }
 
-    /// Project the digit sums back to `Σ labels` mod q_dgt.
-    pub fn project_labels(&self) -> Vec<DgtNTTPoly> {
+    /// Project the digit sums back to `Σ labels` in both RNS channels.
+    pub fn project_labels(&self) -> Vec<RsNTTPoly> {
         (0..LABEL_POLYS)
             .map(|k| project_share_poly(&self.data[k * DGT_WIDTH..(k + 1) * DGT_WIDTH]))
             .collect()
@@ -336,7 +326,7 @@ pub fn commit_shares(pp: &ShareCommitmentParams, shares: &[Share]) -> (HVCPoly, 
 pub fn open_share(
     pp: &ShareCommitmentParams,
     lane: usize,
-    share: &[DgtNTTPoly],
+    share: &[RsNTTPoly],
     path: &SharePath,
 ) -> Option<ShareOpening> {
     if lane >= pp.n_lanes || path.lane_index != lane || share.len() != pp.block_len {
@@ -366,7 +356,7 @@ pub fn ingest_share(
     pp: &ShareCommitmentParams,
     root: &HVCPoly,
     lane: usize,
-    share: &[DgtNTTPoly],
+    share: &[RsNTTPoly],
     path: &SharePath,
 ) -> Option<ShareOpening> {
     let o = open_share(pp, lane, share, path)?;
@@ -385,7 +375,7 @@ pub fn ingest_share(
 pub fn verify_aggregated(
     pp: &ShareCommitmentParams,
     summed_root: &HVCPoly,
-    share_sum: &[DgtNTTPoly],
+    share_sum: &[RsNTTPoly],
     o: &ShareOpening,
 ) -> bool {
     if share_sum.len() != pp.block_len {
@@ -538,7 +528,7 @@ pub fn fresh_path_packed_len(n_lanes: usize) -> usize {
 pub fn lane_post_packed_len(block_len: usize, n_lanes: usize, rho_max: usize) -> usize {
     let path_len = n_lanes.next_power_of_two().max(2).trailing_zeros() as usize;
     let polys = LABEL_POLYS * DGT_WIDTH + path_len * 2 * HVC_WIDTH;
-    block_len * dgt_packed_len() + digits_packed_len(polys, rho_max as u32 * ZETA)
+    block_len * rs_poly_packed_len() + digits_packed_len(polys, rho_max as u32 * ZETA)
 }
 
 #[cfg(test)]
@@ -547,7 +537,7 @@ mod tests {
     use crate::rs::{Rs, RsParams};
     use crate::KahePoly;
     fn rand_share(rng: &mut ChaCha20Rng, len: usize) -> Share {
-        (0..len).map(|_| DgtNTTPoly::rand_ntt_poly(rng)).collect()
+        (0..len).map(|_| RsNTTPoly::rand_ntt_poly(rng)).collect()
     }
 
     fn params(block_len: usize, n_lanes: usize, rho_max: usize) -> ShareCommitmentParams {
@@ -558,12 +548,12 @@ mod tests {
     fn decompose_project_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
         for _ in 0..8 {
-            let p = DgtNTTPoly::rand_ntt_poly(&mut rng);
+            let p = RsNTTPoly::rand_ntt_poly(&mut rng);
             let digits = decompose_share_poly(&p);
             assert!(digits.iter().all(|d| d.infinity_norm() <= ZETA));
             assert_eq!(project_share_poly(&digits), p);
         }
-        let embedded = DgtNTTPoly::from_kahe(&KahePoly::rand_poly(&mut rng));
+        let embedded = RsNTTPoly::from_kahe(&KahePoly::rand_poly(&mut rng));
         assert_eq!(
             project_share_poly(&decompose_share_poly(&embedded)),
             embedded
@@ -571,11 +561,20 @@ mod tests {
     }
 
     #[test]
+    fn decompose_step_matches_balanced_remainder() {
+        for value in -10_000..=10_000 {
+            let (digit, next) = decompose_step(value);
+            assert!((-(ZETA as i32)..=ZETA as i32).contains(&digit));
+            assert_eq!(next * BASE + digit as i64, value);
+        }
+    }
+
+    #[test]
     fn projection_is_linear_and_i128_safe() {
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
         let rho = 300;
-        let polys: Vec<DgtNTTPoly> = (0..rho)
-            .map(|_| DgtNTTPoly::rand_ntt_poly(&mut rng))
+        let polys: Vec<RsNTTPoly> = (0..rho)
+            .map(|_| RsNTTPoly::rand_ntt_poly(&mut rng))
             .collect();
         let mut digit_sum = [HVCPoly::default(); DGT_WIDTH];
         for p in &polys {
@@ -588,19 +587,6 @@ mod tests {
             .all(|d| d.infinity_norm() <= rho as u32 * ZETA));
         let want = polys.iter().skip(1).fold(polys[0], |acc, p| acc + *p);
         assert_eq!(project_share_poly(&digit_sum), want);
-
-        // Adversarial magnitude: every digit at ±ρ_max·ζ. Wrong under i64.
-        let hi = HVCPoly::from_coeffs([10_200i32; POLY_N]);
-        let lo = HVCPoly::from_coeffs([-10_200i32; POLY_N]);
-        let extreme: Vec<HVCPoly> = (0..DGT_WIDTH)
-            .map(|w| if w % 2 == 0 { hi } else { lo })
-            .collect();
-        let mut acc: i128 = extreme[DGT_WIDTH - 1].coeffs()[0] as i128;
-        for d in extreme.iter().rev().skip(1) {
-            acc = acc * BASE as i128 + d.coeffs()[0] as i128;
-        }
-        let want = acc.rem_euclid(DGT_MODULUS as i128) as u64;
-        assert_eq!(project_share_poly(&extreme).coeffs()[0], want);
     }
 
     #[test]
@@ -668,7 +654,7 @@ mod tests {
         for j in 0..n_lanes {
             let refs: Vec<&ShareOpening> = per_lane[j].iter().collect();
             let agg = sum_openings(&refs);
-            let share_refs: Vec<&[DgtNTTPoly]> =
+            let share_refs: Vec<&[RsNTTPoly]> =
                 raw_shares[j].iter().map(|s| s.as_slice()).collect();
             let share_sum = Rs::sum_shares(&share_refs);
             assert!(
@@ -742,19 +728,13 @@ mod tests {
         let a = rand_share(&mut rng, 4);
         let b = rand_share(&mut rng, 4);
         let sum: Share = a.iter().zip(b.iter()).map(|(x, y)| *x + *y).collect();
-        let want: Vec<DgtNTTPoly> = pp
+        let want: Vec<RsNTTPoly> = pp
             .hash_share(&a)
             .iter()
             .zip(pp.hash_share(&b).iter())
             .map(|(x, y)| *x + *y)
             .collect();
         assert_eq!(pp.hash_share(&sum), want);
-    }
-
-    #[test]
-    #[should_panic(expected = "exceeds the digest ring")]
-    fn rho_beyond_the_ring_is_rejected_at_setup() {
-        params(4, 16, 1 << 20);
     }
 
     #[test]

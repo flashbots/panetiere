@@ -16,7 +16,7 @@ use panetiere::rs::Share;
 use panetiere::share_commitment::SharePath;
 use panetiere::sig::SigningKey;
 use panetiere::{kahe::T_MODULUS_DEFAULT, pke};
-use panetiere::{DgtNTTPoly, KahePoly};
+use panetiere::{KahePoly, RsNTTPoly};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -521,7 +521,7 @@ fn ingest_rejects_a_bad_share_naming_the_client() {
 
     let good = r.rounds[culprit].rs_shares[lane].clone();
     let p = r.rounds[culprit].rs_shares[lane][0];
-    assert_ne!(p, DgtNTTPoly::default(), "tamper must change the share");
+    assert_ne!(p, RsNTTPoly::default(), "tamper must change the share");
     r.rounds[culprit].rs_shares[lane][0] = p + p;
     for j in 0..N_NODES {
         let got = r.node_round(j, &r.canonical, &roots);

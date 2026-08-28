@@ -56,7 +56,7 @@
 //! ──────────────────────────────────────────────────────────────────────
 //!  src/rings.rs: N = 2048, q_cs = 139_301, q_kahe = 347_280_875_347_969
 //!  chipmunk param.rs: q_hvc = 40_961, HVC_WIDTH = 3
-//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^36, σ_s = σ_e = 15.72
+//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^35, σ_s = σ_e = 15.72
 //!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
 //!                — reported per cell as `eps`, the exponent that condition
 //!                actually buys at that (ρ, μ). It falls with √ρ and with
@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
-use crate::bulletin::dgt_packed_len;
+use crate::bulletin::rs_poly_packed_len;
 use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::channel::{self, ChannelParams};
 use crate::codec::{self, BYTES_PER_COEFF, BYTES_PER_POLY};
@@ -85,7 +85,6 @@ use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
 };
-use crate::digest::embed;
 use crate::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::mse::BITS_PER_SYMBOL;
 use crate::pke;
@@ -147,7 +146,7 @@ const RS_PLANS: &[(usize, usize)] = &[(14, 16)];
 /// k values priced (not measured) in the sizing table, at n = k+2.
 const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
 
-/// Aggregation ceiling the digest ring is sized for (see `digest::DigestParams`).
+/// Aggregation ceiling for the RNS share commitment.
 const RS_RHO_MAX: usize = 300;
 
 // Per-client element size = ξ symbols · 36 bits: 911 ⇒ 4 KiB, 3641 ⇒ 16 KiB.
@@ -371,7 +370,7 @@ struct RsPlan {
     /// A lane's digit-domain post: the summed opening plus its path.
     lane_post_b: usize,
     bulletin_b: usize,
-    dgt_embed: Stat,
+    rns_encrypt: Stat,
     share_commit: Stat,
     rs_enc: Stat,
     client_sign: Stat,
@@ -644,7 +643,7 @@ mod csv_tests {
                 path_b: 86016,
                 lane_post_b: 4423680,
                 bulletin_b: 4194,
-                dgt_embed: Stat::default(),
+                rns_encrypt: Stat::default(),
                 share_commit: Stat::default(),
                 rs_enc: Stat::default(),
                 client_sign: Stat::default(),
@@ -1263,16 +1262,15 @@ fn run_cell(
                 scp.path_len() * 2 * HVC_WIDTH
             );
 
-            // Embedding into the digest ring is n_polys forward NTTs; encoding is
-            // (n−k)·n_polys·N modmuls, since systematic shares are the blocks; the
-            // commitment is n leaf hashes over block_len·DGT_WIDTH digits each.
+            // Full encryption directly into persistent NTT channels. Encoding
+            // is (n−k)·n_polys·N modmuls.
             let key0 = kahe_keygen(&mut rrng, &pp_rs);
-            let ctxt0 = kahe_encrypt(&mut rrng, &pp_rs, &key0, &client_polys[0]);
-            let (dgt_embed, embedded0) = measure(|| embed(&ctxt0));
+            let (rns_encrypt, embedded0) =
+                measure(|| Kahe::enc_ntt(&mut rrng, &pp_rs.kahe, &key0, &client_polys[0]));
             let rs_params = pp_rs.rs.as_ref().unwrap();
             let (rs_enc, shares0) = measure(|| Rs::encode(rs_params, &embedded0));
             let (share_commit, _) = measure(|| commit_shares(scp, &shares0));
-            let share_b = shares0[0].len() * dgt_packed_len();
+            let share_b = shares0[0].len() * rs_poly_packed_len();
 
             let run_verify = |nodes: &[RsNodeBulletinEntry]| {
                 aggregate_and_decrypt_rs(&pp_rs, &SESSION, &canonical, &entries, &rs_outputs, nodes)
@@ -1327,7 +1325,7 @@ fn run_cell(
                 path_b: fresh_path_packed_len(n_nodes),
                 lane_post_b: lane_post_packed_len(scp.block_len, n_nodes, RS_RHO_MAX),
                 bulletin_b: RsClientBulletinEntry::packed_len(),
-                dgt_embed,
+                rns_encrypt,
                 share_commit,
                 rs_enc,
                 client_sign,
@@ -1408,7 +1406,7 @@ fn run_cell(
             .into_iter()
             .map(|mut p| {
                 for st in [
-                    &mut p.dgt_embed,
+                    &mut p.rns_encrypt,
                     &mut p.share_commit,
                     &mut p.rs_enc,
                     &mut p.client_sign,
@@ -1502,10 +1500,10 @@ fn model(r: &Row) -> Model {
         .rs_plans
         .iter()
         .map(|p| {
+            let encryption_us = p.rns_encrypt.med;
             r.enc_app.med
                 + r.kahe_keygen.med
-                + r.kahe_enc.med
-                + p.dgt_embed.med
+                + encryption_us
                 + p.rs_enc.med
                 + p.share_commit.med
                 + p.client_sign.med
@@ -1820,7 +1818,7 @@ fn print_tables(rows: &[Row]) {
                     "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>10}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}{}",
                     cell_id(i),
                     format!("{}/{}", p.k, p.n_nodes),
-                    fmt_us(p.dgt_embed.med),
+                    fmt_us(p.rns_encrypt.med),
                     fmt_us(p.rs_enc.med),
                     fmt_us(p.share_commit.med),
                     fmt_us(p.client_sign.med),
@@ -1878,7 +1876,7 @@ fn print_tables(rows: &[Row]) {
                     continue;
                 }
                 let block_len = r.n_polys.div_ceil(k);
-                let share_b = (block_len * dgt_packed_len()) as f64;
+                let share_b = (block_len * rs_poly_packed_len()) as f64;
                 // The path rides with the share; the lane's post is its proof.
                 let path_b = fresh_path_packed_len(n_nodes) as f64;
                 let lane_post_b = lane_post_packed_len(block_len, n_nodes, RS_RHO_MAX) as f64;
@@ -2198,12 +2196,13 @@ const PHASES: &[PhaseCol] = &[
         set: |r, s| r.agg.leader = s,
     },
     PhaseCol {
+        // Stable CSV name retained for pre-RNS sweep compatibility.
         name: "rs_dgt_embed",
         owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.dgt_embed),
+        get: |r| rs0(r).map_or(Stat::default(), |p| p.rns_encrypt),
         set: |r, s| {
             if let Some(p) = r.rs_plans.first_mut() {
-                p.dgt_embed = s
+                p.rns_encrypt = s
             }
         },
     },
@@ -2610,7 +2609,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
             path_b: num("d_rs_path_b")? as usize,
             lane_post_b: num("d_rs_lane_post_b")? as usize,
             bulletin_b: num("d_rs_bulletin_b")? as usize,
-            dgt_embed: stat("rs_dgt_embed")?,
+            rns_encrypt: stat("rs_dgt_embed")?,
             share_commit: stat("rs_share_commit")?,
             rs_enc: stat("rs_enc")?,
             client_sign: stat("rs_client_sign")?,

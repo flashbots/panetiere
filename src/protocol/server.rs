@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{CsPoly, DgtNTTPoly};
+use crate::{CsPoly, RsNTTPoly};
 use chipmunk_code::HVCPoly;
 use rayon::prelude::*;
 
@@ -110,7 +110,7 @@ pub fn run_rs_node_round(
             || {
                 (
                     ShareOpeningAcc::zero(scp, lane),
-                    vec![DgtNTTPoly::default(); scp.block_len],
+                    vec![RsNTTPoly::default(); scp.block_len],
                 )
             },
             |(mut acc, mut sum), (cid, &i)| {
@@ -128,7 +128,7 @@ pub fn run_rs_node_round(
             || {
                 (
                     ShareOpeningAcc::zero(scp, lane),
-                    vec![DgtNTTPoly::default(); scp.block_len],
+                    vec![RsNTTPoly::default(); scp.block_len],
                 )
             },
             |(mut a, mut sa), (b, sb)| {

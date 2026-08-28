@@ -14,7 +14,7 @@ use crate::rs::{Rs, RsError};
 use crate::share_commitment::verify_aggregated;
 use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
-use crate::DgtNTTPoly;
+use crate::RsNTTPoly;
 use chipmunk_code::HVCPoly;
 
 use super::ProtocolParams;
@@ -43,9 +43,6 @@ pub enum VerifyError {
     Reconstruct(RsError),
     /// These lanes' posts do not open the summed signed roots.
     LaneOpeningFailed(Vec<NodeId>),
-    /// Reconstruction exceeded `ρ_max·q_kahe/2`, so it is not a sum of honest
-    /// ciphertexts.
-    CiphertextOutOfRange,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -319,19 +316,12 @@ pub fn aggregate_and_decrypt_rs(
     tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Each lane's post is its own proof: `A·share_sum` must open the summed
-    // signed roots at that lane's position. Systematic sums are additionally
-    // norm-gated — that shortness is what makes the Ajtai layer binding for
-    // them. Parity sums are full-range and get no gate; their binding comes
-    // from the reconstruction bound (an in-bound forgery is a short kernel
-    // vector of a rotated `A`, i.e. SIS) plus the re-encode check below.
+    // signed roots at that lane's position in both channels.
     let now = Instant::now();
     let bad: Vec<NodeId> = node_outputs
         .par_iter()
         .filter(|np| {
-            let systematic_ok = (np.node_id.0 as usize) >= rs.k
-                || crate::digest::centered_within_bound(scp.rho_max, &np.share_sum).is_some();
             np.agg_open.lane_index != np.node_id.0 as usize
-                || !systematic_ok
                 || !verify_aggregated(scp, &summed_root, &np.share_sum, &np.agg_open)
         })
         .map(|np| np.node_id)
@@ -347,7 +337,7 @@ pub fn aggregate_and_decrypt_rs(
     let now = Instant::now();
     let mut ordered: Vec<&RsNodeBulletinEntry> = node_outputs.iter().collect();
     ordered.sort_by_key(|np| ((np.node_id.0 as usize) >= rs.k, np.node_id.0));
-    let samples: Vec<(usize, &[DgtNTTPoly])> = ordered
+    let samples: Vec<(usize, &[RsNTTPoly])> = ordered
         .iter()
         .map(|np| (np.node_id.0 as usize, np.share_sum.as_slice()))
         .collect();
@@ -355,10 +345,8 @@ pub fn aggregate_and_decrypt_rs(
     tt.reconstruct_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
-    let centered = crate::digest::centered_within_bound(scp.rho_max, &summed_ntt)
-        .ok_or(VerifyError::CiphertextOutOfRange)?;
-    // The reconstruction is in-bound, so it is the committed codeword; any
-    // reporting lane whose post disagrees with its re-encoding lied.
+    // Any reporting lane whose post disagrees with the reconstructed
+    // codeword's re-encoding lied.
     let expected = Rs::encode(rs, &summed_ntt);
     let liars: Vec<NodeId> = node_outputs
         .iter()
@@ -371,8 +359,7 @@ pub fn aggregate_and_decrypt_rs(
     tt.crosscheck_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
-    let summed_ctxt = crate::digest::to_kahe(&centered);
-    let plain = Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key);
+    let plain = Kahe::dec_ntt(&pp.kahe, &summed_ntt, &agg_key);
     tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
 
     Ok((plain, tt))

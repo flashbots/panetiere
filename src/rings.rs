@@ -1,12 +1,8 @@
 use chipmunk_code::{HVCPoly, ALPHA_H, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use negacyclic_rings::arithmetic;
 use negacyclic_rings::decomposition;
-use negacyclic_rings::ntt64::{self, Ring64};
-#[cfg(feature = "rns")]
 use negacyclic_rings::params::{find_psi32, generate_ring32};
-use negacyclic_rings::params::{find_psi64, generate_ring64};
-#[cfg(feature = "rns")]
-use negacyclic_rings::{Residues, Rns};
+use negacyclic_rings::{ntt32, Residues, Rns};
 use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
@@ -15,55 +11,46 @@ pub const N: usize = chipmunk_code::N;
 pub const CS_MODULUS: i32 = 139_301;
 pub const CS_MODULUS_OVER_TWO: i32 = (CS_MODULUS - 1) / 2;
 
-#[cfg(not(feature = "rns"))]
-pub const KAHE_MODULUS: i64 = 347_280_875_347_969;
-#[cfg(feature = "rns")]
 pub const KAHE_MODULUS: i64 = 280_513_608_622_081;
 pub const KAHE_MODULUS_OVER_TWO: i64 = (KAHE_MODULUS - 1) / 2;
 
-pub const DGT_MODULUS: u64 = 2_305_843_009_213_616_129;
-
-#[cfg(not(feature = "rns"))]
-const CS_AUX_MODULUS: u64 = 288_230_376_151_748_609;
-#[cfg(feature = "rns")]
-const KAHE_RNS_MODULI: [u32; 2] = [16_760_833, 16_736_257];
-#[cfg(feature = "rns")]
+pub(crate) const KAHE_RNS_MODULI: [u32; 2] = [16_760_833, 16_736_257];
 const CS_AUX_RNS_MODULI: [u32; 2] = [1_073_692_673, 1_073_668_097];
 
-fn ring64(cell: &'static OnceLock<Ring64<N>>, modulus: u64) -> &'static Ring64<N> {
-    cell.get_or_init(|| generate_ring64(modulus, find_psi64::<N>(modulus)))
-}
-
-#[cfg(not(feature = "rns"))]
-fn kahe_ring64() -> &'static Ring64<N> {
-    static RING: OnceLock<Ring64<N>> = OnceLock::new();
-    ring64(&RING, KAHE_MODULUS as u64)
-}
-
-#[cfg(not(feature = "rns"))]
-fn cs_aux_ring64() -> &'static Ring64<N> {
-    static RING: OnceLock<Ring64<N>> = OnceLock::new();
-    ring64(&RING, CS_AUX_MODULUS)
-}
-
-fn dgt_ring64() -> &'static Ring64<N> {
-    static RING: OnceLock<Ring64<N>> = OnceLock::new();
-    ring64(&RING, DGT_MODULUS)
-}
-
-#[cfg(feature = "rns")]
 fn kahe_rns() -> &'static Rns<N, 2> {
-    static RING: OnceLock<Rns<N, 2>> = OnceLock::new();
-    RING.get_or_init(|| Rns::new(KAHE_RNS_MODULI.map(|q| generate_ring32(q, find_psi32::<N>(q)))))
+    static RING: OnceLock<Box<Rns<N, 2>>> = OnceLock::new();
+    RING.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("kahe-rns-init".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Box::new(Rns::new(
+                    KAHE_RNS_MODULI.map(|q| generate_ring32(q, find_psi32::<N>(q))),
+                ))
+            })
+            .expect("spawn KAHE RNS initialization")
+            .join()
+            .expect("KAHE RNS initialization panicked")
+    })
 }
 
-#[cfg(feature = "rns")]
 fn cs_aux_rns() -> &'static Rns<N, 2> {
-    static RING: OnceLock<Rns<N, 2>> = OnceLock::new();
-    RING.get_or_init(|| Rns::new(CS_AUX_RNS_MODULI.map(|q| generate_ring32(q, find_psi32::<N>(q)))))
+    static RING: OnceLock<Box<Rns<N, 2>>> = OnceLock::new();
+    RING.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("cs-rns-init".into())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                Box::new(Rns::new(
+                    CS_AUX_RNS_MODULI.map(|q| generate_ring32(q, find_psi32::<N>(q))),
+                ))
+            })
+            .expect("spawn CS RNS initialization")
+            .join()
+            .expect("CS RNS initialization panicked")
+    })
 }
 
-#[cfg(feature = "rns")]
 fn boxed_residues() -> Box<Residues<N, 2>> {
     let mut value = Box::<Residues<N, 2>>::new_uninit();
     unsafe {
@@ -72,8 +59,7 @@ fn boxed_residues() -> Box<Residues<N, 2>> {
     }
 }
 
-#[cfg(feature = "rns")]
-fn boxed_i64_coeffs() -> Box<[i64; N]> {
+pub(crate) fn boxed_i64_coeffs() -> Box<[i64; N]> {
     let mut value = Box::<[i64; N]>::new_uninit();
     unsafe {
         value.as_mut_ptr().write_bytes(0, 1);
@@ -119,7 +105,7 @@ fn normalize64(value: i64, modulus: i64) -> i64 {
     center_i64(value, modulus)
 }
 
-#[cfg(all(feature = "rns", test))]
+#[cfg(test)]
 #[inline]
 fn reduce_i64_rns2<const Q0: u32, const Q1: u32>(value: i64) -> [u32; 2] {
     #[inline]
@@ -130,7 +116,7 @@ fn reduce_i64_rns2<const Q0: u32, const Q1: u32>(value: i64) -> [u32; 2] {
     [reduce::<Q0>(value), reduce::<Q1>(value)]
 }
 
-#[cfg(all(feature = "rns", test))]
+#[cfg(test)]
 #[inline]
 fn reduce_small_i32_rns2<const Q0: u32, const Q1: u32>(value: i32) -> [u32; 2] {
     debug_assert!(value.unsigned_abs() < Q0);
@@ -144,7 +130,7 @@ fn reduce_small_i32_rns2<const Q0: u32, const Q1: u32>(value: i32) -> [u32; 2] {
     ]
 }
 
-#[cfg(all(feature = "rns", test))]
+#[cfg(test)]
 #[inline]
 fn lift_centered_rns2<const Q0: u32, const Q1: u32>(
     prefix_inverse: u32,
@@ -302,9 +288,6 @@ impl KahePoly {
     }
 }
 
-#[cfg(not(feature = "rns"))]
-type KaheNTTCoeffs = [u64; N];
-#[cfg(feature = "rns")]
 type KaheNTTCoeffs = Residues<N, 2>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,31 +297,19 @@ pub struct KaheNTTPoly {
 
 impl Default for KaheNTTPoly {
     fn default() -> Self {
-        #[cfg(not(feature = "rns"))]
-        let coeffs = [0u64; N];
-        #[cfg(feature = "rns")]
-        let coeffs = [[0u32; N]; 2];
-        Self { coeffs }
+        Self {
+            coeffs: [[0u32; N]; 2],
+        }
     }
 }
 
 impl From<&KahePoly> for KaheNTTPoly {
     fn from(poly: &KahePoly) -> Self {
-        #[cfg(not(feature = "rns"))]
-        {
-            let ring = kahe_ring64();
-            let mut coeffs = poly.coeffs.map(|x| lift64(x, KAHE_MODULUS) as u64);
-            ntt64::ntt(ring, &mut coeffs);
-            Self { coeffs }
-        }
-        #[cfg(feature = "rns")]
-        {
-            let ring = kahe_rns();
-            let mut coeffs = boxed_residues();
-            ring.reduce_i64_into(&poly.coeffs, &mut coeffs);
-            ring.forward(&mut coeffs);
-            Self { coeffs: *coeffs }
-        }
+        let ring = kahe_rns();
+        let mut coeffs = boxed_residues();
+        ring.reduce_i64_into(&poly.coeffs, &mut coeffs);
+        ring.forward(&mut coeffs);
+        Self { coeffs: *coeffs }
     }
 }
 
@@ -350,25 +321,14 @@ impl From<KahePoly> for KaheNTTPoly {
 
 impl From<&KaheNTTPoly> for KahePoly {
     fn from(poly: &KaheNTTPoly) -> Self {
-        #[cfg(not(feature = "rns"))]
-        {
-            let mut coeffs = poly.coeffs;
-            ntt64::inv_ntt(kahe_ring64(), &mut coeffs);
-            Self {
-                coeffs: coeffs.map(|x| normalize64(x as i64, KAHE_MODULUS)),
-            }
-        }
-        #[cfg(feature = "rns")]
-        {
-            let ring = kahe_rns();
-            let mut residues = boxed_residues();
-            residues[0].copy_from_slice(&poly.coeffs[0]);
-            residues[1].copy_from_slice(&poly.coeffs[1]);
-            ring.inverse(&mut residues);
-            let mut output = Self::default();
-            ring.lift_centered_i64_into(&residues, &mut output.coeffs);
-            output
-        }
+        let ring = kahe_rns();
+        let mut residues = boxed_residues();
+        residues[0].copy_from_slice(&poly.coeffs[0]);
+        residues[1].copy_from_slice(&poly.coeffs[1]);
+        ring.inverse(&mut residues);
+        let mut output = Self::default();
+        ring.lift_centered_i64_into(&residues, &mut output.coeffs);
+        output
     }
 }
 
@@ -389,9 +349,6 @@ impl std::ops::Add for KaheNTTPoly {
 
 impl std::ops::AddAssign for KaheNTTPoly {
     fn add_assign(&mut self, other: Self) {
-        #[cfg(not(feature = "rns"))]
-        ntt64::add_assign(kahe_ring64(), &mut self.coeffs, &other.coeffs);
-        #[cfg(feature = "rns")]
         kahe_rns().add_assign(&mut self.coeffs, &other.coeffs);
     }
 }
@@ -400,9 +357,6 @@ impl std::ops::Sub for KaheNTTPoly {
     type Output = Self;
 
     fn sub(mut self, other: Self) -> Self {
-        #[cfg(not(feature = "rns"))]
-        ntt64::sub_assign(kahe_ring64(), &mut self.coeffs, &other.coeffs);
-        #[cfg(feature = "rns")]
         kahe_rns().sub_assign(&mut self.coeffs, &other.coeffs);
         self
     }
@@ -412,9 +366,6 @@ impl std::ops::Mul for KaheNTTPoly {
     type Output = Self;
 
     fn mul(self, other: Self) -> Self {
-        #[cfg(not(feature = "rns"))]
-        let coeffs = ntt64::pointwise_mul(kahe_ring64(), &self.coeffs, &other.coeffs);
-        #[cfg(feature = "rns")]
         let coeffs = kahe_rns().pointwise_mul(&self.coeffs, &other.coeffs);
         Self { coeffs }
     }
@@ -422,44 +373,85 @@ impl std::ops::Mul for KaheNTTPoly {
 
 impl KaheNTTPoly {
     pub fn rand_ntt_poly<R: Rng>(rng: &mut R) -> Self {
-        #[cfg(not(feature = "rns"))]
-        {
-            let q = KAHE_MODULUS as u64;
-            let threshold = (((1u128 << 64) / q as u128) * q as u128) as u64;
-            Self {
-                coeffs: core::array::from_fn(|_| {
-                    let mut value = rng.next_u64();
-                    while value >= threshold {
-                        value = rng.next_u64();
-                    }
-                    value % q
-                }),
+        let mut result = Self::default();
+        result.fill_random(rng);
+        result
+    }
+
+    pub(crate) fn fill_random<R: Rng>(&mut self, rng: &mut R) {
+        let ring = kahe_rns();
+        for limb in 0..2 {
+            for coefficient in &mut self.coeffs[limb] {
+                let mut value = rng.next_u32();
+                while value >= ring.sample_threshold[limb] {
+                    value = rng.next_u32();
+                }
+                *coefficient = value % ring.ch[limb].q;
             }
         }
-        #[cfg(feature = "rns")]
-        {
-            Self {
-                coeffs: kahe_rns().rand(rng),
+    }
+
+    pub(crate) fn residues(&self) -> &Residues<N, 2> {
+        &self.coeffs
+    }
+
+    pub fn ntt_slots(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        (0..N).map(|i| kahe_rns().lift_coeff([self.coeffs[0][i], self.coeffs[1][i]]) as u64)
+    }
+
+    pub fn from_ntt_slots(slots: &[u64]) -> Option<Self> {
+        if slots.len() != N || slots.iter().any(|&x| x >= KAHE_MODULUS as u64) {
+            return None;
+        }
+        let mut coeffs = boxed_residues();
+        for (i, &value) in slots.iter().enumerate() {
+            coeffs[0][i] = (value % KAHE_RNS_MODULI[0] as u64) as u32;
+            coeffs[1][i] = (value % KAHE_RNS_MODULI[1] as u64) as u32;
+        }
+        Some(Self { coeffs: *coeffs })
+    }
+
+    pub(crate) fn from_residues(coeffs: Residues<N, 2>) -> Option<Self> {
+        coeffs
+            .iter()
+            .zip(KAHE_RNS_MODULI)
+            .all(|(channel, q)| channel.iter().all(|&x| x < q))
+            .then_some(Self { coeffs })
+    }
+
+    pub fn from_kahe(poly: &KahePoly) -> Self {
+        Self::from(poly)
+    }
+
+    pub(crate) fn set_from_coeffs(&mut self, coeffs: &[i64; N]) {
+        let ring = kahe_rns();
+        ring.reduce_i64_into(coeffs, &mut self.coeffs);
+        ring.forward(&mut self.coeffs);
+    }
+
+    pub(crate) fn add_product_assign(&mut self, lhs: &Self, rhs: &Self) {
+        let ring = kahe_rns();
+        for limb in 0..2 {
+            for i in 0..N {
+                let product =
+                    ntt32::mul_mod(lhs.coeffs[limb][i], rhs.coeffs[limb][i], &ring.ch[limb]);
+                self.coeffs[limb][i] =
+                    ntt32::add_mod(self.coeffs[limb][i], product, ring.ch[limb].q);
             }
         }
+    }
+
+    pub fn to_centered_coeffs(&self) -> [i64; N] {
+        KahePoly::from(self).coeffs
     }
 }
 
 pub fn pointwise_dot_kahe(a: &[KaheNTTPoly], b: &[KaheNTTPoly]) -> KaheNTTPoly {
     debug_assert_eq!(a.len(), b.len());
     let mut result = KaheNTTPoly::default();
-    #[cfg(not(feature = "rns"))]
-    {
-        let a: Vec<_> = a.iter().map(|poly| &poly.coeffs).collect();
-        let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
-        ntt64::pointwise_mac(kahe_ring64(), &mut result.coeffs, &a, &b);
-    }
-    #[cfg(feature = "rns")]
-    {
-        let a: Vec<_> = a.iter().map(|poly| &poly.coeffs).collect();
-        let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
-        kahe_rns().pointwise_mac(&mut result.coeffs, &a, &b);
-    }
+    let a: Vec<_> = a.iter().map(|poly| &poly.coeffs).collect();
+    let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
+    kahe_rns().pointwise_mac(&mut result.coeffs, &a, &b);
     result
 }
 
@@ -622,9 +614,6 @@ impl CsPoly {
     }
 }
 
-#[cfg(not(feature = "rns"))]
-type CsNTTCoeffs = [u64; N];
-#[cfg(feature = "rns")]
 type CsNTTCoeffs = Residues<N, 2>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -634,40 +623,21 @@ pub struct CsNTTPoly {
 
 impl Default for CsNTTPoly {
     fn default() -> Self {
-        #[cfg(not(feature = "rns"))]
-        let coeffs = [0u64; N];
-        #[cfg(feature = "rns")]
-        let coeffs = [[0u32; N]; 2];
-        Self { coeffs }
+        Self {
+            coeffs: [[0u32; N]; 2],
+        }
     }
 }
 
 impl From<&CsPoly> for CsNTTPoly {
     fn from(poly: &CsPoly) -> Self {
-        #[cfg(not(feature = "rns"))]
-        {
-            let mut coeffs = [0u64; N];
-            for (output, &input) in coeffs.iter_mut().zip(&poly.coeffs) {
-                let centered = arithmetic::normalize_i32(input, CS_MODULUS) as i64;
-                *output = if centered < 0 {
-                    (CS_AUX_MODULUS as i64 + centered) as u64
-                } else {
-                    centered as u64
-                };
-            }
-            ntt64::ntt(cs_aux_ring64(), &mut coeffs);
-            Self { coeffs }
-        }
-        #[cfg(feature = "rns")]
-        {
-            let ring = cs_aux_rns();
-            let mut coeffs = boxed_residues();
-            let mut centered = poly.coeffs;
-            arithmetic::normalize_assign_i32(&mut centered, CS_MODULUS);
-            ring.reduce_centered_i32_into(&centered, &mut coeffs);
-            ring.forward(&mut coeffs);
-            Self { coeffs: *coeffs }
-        }
+        let ring = cs_aux_rns();
+        let mut coeffs = boxed_residues();
+        let mut centered = poly.coeffs;
+        arithmetic::normalize_assign_i32(&mut centered, CS_MODULUS);
+        ring.reduce_centered_i32_into(&centered, &mut coeffs);
+        ring.forward(&mut coeffs);
+        Self { coeffs: *coeffs }
     }
 }
 
@@ -679,13 +649,6 @@ impl From<CsPoly> for CsNTTPoly {
 
 impl From<&CsNTTPoly> for CsPoly {
     fn from(poly: &CsNTTPoly) -> Self {
-        #[cfg(not(feature = "rns"))]
-        let exact: [i64; N] = {
-            let mut coeffs = poly.coeffs;
-            ntt64::inv_ntt(cs_aux_ring64(), &mut coeffs);
-            coeffs.map(|value| center_canonical_i64(value as i64, CS_AUX_MODULUS as i64))
-        };
-        #[cfg(feature = "rns")]
         let exact: [i64; N] = {
             let ring = cs_aux_rns();
             let mut coeffs = boxed_residues();
@@ -722,9 +685,6 @@ impl std::ops::Add for CsNTTPoly {
 
 impl std::ops::AddAssign for CsNTTPoly {
     fn add_assign(&mut self, other: Self) {
-        #[cfg(not(feature = "rns"))]
-        ntt64::add_assign(cs_aux_ring64(), &mut self.coeffs, &other.coeffs);
-        #[cfg(feature = "rns")]
         cs_aux_rns().add_assign(&mut self.coeffs, &other.coeffs);
     }
 }
@@ -733,9 +693,6 @@ impl std::ops::Sub for CsNTTPoly {
     type Output = Self;
 
     fn sub(mut self, other: Self) -> Self {
-        #[cfg(not(feature = "rns"))]
-        ntt64::sub_assign(cs_aux_ring64(), &mut self.coeffs, &other.coeffs);
-        #[cfg(feature = "rns")]
         cs_aux_rns().sub_assign(&mut self.coeffs, &other.coeffs);
         self
     }
@@ -745,9 +702,6 @@ impl std::ops::Mul for CsNTTPoly {
     type Output = Self;
 
     fn mul(self, other: Self) -> Self {
-        #[cfg(not(feature = "rns"))]
-        let coeffs = ntt64::pointwise_mul(cs_aux_ring64(), &self.coeffs, &other.coeffs);
-        #[cfg(feature = "rns")]
         let coeffs = cs_aux_rns().pointwise_mul(&self.coeffs, &other.coeffs);
         Self { coeffs }
     }
@@ -756,111 +710,18 @@ impl std::ops::Mul for CsNTTPoly {
 pub fn pointwise_dot_cs(a: &[CsNTTPoly], b: &[CsNTTPoly]) -> CsNTTPoly {
     debug_assert_eq!(a.len(), b.len());
     let mut result = CsNTTPoly::default();
-    #[cfg(not(feature = "rns"))]
-    {
-        let a: Vec<_> = a.iter().map(|poly| &poly.coeffs).collect();
-        let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
-        ntt64::pointwise_mac(cs_aux_ring64(), &mut result.coeffs, &a, &b);
-    }
-    #[cfg(feature = "rns")]
-    {
-        let a: Vec<_> = a.iter().map(|poly| &poly.coeffs).collect();
-        let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
-        cs_aux_rns().pointwise_mac(&mut result.coeffs, &a, &b);
-    }
-    result
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DgtNTTPoly {
-    coeffs: [u64; N],
-}
-
-impl Default for DgtNTTPoly {
-    fn default() -> Self {
-        Self { coeffs: [0; N] }
-    }
-}
-
-impl DgtNTTPoly {
-    pub fn rand_ntt_poly<R: Rng>(rng: &mut R) -> Self {
-        let threshold = (((1u128 << 64) / DGT_MODULUS as u128) * DGT_MODULUS as u128) as u64;
-        Self {
-            coeffs: core::array::from_fn(|_| {
-                let mut value = rng.next_u64();
-                while value >= threshold {
-                    value = rng.next_u64();
-                }
-                value % DGT_MODULUS
-            }),
-        }
-    }
-
-    pub fn from_kahe(poly: &KahePoly) -> Self {
-        let mut coeffs = [0u64; N];
-        for (output, &input) in coeffs.iter_mut().zip(poly.coeffs()) {
-            let centered = normalize64(input, KAHE_MODULUS);
-            *output = if centered < 0 {
-                (DGT_MODULUS as i64 + centered) as u64
-            } else {
-                centered as u64
-            };
-        }
-        ntt64::ntt(dgt_ring64(), &mut coeffs);
-        Self { coeffs }
-    }
-
-    pub fn to_centered_coeffs(&self) -> [i64; N] {
-        let mut coeffs = self.coeffs;
-        ntt64::inv_ntt(dgt_ring64(), &mut coeffs);
-        coeffs.map(|value| center_canonical_i64(value as i64, DGT_MODULUS as i64))
-    }
-
-    pub fn coeffs(&self) -> &[u64; N] {
-        &self.coeffs
-    }
-
-    pub fn from_raw(coeffs: &[u64; N]) -> Self {
-        Self {
-            coeffs: coeffs.map(|value| value % DGT_MODULUS),
-        }
-    }
-}
-
-impl std::ops::Add for DgtNTTPoly {
-    type Output = Self;
-
-    fn add(mut self, other: Self) -> Self {
-        self += other;
-        self
-    }
-}
-
-impl std::ops::AddAssign for DgtNTTPoly {
-    fn add_assign(&mut self, other: Self) {
-        ntt64::add_assign(dgt_ring64(), &mut self.coeffs, &other.coeffs);
-    }
-}
-
-impl std::ops::Sub for DgtNTTPoly {
-    type Output = Self;
-
-    fn sub(mut self, other: Self) -> Self {
-        ntt64::sub_assign(dgt_ring64(), &mut self.coeffs, &other.coeffs);
-        self
-    }
-}
-
-pub fn pointwise_dot_dgt(a: &[DgtNTTPoly], b: &[DgtNTTPoly]) -> DgtNTTPoly {
-    debug_assert_eq!(a.len(), b.len());
-    let mut result = DgtNTTPoly::default();
     let a: Vec<_> = a.iter().map(|poly| &poly.coeffs).collect();
     let b: Vec<_> = b.iter().map(|poly| &poly.coeffs).collect();
-    ntt64::pointwise_mac(dgt_ring64(), &mut result.coeffs, &a, &b);
+    cs_aux_rns().pointwise_mac(&mut result.coeffs, &a, &b);
     result
 }
+pub type RsNTTPoly = KaheNTTPoly;
 
-#[cfg(all(test, feature = "rns"))]
+pub fn pointwise_dot_rs(a: &[RsNTTPoly], b: &[RsNTTPoly]) -> RsNTTPoly {
+    pointwise_dot_kahe(a, b)
+}
+
+#[cfg(test)]
 mod rns_conversion_tests {
     use super::*;
 
