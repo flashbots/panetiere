@@ -191,6 +191,26 @@ pub fn run_client_round_rs<R: CryptoRng + Rng>(
                                       //   rs_shares, share_paths }
 ```
 
+The expensive message-independent work can run ahead using the ordinary APIs.
+Build the next round with an all-zero plaintext, then consume it once the
+message arrives:
+
+```rust
+let zero = run_client_round(
+    &mut rng, &pp, &next_session, client_id, zero_message(&pp), &servers,
+);
+// ... later ...
+let round = zero.with_message(&message);
+```
+
+This moves key generation, zero encryption, Shamir sharing, the key-share
+commitment, and sealed openings out of the message-critical path. `with_message`
+consumes the zero round so it cannot be reused accidentally. In RS mode the same
+pattern is available as
+`zero.with_message(&pp, &next_session, &message, &signing_key)`; RS encoding of
+the zero ciphertext is reused, while the final share commitment and signature
+are rebuilt because they bind the message-dependent shares.
+
 Publish `encrypted_message` / `bulletin`; send `sealed_openings[i]` to server
 `i` over any channel (already CCA2-sealed and context-bound); with erasure
 coding, send `(rs_shares[j], share_paths[j])` to lane `j` — the path is that

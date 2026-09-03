@@ -126,6 +126,71 @@ fn reduce_centered_mod_t(poly: KahePoly, t: u64) -> KahePoly {
     KahePoly::from_coeffs(coeffs)
 }
 
+#[test]
+fn zero_round_accepts_message_after_offline_work() {
+    let mut rng = ChaCha20Rng::from_seed([0x39; 32]);
+    let pp = ProtocolParams::setup(&mut rng, 4);
+    let server_keys: Vec<_> = (0..4)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<_> = server_keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| (ServerId(i as u32), key.public()))
+        .collect();
+    let message = rand_message_poly(&mut rng, pp.kahe.t_modulus);
+    let mut direct_rng = rng.clone();
+    let direct = run_client_round(
+        &mut direct_rng,
+        &pp,
+        &SESSION,
+        ClientId(0),
+        vec![message],
+        &servers,
+    );
+    let round = run_client_round(
+        &mut rng,
+        &pp,
+        &SESSION,
+        ClientId(0),
+        vec![KahePoly::default()],
+        &servers,
+    )
+    .with_message(&[message]);
+    assert_eq!(round.encrypted_message.ctxt, direct.encrypted_message.ctxt);
+    assert_eq!(
+        round.encrypted_message.comm.to_bytes(),
+        direct.encrypted_message.comm.to_bytes(),
+    );
+    assert_eq!(round.sealed_openings, direct.sealed_openings);
+    let mut outputs = Vec::new();
+    for (i, (server_id, sealed)) in round.sealed_openings.iter().enumerate() {
+        let opening =
+            unseal_opening(&server_keys[i], &SESSION, ClientId(0), *server_id, sealed).unwrap();
+        outputs.push(
+            run_server_round(
+                &ServerInbox {
+                    server_id: *server_id,
+                    items: vec![(ClientId(0), opening)],
+                },
+                &[ClientId(0)],
+            )
+            .unwrap(),
+        );
+    }
+    let recovered = aggregate_and_decrypt(
+        &pp,
+        &[ClientId(0)],
+        &[(ClientId(0), round.encrypted_message)],
+        &outputs,
+    )
+    .unwrap();
+    assert_eq!(
+        recovered,
+        vec![reduce_centered_mod_t(message, pp.kahe.t_modulus)]
+    );
+}
+
 fn run<R: rand::Rng + rand::CryptoRng>(
     rng: &mut R,
     n_servers: usize,

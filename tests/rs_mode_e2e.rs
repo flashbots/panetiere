@@ -61,7 +61,20 @@ impl Round {
         for (i, m) in payloads.into_iter().enumerate() {
             let cid = ClientId(i as u32);
             let sk = SigningKey::generate(&mut rng);
-            let r = run_client_round_rs(&mut rng, &pp, &SESSION, cid, m, &servers, &sk);
+            let r = if i == 0 {
+                run_client_round_rs(
+                    &mut rng,
+                    &pp,
+                    &SESSION,
+                    cid,
+                    vec![KahePoly::default(); m.len()],
+                    &servers,
+                    &sk,
+                )
+                .with_message(&pp, &SESSION, &m, &sk)
+            } else {
+                run_client_round_rs(&mut rng, &pp, &SESSION, cid, m, &servers, &sk)
+            };
             entries.push((cid, r.bulletin.clone()));
             rounds.push(r);
         }
