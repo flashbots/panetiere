@@ -98,17 +98,33 @@ pub fn cs_commit<R: Rng>(
     HidingMerkleCommitment::commit(rng, &pp.cs, &as_vectors)
 }
 
-/// Output of a single client round
 pub struct ClientRound {
-    pub client_id: ClientId,
-    pub encrypted_message: ClientBulletinEntry,
-    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
+    client_id: ClientId,
+    encrypted_message: ClientBulletinEntry,
+    sealed_openings: Vec<(ServerId, Vec<u8>)>,
 }
 
 impl ClientRound {
-    /// Turn a completed encryption of the all-zero plaintext into an encryption
-    /// of `message`. Key sharing, commitment, and sealing stay unchanged.
-    pub fn with_message(mut self, message: &[KahePoly]) -> Self {
+    pub fn new<R: CryptoRng + Rng>(
+        rng: &mut R,
+        pp: &ProtocolParams,
+        sid: &SessionId,
+        client_id: ClientId,
+        servers: &[(ServerId, pke::PublicKey)],
+    ) -> Self {
+        let key = kahe_keygen(rng, pp);
+        let ctxt = kahe_encrypt(rng, pp, &key, &super::zero_message(pp));
+        let shares_per_server = shamir_share(rng, pp, &key);
+        let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
+        let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
+        Self {
+            client_id,
+            encrypted_message: ClientBulletinEntry { ctxt, comm },
+            sealed_openings,
+        }
+    }
+
+    pub fn finalize(mut self, message: &[KahePoly]) -> ClientRoundOutput {
         assert_eq!(
             self.encrypted_message.ctxt.len(),
             message.len(),
@@ -119,8 +135,19 @@ impl ClientRound {
             .par_iter_mut()
             .zip(message.par_iter())
             .for_each(|(ciphertext, message)| *ciphertext += *message);
-        self
+        ClientRoundOutput {
+            client_id: self.client_id,
+            encrypted_message: self.encrypted_message,
+            sealed_openings: self.sealed_openings,
+        }
     }
+}
+
+/// Output of a single client round.
+pub struct ClientRoundOutput {
+    pub client_id: ClientId,
+    pub encrypted_message: ClientBulletinEntry,
+    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
 }
 
 pub fn run_client_round<R: CryptoRng + Rng>(
@@ -130,39 +157,47 @@ pub fn run_client_round<R: CryptoRng + Rng>(
     client_id: ClientId,
     message: <Kahe as KaheScheme>::Message,
     servers: &[(ServerId, pke::PublicKey)],
-) -> ClientRound {
-    let key = kahe_keygen(rng, pp);
-    let ctxt = kahe_encrypt(rng, pp, &key, &message);
-    let shares_per_server = shamir_share(rng, pp, &key);
-    let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
-    let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
-    ClientRound {
-        client_id,
-        encrypted_message: ClientBulletinEntry { ctxt, comm },
-        sealed_openings,
-    }
+) -> ClientRoundOutput {
+    ClientRound::new(rng, pp, sid, client_id, servers).finalize(&message)
 }
 
-/// Output of one RS-mode client round.
 pub struct RsClientRound {
-    pub client_id: ClientId,
-    pub bulletin: RsClientBulletinEntry,
-    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
-    pub rs_shares: Vec<Share>,
-    /// Index-aligned with `rs_shares`: lane `j` receives `(rs_shares[j], share_paths[j])`.
-    pub share_paths: Vec<SharePath>,
+    client_id: ClientId,
+    comm: Commitment,
+    sealed_openings: Vec<(ServerId, Vec<u8>)>,
+    rs_shares: Vec<Share>,
 }
 
 impl RsClientRound {
-    /// Add `message` to a completed all-zero RS round, then rebuild and sign the
-    /// share commitment that binds the resulting shares.
-    pub fn with_message(
+    pub fn new<R: CryptoRng + Rng>(
+        rng: &mut R,
+        pp: &ProtocolParams,
+        sid: &SessionId,
+        client_id: ClientId,
+        servers: &[(ServerId, pke::PublicKey)],
+    ) -> Self {
+        let rs = pp.rs.as_ref().expect("RS mode params");
+        let key = kahe_keygen(rng, pp);
+        let embedded = Kahe::enc_ntt(rng, &pp.kahe, &key, &super::zero_message(pp));
+        let rs_shares = Rs::encode(rs, &embedded);
+        let shares_per_server = shamir_share(rng, pp, &key);
+        let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
+        let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
+        Self {
+            client_id,
+            comm,
+            sealed_openings,
+            rs_shares,
+        }
+    }
+
+    pub fn finalize(
         mut self,
         pp: &ProtocolParams,
         sid: &SessionId,
         message: &[KahePoly],
         signing_key: &SigningKey,
-    ) -> Self {
+    ) -> RsClientRoundOutput {
         let rs = pp.rs.as_ref().expect("RS mode params");
         let scp = pp.share_comm.as_ref().expect("share-commitment params");
         assert_eq!(
@@ -187,18 +222,32 @@ impl RsClientRound {
         let sig = signing_key.sign(&RsClientBulletinEntry::signing_bytes(
             sid,
             self.client_id,
-            &self.bulletin.comm,
+            &self.comm,
             &share_root,
         ));
-        self.bulletin = RsClientBulletinEntry {
-            comm: self.bulletin.comm,
-            share_root,
-            pubkey: signing_key.verifying_key().to_sec1_bytes(),
-            sig,
-        };
-        self.share_paths = share_paths;
-        self
+        RsClientRoundOutput {
+            client_id: self.client_id,
+            bulletin: RsClientBulletinEntry {
+                comm: self.comm,
+                share_root,
+                pubkey: signing_key.verifying_key().to_sec1_bytes(),
+                sig,
+            },
+            sealed_openings: self.sealed_openings,
+            rs_shares: self.rs_shares,
+            share_paths,
+        }
     }
+}
+
+/// Output of one RS-mode client round.
+pub struct RsClientRoundOutput {
+    pub client_id: ClientId,
+    pub bulletin: RsClientBulletinEntry,
+    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
+    pub rs_shares: Vec<Share>,
+    /// Index-aligned with `rs_shares`: lane `j` receives `(rs_shares[j], share_paths[j])`.
+    pub share_paths: Vec<SharePath>,
 }
 
 /// RS-sharded ingress round.
@@ -210,32 +259,6 @@ pub fn run_client_round_rs<R: CryptoRng + Rng>(
     message: <Kahe as KaheScheme>::Message,
     servers: &[(ServerId, pke::PublicKey)],
     signing_key: &SigningKey,
-) -> RsClientRound {
-    let rs = pp.rs.as_ref().expect("RS mode params");
-    let scp = pp.share_comm.as_ref().expect("share-commitment params");
-    let key = kahe_keygen(rng, pp);
-    let embedded = Kahe::enc_ntt(rng, &pp.kahe, &key, &message);
-    let rs_shares = Rs::encode(rs, &embedded);
-    let (share_root, share_paths) = commit_shares(scp, &rs_shares);
-    let shares_per_server = shamir_share(rng, pp, &key);
-    let (comm, openings) = cs_commit(rng, pp, &shares_per_server);
-    let sealed_openings = seal_openings(rng, pp, sid, client_id, &openings, servers);
-    let sig = signing_key.sign(&RsClientBulletinEntry::signing_bytes(
-        sid,
-        client_id,
-        &comm,
-        &share_root,
-    ));
-    RsClientRound {
-        client_id,
-        bulletin: RsClientBulletinEntry {
-            comm,
-            share_root,
-            pubkey: signing_key.verifying_key().to_sec1_bytes(),
-            sig,
-        },
-        sealed_openings,
-        rs_shares,
-        share_paths,
-    }
+) -> RsClientRoundOutput {
+    RsClientRound::new(rng, pp, sid, client_id, servers).finalize(pp, sid, &message, signing_key)
 }

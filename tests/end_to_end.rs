@@ -2,7 +2,7 @@
 
 use panetiere::codec;
 use panetiere::pke;
-use panetiere::protocol::client::run_client_round;
+use panetiere::protocol::client::{run_client_round, ClientRound};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::aggregate_and_decrypt;
 use panetiere::protocol::ProtocolParams;
@@ -148,15 +148,8 @@ fn zero_round_accepts_message_after_offline_work() {
         vec![message],
         &servers,
     );
-    let round = run_client_round(
-        &mut rng,
-        &pp,
-        &SESSION,
-        ClientId(0),
-        vec![KahePoly::default()],
-        &servers,
-    )
-    .with_message(&[message]);
+    let round =
+        ClientRound::new(&mut rng, &pp, &SESSION, ClientId(0), &servers).finalize(&[message]);
     assert_eq!(round.encrypted_message.ctxt, direct.encrypted_message.ctxt);
     assert_eq!(
         round.encrypted_message.comm.to_bytes(),

@@ -181,35 +181,34 @@ carry a per-coefficient length header that multiplies under summation.
 pub fn run_client_round<R: CryptoRng + Rng>(
     rng: &mut R, pp: &ProtocolParams, sid: &SessionId, client_id: ClientId,
     message: Vec<KahePoly>, servers: &[(ServerId, pke::PublicKey)],
-) -> ClientRound;                     // { client_id, encrypted_message, sealed_openings }
+) -> ClientRoundOutput;               // { client_id, encrypted_message, sealed_openings }
 
 pub fn run_client_round_rs<R: CryptoRng + Rng>(
     rng: &mut R, pp: &ProtocolParams, sid: &SessionId, client_id: ClientId,
     message: Vec<KahePoly>, servers: &[(ServerId, pke::PublicKey)],
     signing_key: &SigningKey,
-) -> RsClientRound;                   // { client_id, bulletin, sealed_openings,
+) -> RsClientRoundOutput;             // { client_id, bulletin, sealed_openings,
                                       //   rs_shares, share_paths }
+
+ClientRound::new(...).finalize(&message) -> ClientRoundOutput;
+RsClientRound::new(...).finalize(pp, sid, &message, signing_key) -> RsClientRoundOutput;
 ```
 
-The expensive message-independent work can run ahead using the ordinary APIs.
-Build the next round with an all-zero plaintext, then consume it once the
-message arrives:
+The expensive message-independent work can run ahead using opaque client rounds:
 
 ```rust
-let zero = run_client_round(
-    &mut rng, &pp, &next_session, client_id, zero_message(&pp), &servers,
-);
-// ... later ...
-let round = zero.with_message(&message);
+let round = ClientRound::new(&mut rng, &pp, &next_session, client_id, &servers);
+// At the fixed emission point, for both real and cover traffic:
+let output = round.finalize(&message);
 ```
 
 This moves key generation, zero encryption, Shamir sharing, the key-share
-commitment, and sealed openings out of the message-critical path. `with_message`
-consumes the zero round so it cannot be reused accidentally. In RS mode the same
-pattern is available as
-`zero.with_message(&pp, &next_session, &message, &signing_key)`; RS encoding of
+commitment, and sealed openings out of the message-critical path. `ClientRound`
+exposes no publishable fields; `finalize` consumes it and must run at the
+same scheduled point for real messages and `zero_message(pp)` covers. In RS mode
+use `round.finalize(&pp, &next_session, &message, &signing_key)`; RS encoding of
 the zero ciphertext is reused, while the final share commitment and signature
-are rebuilt because they bind the message-dependent shares.
+are built after the message because they bind the message-dependent shares.
 
 Publish `encrypted_message` / `bulletin`; send `sealed_openings[i]` to server
 `i` over any channel (already CCA2-sealed and context-bound); with erasure

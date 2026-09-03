@@ -6,7 +6,7 @@ use chipmunk_code::HVCPoly;
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
-use panetiere::protocol::client::{run_client_round_rs, RsClientRound};
+use panetiere::protocol::client::{run_client_round_rs, RsClientRound, RsClientRoundOutput};
 use panetiere::protocol::server::{
     run_rs_node_round, run_server_round, unseal_opening, RsNodeInbox, ServerInbox, ServerRoundError,
 };
@@ -32,7 +32,7 @@ struct Round {
     pp: ProtocolParams,
     canonical: Vec<ClientId>,
     entries: Vec<(ClientId, RsClientBulletinEntry)>,
-    rounds: Vec<RsClientRound>,
+    rounds: Vec<RsClientRoundOutput>,
     server_keys: Vec<pke::PrivateKey>,
 }
 
@@ -62,16 +62,8 @@ impl Round {
             let cid = ClientId(i as u32);
             let sk = SigningKey::generate(&mut rng);
             let r = if i == 0 {
-                run_client_round_rs(
-                    &mut rng,
-                    &pp,
-                    &SESSION,
-                    cid,
-                    vec![KahePoly::default(); m.len()],
-                    &servers,
-                    &sk,
-                )
-                .with_message(&pp, &SESSION, &m, &sk)
+                RsClientRound::new(&mut rng, &pp, &SESSION, cid, &servers)
+                    .finalize(&pp, &SESSION, &m, &sk)
             } else {
                 run_client_round_rs(&mut rng, &pp, &SESSION, cid, m, &servers, &sk)
             };
@@ -478,7 +470,7 @@ fn the_lane_pays_for_attribution_only_on_failure() {
     let servers: Vec<(ServerId, pke::PublicKey)> = (0..S)
         .map(|i| (ServerId(i as u32), keys[i].public()))
         .collect();
-    let rounds: Vec<RsClientRound> = (0..4u32)
+    let rounds: Vec<RsClientRoundOutput> = (0..4u32)
         .map(|i| {
             let sk = SigningKey::generate(&mut rng);
             let msg = vec![KahePoly::default(); tight.kahe.mu_kahe];
