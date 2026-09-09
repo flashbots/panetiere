@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", branch = "main", default-features = false, features = ["fast-ntt"] }
+chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", rev = "dd5e8287c9072547368bc1140e04e978d9984c7a", default-features = false }
 negacyclic-rings = { git = "https://github.com/Ruteri/negacyclic-rings", branch = "main" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ml-kem = "0.3"
