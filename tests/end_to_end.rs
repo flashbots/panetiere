@@ -4,7 +4,7 @@ use panetiere::codec;
 use panetiere::pke;
 use panetiere::protocol::client::{run_client_round, ClientRound};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::{CsPoly, KahePoly, N};
@@ -74,7 +74,7 @@ fn run_full_round_bytes(
         .iter()
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
-    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+    let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
         .expect("verify failed");
 
     (ctxts, comm_bytes, sealed_all, recovered)
@@ -127,7 +127,7 @@ fn reduce_centered_mod_t(poly: KahePoly, t: u64) -> KahePoly {
 }
 
 #[test]
-fn zero_round_accepts_message_after_offline_work() {
+fn client_round_accepts_message_after_offline_work() {
     let mut rng = ChaCha20Rng::from_seed([0x39; 32]);
     let pp = ProtocolParams::setup(&mut rng, 4);
     let server_keys: Vec<_> = (0..4)
@@ -171,7 +171,7 @@ fn zero_round_accepts_message_after_offline_work() {
             .unwrap(),
         );
     }
-    let recovered = aggregate_and_decrypt(
+    let recovered = aggregate_and_decrypt_unverified(
         &pp,
         &[ClientId(0)],
         &[(ClientId(0), round.encrypted_message)],
@@ -230,7 +230,7 @@ fn run<R: rand::Rng + rand::CryptoRng>(
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+    let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
         .expect("verify failed");
     assert_eq!(recovered.len(), pp.kahe.mu_kahe);
 
@@ -316,7 +316,7 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         .collect();
 
     let recovered =
-        aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).expect("verify failed");
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs).expect("verify failed");
     let recovered_bytes = codec::decode_raw(&recovered).expect("decode");
     assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
 
@@ -413,7 +413,7 @@ fn slot_mode_8kb_message_multi_poly() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
+        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", poly_idx, e));
         assert_eq!(recovered.len(), 1);
         recovered_polys.push(recovered[0]);
@@ -442,13 +442,13 @@ fn end_to_end_recovers_sum() {
 
 /// Aggregated flow recovers the same sum as the direct flow: clients' public
 /// ciphertexts/commitments are summed per group, re-summed across groups, and
-/// fed to `decrypt_aggregate` — openings still go to every server as usual.
+/// fed to `decrypt_unverified_aggregate` — openings still go to every server as usual.
 #[test]
 fn aggregated_recovers_same_sum() {
     use panetiere::cs::{Cs, HidingMerkleCommitment};
     use panetiere::kahe::{Kahe, KaheScheme};
     use panetiere::protocol::aggregator::run_aggregator_round;
-    use panetiere::protocol::verify::decrypt_aggregate;
+    use panetiere::protocol::verify::decrypt_unverified_aggregate;
 
     let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
     let n_servers = 4;
@@ -493,7 +493,7 @@ fn aggregated_recovers_same_sum() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let direct = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+    let direct = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
         .expect("direct verify failed");
 
     // Partition clients into groups; each aggregator sums its group's publics.
@@ -515,7 +515,7 @@ fn aggregated_recovers_same_sum() {
     let total_ctxt = Kahe::agg_ctxt(&group_ctxts);
     let total_comm = HidingMerkleCommitment::sum_commitments(&group_comms);
 
-    let aggregated = decrypt_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
+    let aggregated = decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
         .expect("aggregated verify failed");
 
     assert_eq!(direct, aggregated);
@@ -605,7 +605,7 @@ fn tampered_agg_share_rejected() {
         .collect();
 
     server_outputs[0].agg_share += CsPoly::rand_poly(&mut rng);
-    let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
+    let result = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
         Err(panetiere::protocol::verify::VerifyError::ShareOpeningMismatch(_))
@@ -616,7 +616,7 @@ fn tampered_agg_share_rejected() {
 fn below_floor_anonymity_set_rejected() {
     use panetiere::cs::{Cs, HidingMerkleCommitment};
     use panetiere::kahe::{Kahe, KaheScheme};
-    use panetiere::protocol::verify::{decrypt_aggregate, VerifyError};
+    use panetiere::protocol::verify::{decrypt_unverified_aggregate, VerifyError};
 
     let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
     let n_servers = 4;
@@ -658,7 +658,7 @@ fn below_floor_anonymity_set_rejected() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
+    let result = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert_eq!(
         result,
         Err(VerifyError::AnonymitySetTooSmall {
@@ -671,7 +671,7 @@ fn below_floor_anonymity_set_rejected() {
     let comms: Vec<_> = client_entries.iter().map(|(_, e)| e.comm.clone()).collect();
     let total_ctxt = Kahe::agg_ctxt(&ctxts);
     let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
-    let result = decrypt_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs);
+    let result = decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs);
     assert_eq!(
         result,
         Err(VerifyError::AnonymitySetTooSmall {
@@ -681,9 +681,9 @@ fn below_floor_anonymity_set_rejected() {
     );
 
     pp.min_clients = n_clients;
-    aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs)
+    aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
         .expect("at-floor set must verify");
-    decrypt_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
+    decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
         .expect("at-floor set must verify");
 }
 
@@ -731,7 +731,7 @@ fn high_norm_r_rejected_in_protocol() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let result = aggregate_and_decrypt(&pp, &canonical, &client_entries, &server_outputs);
+    let result = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
         Err(panetiere::protocol::verify::VerifyError::InvalidServerOpening(_))
@@ -809,7 +809,7 @@ fn recovers_from_t_of_n_servers() {
         &[2, 3, 4],
     ] {
         let subset: Vec<_> = chosen.iter().map(|&i| outputs[i].clone()).collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &subset)
+        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &subset)
             .expect("verify failed");
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0], expected, "subset {:?}", chosen);

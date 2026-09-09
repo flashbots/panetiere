@@ -132,6 +132,8 @@ impl MseEncoding {
         row * self.params.delta + col
     }
 
+    /// May be called repeatedly; one item per client is enforced by client code,
+    /// not by this multiset encoding.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i64]) {
         let r_space = self.params.r_space();
         let r: u128 = rng.gen::<u128>() % r_space;

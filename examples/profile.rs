@@ -21,7 +21,7 @@
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::KahePoly;
@@ -115,7 +115,7 @@ fn main() {
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
         let _recovered =
-            aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs).expect("verify");
+            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs).expect("verify");
         if iter == 0 {
             eprintln!("profile: first iteration completed");
         }

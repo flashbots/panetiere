@@ -235,6 +235,10 @@ pub fn decode_messages(
         .collect())
 }
 
+/// `expect` optionally checks the total decoded item count, not items per client.
+/// Leave it `None` when the active-sender count is unknown (e.g. with cover traffic).
+/// MSE residual and Prony slack checks test decoding consistency, not per-client
+/// input validity or payload authenticity.
 pub fn decode_symbols(
     p: &ChannelParams,
     plaintext: &[KahePoly],

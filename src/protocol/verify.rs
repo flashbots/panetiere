@@ -23,6 +23,7 @@ use super::{ClientId, NodeId, ServerId, SessionId};
 #[derive(Debug, PartialEq)]
 pub enum VerifyError {
     MissingClient(ClientId),
+    DuplicateClient(ClientId),
     InvalidServerOpening(usize),
     ShareOpeningMismatch(usize),
     NoServers,
@@ -32,6 +33,10 @@ pub enum VerifyError {
     AnonymitySetTooSmall {
         got: usize,
         min: usize,
+    },
+    TooManyClients {
+        got: usize,
+        max: usize,
     },
     ShareRecovery(SssError),
     /// RS mode only.
@@ -72,6 +77,8 @@ fn verify_one_server(
     Ok(())
 }
 
+// Valid openings do not prove degree consistency. With inconsistent client
+// shares, the first t reports can recover a different key than another subset.
 fn recover_agg_key(
     pp: &ProtocolParams,
     server_outputs: &[ServerBulletinEntry],
@@ -86,11 +93,27 @@ fn recover_agg_key(
     Ok(lift_cs_to_kahe(&recovered_cs))
 }
 
-pub(super) fn check_anonymity_floor(
+fn check_unique_clients(clients: &[ClientId]) -> Result<(), VerifyError> {
+    let mut seen = HashSet::with_capacity(clients.len());
+    for &cid in clients {
+        if !seen.insert(cid) {
+            return Err(VerifyError::DuplicateClient(cid));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn check_client_count(
     pp: &ProtocolParams,
     clients: &[ClientId],
 ) -> Result<(), VerifyError> {
     let got = clients.iter().collect::<HashSet<_>>().len();
+    if got > pp.max_clients {
+        return Err(VerifyError::TooManyClients {
+            got,
+            max: pp.max_clients,
+        });
+    }
     if got < pp.min_clients {
         return Err(VerifyError::AnonymitySetTooSmall {
             got,
@@ -100,16 +123,16 @@ pub(super) fn check_anonymity_floor(
     Ok(())
 }
 
-pub fn aggregate_and_decrypt(
+pub fn aggregate_and_decrypt_unverified(
     pp: &ProtocolParams,
     canonical: &[ClientId],
     client_entries: &[(ClientId, ClientBulletinEntry)],
     server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
-    aggregate_and_decrypt_timed(pp, canonical, client_entries, server_outputs).map(|(m, _)| m)
+    aggregate_and_decrypt_unverified_timed(pp, canonical, client_entries, server_outputs).map(|(m, _)| m)
 }
 
-pub fn aggregate_and_decrypt_timed(
+pub fn aggregate_and_decrypt_unverified_timed(
     pp: &ProtocolParams,
     canonical: &[ClientId],
     client_entries: &[(ClientId, ClientBulletinEntry)],
@@ -118,7 +141,8 @@ pub fn aggregate_and_decrypt_timed(
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
-    check_anonymity_floor(pp, canonical)?;
+    check_unique_clients(canonical)?;
+    check_client_count(pp, canonical)?;
     // A ciphertext may be shorter than μ; all clients must agree on the exact
     // length, since agg_ctxt sums positionally.
     let max_ctxt_len = pp.kahe.mu_kahe;
@@ -228,7 +252,8 @@ pub fn aggregate_and_decrypt_rs(
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
-    check_anonymity_floor(pp, canonical)?;
+    check_unique_clients(canonical)?;
+    check_client_count(pp, canonical)?;
     if server_outputs.len() < pp.shamir.t {
         return Err(VerifyError::BadServerCoverage);
     }
@@ -345,8 +370,8 @@ pub fn aggregate_and_decrypt_rs(
     tt.reconstruct_us = now.elapsed().as_secs_f64() * 1e6;
 
     let now = Instant::now();
-    // Any reporting lane whose post disagrees with the reconstructed
-    // codeword's re-encoding lied.
+    // Check reporting lanes against the re-encoded reconstruction. Exactly k
+    // lanes provide no independent lane redundancy; unreported lanes are unchecked.
     let expected = Rs::encode(rs, &summed_ntt);
     let liars: Vec<NodeId> = node_outputs
         .iter()
@@ -367,7 +392,7 @@ pub fn aggregate_and_decrypt_rs(
 
 /// Aggregated-flow verifier: ciphertext and commitment are already summed over
 /// the whole client set, so there is no per-client `canonical` to cross-check.
-pub fn decrypt_aggregate(
+pub fn decrypt_unverified_aggregate(
     pp: &ProtocolParams,
     summed_ctxt: &[KahePoly],
     summed_comm: &Commitment,
@@ -399,7 +424,8 @@ pub fn decrypt_aggregate(
             return Err(VerifyError::InconsistentCanonical(sp.server_id));
         }
     }
-    check_anonymity_floor(pp, &server_outputs[0].clients)?;
+    check_unique_clients(&server_outputs[0].clients)?;
+    check_client_count(pp, &server_outputs[0].clients)?;
 
     let results: Vec<Result<(), VerifyError>> = server_outputs
         .par_iter()

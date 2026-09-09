@@ -7,6 +7,13 @@ encoding turns that sum back into the individual messages. Not audited — do no
 
 This file is the integration guide: architecture, roles, and the call sequence.
 
+Direct mode requires authenticated, consistent broadcast delivery: callers must
+supply the same unmodified client posts, bound to their sender and session, to
+all participants. The library does not implement that channel. Aggregated
+recovery verifies key-share openings but does not check ciphertext-sum
+correctness; callers requiring aggregate integrity must verify the sum against
+the authentic individual posts.
+
 Ring arithmetic comes from [negacyclic-rings](https://github.com/Ruteri/negacyclic-rings).
 [Chipmunk](https://github.com/Ruteri/Chipmunk) supplies the Ring-SIS hash and
 Merkle tree used by the commitment layer.
@@ -28,7 +35,10 @@ Any $t$ shares reconstruct $\sum sk$, so **anonymity needs enough servers to ref
 to decrypt over any client set other than the canonical one — at least
 $S - t + 1$ of them.** The canonical set is a slice the caller supplies; the verifier
 only checks that the servers it counts agree on it. `ProtocolParams::min_clients` and
-`SetPolicy::min_clients` bound its size.
+`SetPolicy::min_clients` set its minimum size. All recovery modes enforce
+`ProtocolParams::max_clients`, derived from the commitment and KAHE noise budgets
+(300 with default parameters, potentially lower with custom parameters or RS
+`rho_max`). `SetPolicy::max_clients` can tighten this cap, not raise it.
 
 ## Architecture
 
@@ -101,7 +111,7 @@ flowchart TB
 | Client posts | ciphertext + commitment | same, to its aggregator | both commitments + signature — constant size in message length |
 | Ciphertext travels | on the bulletin | summed per group | as $n$ coded shares, one per lane |
 | Client fn | `run_client_round` | `run_client_round` | `run_client_round_rs` |
-| Recipient fn | `recover_direct` | `recover_aggregated` | `aggregate_and_decrypt_rs` |
+| Recipient fn | `recover_unverified_direct` | `recover_unverified_aggregate` | `aggregate_and_decrypt_rs` |
 | Extra checks | — | — | signatures; each lane's sum opens the summed share commitments |
 
 ## Integration
@@ -122,7 +132,7 @@ sequenceDiagram
     Note over S: unseal_opening, then run_server_round —<br/>all-or-nothing over the canonical set
     S->>B: summed share + summed opening
     B-->>R: all client posts + server entries
-    Note over R: recover_direct — verify each opening, drop culprits,<br/>interpolate Σsk from t shares, decrypt Σct
+    Note over R: recover_unverified_direct — verify each opening, drop culprits,<br/>interpolate Σsk from t shares, decrypt Σct
     Note over R: channel::decode_messages — Σm mod t back to payloads
 ```
 
@@ -266,16 +276,16 @@ canonical-set rule and drops faulty servers instead of failing the round.
 ```rust
 let policy = SetPolicy::anchored(&announced, min_clients, max_clients);
 let Recovered { canonical, plaintext, culprits } =
-    recover_direct(&pp, &policy, |cid| bulletin.get(cid), &server_outputs)?;
+    recover_unverified_direct(&pp, &policy, |cid| bulletin.get(cid), &server_outputs)?;
 ```
 
 Decoding is strictly over the canonical client set: servers that shared over
 any other set do not count towards $t$. `culprits` are the servers excluded to
-reach the threshold. `recover_aggregated` is the same over `(group client set,
-summed entry)` pairs. `recover_once` is one attempt over a caller-named set with
+reach the threshold. `recover_unverified_aggregate` is the same over `(group client set,
+summed entry)` pairs. `recover_unverified_once` is one attempt over a caller-named set with
 no exclusion.
 
-Underneath: `aggregate_and_decrypt` (+ `_timed`), `decrypt_aggregate` for a
+Underneath: `aggregate_and_decrypt_unverified` (+ `_timed`), `decrypt_unverified_aggregate` for a
 pre-summed ciphertext, and `aggregate_and_decrypt_rs` for RS mode (no recipient
 wrapper — call it directly). All return $\sum m_i \bmod t$ as `Vec<KahePoly>`, which
 goes straight back to the payload layer.
@@ -288,10 +298,15 @@ re-sums groups with the same operations and gets the direct round's value.
 
 In erasure-coded mode each lane's post is checked on its own: the opening must
 walk to the sum of the roots the clients signed, and the lane's share sum must
-hash to what that opening projects to. A lane whose sum is wrong is named in
-`VerifyError::LaneOpeningFailed(Vec<NodeId>)`, and the verifier re-encodes the
-reconstruction and compares every reporting lane, so a liar is named in any
-round that reconstructs at all. Nothing here needs an honest lane majority.
+hash to what that opening projects to. A lane whose sum fails this check is named
+in `VerifyError::LaneOpeningFailed(Vec<NodeId>)`. This binds the lane sums to the
+clients' signed shares, but does not prove those shares form RS codewords.
+
+The verifier also re-encodes the reconstruction and compares every reporting
+lane. Exactly $k$ lanes provide no independent lane redundancy; additional
+reporting lanes allow consistency checks, but unreported lanes remain unchecked.
+This is erasure recovery, not error correction. Correct client encoding is
+assumed; no honest lane majority is required.
 
 ## Errors
 

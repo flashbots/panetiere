@@ -192,6 +192,7 @@ pub fn run_server_round(
         let (_, op) = &inbox.items[i];
         opening_refs.push(op);
     }
+    // Individual openings are not verified here; the recipient verifies the aggregate opening.
     let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs)
         .ok_or(ServerRoundError::MalformedOpening)?;
     let agg_share: CsPoly = agg_open.s()[0];

@@ -8,7 +8,7 @@
 //! `agg_ctxt` and `sum_commitments` are coefficient-wise sums, hence
 //! associative: the verifier re-sums per-group aggregates across groups with
 //! the same two operations and recovers the same value a direct
-//! `aggregate_and_decrypt` would over every individual entry.
+//! `aggregate_and_decrypt_unverified` would over every individual entry.
 
 use std::collections::HashSet;
 

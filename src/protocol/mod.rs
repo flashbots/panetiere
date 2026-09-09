@@ -56,6 +56,8 @@ pub struct ProtocolParams {
     pub cs: <HidingMerkleCommitment as Cs>::Params,
     pub shamir: ShamirParams,
     pub min_clients: usize,
+    /// Aggregate capacity derived at setup from commitment and KAHE bounds.
+    pub max_clients: usize,
     /// Set only in the RS-sharded ingress mode; `None` is the broadcast flow.
     pub rs: Option<RsParams>,
     pub share_comm: Option<ShareCommitmentParams>,
@@ -73,6 +75,7 @@ impl ProtocolParams {
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         let shamir = ShamirParams::new(t, n_servers);
         Self {
+            max_clients: aggregate_capacity(&kahe, &cs),
             kahe,
             cs,
             shamir,
@@ -106,6 +109,7 @@ impl ProtocolParams {
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         let shamir = ShamirParams::new(t, n_servers);
         Self {
+            max_clients: aggregate_capacity(&kahe, &cs),
             kahe,
             cs,
             shamir,
@@ -143,9 +147,11 @@ impl ProtocolParams {
         );
         let rs = RsParams::new(k, n_nodes);
         let block_len = rs.block_len(payload_polys);
+        let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         Self {
+            max_clients: aggregate_capacity(&kahe, &cs).min(rho_max),
             kahe,
-            cs: HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS),
+            cs,
             shamir: ShamirParams::new(t, n_servers),
             min_clients: 1,
             rs: Some(rs),
@@ -154,6 +160,21 @@ impl ProtocolParams {
             )),
         }
     }
+}
+
+fn aggregate_capacity(kahe: &KaheParams, cs: &crate::cs::CsParams) -> usize {
+    let commitment_cap = (cs.r_bound / cs.beta_cs)
+        .min(cs.beta_agg_hvc / chipmunk_code::ZETA) as usize;
+    let t = kahe.t_modulus as f64;
+    // Eight-sigma aggregate noise plus the worst-case centered message sum.
+    (1..=commitment_cap)
+        .take_while(|&rho| {
+            let rho = rho as f64;
+            t * (8.0 * kahe.sigma_e * rho.sqrt() + rho / 2.0)
+                < crate::rings::KAHE_MODULUS as f64 / 2.0
+        })
+        .last()
+        .unwrap_or(0)
 }
 
 /// Exact crypto bytes each role puts on the wire in one round.
@@ -177,3 +198,55 @@ const MU_CS: usize = 1;
 
 /// BDLOP randomness width
 const KAPPA_CS: usize = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+    use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn aggregate_capacity_tracks_parameter_bounds() {
+        let mut rng = ChaCha20Rng::from_seed([91; 32]);
+        let pp = ProtocolParams::setup(&mut rng, 4);
+        assert_eq!(pp.max_clients, 300);
+        let at_cap: Vec<_> = (0..300).map(ClientId).collect();
+        assert_eq!(verify::check_client_count(&pp, &at_cap), Ok(()));
+        let above_cap: Vec<_> = (0..301).map(ClientId).collect();
+        assert_eq!(
+            verify::check_client_count(&pp, &above_cap),
+            Err(verify::VerifyError::TooManyClients { got: 301, max: 300 })
+        );
+
+        let pp = ProtocolParams::setup_with_kahe_dims_full(
+            &mut rng,
+            4,
+            1,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT * 4,
+        );
+        assert!(pp.max_clients > 0 && pp.max_clients < 300);
+        let budget = |rho: usize| {
+            pp.kahe.t_modulus as f64
+                * (8.0 * pp.kahe.sigma_e * (rho as f64).sqrt() + rho as f64 / 2.0)
+        };
+        let half_q = crate::rings::KAHE_MODULUS as f64 / 2.0;
+        assert!(budget(pp.max_clients) < half_q);
+        assert!(budget(pp.max_clients + 1) >= half_q);
+
+        for rho_max in [3, 400] {
+            let pp = ProtocolParams::setup_rs_mode(
+                &mut rng,
+                4,
+                1,
+                3,
+                4,
+                T_MODULUS_DEFAULT,
+                rho_max,
+                [92; 32],
+            );
+            assert_eq!(pp.max_clients, rho_max.min(300));
+        }
+    }
+}

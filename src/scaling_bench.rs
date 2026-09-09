@@ -97,7 +97,7 @@ use crate::protocol::server::{
     run_rs_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
 };
 use crate::protocol::verify::{
-    aggregate_and_decrypt_rs, aggregate_and_decrypt_timed, decrypt_aggregate, RsVerifyTimings,
+    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate, RsVerifyTimings,
     VerifyError, VerifyTimings,
 };
 use crate::protocol::ProtocolParams;
@@ -1026,7 +1026,7 @@ fn run_cell(
     let mut recovered: Option<Vec<KahePoly>> = None;
     for _ in 0..REPS {
         if let Ok((rec, vt)) =
-            aggregate_and_decrypt_timed(&pp, &canonical, &client_entries, &outputs)
+            aggregate_and_decrypt_unverified_timed(&pp, &canonical, &client_entries, &outputs)
         {
             vts.push(vt);
             recovered = Some(rec);
@@ -1107,7 +1107,7 @@ fn run_cell(
         let (leader, res) = measure(|| {
             let total_ctxt = Kahe::agg_ctxt(&ctxts);
             let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
-            decrypt_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
+            decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
         });
         let recovered = res.map(|rec| check_decode(&rec)).unwrap_or(false);
 

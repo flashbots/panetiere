@@ -10,7 +10,7 @@ use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::aggregate_and_decrypt;
+use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
 use panetiere::protocol::ProtocolParams;
 use panetiere::protocol::{ClientId, ServerId, SessionId};
 use panetiere::KahePoly;
@@ -89,7 +89,7 @@ fn mse_recovers_through_panetiere() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
+        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         assert_eq!(recovered.len(), 1);
         recovered_polys.push(recovered[0]);
@@ -177,7 +177,7 @@ fn cover_clients_do_not_inflate_iblt() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
+        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         recovered_polys.push(recovered[0]);
     }
@@ -266,7 +266,7 @@ fn multi_symbol_cover_through_panetiere() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt(&pp, &canonical, &client_entries, &outputs)
+        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
             .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         recovered_polys.push(recovered[0]);
     }

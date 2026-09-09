@@ -12,7 +12,7 @@ use panetiere::bulletin::{ClientBulletinEntry, InMemoryBulletin};
 use panetiere::channel::{self, ChannelParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::recipient::{recover_direct, SetPolicy};
+use panetiere::protocol::recipient::{recover_unverified_direct, SetPolicy};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::{ClientId, ServerId, SessionId};
 use rand::SeedableRng;
@@ -120,7 +120,7 @@ fn main() {
     // whose shares fail their opening, then decrypts.
     let posts: HashMap<ClientId, ClientBulletinEntry> = bulletin.clients().into_iter().collect();
     let policy = SetPolicy::anchored(&canonical, MIN_CLIENTS, n_clients);
-    let recovered = recover_direct(
+    let recovered = recover_unverified_direct(
         &pp,
         &policy,
         |cid| posts.get(&cid).cloned(),

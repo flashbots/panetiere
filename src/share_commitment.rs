@@ -280,6 +280,7 @@ impl ShareOpening {
 /// Commit to all `n_lanes` shares: hash each share to its label, one leaf per
 /// lane over the label digits, chipmunk tree above, one decomposed path per
 /// lane. The root is what the client signs.
+/// Binds each lane's share, but does not prove the shares form an RS codeword.
 pub fn commit_shares(pp: &ShareCommitmentParams, shares: &[Share]) -> (HVCPoly, Vec<SharePath>) {
     assert_eq!(shares.len(), pp.n_lanes);
     for s in shares {

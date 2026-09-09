@@ -83,6 +83,8 @@ pub fn kahe_encrypt<R: Rng>(
 
 /// Bridge the KAHE key into R_{q_cs} via centered-rep and Shamir-share it. One
 /// share per server, `pp.shamir.n` of them.
+/// The protocol assumes clients execute this honestly: the share commitment
+/// does not prove degree consistency.
 pub fn shamir_share<R: Rng>(rng: &mut R, pp: &ProtocolParams, key: &KaheKey) -> Vec<CsPoly> {
     ShamirSharing::share(rng, &pp.shamir, &kahe_to_cs_centered(key.inner()))
 }

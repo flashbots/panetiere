@@ -5,10 +5,11 @@ use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
-    recover_direct, recover_once, RecipientError, RejectReason, SetPolicy,
+    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_once, RecipientError,
+    RejectReason, SetPolicy,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::{aggregate_and_decrypt, VerifyError};
+use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
 use panetiere::{CsPoly, KahePoly, N};
 use rand::{Rng, SeedableRng};
@@ -94,8 +95,8 @@ fn round(seed: u8, n_servers: usize, n_clients: usize) -> Round {
 #[test]
 fn recover_once_matches_aggregate_and_decrypt() {
     let r = round(1, 4, 6);
-    let want = aggregate_and_decrypt(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
-    let got = recover_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    let want = aggregate_and_decrypt_unverified(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    let got = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     assert_eq!(got, want);
 }
 
@@ -107,7 +108,7 @@ fn recover_once_names_the_faulty_server() {
     let mut r = round(2, 5, 4);
     r.outputs[1].agg_share += CsPoly::rand_poly(&mut rng);
     assert_eq!(
-        recover_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
+        recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
         Err(VerifyError::ShareOpeningMismatch(1))
     );
 }
@@ -122,7 +123,7 @@ fn recover_direct_excludes_culprits() {
     for i in [1usize, 3] {
         r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
     }
-    let honest = recover_once(&r.pp, &r.canonical, &r.publics, &{
+    let honest = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &{
         let mut v = r.outputs.clone();
         v.retain(|sp| sp.server_id.0 != 1 && sp.server_id.0 != 3);
         v
@@ -130,7 +131,7 @@ fn recover_direct_excludes_culprits() {
     .unwrap();
 
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    let got = recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap();
+    let got = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap();
     assert_eq!(got.plaintext, honest);
     let mut culprits: Vec<u32> = got.culprits.iter().map(|s| s.0).collect();
     culprits.sort();
@@ -148,7 +149,7 @@ fn recover_direct_reports_exhausted_shares() {
         r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
+    match recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
         Err(RecipientError::Rejected(reason)) => assert!(
             matches!(reason, RejectReason::ExhaustedShares { need: 3, .. }),
             "got {reason:?}"
@@ -161,7 +162,7 @@ fn recover_direct_reports_exhausted_shares() {
 fn below_share_threshold_is_its_own_error() {
     let r = round(5, 5, 4);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    match recover_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]) {
+    match recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]) {
         Err(e) => assert_eq!(e, RecipientError::BelowShareThreshold { have: 2, need: 3 }),
         Ok(other) => panic!("expected BelowShareThreshold, got {other:?}"),
     }
@@ -174,7 +175,7 @@ fn max_clients_rejects_an_oversized_anchor() {
     let r = round(6, 4, 6);
     let policy = SetPolicy::anchored(&r.canonical, 0, 4);
     assert_eq!(
-        recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::AboveMaxClients { got: 6, max: 4 })
     );
 }
@@ -185,7 +186,7 @@ fn missing_client_public_is_rejected() {
     r.publics.remove(2);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
-        recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::MissingClientPublics { have: 4, need: 5 })
     );
 }
@@ -205,7 +206,7 @@ fn servers_disagreeing_with_the_anchor_do_not_count() {
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
-        recover_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::TooFewAgreeingServers {
             agreeing: 2,
             need: 3
@@ -219,7 +220,134 @@ fn anonymity_floor_rejects_a_small_set() {
     r.pp.min_clients = 5;
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
-        recover_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::BelowAnonymityFloor { got: 4, min: 5 })
     );
+}
+
+#[test]
+fn duplicate_canonical_is_rejected() {
+    let r = round(11, 4, 4);
+    let mut canonical = r.canonical.clone();
+    canonical.push(canonical[0]);
+    let mut outputs = r.outputs.clone();
+    for sp in &mut outputs {
+        sp.clients = canonical.clone();
+    }
+    assert_eq!(
+        recover_unverified_once(&r.pp, &canonical, &r.publics, &outputs),
+        Err(VerifyError::DuplicateClient(canonical[0]))
+    );
+}
+
+#[test]
+fn roster_duplicates_are_excluded_and_order_is_normalized() {
+    let r = round(12, 4, 4);
+    assert_eq!(r.pp.shamir.t, 3);
+    let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    let groups: Vec<_> = r
+        .publics
+        .iter()
+        .map(|(cid, entry)| (vec![*cid], entry.clone()))
+        .collect();
+    let mut anchor = r.canonical.clone();
+    anchor.reverse();
+    let policy = SetPolicy::anchored(&anchor, 0, NO_CAP);
+
+    for bad in 0..r.outputs.len() {
+        let mut outputs = r.outputs.clone();
+        outputs[bad].clients.push(r.canonical[0]);
+        outputs[(bad + 1) % r.outputs.len()].clients.reverse();
+        let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap();
+        let aggregate = recover_unverified_aggregate(&r.pp, &policy, &groups, &outputs).unwrap();
+        assert_eq!(direct.plaintext, want);
+        assert_eq!(aggregate.plaintext, want);
+        assert_eq!(direct.canonical, r.canonical);
+        assert_eq!(aggregate.canonical, r.canonical);
+    }
+
+    let mut outputs = r.outputs.clone();
+    for sp in &mut outputs[..2] {
+        sp.clients.push(r.canonical[0]);
+    }
+    let expected = RecipientError::Rejected(RejectReason::TooFewAgreeingServers {
+        agreeing: 2,
+        need: 3,
+    });
+    assert_eq!(
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        recover_unverified_aggregate(&r.pp, &policy, &groups, &outputs).unwrap_err(),
+        expected
+    );
+}
+
+#[test]
+fn protocol_capacity_cannot_be_raised_by_policy() {
+    use panetiere::protocol::verify::{aggregate_and_decrypt_rs, decrypt_unverified_aggregate};
+
+    let mut r = round(13, 4, 4);
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    let groups: Vec<_> = r
+        .publics
+        .iter()
+        .map(|(cid, entry)| (vec![*cid], entry.clone()))
+        .collect();
+    r.pp.max_clients = 4;
+    let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    assert_eq!(
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs)
+            .unwrap()
+            .plaintext,
+        want
+    );
+    assert_eq!(
+        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs)
+            .unwrap()
+            .plaintext,
+        want
+    );
+
+    r.pp.max_clients = 3;
+    let expected = RecipientError::Rejected(RejectReason::AboveMaxClients { got: 4, max: 3 });
+    assert_eq!(
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        expected
+    );
+    assert_eq!(
+        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs).unwrap_err(),
+        expected
+    );
+    let expected = Err(VerifyError::TooManyClients { got: 4, max: 3 });
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
+        expected
+    );
+    assert_eq!(
+        decrypt_unverified_aggregate(
+            &r.pp,
+            &r.publics[0].1.ctxt,
+            &r.publics[0].1.comm,
+            &r.outputs
+        ),
+        expected
+    );
+
+    let mut rng = ChaCha20Rng::from_seed([93; 32]);
+    let pp = ProtocolParams::setup_rs_mode(
+        &mut rng,
+        4,
+        1,
+        3,
+        4,
+        panetiere::kahe::T_MODULUS_DEFAULT,
+        3,
+        [94; 32],
+    );
+    assert!(matches!(
+        aggregate_and_decrypt_rs(&pp, &SESSION, &r.canonical, &[], &r.outputs, &[]),
+        Err(VerifyError::TooManyClients { got: 4, max: 3 })
+    ));
 }

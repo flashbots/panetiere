@@ -180,6 +180,7 @@ impl Rs {
 
     /// Interpolate the `k` blocks back from any `k` `(node_index, share)`
     /// samples and flatten to `ctxt_len` polys. Extra samples are ignored.
+    /// Performs erasure recovery, not error correction or codeword validation.
     pub fn reconstruct(
         params: &RsParams,
         ctxt_len: usize,

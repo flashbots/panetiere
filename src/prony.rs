@@ -577,6 +577,8 @@ impl PronySketch {
     }
 
     /// Insert one element under a fresh random evaluation point.
+    /// May be called repeatedly; one item per client is enforced by client code,
+    /// not by this multiset encoding.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i64]) {
         let p = self.params.p;
         let z = rng.gen_range(1..p);

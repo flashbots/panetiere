@@ -1,8 +1,8 @@
 //! The recipient: decide the canonical client set, then decode over it.
 //!
-//! - [`recover_once`] is a single attempt over a set the caller names. A faulty
+//! - [`recover_unverified_once`] is a single attempt over a set the caller names. A faulty
 //!   share fails the round and names the server; nothing is retried.
-//! - [`recover_direct`] and [`recover_aggregated`] admit the set per
+//! - [`recover_unverified_direct`] and [`recover_unverified_aggregate`] admit the set per
 //!   [`SetPolicy`], then drop servers whose shares fail their opening until `t`
 //!   honest ones remain. Threshold decryption tolerates that; the excluded
 //!   servers come back in [`Recovered::culprits`] for the caller to attribute.
@@ -13,7 +13,7 @@ use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Commitment, HidingMerkleCommitment};
 use crate::kahe::Kahe;
 
-use super::verify::{aggregate_and_decrypt, check_anonymity_floor, decrypt_aggregate, VerifyError};
+use super::verify::{aggregate_and_decrypt_unverified, decrypt_unverified_aggregate, VerifyError};
 use super::{ClientId, ProtocolParams, ServerId};
 
 /// The canonical-set rule: decode strictly over the anchor the caller names.
@@ -105,8 +105,15 @@ fn anchored_set(
     let canonical = sorted_dedup(policy.anchor);
     let agreeing = server_outputs
         .iter()
-        .filter(|sp| sorted_dedup(&sp.clients) == canonical)
-        .cloned()
+        .filter_map(|sp| {
+            let clients = sorted_dedup(&sp.clients);
+            if clients.len() != sp.clients.len() || clients != canonical {
+                return None;
+            }
+            let mut sp = sp.clone();
+            sp.clients = clients;
+            Some(sp)
+        })
         .collect();
     (canonical, agreeing)
 }
@@ -125,11 +132,11 @@ fn admit(
             min: floor,
         });
     }
-    debug_assert!(check_anonymity_floor(pp, canonical).is_ok());
-    if canonical.len() > policy.max_clients {
+    let max = policy.max_clients.min(pp.max_clients);
+    if canonical.len() > max {
         return Err(RejectReason::AboveMaxClients {
             got: canonical.len(),
-            max: policy.max_clients,
+            max,
         });
     }
     if agreeing < pp.shamir.t {
@@ -142,13 +149,13 @@ fn admit(
 }
 
 /// One decode attempt over a caller-named set.
-pub fn recover_once(
+pub fn recover_unverified_once(
     pp: &ProtocolParams,
     canonical: &[ClientId],
     publics: &[(ClientId, ClientBulletinEntry)],
     server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
-    aggregate_and_decrypt(pp, canonical, publics, server_outputs)
+    aggregate_and_decrypt_unverified(pp, canonical, publics, server_outputs)
 }
 
 /// Drop servers whose shares fail their opening until `t` remain, then decode.
@@ -184,7 +191,9 @@ where
 }
 
 /// Direct flow: clients posted their own ciphertext and commitment.
-pub fn recover_direct<L>(
+/// Requires authentic, session-bound posts consistent with the servers' view;
+/// recovery does not authenticate the supplied ciphertexts.
+pub fn recover_unverified_direct<L>(
     pp: &ProtocolParams,
     policy: &SetPolicy,
     publics: L,
@@ -215,7 +224,7 @@ where
         ));
     }
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
-        aggregate_and_decrypt(pp, &canonical, &entries, outs)
+        aggregate_and_decrypt_unverified(pp, &canonical, &entries, outs)
     })
     .map_err(RecipientError::Rejected)?;
     Ok(Recovered {
@@ -227,7 +236,9 @@ where
 
 /// Aggregated flow: aggregators already summed each group's public parts, so the
 /// recipient re-sums the groups instead of the individual posts.
-pub fn recover_aggregated(
+/// Ciphertext-sum correctness is unchecked, even when recovery succeeds.
+/// Callers requiring integrity must verify the sum against authentic client posts.
+pub fn recover_unverified_aggregate(
     pp: &ProtocolParams,
     policy: &SetPolicy,
     groups: &[(Vec<ClientId>, ClientBulletinEntry)],
@@ -266,7 +277,7 @@ pub fn recover_aggregated(
     let total_ctxt = Kahe::agg_ctxt_refs(&ctxts);
     let total_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
-        decrypt_aggregate(pp, &total_ctxt, &total_comm, outs)
+        decrypt_unverified_aggregate(pp, &total_ctxt, &total_comm, outs)
     })
     .map_err(RecipientError::Rejected)?;
     Ok(Recovered {
