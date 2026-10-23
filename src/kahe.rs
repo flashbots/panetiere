@@ -12,8 +12,8 @@
 //!
 //! Parameters:
 //! - `a ∈ R_{q_kahe}^μ` — public vector.
-//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 15.72).
-//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 15.72).
+//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 6.70).
+//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 6.70).
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
@@ -200,7 +200,7 @@ pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
     KahePoly::from_signed_coeffs(&coeffs)
 }
 
-/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 15.72,
+/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 6.70,
 /// `‖·‖_∞ ≤ 8σ_s ≈ 126`) into a `CsPoly` by centered-rep re-interpretation.
 /// Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client side to feed Shamir
 /// sharing, which operates over `R_{q_cs}`.
@@ -315,8 +315,8 @@ impl Kahe {
     }
 }
 
-pub const SIGMA_S_DEFAULT: f64 = 15.72;
-pub const SIGMA_E_DEFAULT: f64 = 15.72;
+pub const SIGMA_S_DEFAULT: f64 = 6.70;
+pub const SIGMA_E_DEFAULT: f64 = 6.70;
 /// Largest power of two satisfying `t·(8σ_e·√ρ + ρ/2) < q_kahe/2` at ρ = 300.
 pub const T_MODULUS_DEFAULT: u64 = 1 << 35;
 
@@ -327,7 +327,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=15.72, `t = 2^35` at q_kahe ≈ 2^48.
+    /// `μ = 1`, σ_s=σ_e=6.70, `t = 2^35` at q_kahe ≈ 2^48.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }

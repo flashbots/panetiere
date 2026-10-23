@@ -4,6 +4,7 @@ use crate::KahePoly;
 use rand::Rng;
 
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
+use crate::iblt_shape::iblt_shape;
 use crate::mse::{self, MseEncoding, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::ProtocolParams;
@@ -16,13 +17,6 @@ pub const BYTES_PER_SYMBOL: usize = 4;
 const _: () = assert!(BYTES_PER_SYMBOL * 8 < mse::BITS_PER_SYMBOL);
 /// Prony needs every packed symbol to be a distinct residue mod `p`.
 const _: () = assert!((1u64 << (BYTES_PER_SYMBOL * 8)) < PRONY_PRIME);
-
-/// Rows in the peeling structure. 2 is the correctness floor; 4 is the usual
-/// operating point.
-const GAMMA: usize = 4;
-
-/// Buckets per insertion, across all rows.
-const BUCKETS_PER_INSERT: usize = 3;
 
 #[derive(Debug, PartialEq)]
 pub enum ChannelError {
@@ -58,13 +52,8 @@ impl ChannelParams {
     /// each. For channels whose payload is already `Z_t` values rather than
     /// bytes — the byte packing of [`encode_message`] does not apply to those.
     pub fn for_symbols(rho: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
-        let delta = (BUCKETS_PER_INSERT * rho.max(1) as usize).div_ceil(GAMMA);
-        ChannelParams::Mse(MseParams::new(
-            GAMMA,
-            delta,
-            payload_symbols.max(1),
-            prf_key,
-        ))
+        let (theta, delta) = iblt_shape(rho as usize);
+        ChannelParams::Mse(MseParams::new(theta, delta, payload_symbols.max(1), prf_key))
     }
 
     /// Sketch channel for up to `rho` payloads of `message_bytes` each.

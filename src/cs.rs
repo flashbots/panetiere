@@ -4,14 +4,14 @@
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
 //! `r ∈ B^{κ_cs}_{β_cs,q_cs}`. `a` is a length-`κ_cs` row vector, `B` is a
 //! `μ_cs × κ_cs` matrix. All BDLOP arithmetic lives on the **CS ring**
-//! `R_{q_cs}` (`CsPoly`, q_cs = 139301), decoupled from the HVC
-//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 40961).
+//! `R_{q_cs}` (`CsPoly`, q_cs = 57637), decoupled from the HVC
+//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 557057).
 //!
 //! **CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span
 //! `[-q_cs/2, q_cs/2]`, larger than `q_hvc`. To feed it into the HVC tree hash
-//! we base-`(2ζ+1)=69` decompose each leaf element into `HVC_WIDTH = 3`
+//! we base-`(2ζ+1)=769` decompose each leaf element into `HVC_WIDTH = 2`
 //! `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); the digits are tiny
-//! (`|·| ≤ ζ = 34 ≪ q_hvc`) so they embed losslessly. The left-inverse
+//! (`|·| ≤ ζ = 384 ≪ q_hvc`) so they embed losslessly. The left-inverse
 //! `CsPoly::project_r_from_hvc` is linear in the digits, so summed opening
 //! digits project to the summed leaf — keeping `sum_openings` correct.
 //!
@@ -614,7 +614,7 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 //
 // Tight pack uses just enough bits per coefficient for each region's bound:
 //   r:    ⌈log₂(2·r_bound + 1)⌉ bits
-//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 139301)
+//   s:    ⌈log₂(q_cs)⌉ bits (16 at q_cs = 57637)
 //   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(69)⌉ = 7 bits
 
 /// Number of bits to encode signed values in [-bound, bound].
@@ -1079,9 +1079,9 @@ fn aggregated_opening_pack_bounds_raw(
 }
 
 /// Fresh per-opening randomness radius.
-pub const BETA_CS: u32 = 116;
+pub const BETA_CS: u32 = 39;
 /// Aggregate verify bound: `ρ_max·β_cs` at `ρ_max = 300`.
-pub const R_BOUND: u32 = 34_800;
+pub const R_BOUND: u32 = 11_700;
 /// Aggregated HVC digit bound: `ρ_max·ζ`.
 pub fn beta_agg_hvc() -> u32 {
     300 * chipmunk_code::ZETA
@@ -1201,7 +1201,7 @@ mod tests {
         let pp = HidingMerkleCommitment::setup(&mut rng, 4);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 69650 ≫ r_bound = 34800.
+        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 28818 ≫ r_bound = 11700.
         openings[1].r_mut()[0] = CsPoly::rand_poly(&mut rng);
         assert!(!HidingMerkleCommitment::verify(&pp, &comm, &openings[1]));
     }
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn opening_size_unchanged_at_mu_1() {
         for path in 0usize..5 {
-            assert_eq!(opening_data_polys(2, path), 6 + 6 * path);
+            assert_eq!(opening_data_polys(2, path), 2 * HVC_WIDTH + 2 * HVC_WIDTH * path);
         }
     }
 

@@ -197,7 +197,7 @@ pub fn round_wire_sizes(n_servers: usize, ctxt_polys: usize, rho: u32) -> RoundW
 const MU_CS: usize = 1;
 
 /// BDLOP randomness width
-const KAPPA_CS: usize = 5;
+const KAPPA_CS: usize = 6;
 
 #[cfg(test)]
 mod tests {

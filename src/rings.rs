@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 pub const N: usize = chipmunk_code::N;
-pub const CS_MODULUS: i32 = 139_301;
+pub const CS_MODULUS: i32 = 57_637;
 pub const CS_MODULUS_OVER_TWO: i32 = (CS_MODULUS - 1) / 2;
 
 pub const KAHE_MODULUS: i64 = 280_513_608_622_081;

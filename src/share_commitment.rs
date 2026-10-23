@@ -31,8 +31,8 @@ use crate::rings::KAHE_RNS_MODULI;
 use crate::rings::{center_canonical_i64, center_i32};
 use crate::rs::Share;
 use crate::{pointwise_dot_rs, RsNTTPoly, N as POLY_N};
-/// Four base-69 digits cover each 24-bit KAHE-RNS channel.
-pub const DGT_WIDTH: usize = 8;
+/// Three base-769 digits cover each 24-bit KAHE-RNS channel.
+pub const DGT_WIDTH: usize = 6;
 
 /// Ajtai-hash output width.
 pub const LABEL_POLYS: usize = 3;
@@ -48,7 +48,7 @@ fn decompose_step(value: i64) -> (i32, i64) {
     ((value - next * BASE) as i32, next)
 }
 
-/// Balanced base-69 digits of the canonical NTT-domain coefficients, centered
+/// Balanced base-769 digits of the canonical NTT-domain coefficients, centered
 /// first. Digit coefficients ∈ [−ζ, ζ], little-endian.
 pub fn decompose_share_poly(p: &RsNTTPoly) -> [HVCPoly; DGT_WIDTH] {
     let mut out = [HVCPoly::default(); DGT_WIDTH];
@@ -60,7 +60,7 @@ pub fn decompose_share_poly(p: &RsNTTPoly) -> [HVCPoly; DGT_WIDTH] {
 /// digit vectors are filled in place rather than moved out by value.
 fn decompose_into(p: &RsNTTPoly, out: &mut [HVCPoly]) {
     debug_assert_eq!(out.len(), DGT_WIDTH);
-    const LIMB_WIDTH: usize = 4;
+    const LIMB_WIDTH: usize = 3;
     for limb in 0..2 {
         let q = KAHE_RNS_MODULI[limb];
         for i in 0..POLY_N {
@@ -76,11 +76,11 @@ fn decompose_into(p: &RsNTTPoly, out: &mut [HVCPoly]) {
 }
 
 /// Left-inverse of [`decompose_share_poly`], linear in the digits. i128
-/// Horner: aggregated digits reach `ρ_max·ζ = 10 200`, and `10 200·69⁹ ≈ 2^68`
+/// Horner: aggregated digits reach `ρ_max·ζ = 115 200`, and `10 200·69⁹ ≈ 2^68`
 /// overflows i64. Reduced independently in each RNS channel.
 pub fn project_share_poly(digits: &[HVCPoly]) -> RsNTTPoly {
     debug_assert_eq!(digits.len(), DGT_WIDTH);
-    const LIMB_WIDTH: usize = 4;
+    const LIMB_WIDTH: usize = 3;
     let mut residues = [[0u32; POLY_N]; 2];
     for limb in 0..2 {
         let ds = &digits[limb * LIMB_WIDTH..(limb + 1) * LIMB_WIDTH];
@@ -741,6 +741,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds the digit budget")]
     fn rho_beyond_the_digit_budget_is_rejected_at_setup() {
-        params(4, 16, 603);
+        let budget = (HVC_MODULUS as usize / 2) / ZETA as usize;
+        params(4, 16, budget + 1);
     }
 }

@@ -45,7 +45,8 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! DERIVED FROM INPUTS (computed per cell — not knobs)
 //! ──────────────────────────────────────────────────────────────────────
-//!  δ              = ⌈3·active/γ⌉ IBLT buckets per MSE row
+//!  θ × δ          = `iblt_shape(active)`: smallest table under the paper's
+//!                   provable 2^-20 stopping-set bound
 //!  μ_kahe         = n_polys — one key covers the whole plaintext
 //!  total_cells    = γ · δ
 //!  Shamir threshold, κ_cs, β, β_agg, block_size — chosen by

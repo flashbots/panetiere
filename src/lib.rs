@@ -8,6 +8,7 @@ pub mod codec;
 pub mod cs;
 #[doc(hidden)]
 pub mod hvc_stream;
+mod iblt_shape;
 #[doc(hidden)]
 pub mod hvc_sum;
 pub mod kahe;
