@@ -129,7 +129,8 @@ pub fn aggregate_and_decrypt_unverified(
     client_entries: &[(ClientId, ClientBulletinEntry)],
     server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
-    aggregate_and_decrypt_unverified_timed(pp, canonical, client_entries, server_outputs).map(|(m, _)| m)
+    aggregate_and_decrypt_unverified_timed(pp, canonical, client_entries, server_outputs)
+        .map(|(m, _)| m)
 }
 
 pub fn aggregate_and_decrypt_unverified_timed(

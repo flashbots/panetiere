@@ -15,7 +15,7 @@ use crate::{KahePoly, N};
 
 pub const BITS_PER_COEFF: usize = BITS_PER_SYMBOL;
 pub const BYTES_PER_POLY: usize = N * BITS_PER_COEFF / 8;
-const _: () = assert!(N * BITS_PER_COEFF % 8 == 0);
+const _: () = assert!((N * BITS_PER_COEFF).is_multiple_of(8));
 const HEADER_LEN: usize = 4;
 /// Per-coefficient symbol modulus (what fits in `BITS_PER_COEFF` bits).
 const SYMBOL_MOD: i64 = 1 << BITS_PER_COEFF;
@@ -61,7 +61,10 @@ pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
 
 fn coeffs_from_bytes(chunk: &[u8]) -> KahePoly {
     let mut coeffs = [0i64; N];
-    for (c, packed) in coeffs.iter_mut().zip(chunking::pack(chunk, BITS_PER_COEFF, N)) {
+    for (c, packed) in coeffs
+        .iter_mut()
+        .zip(chunking::pack(chunk, BITS_PER_COEFF, N))
+    {
         *c = packed as i64;
     }
     KahePoly::from_coeffs(coeffs)

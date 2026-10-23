@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-chipmunk_code = { path = "../chipmunk", default-features = false }
+chipmunk_code = { git = "https://github.com/noot/Chipmunk", rev = "5c6a3324607eae7e25c509e44b4cb4658a86d994", default-features = false }
 negacyclic-rings = { git = "https://github.com/Ruteri/negacyclic-rings", branch = "main" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ml-kem = "0.3"

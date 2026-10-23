@@ -36,7 +36,10 @@ pub(crate) fn iblt_shape(rho: usize) -> (usize, usize) {
     let pair_log2 = log2_binomial(&table.log_factorial, rho, 2);
     let mut best: Option<(usize, usize)> = None;
     for theta in (MIN_THETA..=MAX_THETA).rev() {
-        let d_lo = ((pair_log2 - target) / theta as f64).exp2().floor().max(2.0) as usize;
+        let d_lo = ((pair_log2 - target) / theta as f64)
+            .exp2()
+            .floor()
+            .max(2.0) as usize;
         if best.is_some_and(|(bt, bd)| theta * d_lo >= bt * bd) {
             continue;
         }
@@ -100,7 +103,9 @@ impl Bound {
                         let log_c = self.log_factorial[s]
                             - self.log_factorial[k]
                             - self.log_factorial[s - k];
-                        (log_c + k as f64 * ln_r + (s - k) as f64 * ln_not_r).exp() * pa[k] * pb[s - k]
+                        (log_c + k as f64 * ln_r + (s - k) as f64 * ln_not_r).exp()
+                            * pa[k]
+                            * pb[s - k]
                     })
                     .sum()
             })

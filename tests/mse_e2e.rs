@@ -90,8 +90,9 @@ fn mse_recovers_through_panetiere() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-            .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
+        let recovered =
+            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+                .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         assert_eq!(recovered.len(), 1);
         recovered_polys.push(recovered[0]);
     }
@@ -178,8 +179,9 @@ fn cover_clients_do_not_inflate_iblt() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-            .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
+        let recovered =
+            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+                .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         recovered_polys.push(recovered[0]);
     }
 
@@ -270,8 +272,9 @@ fn multi_symbol_cover_through_panetiere() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-            .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
+        let recovered =
+            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+                .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
         recovered_polys.push(recovered[0]);
     }
 

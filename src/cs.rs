@@ -1361,7 +1361,10 @@ mod tests {
     #[test]
     fn opening_size_unchanged_at_mu_1() {
         for path in 0usize..5 {
-            assert_eq!(opening_data_polys(2, path), 2 * HVC_WIDTH + 2 * HVC_WIDTH * path);
+            assert_eq!(
+                opening_data_polys(2, path),
+                2 * HVC_WIDTH + 2 * HVC_WIDTH * path
+            );
         }
     }
 

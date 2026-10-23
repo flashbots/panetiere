@@ -77,8 +77,8 @@
 //!   RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep
 //!   BENCH_BUDGET_SECS=600 cargo bench --bench protocol_sweep
 
-use std::fmt::Write as _;
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -104,8 +104,8 @@ use crate::protocol::server::{
     run_rs_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
 };
 use crate::protocol::verify::{
-    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate, RsVerifyTimings,
-    VerifyError, VerifyTimings,
+    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate,
+    RsVerifyTimings, VerifyError, VerifyTimings,
 };
 use crate::protocol::ProtocolParams;
 use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
@@ -937,10 +937,17 @@ fn recipient_cpu_us(r: &Row) -> f64 {
 /// Peak heap growth per role: the largest single phase, since phases run one
 /// after another and release their scratch in between.
 fn client_mem_kib(r: &Row) -> f64 {
-    [&r.enc_app, &r.kahe_keygen, &r.kahe_enc, &r.share, &r.cs, &r.seal]
-        .iter()
-        .map(|s| s.mem_kib)
-        .fold(0.0, f64::max)
+    [
+        &r.enc_app,
+        &r.kahe_keygen,
+        &r.kahe_enc,
+        &r.share,
+        &r.cs,
+        &r.seal,
+    ]
+    .iter()
+    .map(|s| s.mem_kib)
+    .fold(0.0, f64::max)
 }
 
 fn server_mem_kib(r: &Row) -> f64 {
@@ -1985,8 +1992,18 @@ fn print_tables(rows: &[Row]) {
     );
     println!(
         "{:<4}{:>10}{:>9}{:>13} {:>10}{:>9}{:>13} {:>10}{:>9}{:>13}  {:>12}{:>14}",
-        "id", "cpu", "cpu/wall", "mem", "cpu", "cpu/wall", "mem", "cpu", "cpu/wall", "mem",
-        "ρ·ctxt [D]", "process peak"
+        "id",
+        "cpu",
+        "cpu/wall",
+        "mem",
+        "cpu",
+        "cpu/wall",
+        "mem",
+        "cpu",
+        "cpu/wall",
+        "mem",
+        "ρ·ctxt [D]",
+        "process peak"
     );
     let ratio = |cpu: f64, wall: f64| {
         if wall > 0.0 {

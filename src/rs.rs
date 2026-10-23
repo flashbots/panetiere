@@ -104,7 +104,7 @@ fn pow_q(base: u64, mut exp: u64) -> u64 {
 /// `q` is prime, so Fermat gives the inverse.
 #[inline]
 fn inv_q(x: u64) -> u64 {
-    debug_assert!(x % Q != 0, "inverse of zero");
+    debug_assert!(!x.is_multiple_of(Q), "inverse of zero");
     pow_q(x, Q - 2)
 }
 

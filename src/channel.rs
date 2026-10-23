@@ -4,8 +4,8 @@ use crate::KahePoly;
 use rand::Rng;
 
 use crate::chunking;
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::iblt_shape::iblt_shape;
+use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::ProtocolParams;
@@ -170,7 +170,11 @@ fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i64> {
 fn symbols_to_bytes(symbols: &[i64]) -> Vec<u8> {
     let t = T_MODULUS_DEFAULT as i64;
     let canonical: Vec<u64> = symbols.iter().map(|&s| s.rem_euclid(t) as u64).collect();
-    chunking::unpack(&canonical, BITS_PER_CHUNK, symbols.len() * BITS_PER_CHUNK / 8)
+    chunking::unpack(
+        &canonical,
+        BITS_PER_CHUNK,
+        symbols.len() * BITS_PER_CHUNK / 8,
+    )
 }
 
 pub fn encode_message<R: Rng>(
