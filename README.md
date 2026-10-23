@@ -56,7 +56,7 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `kahe` | key-additive homomorphic encryption, plus the CS↔KAHE bridge |
 | `sss` | Shamir *t*-of-*n* (and additive) sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
-| `rs` | systematic Reed–Solomon erasure coding over the KAHE RNS channels |
+| `rs` | systematic Reed–Solomon erasure coding over the KAHE ring |
 | `share_commitment` | commitment to the $n$ coded shares, one tree leaf per lane |
 | `pke` / `sig` | ML-KEM-768 + AES-GCM envelopes for the key shares / P-256 post signatures |
 | `bulletin` | published entry types and their byte encodings |
@@ -373,9 +373,10 @@ RAYON_NUM_THREADS=8 cargo test -j 8
 RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep   # (S, ρ) × encoding sweep
 ```
 
-KAHE and the CS auxiliary domain use two-prime RNS parameter sets from
-`src/rings.rs`. Their 32-bit NTT channels dispatch to scalar, AVX2, or NEON.
-CS and Prony retain their semantic prime fields.
+KAHE runs on a single 64-bit NTT over its prime modulus; the CS auxiliary
+domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
+channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their semantic
+prime fields.
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
 slot mode, *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread

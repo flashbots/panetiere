@@ -1,6 +1,6 @@
 //! Key-additive homomorphic encryption
 //!
-//! Lives on its own two-limb RNS ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^47.995).
+//! Lives on the prime ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^46.2).
 //! The modulus is chosen for headroom in the noise budget.
 //!
 //! Per-poly form:
@@ -330,7 +330,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=6.70, `t = 2^31 + 11` at q_kahe ≈ 2^48.
+    /// `μ = 1`, σ_s=σ_e=6.70, `t = 2^31 + 11` at q_kahe ≈ 2^46.2.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }

@@ -55,7 +55,7 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
 //! ──────────────────────────────────────────────────────────────────────
-//!  src/rings.rs: N = 2048, q_cs = 57_637, q_kahe = 280_513_608_622_081
+//!  src/rings.rs: N = 2048, q_cs = 57_637, q_kahe = 79_718_129_102_849
 //!  chipmunk param.rs: q_hvc = 557_057, HVC_WIDTH = 2
 //!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^31 + 11, σ_s = σ_e = 6.70
 //!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
