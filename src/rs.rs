@@ -34,7 +34,7 @@ pub fn unpack_share(bytes: &[u8], n_polys: usize) -> Option<Share> {
     let mut out = Vec::with_capacity(n_polys);
     for chunk in bytes.chunks_exact(rs_poly_packed_len()) {
         let mut coeffs = [0u64; N];
-        for (c, b) in coeffs.iter_mut().zip(chunk.chunks_exact(RS_COEFF_BYTES)) {
+        for (c, b) in coeffs.iter_mut().zip(chunk.as_chunks::<RS_COEFF_BYTES>().0) {
             let mut word = [0u8; 8];
             word[..RS_COEFF_BYTES].copy_from_slice(b);
             *c = u64::from_le_bytes(word);

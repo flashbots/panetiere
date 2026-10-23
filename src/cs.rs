@@ -813,11 +813,11 @@ pub(crate) fn unpack_digits(bytes: &[u8], n_polys: usize, bound: u32) -> Option<
     }
     let mut flat = vec![0i32; n_polys * POLY_N];
     unpack_bits(bytes, 0, &mut flat, bound, bits_for_signed(bound));
-    flat.chunks_exact(POLY_N)
+    flat.as_chunks::<POLY_N>()
+        .0
+        .iter()
         .map(|chunk| {
-            let mut coeffs = [0i32; POLY_N];
-            coeffs.copy_from_slice(chunk);
-            let p = HVCPoly::from_coeffs(coeffs);
+            let p = HVCPoly::from_coeffs(*chunk);
             // Offset decoding spans [−bound, −bound + 2^bits − 1].
             (p.infinity_norm() <= bound).then_some(p)
         })
