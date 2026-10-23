@@ -14,6 +14,7 @@ rand_chacha = "0.3"
 rand_distr = "0.4"
 sha2 = "0.10"
 rayon = "1.10"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

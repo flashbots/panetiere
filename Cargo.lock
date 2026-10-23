@@ -742,6 +742,7 @@ dependencies = [
  "aes-gcm",
  "chipmunk_code",
  "criterion",
+ "libc",
  "ml-kem",
  "negacyclic-rings",
  "p256",

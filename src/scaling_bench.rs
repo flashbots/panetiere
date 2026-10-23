@@ -5,9 +5,13 @@
 //! provenance-tagged tables (one row per cell) plus `scaling_sweep.csv`
 //! with every number including min/max spread:
 //!
-//!   [M] measured  — per-phase CPU, median of REPS one-party runs through the
-//!                   same APIs the protocol uses; plus wire sizes read off
-//!                   real packed bytes (sealed opening envelope, server entry)
+//!   [M] measured  — per-phase wall time, median of REPS one-party runs through
+//!                   the same APIs the protocol uses; per phase also the
+//!                   process CPU time (user+sys over all threads, median) and
+//!                   the peak heap growth (counting allocator: peak live bytes
+//!                   minus live bytes at phase start, max over reps); plus
+//!                   wire sizes read off real packed bytes (sealed opening
+//!                   envelope, server entry)
 //!   [D] derived   — exact byte arithmetic from packing formulas
 //!   [C] composed  — cost model `wall = fixed + payload` over [M] medians;
 //!                   one client → one server → verifier, summed as a serial
@@ -74,6 +78,8 @@
 //!   BENCH_BUDGET_SECS=600 cargo bench --bench protocol_sweep
 
 use std::fmt::Write as _;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -285,6 +291,13 @@ struct Stat {
     med: f64,
     min: f64,
     max: f64,
+    /// Process CPU time (user + system, all threads) per rep, median, µs.
+    /// Zero for phases timed inside the protocol rather than by `measure`.
+    cpu: f64,
+    /// Peak heap growth during a rep (peak live bytes − live bytes at start,
+    /// from [`CountingAlloc`]), max over reps, KiB. Zero where not measured or
+    /// when the binary does not install the counting allocator.
+    mem_kib: f64,
 }
 
 fn stat(mut v: Vec<f64>) -> Stat {
@@ -293,21 +306,145 @@ fn stat(mut v: Vec<f64>) -> Stat {
         med: v[v.len() / 2],
         min: v[0],
         max: *v.last().unwrap(),
+        cpu: 0.0,
+        mem_kib: 0.0,
     }
 }
 
+/// One instrumented run of a phase.
+#[derive(Clone, Copy)]
+struct Rep {
+    wall_us: f64,
+    cpu_us: f64,
+    mem_kib: f64,
+}
+
+/// Process CPU time (user + system over all threads), microseconds.
+fn cpu_time_us() -> f64 {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` only writes the struct it is handed; no pointer
+    // outlives the call.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return 0.0;
+    }
+    // SAFETY: a zero return means the struct was fully written.
+    let ru = unsafe { ru.assume_init() };
+    (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as f64 * 1e6
+        + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as f64
+}
+
+/// A `/proc/self/status` field in KiB (`VmRSS`, `VmHWM`), 0 where unavailable.
+fn proc_status_kib(key: &str) -> f64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return 0.0;
+    };
+    text.lines()
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(|rest| rest.trim_start_matches(':').split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Reset the peak-RSS watermark to the current RSS (Linux ≥ 4.0; a no-op
+/// elsewhere, where the cell peak then reports the lifetime peak).
+fn reset_peak_rss() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
+
+/// Heap accounting for the bench binaries: live bytes and a resettable peak.
+/// Installed with `#[global_allocator]` by `protocol_sweep` and
+/// `panetiere_scaling`; without it the counters stay at zero and `mem_kib`
+/// reads as unmeasured. Counting bytes rather than resident pages is what
+/// makes per-phase numbers meaningful: after the first rep the allocator
+/// reuses freed pages, so RSS stops growing while the phase's working set
+/// does not shrink.
+pub struct CountingAlloc;
+
+static HEAP_LIVE: AtomicUsize = AtomicUsize::new(0);
+static HEAP_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: delegates every operation to `System` and only touches two atomics.
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            let live = HEAP_LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            HEAP_PEAK.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            let live = if new_size >= layout.size() {
+                HEAP_LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed) + new_size
+                    - layout.size()
+            } else {
+                HEAP_LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed) + new_size
+                    - layout.size()
+            };
+            HEAP_PEAK.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+fn heap_live() -> usize {
+    HEAP_LIVE.load(Ordering::Relaxed)
+}
+
+fn heap_reset_peak() -> usize {
+    let live = heap_live();
+    HEAP_PEAK.store(live, Ordering::Relaxed);
+    live
+}
+
+fn timed_rep<R>(f: impl FnOnce() -> R) -> (Rep, R) {
+    let live0 = heap_reset_peak();
+    let cpu0 = cpu_time_us();
+    let t = Instant::now();
+    let r = f();
+    let wall_us = t.elapsed().as_secs_f64() * 1e6;
+    let cpu_us = cpu_time_us() - cpu0;
+    let mem_kib = HEAP_PEAK.load(Ordering::Relaxed).saturating_sub(live0) as f64 / 1024.0;
+    (
+        Rep {
+            wall_us,
+            cpu_us,
+            mem_kib,
+        },
+        r,
+    )
+}
+
+fn stat_of_reps(reps: &[Rep]) -> Stat {
+    if reps.is_empty() {
+        return Stat::default();
+    }
+    let mut st = stat(reps.iter().map(|r| r.wall_us).collect());
+    st.cpu = stat(reps.iter().map(|r| r.cpu_us).collect()).med;
+    st.mem_kib = reps.iter().map(|r| r.mem_kib).fold(0.0, f64::max);
+    st
+}
+
 fn measure<R>(mut f: impl FnMut() -> R) -> (Stat, R) {
-    let mut times = Vec::with_capacity(REPS);
+    let mut reps = Vec::with_capacity(REPS);
     let mut out = None;
     for _ in 0..REPS {
-        let t = Instant::now();
-        let r = f();
-        times.push(t.elapsed().as_secs_f64() * 1e6);
+        let (rep, r) = timed_rep(&mut f);
+        reps.push(rep);
         // Assign after stopping the clock: dropping the previous rep's result
         // (a multi-MB ciphertext at large ξ) must not land inside the window.
         out = Some(r);
     }
-    (stat(times), out.unwrap())
+    (stat_of_reps(&reps), out.unwrap())
 }
 
 fn fmt_us(us: f64) -> String {
@@ -414,6 +551,11 @@ struct Row {
     threads: usize,
     affinity: String,
     recovered_ok: bool,
+    /// [M] highest resident set the process reached while running this cell,
+    /// KiB. The bench holds every party's state at once (all ρ clients' posts,
+    /// every lane's shares, the aggregation tree), so this is the harness's
+    /// footprint, an upper bound on any one role's.
+    peak_rss_kib: f64,
     // [M] CPU, per-round totals for one party.
     enc_app: Stat,
     kahe_keygen: Stat,
@@ -432,6 +574,10 @@ struct Row {
     /// One fresh opening against one commitment — the per-opening `VC.Vf` unit,
     /// as distinct from `v_open`, which times the S-way parallel verify.
     v_one_open: Stat,
+    /// The whole recipient verify-and-decrypt call (`v_agg_ctxt` … `v_kahe_dec`
+    /// are its internal splits, timed inside the protocol): the only place the
+    /// recipient's CPU time and working set are measured.
+    verify: Stat,
     // [M] wire: real ML-KEM-sealed opening envelope (client → one server).
     open_env_b: usize,
     // [D] wire components (bytes).
@@ -602,6 +748,7 @@ mod csv_tests {
             threads: 8,
             affinity: "0-7".into(),
             recovered_ok: true,
+            peak_rss_kib: 0.0,
             enc_app: Stat::default(),
             kahe_keygen: Stat::default(),
             kahe_enc: Stat::default(),
@@ -617,6 +764,7 @@ mod csv_tests {
             v_kahe_dec: Stat::default(),
             dec_app: Stat::default(),
             v_one_open: Stat::default(),
+            verify: Stat::default(),
             open_env_b: 57862,
             comm_client_b: 4352,
             ctxt_client_b: 1715200,
@@ -671,6 +819,8 @@ mod csv_tests {
                     med: base,
                     min: base - 10.0,
                     max: base + 10.0,
+                    cpu: base * 4.0,
+                    mem_kib: base,
                 },
             );
         }
@@ -769,6 +919,38 @@ fn recipient_us(r: &Row) -> f64 {
         + r.dec_app.med
 }
 
+/// CPU-seconds per role, the same phase grouping as the wall totals. The
+/// recipient's verify splits are timed inside the protocol, so its CPU comes
+/// from the whole-call `verify` measurement instead.
+fn client_cpu_us(r: &Row) -> f64 {
+    r.enc_app.cpu + r.kahe_keygen.cpu + r.kahe_enc.cpu + r.share.cpu + r.cs.cpu + r.seal.cpu
+}
+
+fn server_cpu_us(r: &Row) -> f64 {
+    r.unseal.cpu + r.server.cpu
+}
+
+fn recipient_cpu_us(r: &Row) -> f64 {
+    r.verify.cpu + r.dec_app.cpu
+}
+
+/// Peak heap growth per role: the largest single phase, since phases run one
+/// after another and release their scratch in between.
+fn client_mem_kib(r: &Row) -> f64 {
+    [&r.enc_app, &r.kahe_keygen, &r.kahe_enc, &r.share, &r.cs, &r.seal]
+        .iter()
+        .map(|s| s.mem_kib)
+        .fold(0.0, f64::max)
+}
+
+fn server_mem_kib(r: &Row) -> f64 {
+    r.unseal.mem_kib.max(r.server.mem_kib)
+}
+
+fn recipient_mem_kib(r: &Row) -> f64 {
+    r.verify.mem_kib.max(r.dec_app.mem_kib)
+}
+
 /// The S sealed openings, addressed to the servers. Depends on S alone — not on
 /// the message.
 fn client_to_server_b(r: &Row) -> usize {
@@ -826,6 +1008,7 @@ fn run_cell(
     roles: Roles,
 ) -> Row {
     let cover = n - active;
+    reset_peak_rss();
     let seed = cell_seed(s, n, active, cfg.payload_symbols, flow, message_bytes);
     let mut rng = ChaCha20Rng::from_seed(seed);
     let sched = flow == "sched";
@@ -1024,15 +1207,19 @@ fn run_cell(
     // Recovery is ATTEMPTED, not asserted: a decode to garbage still yields
     // timings; an Err on every rep leaves the verifier phases at zero.
     let mut vts: Vec<VerifyTimings> = Vec::with_capacity(REPS);
+    let mut verify_reps: Vec<Rep> = Vec::with_capacity(REPS);
     let mut recovered: Option<Vec<KahePoly>> = None;
     for _ in 0..REPS {
-        if let Ok((rec, vt)) =
+        let (rep, result) = timed_rep(|| {
             aggregate_and_decrypt_unverified_timed(&pp, &canonical, &client_entries, &outputs)
-        {
+        });
+        if let Ok((rec, vt)) = result {
             vts.push(vt);
+            verify_reps.push(rep);
             recovered = Some(rec);
         }
     }
+    let verify = stat_of_reps(&verify_reps);
     if vts.is_empty() {
         eprintln!("  verify errored on all {REPS} reps; verifier phases recorded as zero");
     }
@@ -1367,6 +1554,7 @@ fn run_cell(
         threads: rayon::current_num_threads(),
         affinity: affinity(),
         recovered_ok,
+        peak_rss_kib: proc_status_kib("VmHWM"),
         // Every phase is measured; only the ones this run owns are recorded, so a
         // split run and a whole run execute identical code.
         enc_app: owned(roles.client, enc_app),
@@ -1384,6 +1572,7 @@ fn run_cell(
         v_kahe_dec: owned(roles.verifier, v_kahe_dec),
         dec_app: owned(roles.verifier, dec_app),
         v_one_open: owned(roles.verifier, v_one_open),
+        verify: owned(roles.verifier, verify),
         open_env_b,
         comm_client_b,
         ctxt_client_b,
@@ -1787,6 +1976,48 @@ fn print_tables(rows: &[Row]) {
     }
     println!();
 
+    println!(
+        "── [M] resources — cpu-seconds (user+sys, all threads) and peak heap growth, one party each ──"
+    );
+    println!(
+        "{:4}{:─^32} {:─^32} {:─^32}",
+        "", " client ", " server ", " recipient "
+    );
+    println!(
+        "{:<4}{:>10}{:>9}{:>13} {:>10}{:>9}{:>13} {:>10}{:>9}{:>13}  {:>12}{:>14}",
+        "id", "cpu", "cpu/wall", "mem", "cpu", "cpu/wall", "mem", "cpu", "cpu/wall", "mem",
+        "ρ·ctxt [D]", "process peak"
+    );
+    let ratio = |cpu: f64, wall: f64| {
+        if wall > 0.0 {
+            format!("{:.2}x", cpu / wall)
+        } else {
+            "-".into()
+        }
+    };
+    for (i, r) in rows.iter().enumerate() {
+        println!(
+            "{:<4}{:>10}{:>9}{:>13} {:>10}{:>9}{:>13} {:>10}{:>9}{:>13}  {:>12}{:>14}",
+            cell_id(i),
+            fmt_us(client_cpu_us(r)),
+            ratio(client_cpu_us(r), client_us(r)),
+            fmt_bytes(client_mem_kib(r) * 1024.0),
+            fmt_us(server_cpu_us(r)),
+            ratio(server_cpu_us(r), server_us(r)),
+            fmt_bytes(server_mem_kib(r) * 1024.0),
+            fmt_us(recipient_cpu_us(r)),
+            ratio(recipient_cpu_us(r), r.verify.med + r.dec_app.med),
+            fmt_bytes(recipient_mem_kib(r) * 1024.0),
+            fmt_bytes(r.wire_ctxt_b),
+            fmt_bytes(r.peak_rss_kib * 1024.0),
+        );
+    }
+    println!(
+        "    (mem = largest per-phase heap growth; ρ·ctxt = what a recipient holds to sum the \
+         round; process peak = the whole harness, every party's state at once)"
+    );
+    println!();
+
     println!("── [M] cpu — aggregated flow (per aggregator / leader) ──────────────────────");
     println!(
         "{:<4}{:>4}  {:<16}{:>11}{:>13}  recovered",
@@ -2185,6 +2416,12 @@ const PHASES: &[PhaseCol] = &[
         set: |r, s| r.dec_app = s,
     },
     PhaseCol {
+        name: "verify_total",
+        owner: Owner::Verifier,
+        get: |r| r.verify,
+        set: |r, s| r.verify = s,
+    },
+    PhaseCol {
         name: "agg1_level",
         owner: Owner::Agg,
         get: |r| r.agg.agg_cpu,
@@ -2355,7 +2592,12 @@ fn write_csv(rows: &[Row]) {
     let mut header = String::new();
     header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
     for p in phases {
-        write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", p.name).unwrap();
+        write!(
+            header,
+            ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max,m_{0}_cpu_us,m_{0}_mem_kib",
+            p.name
+        )
+        .unwrap();
     }
     header.push_str(
         ",m_open_env_b\
@@ -2365,6 +2607,8 @@ fn write_csv(rows: &[Row]) {
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
          ,d_rs_share_b,d_rs_path_b,d_rs_lane_post_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
          ,c_client_us,c_server_us,c_recipient_us\
+         ,c_client_cpu_us,c_server_cpu_us,c_recipient_cpu_us\
+         ,m_client_mem_kib,m_server_mem_kib,m_recipient_mem_kib,m_peak_rss_kib\
          ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
     );
     for prof in NETWORKS {
@@ -2418,7 +2662,12 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
         for p in phases {
             let st = (p.get)(r);
-            write!(out, ",{:.3},{:.3},{:.3}", st.med, st.min, st.max).unwrap();
+            write!(
+                out,
+                ",{:.3},{:.3},{:.3},{:.3},{:.0}",
+                st.med, st.min, st.max, st.cpu, st.mem_kib
+            )
+            .unwrap();
         }
         write!(
             out,
@@ -2468,10 +2717,17 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
         write!(
             out,
-            ",{:.3},{:.3},{:.3}",
+            ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.0},{:.0},{:.0},{:.0}",
             client_us(r),
             server_us(r),
             recipient_us(r),
+            client_cpu_us(r),
+            server_cpu_us(r),
+            recipient_cpu_us(r),
+            client_mem_kib(r),
+            server_mem_kib(r),
+            recipient_mem_kib(r),
+            r.peak_rss_kib,
         )
         .unwrap();
         write!(
@@ -2572,11 +2828,20 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
     };
     let idx = |name: &str| -> Result<usize, String> { Ok(num(name)? as usize) };
     let flag = |name: &str| -> Result<bool, String> { Ok(at(name)? == "true") };
+    // Resource columns are newer than the timing ones; older sweeps read as zero.
+    let opt_num = |name: &str| -> Result<f64, String> {
+        match at(name) {
+            Ok(_) => num(name),
+            Err(_) => Ok(0.0),
+        }
+    };
     let stat = |name: &str| -> Result<Stat, String> {
         Ok(Stat {
             med: num(&format!("m_{name}_us_med"))?,
             min: num(&format!("m_{name}_us_min"))?,
             max: num(&format!("m_{name}_us_max"))?,
+            cpu: opt_num(&format!("m_{name}_cpu_us"))?,
+            mem_kib: opt_num(&format!("m_{name}_mem_kib"))?,
         })
     };
 
@@ -2651,6 +2916,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         threads: idx("m_threads")?,
         affinity: at("m_affinity")?.to_string(),
         recovered_ok: flag("recovered")?,
+        peak_rss_kib: opt_num("m_peak_rss_kib")?,
         enc_app: Stat::default(),
         kahe_keygen: Stat::default(),
         kahe_enc: Stat::default(),
@@ -2666,6 +2932,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         v_kahe_dec: Stat::default(),
         dec_app: Stat::default(),
         v_one_open: Stat::default(),
+        verify: Stat::default(),
         open_env_b: idx("m_open_env_b")?,
         comm_client_b: idx("d_comm_client_b")?,
         ctxt_client_b: idx("d_ctxt_client_b")?,
