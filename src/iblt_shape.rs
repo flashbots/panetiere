@@ -52,14 +52,14 @@ pub(crate) fn iblt_shape(rho: usize) -> (usize, usize) {
         }
         let (mut lo, mut hi) = (d_lo, d_hi);
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = lo.midpoint(hi);
             if table.union_bound_log2(theta, mid) <= target {
                 hi = mid;
             } else {
                 lo = mid + 1;
             }
         }
-        if best.map_or(true, |(bt, bd)| theta * lo < bt * bd) {
+        if best.is_none_or(|(bt, bd)| theta * lo < bt * bd) {
             best = Some((theta, lo));
         }
     }
@@ -92,7 +92,7 @@ impl Bound {
     /// `φ_{a+b}(s)` from `φ_a` and `φ_b`.
     fn combine(&self, pa: &[f64], a: usize, pb: &[f64], b: usize) -> Vec<f64> {
         let r = a as f64 / (a + b) as f64;
-        let (ln_r, ln_1r) = (r.ln(), (-r).ln_1p());
+        let (ln_r, ln_not_r) = (r.ln(), (-r).ln_1p());
         (0..=self.rho)
             .map(|s| {
                 (0..=s)
@@ -100,7 +100,7 @@ impl Bound {
                         let log_c = self.log_factorial[s]
                             - self.log_factorial[k]
                             - self.log_factorial[s - k];
-                        (log_c + k as f64 * ln_r + (s - k) as f64 * ln_1r).exp() * pa[k] * pb[s - k]
+                        (log_c + k as f64 * ln_r + (s - k) as f64 * ln_not_r).exp() * pa[k] * pb[s - k]
                     })
                     .sum()
             })

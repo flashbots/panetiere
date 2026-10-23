@@ -55,14 +55,14 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
 //! ──────────────────────────────────────────────────────────────────────
-//!  src/rings.rs: N = 2048, q_cs = 139_301, q_kahe = 347_280_875_347_969
-//!  chipmunk param.rs: q_hvc = 40_961, HVC_WIDTH = 3
-//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^35, σ_s = σ_e = 15.72
+//!  src/rings.rs: N = 2048, q_cs = 57_637, q_kahe = 280_513_608_622_081
+//!  chipmunk param.rs: q_hvc = 557_057, HVC_WIDTH = 2
+//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^31 + 11, σ_s = σ_e = 6.70
 //!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
 //!                — reported per cell as `eps`, the exponent that condition
 //!                actually buys at that (ρ, μ). It falls with √ρ and with
 //!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
-//!  src/mse.rs:   BITS_PER_SYMBOL = 36, K_LIMBS = 2
+//!  src/mse.rs:   BITS_PER_SYMBOL = 31, K_LIMBS = 2
 //!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
 //!                  over (S, ρ, active, ξ, flow, message_bytes), so cells never
 //!                  share a stream
@@ -81,7 +81,7 @@ use rayon::prelude::*;
 use crate::bulletin::rs_poly_packed_len;
 use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::channel::{self, ChannelParams};
-use crate::codec::{self, BYTES_PER_COEFF, BYTES_PER_POLY};
+use crate::codec::{self, BYTES_PER_POLY};
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
@@ -150,8 +150,8 @@ const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
 /// Aggregation ceiling for the RNS share commitment.
 const RS_RHO_MAX: usize = 300;
 
-// Per-client element size = ξ symbols · 36 bits: 911 ⇒ 4 KiB, 3641 ⇒ 16 KiB.
-const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[911, 3641];
+// Per-client element size = ξ symbols · 31 bits: 1058 ⇒ 4 KiB, 4229 ⇒ 16 KiB.
+const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[1058, 4229];
 
 // ── env sweep knobs (fall back to the consts above) ─────────────────────────
 
@@ -849,10 +849,10 @@ fn run_cell(
         ChannelParams::Mse(p) => (p.total_cells(), p.delta),
         ChannelParams::Prony(p) => (p.cols(), p.cols()),
     };
-    // Slot alignment matches the codec's packing width, so `active` slots fill
-    // the vector exactly and `allocate` never rounds one past the end.
+    // Slots are byte-granular: chunks straddle bytes, but disjoint slots have
+    // disjoint bits, so the summed vector still decodes exactly.
     let slot_bytes = if sched {
-        (message_bytes / active.max(1)).next_multiple_of(BYTES_PER_COEFF)
+        (message_bytes / active.max(1)).max(1)
     } else {
         0
     };

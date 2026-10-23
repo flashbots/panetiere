@@ -317,8 +317,11 @@ impl Kahe {
 
 pub const SIGMA_S_DEFAULT: f64 = 6.70;
 pub const SIGMA_E_DEFAULT: f64 = 6.70;
-/// Largest power of two satisfying `t·(8σ_e·√ρ + ρ/2) < q_kahe/2` at ρ = 300.
-pub const T_MODULUS_DEFAULT: u64 = 1 << 35;
+/// Plaintext modulus: the smallest prime above `2^31`, shared by both multiset
+/// encodings. The paper needs `t` prime and above the capacity, since the
+/// peeling counters and Newton's identities both live in `Z_t`. Messages are
+/// chunked into `⌊log₂ t⌋ = 31` bits per coordinate.
+pub const T_MODULUS_DEFAULT: u64 = (1 << 31) + 11;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -327,7 +330,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=6.70, `t = 2^35` at q_kahe ≈ 2^48.
+    /// `μ = 1`, σ_s=σ_e=6.70, `t = 2^31 + 11` at q_kahe ≈ 2^48.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }

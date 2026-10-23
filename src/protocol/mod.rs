@@ -224,7 +224,7 @@ mod tests {
             1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT * 4,
+            T_MODULUS_DEFAULT * 128,
         );
         assert!(pp.max_clients > 0 && pp.max_clients < 300);
         let budget = |rho: usize| {

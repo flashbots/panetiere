@@ -1,20 +1,24 @@
 //! Byte ↔ polynomial codec for KAHE messages.
 //!
 //! Layout: little-endian `u32` byte-length header, then the bytes themselves,
-//! padded with zeros up to the next 4-byte boundary, then packed four bytes per
-//! coefficient (little-endian `u32`). Each `KahePoly` carries `N = 2048`
-//! coefficients = `8192` bytes; the final poly is zero-padded to fill `N`
-//! coefficients. Coefficients land in `[0, 2^32) ⊂ [0, t)` so a fresh
-//! single-client encode/decode is exact round-trip. Per-coefficient headroom
-//! under mod-t summation is `t/2^32 = 2^3`.
+//! chunked `BITS_PER_COEFF = ⌊log₂ t⌋` bits per coefficient (see
+//! [`crate::chunking`]). Each `KahePoly` carries `N = 2048` coefficients =
+//! `BYTES_PER_POLY` bytes; the final poly is zero-padded to fill `N`
+//! coefficients. Coefficients land in `[0, 2^BITS_PER_COEFF) ⊂ [0, t)`, so a
+//! fresh single-client encode/decode is an exact round-trip, and byte slots
+//! with disjoint bits sum without carries.
 
+use crate::chunking;
+use crate::kahe::T_MODULUS_DEFAULT;
+use crate::mse::BITS_PER_SYMBOL;
 use crate::{KahePoly, N};
 
-pub const BYTES_PER_COEFF: usize = 4;
-pub const BYTES_PER_POLY: usize = N * BYTES_PER_COEFF;
+pub const BITS_PER_COEFF: usize = BITS_PER_SYMBOL;
+pub const BYTES_PER_POLY: usize = N * BITS_PER_COEFF / 8;
+const _: () = assert!(N * BITS_PER_COEFF % 8 == 0);
 const HEADER_LEN: usize = 4;
-/// Per-coefficient symbol modulus (what fits in `BYTES_PER_COEFF` bytes).
-const SYMBOL_MOD: i64 = 1 << 32;
+/// Per-coefficient symbol modulus (what fits in `BITS_PER_COEFF` bits).
+const SYMBOL_MOD: i64 = 1 << BITS_PER_COEFF;
 
 #[derive(Debug, PartialEq)]
 pub enum CodecError {
@@ -34,29 +38,31 @@ pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
     if polys.is_empty() {
         return Err(CodecError::Empty);
     }
+    let t = T_MODULUS_DEFAULT as i64;
     let mut buf = Vec::with_capacity(polys.len() * BYTES_PER_POLY);
+    let mut coeffs = [0u64; N];
     for poly in polys {
         let mut p = *poly;
         p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
-            // Symbols are `[0, 2^32)` both raw (direct encode) and after KAHE
-            // dec (`poly_mod_t` centers mod t, which leaves values < t/2
-            // untouched, and t/2 ≥ 2^34). Anything else is genuine overflow.
-            if !(0..SYMBOL_MOD).contains(&c) {
+            // Symbols are `[0, 2^BITS_PER_COEFF)` raw; after KAHE decryption
+            // `poly_mod_t` has centered them, so the upper half of that range
+            // shows up in `[-t/2, 0)`. Anything else is genuine overflow.
+            let v = if c < 0 { c + t } else { c };
+            if c < -(t / 2) || !(0..SYMBOL_MOD).contains(&v) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }
-            buf.extend_from_slice(&(c as u32).to_le_bytes());
+            coeffs[i] = v as u64;
         }
+        buf.extend(chunking::unpack(&coeffs, BITS_PER_COEFF, BYTES_PER_POLY));
     }
     Ok(buf)
 }
 
 fn coeffs_from_bytes(chunk: &[u8]) -> KahePoly {
     let mut coeffs = [0i64; N];
-    for (i, group) in chunk.chunks(BYTES_PER_COEFF).enumerate() {
-        let mut bytes = [0u8; 4];
-        bytes[..group.len()].copy_from_slice(group);
-        coeffs[i] = u32::from_le_bytes(bytes) as i64;
+    for (c, packed) in coeffs.iter_mut().zip(chunking::pack(chunk, BITS_PER_COEFF, N)) {
+        *c = packed as i64;
     }
     KahePoly::from_coeffs(coeffs)
 }
@@ -78,22 +84,7 @@ pub fn encode(bytes: &[u8]) -> Vec<KahePoly> {
 }
 
 pub fn decode(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
-    if polys.is_empty() {
-        return Err(CodecError::Empty);
-    }
-    let total_bytes = polys.len() * BYTES_PER_POLY;
-    let mut buf = Vec::with_capacity(total_bytes);
-    for poly in polys {
-        let mut p = *poly;
-        p.normalize();
-        for (i, &c) in p.coeffs().iter().enumerate() {
-            // See `decode_raw`: symbols are `[0, 2^32)`.
-            if !(0..SYMBOL_MOD).contains(&c) {
-                return Err(CodecError::CoeffOutOfRange { index: i, value: c });
-            }
-            buf.extend_from_slice(&(c as u32).to_le_bytes());
-        }
-    }
+    let buf = decode_raw(polys)?;
     if buf.len() < HEADER_LEN {
         return Err(CodecError::Empty);
     }
@@ -144,10 +135,10 @@ pub fn allocate(
             pos = run_end;
             continue;
         }
-        let aligned = reservations[order[pos]].1.next_multiple_of(BYTES_PER_COEFF);
-        if cursor + aligned <= vector_bytes {
+        let size = reservations[order[pos]].1;
+        if cursor + size <= vector_bytes {
             out[order[pos]] = Some(cursor);
-            cursor += aligned;
+            cursor += size;
         }
         pos += 1;
     }
@@ -221,7 +212,7 @@ mod tests {
     #[test]
     fn round_trip_odd_length() {
         let msg = b"odd-length-message-with-31-byte";
-        assert_eq!(msg.len() % BYTES_PER_COEFF, 3);
+        assert_eq!(msg.len(), 31);
         let polys = encode(msg);
         assert_eq!(decode(&polys).unwrap().as_slice(), msg);
     }

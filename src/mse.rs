@@ -19,27 +19,37 @@ const T: i64 = T_MODULUS_DEFAULT as i64;
 const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
-/// Bits of payload carried per symbol.
-pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
+/// Bits of payload carried per symbol: `⌊log₂ t⌋`.
+pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.ilog2() as usize;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
     pub gamma: usize,
     /// Buckets per row.
     pub delta: usize,
+    /// Elements the table is sized for; decoding peels at most this many.
+    pub capacity: usize,
     pub payload_symbols: usize,
     pub prf_key: [u8; 32],
 }
 
 impl MseParams {
     /// Uniform `γ × δ` layout (standard IBLT shape).
-    pub fn new(gamma: usize, delta: usize, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
+    pub fn new(
+        gamma: usize,
+        delta: usize,
+        capacity: usize,
+        payload_symbols: usize,
+        prf_key: [u8; 32],
+    ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
+        assert!(capacity >= 1, "capacity must be ≥ 1");
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
         Self {
             gamma,
             delta,
+            capacity,
             payload_symbols,
             prf_key,
         }
@@ -61,7 +71,7 @@ impl MseParams {
         (1 + K_LIMBS + self.payload_symbols) * self.total_cells()
     }
 
-    /// `t^K_LIMBS`, the size of the randomness space. `t^2 = 2^72`, so u128.
+    /// `t^K_LIMBS`, the size of the randomness space.
     pub fn r_space(&self) -> u128 {
         let t = T_MODULUS_DEFAULT as u128;
         let mut p: u128 = 1;
@@ -86,6 +96,12 @@ pub struct MseEncoding {
 #[derive(Debug, PartialEq)]
 pub enum MseError {
     PeelStalled,
+    /// A pure cell's key does not hash to that cell: the table is not a sum of
+    /// honest encodings.
+    Malformed,
+    /// More pure cells than the capacity: the table is not a sum of honest
+    /// encodings, or it holds more elements than it was sized for.
+    OverCapacity,
     ParamsMismatch,
     PayloadArity,
 }
@@ -207,6 +223,9 @@ impl MseEncoding {
             if c[idx] != 1 {
                 continue;
             }
+            if emitted.len() == self.params.capacity {
+                return Err(MseError::OverCapacity);
+            }
             let mut r_star: u128 = 0;
             let mut place: u128 = 1;
             for ell in 0..K_LIMBS {
@@ -215,10 +234,13 @@ impl MseEncoding {
                 r_star += to_canonical(signed) * place;
                 place *= t_u128;
             }
+            if prf_bucket(&self.params.prf_key, row, r_star, self.params.delta) != col {
+                return Err(MseError::Malformed);
+            }
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
             }
-            emitted.push(x_star_buf.clone());
+            emitted.push(x_star_buf.iter().map(|&x| to_canonical(x) as i64).collect());
             for i in 0..self.params.gamma {
                 let j = prf_bucket(&self.params.prf_key, i, r_star, self.params.delta);
                 let cell = i * self.params.delta + j;
@@ -323,7 +345,41 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> MseParams {
-        MseParams::new(gamma, delta, payload_symbols, [seed; 32])
+        MseParams::new(gamma, delta, delta, payload_symbols, [seed; 32])
+    }
+
+    /// A pure cell whose key hashes elsewhere is a forgery, not an element.
+    #[test]
+    fn poisoned_pure_cell_is_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
+        let mut enc = MseEncoding::new(params_for(4, 16, 1, 3));
+        enc.insert(&mut rng, &[42]);
+        for idx in 0..enc.c.len() {
+            if enc.c[idx] == 1 {
+                enc.k[0][idx] = reduce(enc.k[0][idx] + 1);
+            }
+        }
+        assert_eq!(enc.decode(), Err(MseError::Malformed));
+    }
+
+    /// Peeling stops at the capacity even when more pure cells remain.
+    #[test]
+    fn peeling_past_capacity_is_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
+        let mut enc = MseEncoding::new(MseParams::new(4, 64, 2, 1, [3u8; 32]));
+        for x in [1, 2, 3] {
+            enc.insert(&mut rng, &[x]);
+        }
+        assert_eq!(enc.decode(), Err(MseError::OverCapacity));
+    }
+
+    /// Decoded symbols are canonical in `[0, t)`, whatever the input's sign.
+    #[test]
+    fn decoded_symbols_are_canonical() {
+        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let mut enc = MseEncoding::new(params_for(4, 16, 1, 9));
+        enc.insert(&mut rng, &[-1]);
+        assert_eq!(enc.decode(), Ok(vec![vec![T - 1]]));
     }
 
     #[test]
@@ -447,13 +503,13 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → 15 symbols at BITS_PER_SYMBOL=35 (t=2^35). Smaller
-    /// multiset but exercises the fat-payload code path end-to-end.
+    /// 512-bit message → `⌈512 / BITS_PER_SYMBOL⌉` symbols. Smaller multiset
+    /// but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = MseParams::payload_symbols_for_bits(512);
-        assert_eq!(xi, 15);
+        assert_eq!(xi, 512usize.div_ceil(BITS_PER_SYMBOL));
         let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..5)

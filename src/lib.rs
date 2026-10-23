@@ -4,6 +4,7 @@
 
 pub mod bulletin;
 pub mod channel;
+mod chunking;
 pub mod codec;
 pub mod cs;
 #[doc(hidden)]
