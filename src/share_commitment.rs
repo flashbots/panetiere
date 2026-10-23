@@ -188,7 +188,10 @@ impl ShareCommitmentParams {
 
 fn label_digits(label: &[RsNTTPoly]) -> Vec<HVCPoly> {
     let mut out = zeroed_polys(label.len() * DGT_WIDTH);
-    for (p, digits) in label.iter().zip(out.chunks_exact_mut(DGT_WIDTH)) {
+    for (p, digits) in label
+        .iter()
+        .zip(out.as_chunks_mut::<DGT_WIDTH>().0.iter_mut())
+    {
         decompose_into(p, digits);
     }
     out

@@ -97,8 +97,8 @@ use crate::protocol::server::{
     run_rs_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
 };
 use crate::protocol::verify::{
-    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate, RsVerifyTimings,
-    VerifyError, VerifyTimings,
+    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate,
+    RsVerifyTimings, VerifyError, VerifyTimings,
 };
 use crate::protocol::ProtocolParams;
 use crate::protocol::{ClientId, NodeId, ServerId, SessionId};

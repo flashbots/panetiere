@@ -6,7 +6,7 @@ use panetiere::{hvc_stream::StreamingHvcDot, hvc_sum::sum_hvc_polys, N};
 use rand::{rngs::StdRng, SeedableRng};
 
 fn hvc(c: &mut Criterion) {
-    let mut rng = StdRng::seed_from_u64(0x4856_43);
+    let mut rng = StdRng::seed_from_u64(0x0048_5643);
     let polys: Vec<_> = (0..63).map(|_| HVCPoly::rand_poly(&mut rng)).collect();
     let ntt: Vec<_> = polys.iter().map(HVCNTTPoly::from).collect();
     let streaming: Vec<_> = [6, 24, 30, 63]
