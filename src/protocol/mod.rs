@@ -197,7 +197,7 @@ pub fn round_wire_sizes(n_servers: usize, ctxt_polys: usize, rho: u32) -> RoundW
 const MU_CS: usize = 1;
 
 /// BDLOP randomness width
-const KAPPA_CS: usize = 5;
+const KAPPA_CS: usize = 6;
 
 #[cfg(test)]
 mod tests {
@@ -224,7 +224,7 @@ mod tests {
             1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT * 4,
+            T_MODULUS_DEFAULT * 128,
         );
         assert!(pp.max_clients > 0 && pp.max_clients < 300);
         let budget = |rho: usize| {

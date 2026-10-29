@@ -153,7 +153,7 @@ impl Round {
 
 fn mse_round(rho: usize, xi: usize) -> (Round, MseParams, Vec<Vec<i64>>) {
     let mut rng = ChaCha20Rng::from_seed([0x31; 32]);
-    let params = MseParams::new(4, (3 * rho).div_ceil(4), xi, [0xAA; 32]);
+    let params = MseParams::new(4, (3 * rho).div_ceil(4), rho, xi, [0xAA; 32]);
     let payload_polys = MseEncoding::n_polys(&params);
     let elements: Vec<Vec<i64>> = (0..rho)
         .map(|i| (0..xi).map(|j| (i + j + 1) as i64).collect())

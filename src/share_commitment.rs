@@ -7,17 +7,17 @@
 //! the client-signed roots: the post is its own correctness proof.
 //!
 //! **Hash, then decompose the hash.** Leaf `j` is not the share but the
-//! base-69 digits of its Ajtai hash `A·s_j` over the share ring, four digits for
-//! each of its two 24-bit channels. Two binding layers:
+//! base-769 digits of its Ajtai hash `A·s_j` over the share ring, six digits
+//! per coefficient. Two binding layers:
 //!
 //! - The HVC tree binds `Σ labels` (digits short by construction, sums
-//!   `ρ_max·ζ = 10 200 < q_hvc/2`-bounded, asserted at setup).
-//! - `A` binds a lane's posted sum to `Σ labels` in both prime channels.
+//!   `ρ_max·ζ = 115 200 < q_hvc/2`-bounded, asserted at setup).
+//! - `A` binds a lane's posted sum to `Σ labels` mod `q_kahe`.
 //!   Re-encoding names any inconsistent lane.
 //!
 //! Everything is NTT-domain: shares arrive as `RsNTTPoly`, `A·s` is pointwise
 //! dots, and the committed label coefficients are the NTT-domain canonical
-//! values. RS and commitment arithmetic never leave the two KAHE channels.
+//! values. RS and commitment arithmetic never leave the KAHE ring.
 
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE, ZETA};
 use rand::{Rng, SeedableRng};
@@ -27,12 +27,11 @@ use rayon::prelude::*;
 use crate::bulletin::rs_poly_packed_len;
 use crate::cs::{digits_packed_len, pack_digits, position_list, unpack_digits, wrapping_add_avx2};
 use crate::hvc_stream::StreamingHvcDot;
-use crate::rings::KAHE_RNS_MODULI;
 use crate::rings::{center_canonical_i64, center_i32};
 use crate::rs::Share;
-use crate::{pointwise_dot_rs, RsNTTPoly, N as POLY_N};
-/// Four base-69 digits cover each 24-bit KAHE-RNS channel.
-pub const DGT_WIDTH: usize = 8;
+use crate::{pointwise_dot_rs, RsNTTPoly, KAHE_MODULUS, N as POLY_N};
+/// Six balanced base-769 digits cover a KAHE coefficient: `769^6 ≈ 2^57.5 > q`.
+pub const DGT_WIDTH: usize = 6;
 
 /// Ajtai-hash output width.
 pub const LABEL_POLYS: usize = 3;
@@ -48,7 +47,7 @@ fn decompose_step(value: i64) -> (i32, i64) {
     ((value - next * BASE) as i32, next)
 }
 
-/// Balanced base-69 digits of the canonical NTT-domain coefficients, centered
+/// Balanced base-769 digits of the canonical NTT-domain coefficients, centered
 /// first. Digit coefficients ∈ [−ζ, ζ], little-endian.
 pub fn decompose_share_poly(p: &RsNTTPoly) -> [HVCPoly; DGT_WIDTH] {
     let mut out = [HVCPoly::default(); DGT_WIDTH];
@@ -60,39 +59,33 @@ pub fn decompose_share_poly(p: &RsNTTPoly) -> [HVCPoly; DGT_WIDTH] {
 /// digit vectors are filled in place rather than moved out by value.
 fn decompose_into(p: &RsNTTPoly, out: &mut [HVCPoly]) {
     debug_assert_eq!(out.len(), DGT_WIDTH);
-    const LIMB_WIDTH: usize = 4;
-    for limb in 0..2 {
-        let q = KAHE_RNS_MODULI[limb];
-        for i in 0..POLY_N {
-            let mut v = center_canonical_i64(p.residues()[limb][i] as i64, q as i64);
-            for digit in &mut out[limb * LIMB_WIDTH..(limb + 1) * LIMB_WIDTH] {
-                let (d, next) = decompose_step(v);
-                digit.coeffs_mut()[i] = d;
-                v = next;
-            }
-            debug_assert_eq!(v, 0);
+    let coeffs = p.coeffs();
+    for i in 0..POLY_N {
+        let mut v = center_canonical_i64(coeffs[i] as i64, KAHE_MODULUS);
+        for digit in out.iter_mut() {
+            let (d, next) = decompose_step(v);
+            digit.coeffs_mut()[i] = d;
+            v = next;
         }
+        debug_assert_eq!(v, 0);
     }
 }
 
 /// Left-inverse of [`decompose_share_poly`], linear in the digits. i128
-/// Horner: aggregated digits reach `ρ_max·ζ = 10 200`, and `10 200·69⁹ ≈ 2^68`
-/// overflows i64. Reduced independently in each RNS channel.
+/// Horner: aggregated digits reach `ρ_max·ζ = 115 200`, and
+/// `115 200·769⁵ ≈ 2^65` overflows i64. Reduced mod `q_kahe`.
 pub fn project_share_poly(digits: &[HVCPoly]) -> RsNTTPoly {
     debug_assert_eq!(digits.len(), DGT_WIDTH);
-    const LIMB_WIDTH: usize = 4;
-    let mut residues = [[0u32; POLY_N]; 2];
-    for limb in 0..2 {
-        let ds = &digits[limb * LIMB_WIDTH..(limb + 1) * LIMB_WIDTH];
-        for i in 0..POLY_N {
-            let mut acc = ds[LIMB_WIDTH - 1].coeffs()[i] as i64;
-            for digit in ds.iter().rev().skip(1) {
-                acc = acc * BASE + digit.coeffs()[i] as i64;
-            }
-            residues[limb][i] = acc.rem_euclid(KAHE_RNS_MODULI[limb] as i64) as u32;
+    let mut raw = [0u64; POLY_N];
+    for (i, r) in raw.iter_mut().enumerate() {
+        let mut acc = digits[DGT_WIDTH - 1].coeffs()[i] as i128;
+        for digit in digits.iter().rev().skip(1) {
+            acc = acc * BASE as i128 + digit.coeffs()[i] as i128;
         }
+        *r = acc.rem_euclid(KAHE_MODULUS as i128) as u64;
     }
-    RsNTTPoly::from_residues(residues).unwrap()
+    // Every coefficient was just reduced mod q, so this cannot fail.
+    RsNTTPoly::from_canonical(raw).expect("projection is reduced mod q")
 }
 
 /// `g^T · u` over the `LABEL_POLYS·DGT_WIDTH` label-digit polys. Linear in
@@ -121,7 +114,7 @@ pub struct ShareCommitmentParams {
     pub n_lanes: usize,
     pub n_leaves: usize,
     pub rho_max: usize,
-    /// Ajtai rows over the channel-wise RNS share ring.
+    /// Ajtai rows over the NTT-domain share ring.
     a_rows: Vec<Vec<RsNTTPoly>>,
     leaf_hash: ShareLeafHash,
     hasher: HVCHash,
@@ -272,7 +265,7 @@ impl ShareOpening {
         })
     }
 
-    /// Project the digit sums back to `Σ labels` in both RNS channels.
+    /// Project the digit sums back to `Σ labels` mod `q_kahe`.
     pub fn project_labels(&self) -> Vec<RsNTTPoly> {
         (0..LABEL_POLYS)
             .map(|k| project_share_poly(&self.data[k * DGT_WIDTH..(k + 1) * DGT_WIDTH]))
@@ -744,6 +737,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "exceeds the digit budget")]
     fn rho_beyond_the_digit_budget_is_rejected_at_setup() {
-        params(4, 16, 603);
+        let budget = (HVC_MODULUS as usize / 2) / ZETA as usize;
+        params(4, 16, budget + 1);
     }
 }

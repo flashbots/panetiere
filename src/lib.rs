@@ -4,12 +4,14 @@
 
 pub mod bulletin;
 pub mod channel;
+mod chunking;
 pub mod codec;
 pub mod cs;
 #[doc(hidden)]
 pub mod hvc_stream;
 #[doc(hidden)]
 pub mod hvc_sum;
+mod iblt_shape;
 pub mod kahe;
 pub mod mse;
 pub mod pke;

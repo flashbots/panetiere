@@ -269,7 +269,7 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
     let n_clients = messages.len();
     const SLOT_SIZE: usize = 128;
     // One KahePoly = N·4 bytes = 8192 at N=2048.
-    const TOTAL_BYTES: usize = 8192;
+    const TOTAL_BYTES: usize = codec::BYTES_PER_POLY;
     assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
@@ -354,7 +354,7 @@ fn slot_mode_8kb_message_multi_poly() {
     const SLOT_SIZE: usize = 4096;
     const TOTAL_BYTES: usize = 16 * 1024;
     // One KahePoly = N·4 bytes = 8192 at N=2048 → 16 KiB spans 2 polys.
-    const N_POLYS: usize = TOTAL_BYTES / 8192;
+    const N_POLYS: usize = TOTAL_BYTES.div_ceil(panetiere::codec::BYTES_PER_POLY);
     assert_eq!(n_clients * SLOT_SIZE, TOTAL_BYTES);
 
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_clients);
@@ -423,7 +423,8 @@ fn slot_mode_8kb_message_multi_poly() {
     }
 
     let recovered_bytes = panetiere::codec::decode_raw(&recovered_polys).expect("decode");
-    assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
+    assert!(recovered_bytes.len() >= TOTAL_BYTES);
+    assert!(recovered_bytes[TOTAL_BYTES..].iter().all(|&b| b == 0));
 
     for slot in 0..n_clients {
         let start = slot * SLOT_SIZE;

@@ -3,26 +3,18 @@
 use crate::KahePoly;
 use rand::Rng;
 
+use crate::chunking;
+use crate::iblt_shape::iblt_shape;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::ProtocolParams;
 
-/// Bytes packed into one symbol, little-endian.
-pub const BYTES_PER_SYMBOL: usize = 4;
+/// Message bits packed into one symbol: `⌊log₂ t⌋`, so every chunk is a
+/// distinct residue of the plaintext modulus both encodings share.
+pub const BITS_PER_CHUNK: usize = mse::BITS_PER_SYMBOL;
 
-/// A symbol must not fill its `Z_t` cell — the slack is the mod-`t` summation
-/// headroom. Breaks the build if `t` is ever lowered under the packing.
-const _: () = assert!(BYTES_PER_SYMBOL * 8 < mse::BITS_PER_SYMBOL);
-/// Prony needs every packed symbol to be a distinct residue mod `p`.
-const _: () = assert!((1u64 << (BYTES_PER_SYMBOL * 8)) < PRONY_PRIME);
-
-/// Rows in the peeling structure. 2 is the correctness floor; 4 is the usual
-/// operating point.
-const GAMMA: usize = 4;
-
-/// Buckets per insertion, across all rows.
-const BUCKETS_PER_INSERT: usize = 3;
+const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PRONY_PRIME);
 
 #[derive(Debug, PartialEq)]
 pub enum ChannelError {
@@ -58,10 +50,11 @@ impl ChannelParams {
     /// each. For channels whose payload is already `Z_t` values rather than
     /// bytes — the byte packing of [`encode_message`] does not apply to those.
     pub fn for_symbols(rho: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
-        let delta = (BUCKETS_PER_INSERT * rho.max(1) as usize).div_ceil(GAMMA);
+        let (theta, delta) = iblt_shape(rho as usize);
         ChannelParams::Mse(MseParams::new(
-            GAMMA,
+            theta,
             delta,
+            rho.max(1) as usize,
             payload_symbols.max(1),
             prf_key,
         ))
@@ -92,8 +85,8 @@ impl ChannelParams {
 
     pub fn from_prony(prony: PronyParams) -> Self {
         assert!(
-            (1u64 << (BYTES_PER_SYMBOL * 8)) < prony.p,
-            "p must exceed the {BYTES_PER_SYMBOL}-byte symbol packing",
+            (1u64 << BITS_PER_CHUNK) <= prony.p,
+            "p must cover the {BITS_PER_CHUNK}-bit chunk packing",
         );
         ChannelParams::Prony(prony)
     }
@@ -129,7 +122,7 @@ impl ChannelParams {
     }
 
     /// Payload bits one symbol carries: `⌊log₂ t⌋` in the peeling structure's
-    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — both are 35.
+    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — the same `t`.
     pub fn bits_per_symbol(&self) -> usize {
         match self {
             ChannelParams::Mse(_) => mse::BITS_PER_SYMBOL,
@@ -147,7 +140,7 @@ impl ChannelParams {
 
     /// Largest payload [`encode_message`] accepts.
     pub fn max_payload_bytes(&self) -> usize {
-        self.payload_symbols() * BYTES_PER_SYMBOL
+        self.payload_symbols() * BITS_PER_CHUNK / 8
     }
 
     /// Protocol parameters whose KAHE width is exactly one packed encoding.
@@ -164,23 +157,24 @@ impl ChannelParams {
 }
 
 fn payload_symbols(message_bytes: usize) -> usize {
-    message_bytes.div_ceil(BYTES_PER_SYMBOL).max(1)
+    (message_bytes * 8).div_ceil(BITS_PER_CHUNK).max(1)
 }
 
 fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i64> {
-    let mut buf = payload.to_vec();
-    buf.resize(xi * BYTES_PER_SYMBOL, 0);
-    buf.chunks(BYTES_PER_SYMBOL)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("chunk is BYTES_PER_SYMBOL")) as i64)
+    chunking::pack(payload, BITS_PER_CHUNK, xi)
+        .into_iter()
+        .map(|s| s as i64)
         .collect()
 }
 
 fn symbols_to_bytes(symbols: &[i64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(symbols.len() * BYTES_PER_SYMBOL);
-    for &s in symbols {
-        out.extend_from_slice(&(s as u32).to_le_bytes());
-    }
-    out
+    let t = T_MODULUS_DEFAULT as i64;
+    let canonical: Vec<u64> = symbols.iter().map(|&s| s.rem_euclid(t) as u64).collect();
+    chunking::unpack(
+        &canonical,
+        BITS_PER_CHUNK,
+        symbols.len() * BITS_PER_CHUNK / 8,
+    )
 }
 
 pub fn encode_message<R: Rng>(
@@ -299,7 +293,7 @@ mod tests {
     fn round_trip_at_capacity() {
         for p in variants(8, 64) {
             let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
-            assert_eq!(p.max_payload_bytes(), 64);
+            assert!(p.max_payload_bytes() >= 64);
 
             let payloads: Vec<Vec<u8>> = (0..8u8)
                 .map(|i| {
@@ -314,6 +308,11 @@ mod tests {
                 .collect();
 
             let mut got = decode_messages(&p, &sum(&contributions), Some(8)).unwrap();
+            // Decoded messages come back at the channel's full byte capacity.
+            for m in &mut got {
+                assert!(m[64..].iter().all(|&b| b == 0), "{p:?}");
+                m.truncate(64);
+            }
             let mut want = payloads;
             got.sort();
             want.sort();
@@ -405,8 +404,8 @@ mod tests {
         }
     }
 
-    /// The symbol path carries the channel's full `bits_per_symbol`, so values
-    /// above the `BYTES_PER_SYMBOL` byte packing round-trip through it.
+    /// The symbol path carries the channel's full `bits_per_symbol`, so the
+    /// top of the chunk range round-trips through it.
     #[test]
     fn wide_symbols_round_trip() {
         // rho=8 for 4 inserts: this test is about symbol width, and the peel
@@ -416,10 +415,7 @@ mod tests {
             ChannelParams::prony_for_symbols(4, 3),
         ] {
             let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
-            // Quarter of the channel's own plaintext modulus, so the value stays
-            // inside `[-t/2, t/2)` whatever `t` the feature set selects.
-            let wide = (p.plaintext_modulus() as i64 / 4) + 12_345;
-            assert!(wide > (1 << (BYTES_PER_SYMBOL * 8)));
+            let wide = (1i64 << BITS_PER_CHUNK) - 12_345;
             let payloads: Vec<Vec<i64>> = (0..4)
                 .map(|i| vec![wide - i, i + 1, wide / (i + 2)])
                 .collect();
@@ -442,8 +438,8 @@ mod tests {
     fn prony_for_bits_sizes_at_the_sketch_width() {
         let bits = 911 * mse::BITS_PER_SYMBOL;
         let p = ChannelParams::prony_for_bits(300, bits);
-        assert_eq!(p.bits_per_symbol(), 35);
-        assert_eq!(p.payload_symbols(), bits.div_ceil(35));
+        assert_eq!(p.bits_per_symbol(), mse::BITS_PER_SYMBOL);
+        assert_eq!(p.payload_symbols(), bits.div_ceil(mse::BITS_PER_SYMBOL));
         assert!(p.payload_symbols() * p.bits_per_symbol() >= bits);
     }
 

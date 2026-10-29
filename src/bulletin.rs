@@ -64,9 +64,9 @@ pub struct RsClientBulletinEntry {
     pub sig: [u8; sig::SIG_LEN],
 }
 
-/// Two canonical 24-bit KAHE-RNS residues per NTT-domain coefficient.
+/// One canonical NTT-domain coefficient (`q < 2^48`) in six bytes.
 pub fn rs_poly_packed_len() -> usize {
-    POLY_N * 2 * 3
+    POLY_N * crate::rs::RS_COEFF_BYTES
 }
 
 impl RsClientBulletinEntry {

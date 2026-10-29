@@ -92,7 +92,7 @@ fn prony_recovers_through_panetiere() {
     let params = PronyParams::new(n_clients, 2);
 
     let messages: Vec<Vec<i64>> = (0..n_clients)
-        .map(|i| vec![1000 + i as i64, (i as i64 + 1) << 30])
+        .map(|i| vec![1000 + i as i64, (i as i64 + 1) << 27])
         .collect();
     let client_polys: Vec<Vec<KahePoly>> = messages
         .iter()
