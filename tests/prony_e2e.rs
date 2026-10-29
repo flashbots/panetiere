@@ -76,8 +76,9 @@ fn round_trip(
                 .iter()
                 .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
                 .collect();
-            let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-                .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
+            let recovered =
+                aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+                    .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", k, e));
             assert_eq!(recovered.len(), 1);
             recovered[0]
         })

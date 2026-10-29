@@ -115,7 +115,8 @@ fn main() {
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
         let _recovered =
-            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs).expect("verify");
+            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+                .expect("verify");
         if iter == 0 {
             eprintln!("profile: first iteration completed");
         }
