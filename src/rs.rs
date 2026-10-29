@@ -30,7 +30,8 @@ pub fn unpack_share(bytes: &[u8], n_polys: usize) -> Option<Share> {
         return None;
     }
     let mut polys = vec![[[0u32; N]; 2]; n_polys];
-    let mut chunks = bytes.chunks_exact(3);
+    let (chunks, rest) = bytes.as_chunks::<3>();
+    let mut chunks = chunks.iter();
     for limb in 0..2 {
         for poly in &mut polys {
             for c in &mut poly[limb] {
@@ -42,7 +43,7 @@ pub fn unpack_share(bytes: &[u8], n_polys: usize) -> Option<Share> {
             }
         }
     }
-    if !chunks.remainder().is_empty() {
+    if !rest.is_empty() {
         return None;
     }
     polys.into_iter().map(RsNTTPoly::from_residues).collect()
