@@ -40,6 +40,26 @@ only checks that the servers it counts agree on it. `ProtocolParams::min_clients
 (300 with default parameters, potentially lower with custom parameters or RS
 `rho_max`). `SetPolicy::max_clients` can tighten this cap, not raise it.
 
+## Guarantee
+
+One execution of the protocol delivers the paper's *relaxed* anonymous
+broadcast. Honest clients stay anonymous even against fully malicious clients,
+and every message from a client that posts a complete round is delivered as
+long as fewer than half the servers are corrupt. What the relaxed notion gives
+up is independence of inputs: the ideal functionality shows the honest messages
+to the adversary before the corrupt clients choose theirs, so a corrupt client's
+message may depend on what honest clients sent.
+
+The paper lifts this to the full notion by running the protocol twice with
+fresh parameters and fresh server keys each time: every client first broadcasts
+a commitment to its message, then broadcasts the opening, and the recipient
+keeps only openings that match a commitment from the first execution. The
+library does not do this for you, since it is orchestration over two ordinary
+executions; `examples/two_run.rs` shows the complete pattern with a hash
+commitment. Note that a corrupt client can still decide whether to open based on
+what it saw in the second execution, but it can no longer change what it opens
+to.
+
 ## Architecture
 
 Everything over the ring arithmetic is linear in the payload — encryption,
