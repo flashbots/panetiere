@@ -5,7 +5,7 @@ use chipmunk_code::HVCPoly;
 use rayon::prelude::*;
 
 use crate::bulletin::{RsNodeBulletinEntry, ServerBulletinEntry};
-use crate::cs::{Cs, HidingMerkleCommitment, Opening, PackedOpening};
+use crate::cs::{Commitment, Cs, CsParams, HidingMerkleCommitment, Opening, PackedOpening};
 use crate::hvc_sum::sum_hvc_polys;
 use crate::pke;
 use crate::rs::Share;
@@ -55,6 +55,10 @@ pub enum ServerRoundError {
     /// Some client's opening disagrees with the others on shape or position, so
     /// the set cannot be summed.
     MalformedOpening,
+    /// This client's opening does not open its own commitment at this server's
+    /// position. The server posts nothing for the round, as in the paper, and
+    /// the client is named so the round can be re-run without it.
+    BadOpening(ClientId),
 }
 
 pub struct RsNodeInbox {
@@ -173,9 +177,15 @@ pub fn run_rs_node_round(
     })
 }
 
+/// The paper's server step: every canonical client's opening must open that
+/// client's own commitment at this server's position, or the server posts
+/// nothing. Only then are the openings summed, so a bad client can never make
+/// an honest server's aggregate fail at the recipient.
 pub fn run_server_round(
+    cs: &CsParams,
     inbox: &ServerInbox,
     canonical: &[ClientId],
+    commitments: &[(ClientId, Commitment)],
 ) -> Result<ServerBulletinEntry, ServerRoundError> {
     let index: HashMap<ClientId, usize> = inbox
         .items
@@ -183,16 +193,38 @@ pub fn run_server_round(
         .enumerate()
         .map(|(i, (cid, _))| (*cid, i))
         .collect();
+    let comm_index: HashMap<ClientId, usize> = commitments
+        .iter()
+        .enumerate()
+        .map(|(i, (cid, _))| (*cid, i))
+        .collect();
 
     let mut opening_refs: Vec<&Opening> = Vec::with_capacity(canonical.len());
+    let mut comm_refs: Vec<&Commitment> = Vec::with_capacity(canonical.len());
     for cid in canonical {
         let i = *index
             .get(cid)
             .ok_or(ServerRoundError::MissingClient(*cid))?;
-        let (_, op) = &inbox.items[i];
-        opening_refs.push(op);
+        let c = *comm_index
+            .get(cid)
+            .ok_or(ServerRoundError::MissingClient(*cid))?;
+        opening_refs.push(&inbox.items[i].1);
+        comm_refs.push(&commitments[c].1);
     }
-    // Individual openings are not verified here; the recipient verifies the aggregate opening.
+
+    let position = inbox.server_id.0 as usize;
+    let culprit = canonical
+        .par_iter()
+        .zip(opening_refs.par_iter())
+        .zip(comm_refs.par_iter())
+        .find_map_first(|((cid, op), comm)| {
+            (op.path_index != position || !HidingMerkleCommitment::verify(cs, comm, op))
+                .then_some(*cid)
+        });
+    if let Some(cid) = culprit {
+        return Err(ServerRoundError::BadOpening(cid));
+    }
+
     let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs)
         .ok_or(ServerRoundError::MalformedOpening)?;
     let agg_share: CsPoly = agg_open.s()[0];

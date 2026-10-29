@@ -4,6 +4,7 @@
 
 use chipmunk_code::HVCPoly;
 use panetiere::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry};
+use panetiere::cs::Commitment;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use panetiere::protocol::client::{run_client_round_rs, RsClientRound, RsClientRoundOutput};
@@ -116,6 +117,11 @@ impl Round {
     /// Servers and lanes over an arbitrary subset, exercising the all-or-nothing
     /// canonical-set path.
     fn outputs(&self, subset: &[ClientId]) -> (Vec<ServerBulletinEntry>, Vec<RsNodeBulletinEntry>) {
+        let commitments: Vec<(ClientId, Commitment)> = self
+            .rounds
+            .iter()
+            .map(|r| (r.client_id, r.bulletin.comm.clone()))
+            .collect();
         let servers = (0..S)
             .map(|j| {
                 let items = self
@@ -138,7 +144,7 @@ impl Round {
                     server_id: ServerId(j as u32),
                     items,
                 };
-                run_server_round(&inbox, subset).unwrap()
+                run_server_round(&self.pp.cs, &inbox, subset, &commitments).unwrap()
             })
             .collect();
 
