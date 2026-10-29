@@ -27,19 +27,34 @@ pub struct MseParams {
     pub gamma: usize,
     /// Buckets per row.
     pub delta: usize,
+    /// The paper's ρ: `decode` emits at most this many elements, which bounds
+    /// its work on a forged table.
+    pub capacity: usize,
     pub payload_symbols: usize,
     pub prf_key: [u8; 32],
 }
 
 impl MseParams {
-    /// Uniform `γ × δ` layout (standard IBLT shape).
-    pub fn new(gamma: usize, delta: usize, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
+    /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity` elements.
+    pub fn new(
+        gamma: usize,
+        delta: usize,
+        capacity: usize,
+        payload_symbols: usize,
+        prf_key: [u8; 32],
+    ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
+        assert!(capacity >= 1, "capacity must be ≥ 1");
+        assert!(
+            (capacity as i64) < T,
+            "capacity must be below the modulus t"
+        );
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
         Self {
             gamma,
             delta,
+            capacity,
             payload_symbols,
             prf_key,
         }
@@ -86,6 +101,12 @@ pub struct MseEncoding {
 #[derive(Debug, PartialEq)]
 pub enum MseError {
     PeelStalled,
+    /// Peeling produced more than `capacity` elements, so the table is not an
+    /// honest sum of at most `capacity` insertions.
+    OverCapacity,
+    /// A cell with count one holds a key that does not hash to that cell, so
+    /// the table was not produced by `insert`.
+    KeyMismatch,
     ParamsMismatch,
     PayloadArity,
 }
@@ -215,6 +236,14 @@ impl MseEncoding {
                 r_star += to_canonical(signed) * place;
                 place *= t_u128;
             }
+            // the paper's two guards: an honest sum never trips them, and a
+            // forged table cannot make peeling run past `capacity` elements
+            if emitted.len() >= self.params.capacity {
+                return Err(MseError::OverCapacity);
+            }
+            if prf_bucket(&self.params.prf_key, row, r_star, self.params.delta) != col {
+                return Err(MseError::KeyMismatch);
+            }
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
             }
@@ -323,7 +352,40 @@ mod tests {
     use rand_chacha::ChaCha20Rng;
 
     fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> MseParams {
-        MseParams::new(gamma, delta, payload_symbols, [seed; 32])
+        // sized the way `channel` does: γ·δ = 3ρ cells hold ρ elements
+        let capacity = (gamma * delta).div_ceil(3);
+        MseParams::new(gamma, delta, capacity, payload_symbols, [seed; 32])
+    }
+
+    /// An honest table with one element, whose cell keys are then moved so
+    /// the count-one cell's key no longer hashes to it.
+    #[test]
+    fn forged_cell_key_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+        let pp = params_for(4, 16, 1, 3);
+        let mut enc = MseEncoding::new(pp);
+        enc.insert(&mut rng, &[42]);
+        for limb in enc.k.iter_mut() {
+            for cell in limb.iter_mut() {
+                if *cell != 0 {
+                    *cell = reduce(*cell + 1);
+                }
+            }
+        }
+        assert_eq!(enc.decode(), Err(MseError::KeyMismatch));
+    }
+
+    /// One more honest element than the capacity peels fine but is refused,
+    /// since the table then is not a sum the scheme promises to decode.
+    #[test]
+    fn over_capacity_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let pp = MseParams::new(4, 64, 3, 1, [9; 32]);
+        let mut enc = MseEncoding::new(pp);
+        for x in [1, 2, 3, 4] {
+            enc.insert(&mut rng, &[x]);
+        }
+        assert_eq!(enc.decode(), Err(MseError::OverCapacity));
     }
 
     #[test]
