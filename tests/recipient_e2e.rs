@@ -5,8 +5,8 @@ use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
-    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_once, RecipientError,
-    RejectReason, SetPolicy,
+    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_once,
+    RecipientError, RejectReason, SetPolicy,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
@@ -95,7 +95,8 @@ fn round(seed: u8, n_servers: usize, n_clients: usize) -> Round {
 #[test]
 fn recover_once_matches_aggregate_and_decrypt() {
     let r = round(1, 4, 6);
-    let want = aggregate_and_decrypt_unverified(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    let want =
+        aggregate_and_decrypt_unverified(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     let got = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     assert_eq!(got, want);
 }

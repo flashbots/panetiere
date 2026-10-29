@@ -74,8 +74,9 @@ fn run_full_round_bytes(
         .iter()
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
-    let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
-        .expect("verify failed");
+    let recovered =
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
+            .expect("verify failed");
 
     (ctxts, comm_bytes, sealed_all, recovered)
 }
@@ -230,8 +231,9 @@ fn run<R: rand::Rng + rand::CryptoRng>(
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
-        .expect("verify failed");
+    let recovered =
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
+            .expect("verify failed");
     assert_eq!(recovered.len(), pp.kahe.mu_kahe);
 
     let expected = reduce_centered_mod_t(
@@ -315,8 +317,8 @@ fn slot_mode_disjoint_clients_recover_each_payload() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let recovered =
-        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs).expect("verify failed");
+    let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+        .expect("verify failed");
     let recovered_bytes = codec::decode_raw(&recovered).expect("decode");
     assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
 
@@ -413,8 +415,9 @@ fn slot_mode_8kb_message_multi_poly() {
             .iter()
             .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
             .collect();
-        let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-            .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", poly_idx, e));
+        let recovered =
+            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
+                .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", poly_idx, e));
         assert_eq!(recovered.len(), 1);
         recovered_polys.push(recovered[0]);
     }
@@ -493,8 +496,9 @@ fn aggregated_recovers_same_sum() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let direct = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
-        .expect("direct verify failed");
+    let direct =
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
+            .expect("direct verify failed");
 
     // Partition clients into groups; each aggregator sums its group's publics.
     let groups: Vec<Vec<(ClientId, _)>> = (0..n_groups)
@@ -605,7 +609,8 @@ fn tampered_agg_share_rejected() {
         .collect();
 
     server_outputs[0].agg_share += CsPoly::rand_poly(&mut rng);
-    let result = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
+    let result =
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
         Err(panetiere::protocol::verify::VerifyError::ShareOpeningMismatch(_))
@@ -658,7 +663,8 @@ fn below_floor_anonymity_set_rejected() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let result = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
+    let result =
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert_eq!(
         result,
         Err(VerifyError::AnonymitySetTooSmall {
@@ -731,7 +737,8 @@ fn high_norm_r_rejected_in_protocol() {
         .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
         .collect();
 
-    let result = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
+    let result =
+        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
         Err(panetiere::protocol::verify::VerifyError::InvalidServerOpening(_))

@@ -163,8 +163,8 @@ impl ProtocolParams {
 }
 
 fn aggregate_capacity(kahe: &KaheParams, cs: &crate::cs::CsParams) -> usize {
-    let commitment_cap = (cs.r_bound / cs.beta_cs)
-        .min(cs.beta_agg_hvc / chipmunk_code::ZETA) as usize;
+    let commitment_cap =
+        (cs.r_bound / cs.beta_cs).min(cs.beta_agg_hvc / chipmunk_code::ZETA) as usize;
     let t = kahe.t_modulus as f64;
     // Eight-sigma aggregate noise plus the worst-case centered message sum.
     (1..=commitment_cap)
