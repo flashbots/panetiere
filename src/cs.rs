@@ -240,6 +240,14 @@ pub(crate) fn position_list(index: usize, depth: usize) -> Vec<bool> {
 }
 
 impl HidingMerkleCommitment {
+    /// Verify one client's own fresh opening. Same as [`Cs::verify`] but with
+    /// the fresh bounds `β_cs` on `r` and `ζ` on the digits, so that any
+    /// `ρ ≤ ρ_max` openings that pass here sum to an opening that passes the
+    /// aggregate check.
+    pub fn verify_fresh(pp: &CsParams, c: &Commitment, o: &Opening) -> bool {
+        verify_with_bounds(pp, c, o, pp.beta_cs, chipmunk_code::ZETA)
+    }
+
     pub fn sum_commitment_refs(cs: &[&Commitment]) -> Commitment {
         let roots: Vec<&HVCPoly> = cs.iter().map(|c| &c.root).collect();
         Commitment {
@@ -285,6 +293,92 @@ impl HidingMerkleCommitment {
             n_leaves,
         }
     }
+}
+
+/// Verify reverses `commit`:
+/// 1. Shape + norm checks (`‖r‖∞ ≤ r_bound` on the CS ring, `‖digits‖∞ ≤
+///    tree_bound` on the HVC ring).
+/// 2. Recompute the raw CS leaf elements from `(r, s, a, B)` and check that
+///    each stored digit group projects back to it (`project_r_from_hvc`).
+/// 3. Label the leaf from the stored digits: `g^T · u`.
+/// 4. Walk the chipmunk path above the leaf label to the commitment root.
+fn verify_with_bounds(
+    pp: &CsParams,
+    c: &Commitment,
+    o: &Opening,
+    r_bound: u32,
+    tree_bound: u32,
+) -> bool {
+    // Step 1
+    if o.kappa_cs() != pp.kappa_cs
+        || o.mu_cs() != pp.mu_cs
+        || o.stored_path_len() != pp.stored_path_len()
+    {
+        return false;
+    }
+    // Guard backing buffers before the accessors slice into them.
+    if o.rs.len() != pp.kappa_cs + pp.mu_cs
+        || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
+    {
+        return false;
+    }
+    if !o.r().iter().all(|p| p.infinity_norm() <= r_bound) {
+        return false;
+    }
+    // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
+    // by tree_bound, so a forged opening can't substitute out-of-range digits
+    // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
+    // after aggregation), well within β_agg_hvc = ρ_max·ζ.
+    if !o.data.iter().all(|p| p.infinity_norm() <= tree_bound) {
+        return false;
+    }
+
+    // Step 2: raw CS leaf elements vs. the stored bridge digits.
+    let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, o.r(), o.s());
+    for (k, exp) in raw.iter().enumerate() {
+        if CsPoly::project_r_from_hvc(o.u_element(k)) != *exp {
+            return false;
+        }
+    }
+
+    // Step 3: one flat Ajtai hash over the stored digits.
+    let leaf_label = pp.leaf_hash.hash(o.u());
+
+    // Step 4: chipmunk path above the leaf label.
+    let stored_path_len = o.stored_path_len();
+    if stored_path_len == 0 {
+        return c.root == leaf_label;
+    }
+
+    let (top_l, top_r) = o.path_node(0);
+    if pp.hasher.hash_separate_inputs(top_l, top_r) != c.root {
+        return false;
+    }
+
+    let leaf_index = o.path_index;
+    let pos = position_list(leaf_index, stored_path_len);
+    for i in 1..stored_path_len {
+        let (cur_l, cur_r) = o.path_node(i);
+        let parent = pp.hasher.hash_separate_inputs(cur_l, cur_r);
+        let (prev_l, prev_r) = o.path_node(i - 1);
+        let expected = if pos[i] {
+            HVCPoly::projection_r(prev_r)
+        } else {
+            HVCPoly::projection_r(prev_l)
+        };
+        if parent != expected {
+            return false;
+        }
+    }
+
+    let last = stored_path_len - 1;
+    let (last_l, last_r) = o.path_node(last);
+    let stored_running = if pos[stored_path_len] {
+        HVCPoly::projection_r(last_r)
+    } else {
+        HVCPoly::projection_r(last_l)
+    };
+    stored_running == leaf_label
 }
 
 impl Cs for HidingMerkleCommitment {
@@ -383,83 +477,10 @@ impl Cs for HidingMerkleCommitment {
         (Commitment { root }, openings)
     }
 
-    /// Verify reverses `commit`:
-    /// 1. Shape + norm checks (`‖r‖∞ ≤ r_bound` on the CS ring).
-    /// 2. Recompute the raw CS leaf elements from `(r, s, a, B)` and check that
-    ///    each stored digit group projects back to it (`project_r_from_hvc`).
-    /// 3. Label the leaf from the stored digits: `g^T · u`.
-    /// 4. Walk the chipmunk path above the leaf label to the commitment root.
+    /// Verify an aggregated opening against the aggregate bounds `r_bound` and
+    /// `β_agg_hvc`. See [`verify_with_bounds`] for the steps.
     fn verify(pp: &CsParams, c: &Commitment, o: &Opening) -> bool {
-        // Step 1
-        if o.kappa_cs() != pp.kappa_cs
-            || o.mu_cs() != pp.mu_cs
-            || o.stored_path_len() != pp.stored_path_len()
-        {
-            return false;
-        }
-        // Guard backing buffers before the accessors slice into them.
-        if o.rs.len() != pp.kappa_cs + pp.mu_cs
-            || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
-        {
-            return false;
-        }
-        if !o.r().iter().all(|p| p.infinity_norm() <= pp.r_bound) {
-            return false;
-        }
-        // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
-        // by β_agg_hvc, so a forged opening can't substitute out-of-range digits
-        // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
-        // after aggregation), well within β_agg_hvc = ρ_max·ζ.
-        if !o.data.iter().all(|p| p.infinity_norm() <= pp.beta_agg_hvc) {
-            return false;
-        }
-
-        // Step 2: raw CS leaf elements vs. the stored bridge digits.
-        let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, o.r(), o.s());
-        for (k, exp) in raw.iter().enumerate() {
-            if CsPoly::project_r_from_hvc(o.u_element(k)) != *exp {
-                return false;
-            }
-        }
-
-        // Step 3: one flat Ajtai hash over the stored digits.
-        let leaf_label = pp.leaf_hash.hash(o.u());
-
-        // Step 4: chipmunk path above the leaf label.
-        let stored_path_len = o.stored_path_len();
-        if stored_path_len == 0 {
-            return c.root == leaf_label;
-        }
-
-        let (top_l, top_r) = o.path_node(0);
-        if pp.hasher.hash_separate_inputs(top_l, top_r) != c.root {
-            return false;
-        }
-
-        let leaf_index = o.path_index;
-        let pos = position_list(leaf_index, stored_path_len);
-        for i in 1..stored_path_len {
-            let (cur_l, cur_r) = o.path_node(i);
-            let parent = pp.hasher.hash_separate_inputs(cur_l, cur_r);
-            let (prev_l, prev_r) = o.path_node(i - 1);
-            let expected = if pos[i] {
-                HVCPoly::projection_r(prev_r)
-            } else {
-                HVCPoly::projection_r(prev_l)
-            };
-            if parent != expected {
-                return false;
-            }
-        }
-
-        let last = stored_path_len - 1;
-        let (last_l, last_r) = o.path_node(last);
-        let stored_running = if pos[stored_path_len] {
-            HVCPoly::projection_r(last_r)
-        } else {
-            HVCPoly::projection_r(last_l)
-        };
-        stored_running == leaf_label
+        verify_with_bounds(pp, c, o, pp.r_bound, pp.beta_agg_hvc)
     }
 
     fn sum_commitments(cs: &[Commitment]) -> Commitment {
@@ -1218,6 +1239,50 @@ mod tests {
         let over = pp.beta_agg_hvc as i32 + 1;
         openings[0].data[0] = HVCPoly::from_coeffs([over; POLY_N]);
         assert!(!HidingMerkleCommitment::verify(&pp, &comm, &openings[0]));
+    }
+
+    #[test]
+    fn fresh_verify_rejects_oversized_randomness() {
+        let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (comm, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        assert!(HidingMerkleCommitment::verify_fresh(
+            &pp,
+            &comm,
+            &openings[0]
+        ));
+
+        // a cheating client commits with r drawn at the aggregate bound instead
+        // of β_cs; the aggregate check cannot tell that apart from an honest
+        // sum of many openings, the fresh check can
+        let r: Vec<CsPoly> = (0..pp.kappa_cs)
+            .map(|_| CsPoly::rand_mod_p(&mut rng, pp.r_bound))
+            .collect();
+        let u = bridge_leaf(&leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, &shares[0]));
+        let mut labels = vec![HVCPoly::default(); pp.n_leaves];
+        labels[0] = pp.leaf_hash.hash(&u);
+        let tree = Tree::new_with_leaf_nodes(&labels, &pp.hasher);
+        let comm = Commitment { root: tree.root() };
+        let raw_path = tree.gen_proof(0);
+        let mut data = u;
+        for (l, r) in raw_path.nodes.iter().take(pp.stored_path_len()) {
+            data.extend_from_slice(&l.decompose_r());
+            data.extend_from_slice(&r.decompose_r());
+        }
+        let mut rs = r;
+        rs.extend_from_slice(&shares[0]);
+        let opening = Opening {
+            server_index: 0,
+            path_index: raw_path.index,
+            kappa_cs: pp.kappa_cs,
+            mu_cs: pp.mu_cs,
+            stored_path_len: pp.stored_path_len(),
+            rs: rs.into_boxed_slice(),
+            data: data.into_boxed_slice(),
+        };
+        assert!(HidingMerkleCommitment::verify(&pp, &comm, &opening));
+        assert!(!HidingMerkleCommitment::verify_fresh(&pp, &comm, &opening));
     }
 
     #[test]

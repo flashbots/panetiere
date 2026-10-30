@@ -178,9 +178,10 @@ pub fn run_rs_node_round(
 }
 
 /// The paper's server step: every canonical client's opening must open that
-/// client's own commitment at this server's position, or the server posts
-/// nothing. Only then are the openings summed, so a bad client can never make
-/// an honest server's aggregate fail at the recipient.
+/// client's own commitment at this server's position, within the fresh norm
+/// bounds, or the server posts nothing. Only then are the openings summed, so
+/// a bad client can never make an honest server's aggregate fail at the
+/// recipient.
 pub fn run_server_round(
     cs: &CsParams,
     inbox: &ServerInbox,
@@ -218,7 +219,7 @@ pub fn run_server_round(
         .zip(opening_refs.par_iter())
         .zip(comm_refs.par_iter())
         .find_map_first(|((cid, op), comm)| {
-            (op.path_index != position || !HidingMerkleCommitment::verify(cs, comm, op))
+            (op.path_index != position || !HidingMerkleCommitment::verify_fresh(cs, comm, op))
                 .then_some(*cid)
         });
     if let Some(cid) = culprit {
