@@ -47,7 +47,7 @@ impl MseParams {
         assert!(delta >= 1, "δ must be ≥ 1");
         assert!(capacity >= 1, "capacity must be ≥ 1");
         assert!(
-            (capacity as i64) < T,
+            (capacity as u64) < T_MODULUS_DEFAULT,
             "capacity must be below the modulus t"
         );
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
