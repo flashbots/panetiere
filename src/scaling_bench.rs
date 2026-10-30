@@ -973,9 +973,13 @@ fn run_cell(
         }
     }
     let canonical = client_ids.clone();
+    let commitments: Vec<(ClientId, Commitment)> = client_entries
+        .iter()
+        .map(|(cid, e)| (*cid, e.comm.clone()))
+        .collect();
     let outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(inb, &canonical).unwrap())
+        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).unwrap())
         .collect();
 
     // Wire ledger. Ciphertext + commitment (root) are uniform-mod-q → tight at
@@ -1017,7 +1021,8 @@ fn run_cell(
         measure(|| seal_openings(&mut rng, &pp, &SESSION, client_ids[0], &openings0, &servers));
     let (unseal, _) =
         measure(|| unseal_openings(&server_keys[0], &SESSION, servers[0].0, &sealed_inbox0));
-    let (server, _) = measure(|| run_server_round(&inboxes[0], &canonical).unwrap());
+    let (server, _) =
+        measure(|| run_server_round(&pp.cs, &inboxes[0], &canonical, &commitments).unwrap());
 
     // Verify: REPS full runs, field-wise medians over the returned timings.
     // Recovery is ATTEMPTED, not asserted: a decode to garbage still yields
@@ -1187,6 +1192,10 @@ fn run_cell(
                 ))
             });
 
+            let rs_commitments: Vec<(ClientId, Commitment)> = entries
+                .iter()
+                .map(|(cid, e)| (*cid, e.comm.clone()))
+                .collect();
             let rs_outputs: Vec<_> = (0..s)
                 .map(|j| {
                     let items = rounds
@@ -1200,11 +1209,13 @@ fn run_cell(
                         })
                         .collect();
                     run_server_round(
+                        &pp_rs.cs,
                         &ServerInbox {
                             server_id: server_ids[j],
                             items,
                         },
                         &canonical,
+                        &rs_commitments,
                     )
                     .unwrap()
                 })

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 
 use panetiere::bulletin::{ClientBulletinEntry, InMemoryBulletin};
 use panetiere::channel::{self, ChannelParams};
+use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{recover_unverified_direct, SetPolicy};
@@ -111,8 +112,16 @@ fn main() {
     let canonical: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
     bulletin.publish_canonical(canonical.clone());
 
+    // each server checks every opening against the client's commitment on the
+    // bulletin before summing, so a bad client cannot get a server blamed.
+    let commitments: Vec<(ClientId, Commitment)> = bulletin
+        .clients()
+        .into_iter()
+        .map(|(cid, post)| (cid, post.comm))
+        .collect();
     for inbox in &inboxes {
-        let entry = run_server_round(inbox, &canonical).expect("canonical client missing");
+        let entry = run_server_round(&pp.cs, inbox, &canonical, &commitments)
+            .expect("canonical client missing");
         bulletin.publish_server(entry);
     }
 
