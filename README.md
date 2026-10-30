@@ -323,7 +323,12 @@ round and is worth demoting to trace level.
 
 On the payload side, an over-subscribed structure surfaces as
 `ChannelError::PeelStalled` or `ChannelError::SketchFailed(PronyError::{CapacityExceeded,
-NotSplit, CheckFailed})` — never as a successfully decoded empty round.
+NotSplit, CheckFailed})` — never as a successfully decoded empty round. A
+peeling table that is not an honest sum comes back as
+`ChannelError::MalformedEncoding(MseError::{OverCapacity, KeyMismatch})`: the
+decoder checks, as the paper's does, that each peeled key hashes to the cell it
+was read from and stops after `capacity` elements, so a forged contribution
+costs the recipient at most `capacity` peels.
 `CodecError::CoeffOutOfRange` means a per-coefficient sum overflowed the symbol
 modulus, i.e. the slot layout let two clients collide. A `None` from
 `unseal_opening` is wrong session, wrong client/server, or a tampered envelope.
