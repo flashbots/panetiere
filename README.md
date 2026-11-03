@@ -44,8 +44,10 @@ only checks that the servers it counts agree on it. `ProtocolParams::min_clients
 
 One execution of the protocol delivers the paper's *relaxed* anonymous
 broadcast. Honest clients stay anonymous even against fully malicious clients,
-and every message from a client that posts a complete round is delivered as
-long as fewer than half the servers are corrupt. What the relaxed notion gives
+and delivery requires well-formed client contributions and at least `t` honest,
+responsive servers, where `t = pp.shamir.t` is the configured Shamir threshold.
+Malformed client contributions can prevent delivery even when all servers are honest.
+What the relaxed notion gives
 up is independence of inputs: the ideal functionality shows the honest messages
 to the adversary before the corrupt clients choose theirs, so a corrupt client's
 message may depend on what honest clients sent.
