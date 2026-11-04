@@ -37,9 +37,9 @@
 
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
-use crate::rings::center_i32;
+use crate::rings::{center_i32, center_i64};
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
-use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH};
+use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
@@ -248,6 +248,67 @@ impl HidingMerkleCommitment {
         verify_with_bounds(pp, c, o, pp.beta_cs, chipmunk_code::ZETA)
     }
 
+    /// The cheap half of [`Self::verify_fresh`]: shape and the fresh norm
+    /// bounds, no ring arithmetic. What [`Self::verify_fresh_batch`] assumes
+    /// of every opening it is handed.
+    pub fn check_fresh_shape(pp: &CsParams, o: &Opening) -> bool {
+        shape_and_norms(pp, o, pp.beta_cs, chipmunk_code::ZETA)
+    }
+
+    /// [`Self::verify_fresh`] over a whole batch at once. Every equation the
+    /// per-opening check tests is linear in the opening and its root, so a
+    /// random weighted sum of the batch is checked in place of each member:
+    /// `weights[combo][i]` scales opening `i` (and its commitment) in
+    /// combination `combo`, and the batch passes iff every combination does.
+    ///
+    /// The weights must be drawn after the openings are fixed. Then a batch
+    /// containing an opening that fails on its own passes a combination with
+    /// probability at most `2^-15` (the weight has to hit the one value that
+    /// cancels the defect, out of `2^15 − 1`), independently per combination;
+    /// eight rows give `2^-120`. A pass says nothing about which member would
+    /// fail, so a failing batch is re-checked member by member.
+    ///
+    /// Requires `openings.len() ≤ batch_capacity(pp)`, every opening to pass
+    /// [`Self::check_fresh_shape`], and all of them to sit at one position;
+    /// anything else is rejected.
+    pub fn verify_fresh_batch(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> bool {
+        let Some(first) = openings.first() else {
+            return false;
+        };
+        let combos = weights.len();
+        if comms.len() != openings.len()
+            || openings.len() > batch_capacity(pp)
+            || combos == 0
+            || weights.iter().any(|row| row.len() != openings.len())
+            || weights.iter().flatten().any(|&w| w == 0 || w >= 1 << 15)
+            || openings
+                .iter()
+                .any(|o| o.path_index != first.path_index || !Self::check_fresh_shape(pp, o))
+        {
+            return false;
+        }
+        let acc = comms
+            .par_iter()
+            .zip(openings.par_iter())
+            .enumerate()
+            .fold(
+                || BatchAcc::zero(pp, combos),
+                |mut acc, (i, (c, o))| {
+                    acc.add(c, o, weights.iter().map(|row| row[i]));
+                    acc
+                },
+            )
+            .reduce(|| BatchAcc::zero(pp, combos), BatchAcc::merge);
+        (0..acc.combos)
+            .into_par_iter()
+            .all(|combo| acc.verify_combo(pp, combo, first.path_index))
+    }
+
     pub fn sum_commitment_refs(cs: &[&Commitment]) -> Commitment {
         let roots: Vec<&HVCPoly> = cs.iter().map(|c| &c.root).collect();
         Commitment {
@@ -310,6 +371,28 @@ fn verify_with_bounds(
     tree_bound: u32,
 ) -> bool {
     // Step 1
+    if !shape_and_norms(pp, o, r_bound, tree_bound) {
+        return false;
+    }
+
+    // Step 2: raw CS leaf elements vs. the stored bridge digits.
+    let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, o.r(), o.s());
+    for (k, exp) in raw.iter().enumerate() {
+        if CsPoly::project_r_from_hvc(o.u_element(k)) != *exp {
+            return false;
+        }
+    }
+
+    // Step 3: one flat Ajtai hash over the stored digits.
+    let leaf_label = pp.leaf_hash.hash(o.u());
+
+    // Step 4: chipmunk path above the leaf label.
+    walk_path(pp, &c.root, &o.data, o.xi(), o.path_index, &leaf_label)
+}
+
+/// Shape of `o` against `pp`, `‖r‖∞ ≤ r_bound` on the CS ring and
+/// `‖digits‖∞ ≤ tree_bound` on the HVC ring.
+fn shape_and_norms(pp: &CsParams, o: &Opening, r_bound: u32, tree_bound: u32) -> bool {
     if o.kappa_cs() != pp.kappa_cs
         || o.mu_cs() != pp.mu_cs
         || o.stored_path_len() != pp.stored_path_len()
@@ -329,38 +412,41 @@ fn verify_with_bounds(
     // by tree_bound, so a forged opening can't substitute out-of-range digits
     // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
     // after aggregation), well within β_agg_hvc = ρ_max·ζ.
-    if !o.data.iter().all(|p| p.infinity_norm() <= tree_bound) {
-        return false;
-    }
+    o.data.iter().all(|p| p.infinity_norm() <= tree_bound)
+}
 
-    // Step 2: raw CS leaf elements vs. the stored bridge digits.
-    let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, o.r(), o.s());
-    for (k, exp) in raw.iter().enumerate() {
-        if CsPoly::project_r_from_hvc(o.u_element(k)) != *exp {
-            return false;
-        }
-    }
-
-    // Step 3: one flat Ajtai hash over the stored digits.
-    let leaf_label = pp.leaf_hash.hash(o.u());
-
-    // Step 4: chipmunk path above the leaf label.
-    let stored_path_len = o.stored_path_len();
+/// Walk the stored path digits in `data` (laid out as an opening's `data`,
+/// leaf digits first) from `leaf_label` up to `root`.
+fn walk_path(
+    pp: &CsParams,
+    root: &HVCPoly,
+    data: &[HVCPoly],
+    xi: usize,
+    path_index: usize,
+    leaf_label: &HVCPoly,
+) -> bool {
+    let stored_path_len = pp.stored_path_len();
+    let node = |level: usize| {
+        let base = xi * HVC_WIDTH + level * 2 * HVC_WIDTH;
+        (
+            &data[base..base + HVC_WIDTH],
+            &data[base + HVC_WIDTH..base + 2 * HVC_WIDTH],
+        )
+    };
     if stored_path_len == 0 {
-        return c.root == leaf_label;
+        return root == leaf_label;
     }
 
-    let (top_l, top_r) = o.path_node(0);
-    if pp.hasher.hash_separate_inputs(top_l, top_r) != c.root {
+    let (top_l, top_r) = node(0);
+    if pp.hasher.hash_separate_inputs(top_l, top_r) != *root {
         return false;
     }
 
-    let leaf_index = o.path_index;
-    let pos = position_list(leaf_index, stored_path_len);
+    let pos = position_list(path_index, stored_path_len);
     for i in 1..stored_path_len {
-        let (cur_l, cur_r) = o.path_node(i);
+        let (cur_l, cur_r) = node(i);
         let parent = pp.hasher.hash_separate_inputs(cur_l, cur_r);
-        let (prev_l, prev_r) = o.path_node(i - 1);
+        let (prev_l, prev_r) = node(i - 1);
         let expected = if pos[i] {
             HVCPoly::projection_r(prev_r)
         } else {
@@ -372,13 +458,161 @@ fn verify_with_bounds(
     }
 
     let last = stored_path_len - 1;
-    let (last_l, last_r) = o.path_node(last);
+    let (last_l, last_r) = node(last);
     let stored_running = if pos[stored_path_len] {
         HVCPoly::projection_r(last_r)
     } else {
         HVCPoly::projection_r(last_l)
     };
-    stored_running == leaf_label
+    stored_running == *leaf_label
+}
+
+/// Largest batch the fresh check can accumulate in i32: every combination
+/// weight is below `2^15` and every accumulated coefficient is bounded by
+/// `max(β_cs, ζ)`, so `ρ · 2^15 · max(β_cs, ζ)` has to stay under `2^31`.
+pub fn batch_capacity(pp: &CsParams) -> usize {
+    u16::MAX as usize / pp.beta_cs.max(chipmunk_code::ZETA) as usize
+}
+
+/// Weights for one batched fresh check: `combos` independent rows, one
+/// weight per opening, each uniform in `[1, 2^15)`.
+pub fn batch_weights<R: Rng>(rng: &mut R, combos: usize, openings: usize) -> Vec<Vec<u16>> {
+    (0..combos)
+        .map(|_| {
+            (0..openings)
+                .map(|_| rng.gen_range(1..1u16 << 15))
+                .collect()
+        })
+        .collect()
+}
+
+/// Running weighted sums of a batch of openings, one row per combination.
+/// `r`, the digits and the roots stay in i32 or i64 unreduced; the capacity
+/// bound keeps them exact.
+struct BatchAcc {
+    combos: usize,
+    r: Vec<[i32; POLY_N]>,
+    s: Vec<[i64; POLY_N]>,
+    data: Vec<[i32; POLY_N]>,
+    root: Vec<[i64; POLY_N]>,
+}
+
+impl BatchAcc {
+    fn zero(pp: &CsParams, combos: usize) -> Self {
+        let data_polys = opening_data_polys(pp.xi(), pp.stored_path_len());
+        Self {
+            combos,
+            r: vec![[0; POLY_N]; combos * pp.kappa_cs],
+            s: vec![[0; POLY_N]; combos * pp.mu_cs],
+            data: vec![[0; POLY_N]; combos * data_polys],
+            root: vec![[0; POLY_N]; combos],
+        }
+    }
+
+    fn add(&mut self, c: &Commitment, o: &Opening, weights: impl Iterator<Item = u16>) {
+        let kappa = o.kappa_cs();
+        let mu = o.mu_cs();
+        let data_polys = o.data.len();
+        for (combo, weight) in weights.enumerate() {
+            let w32 = weight as i32;
+            let w64 = weight as i64;
+            for (acc, poly) in self.r[combo * kappa..].iter_mut().zip(o.r()) {
+                mac_i32(acc, poly.coeffs(), w32);
+            }
+            for (acc, poly) in self.s[combo * mu..].iter_mut().zip(o.s()) {
+                mac_i64(acc, poly.coeffs(), w64);
+            }
+            for (acc, poly) in self.data[combo * data_polys..]
+                .iter_mut()
+                .zip(o.data.iter())
+            {
+                mac_i32(acc, poly.coeffs(), w32);
+            }
+            mac_i64(&mut self.root[combo], c.root.coeffs(), w64);
+        }
+    }
+
+    fn merge(mut self, other: Self) -> Self {
+        for (a, b) in self.r.iter_mut().zip(&other.r) {
+            for (x, &y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        for (a, b) in self.s.iter_mut().zip(&other.s) {
+            for (x, &y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        for (a, b) in self.data.iter_mut().zip(&other.data) {
+            for (x, &y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        for (a, b) in self.root.iter_mut().zip(&other.root) {
+            for (x, &y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        self
+    }
+
+    /// Run the fresh check's algebra on combination `combo`: the weighted
+    /// digit sums must project to the weighted leaf block over the integers
+    /// and, reduced mod `q_hvc`, hash and walk to the weighted root.
+    fn verify_combo(&self, pp: &CsParams, combo: usize, path_index: usize) -> bool {
+        let kappa = pp.kappa_cs;
+        let mu = pp.mu_cs;
+        let xi = pp.xi();
+        let data_polys = opening_data_polys(xi, pp.stored_path_len());
+        let r: Vec<CsPoly> = self.r[combo * kappa..(combo + 1) * kappa]
+            .iter()
+            .map(|acc| CsPoly::from_coeffs(acc.map(|x| center_i32(x, CS_MODULUS))))
+            .collect();
+        let s: Vec<CsPoly> = self.s[combo * mu..(combo + 1) * mu]
+            .iter()
+            .map(|acc| CsPoly::from_coeffs(acc.map(|x| center_i64(x, CS_MODULUS as i64) as i32)))
+            .collect();
+        let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, &s);
+        let digits = &self.data[combo * data_polys..(combo + 1) * data_polys];
+        // the projection is linear over the integers, so it is taken on the
+        // unreduced sums; the hash and the path live mod q_hvc
+        for (k, expected) in raw.iter().enumerate() {
+            let group = &digits[k * HVC_WIDTH..(k + 1) * HVC_WIDTH];
+            let mut projected = [0i32; POLY_N];
+            for (j, out) in projected.iter_mut().enumerate() {
+                let mut acc = 0i64;
+                for digit in group.iter().rev() {
+                    acc = acc * TWO_ZETA_PLUS_ONE as i64 + digit[j] as i64;
+                }
+                *out = center_i64(acc, CS_MODULUS as i64) as i32;
+            }
+            if CsPoly::from_coeffs(projected) != *expected {
+                return false;
+            }
+        }
+        let reduced: Vec<HVCPoly> = digits
+            .iter()
+            .map(|acc| HVCPoly::from_coeffs(acc.map(|x| center_i32(x, HVC_MODULUS))))
+            .collect();
+        let root = HVCPoly::from_coeffs(
+            self.root[combo].map(|x| center_i64(x, HVC_MODULUS as i64) as i32),
+        );
+        let leaf_label = pp.leaf_hash.hash(&reduced[..xi * HVC_WIDTH]);
+        walk_path(pp, &root, &reduced, xi, path_index, &leaf_label)
+    }
+}
+
+/// `acc[i] += v[i] · weight`; the caller's bounds keep it in range.
+fn mac_i32(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    for (a, &x) in acc.iter_mut().zip(v) {
+        *a += x * weight;
+    }
+}
+
+fn mac_i64(acc: &mut [i64; POLY_N], v: &[i32; POLY_N], weight: i64) {
+    for (a, &x) in acc.iter_mut().zip(v) {
+        *a += x as i64 * weight;
+    }
 }
 
 impl Cs for HidingMerkleCommitment {
@@ -1168,6 +1402,65 @@ mod tests {
         assert!(bytes.len() < POLY_N * 4);
         assert_eq!(Commitment::from_bytes(&bytes).unwrap().root, comm.root);
         assert!(Commitment::from_bytes(&[0u8; 3]).is_none());
+    }
+
+    /// A batch of honest openings at one position passes with any weights;
+    /// a single tampered member — share, randomness, leaf digit, path digit
+    /// or root — fails it.
+    #[test]
+    fn batched_fresh_check_accepts_honest_and_catches_one_bad_member() {
+        let mut rng = ChaCha20Rng::from_seed([77u8; 32]);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let position = 2;
+        let rounds: Vec<(Commitment, Opening)> = (0..12)
+            .map(|_| {
+                let shares = rand_shares(&mut rng, 4, 1);
+                let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+                (c, os.swap_remove(position))
+            })
+            .collect();
+        let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
+        let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
+        let weights = batch_weights(&mut rng, 3, rounds.len());
+        assert!(HidingMerkleCommitment::verify_fresh_batch(
+            &pp, &comms, &opens, &weights
+        ));
+
+        fn unit(i: usize) -> CsPoly {
+            let mut c = [0i32; POLY_N];
+            c[i] = 1;
+            CsPoly::from_coeffs(c)
+        }
+        let tamper: [fn(&mut Commitment, &mut Opening); 5] = [
+            |_, o| o.s_mut()[0] += CsPoly::from_coeffs([1; POLY_N]),
+            |_, o| o.r_mut()[1] += unit(5),
+            |_, o| o.data[0].coeffs_mut()[0] += 1,
+            |_, o| o.data[o.data.len() - 1].coeffs_mut()[7] -= 1,
+            |c, _| c.root.coeffs_mut()[3] += 1,
+        ];
+        for (which, t) in tamper.iter().enumerate() {
+            let mut bad = rounds.clone();
+            let (c, o) = &mut bad[5];
+            t(c, o);
+            assert!(
+                !HidingMerkleCommitment::verify_fresh(&pp, c, o),
+                "tamper {which}"
+            );
+            let comms: Vec<&Commitment> = bad.iter().map(|(c, _)| c).collect();
+            let opens: Vec<&Opening> = bad.iter().map(|(_, o)| o).collect();
+            assert!(
+                !HidingMerkleCommitment::verify_fresh_batch(&pp, &comms, &opens, &weights),
+                "tamper {which} slipped through the batch"
+            );
+        }
+
+        let one_too_many = batch_capacity(&pp) + 1;
+        let comms: Vec<&Commitment> = std::iter::repeat_n(&rounds[0].0, one_too_many).collect();
+        let opens: Vec<&Opening> = std::iter::repeat_n(&rounds[0].1, one_too_many).collect();
+        let weights = batch_weights(&mut rng, 1, one_too_many);
+        assert!(!HidingMerkleCommitment::verify_fresh_batch(
+            &pp, &comms, &opens, &weights
+        ));
     }
 
     #[test]
