@@ -292,18 +292,7 @@ impl HidingMerkleCommitment {
         {
             return false;
         }
-        let acc = comms
-            .par_iter()
-            .zip(openings.par_iter())
-            .enumerate()
-            .fold(
-                || BatchAcc::zero(pp, combos),
-                |mut acc, (i, (c, o))| {
-                    acc.add(c, o, weights.iter().map(|row| row[i]));
-                    acc
-                },
-            )
-            .reduce(|| BatchAcc::zero(pp, combos), BatchAcc::merge);
+        let acc = BatchAcc::accumulate(pp, comms, openings, weights);
         (0..acc.combos)
             .into_par_iter()
             .all(|combo| acc.verify_combo(pp, combo, first.path_index))
@@ -405,14 +394,20 @@ fn shape_and_norms(pp: &CsParams, o: &Opening, r_bound: u32, tree_bound: u32) ->
     {
         return false;
     }
-    if !o.r().iter().all(|p| p.infinity_norm() <= r_bound) {
+    if !o.r().iter().all(|p| norm_within(p.coeffs(), r_bound)) {
         return false;
     }
     // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
     // by tree_bound, so a forged opening can't substitute out-of-range digits
     // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
     // after aggregation), well within β_agg_hvc = ρ_max·ζ.
-    o.data.iter().all(|p| p.infinity_norm() <= tree_bound)
+    o.data.iter().all(|p| norm_within(p.coeffs(), tree_bound))
+}
+
+/// `‖coeffs‖∞ ≤ bound`, as a full reduction rather than an early-exit scan
+/// so it compiles to vector absolute-value and max instructions.
+fn norm_within(coeffs: &[i32; POLY_N], bound: u32) -> bool {
+    coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs())) <= bound
 }
 
 /// Walk the stored path digits in `data` (laid out as an opening's `data`,
@@ -486,9 +481,9 @@ pub fn batch_weights<R: Rng>(rng: &mut R, combos: usize, openings: usize) -> Vec
         .collect()
 }
 
-/// Running weighted sums of a batch of openings, one row per combination.
-/// `r`, the digits and the roots stay in i32 or i64 unreduced; the capacity
-/// bound keeps them exact.
+/// Weighted sums of a batch of openings, every slot holding one accumulator
+/// per combination (slot-major). `r`, the digits and the roots stay in i32 or
+/// i64 unreduced; the capacity bound keeps them exact.
 struct BatchAcc {
     combos: usize,
     r: Vec<[i32; POLY_N]>,
@@ -498,91 +493,72 @@ struct BatchAcc {
 }
 
 impl BatchAcc {
-    fn zero(pp: &CsParams, combos: usize) -> Self {
+    /// Each slot is accumulated on its own, over every opening and every
+    /// combination at once, so an opening's poly is read from memory once
+    /// and there is nothing to merge afterwards.
+    fn accumulate(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> Self {
+        let combos = weights.len();
+        let kappa = pp.kappa_cs;
+        let mu = pp.mu_cs;
         let data_polys = opening_data_polys(pp.xi(), pp.stored_path_len());
+        let r: Vec<[i32; POLY_N]> = (0..kappa)
+            .into_par_iter()
+            .flat_map_iter(|p| slot_i32(openings, weights, move |o| o.r()[p].coeffs()))
+            .collect();
+        let data: Vec<[i32; POLY_N]> = (0..data_polys)
+            .into_par_iter()
+            .flat_map_iter(|p| slot_i32(openings, weights, move |o| o.data[p].coeffs()))
+            .collect();
+        let s: Vec<[i64; POLY_N]> = (0..mu)
+            .into_par_iter()
+            .flat_map_iter(|p| {
+                slot_i64(openings.len(), weights, move |i| {
+                    openings[i].s()[p].coeffs()
+                })
+            })
+            .collect();
+        let root = slot_i64(comms.len(), weights, |i| comms[i].root.coeffs());
         Self {
             combos,
-            r: vec![[0; POLY_N]; combos * pp.kappa_cs],
-            s: vec![[0; POLY_N]; combos * pp.mu_cs],
-            data: vec![[0; POLY_N]; combos * data_polys],
-            root: vec![[0; POLY_N]; combos],
+            r,
+            s,
+            data,
+            root,
         }
-    }
-
-    fn add(&mut self, c: &Commitment, o: &Opening, weights: impl Iterator<Item = u16>) {
-        let kappa = o.kappa_cs();
-        let mu = o.mu_cs();
-        let data_polys = o.data.len();
-        for (combo, weight) in weights.enumerate() {
-            let w32 = weight as i32;
-            let w64 = weight as i64;
-            for (acc, poly) in self.r[combo * kappa..].iter_mut().zip(o.r()) {
-                mac_i32(acc, poly.coeffs(), w32);
-            }
-            for (acc, poly) in self.s[combo * mu..].iter_mut().zip(o.s()) {
-                mac_i64(acc, poly.coeffs(), w64);
-            }
-            for (acc, poly) in self.data[combo * data_polys..]
-                .iter_mut()
-                .zip(o.data.iter())
-            {
-                mac_i32(acc, poly.coeffs(), w32);
-            }
-            mac_i64(&mut self.root[combo], c.root.coeffs(), w64);
-        }
-    }
-
-    fn merge(mut self, other: Self) -> Self {
-        for (a, b) in self.r.iter_mut().zip(&other.r) {
-            for (x, &y) in a.iter_mut().zip(b) {
-                *x += y;
-            }
-        }
-        for (a, b) in self.s.iter_mut().zip(&other.s) {
-            for (x, &y) in a.iter_mut().zip(b) {
-                *x += y;
-            }
-        }
-        for (a, b) in self.data.iter_mut().zip(&other.data) {
-            for (x, &y) in a.iter_mut().zip(b) {
-                *x += y;
-            }
-        }
-        for (a, b) in self.root.iter_mut().zip(&other.root) {
-            for (x, &y) in a.iter_mut().zip(b) {
-                *x += y;
-            }
-        }
-        self
     }
 
     /// Run the fresh check's algebra on combination `combo`: the weighted
     /// digit sums must project to the weighted leaf block over the integers
     /// and, reduced mod `q_hvc`, hash and walk to the weighted root.
     fn verify_combo(&self, pp: &CsParams, combo: usize, path_index: usize) -> bool {
-        let kappa = pp.kappa_cs;
-        let mu = pp.mu_cs;
+        let c = self.combos;
         let xi = pp.xi();
-        let data_polys = opening_data_polys(xi, pp.stored_path_len());
-        let r: Vec<CsPoly> = self.r[combo * kappa..(combo + 1) * kappa]
-            .iter()
-            .map(|acc| CsPoly::from_coeffs(acc.map(|x| center_i32(x, CS_MODULUS))))
+        let r: Vec<CsPoly> = (0..pp.kappa_cs)
+            .map(|p| CsPoly::from_coeffs(self.r[p * c + combo].map(|x| center_i32(x, CS_MODULUS))))
             .collect();
-        let s: Vec<CsPoly> = self.s[combo * mu..(combo + 1) * mu]
-            .iter()
-            .map(|acc| CsPoly::from_coeffs(acc.map(|x| center_i64(x, CS_MODULUS as i64) as i32)))
+        let s: Vec<CsPoly> = (0..pp.mu_cs)
+            .map(|p| {
+                CsPoly::from_coeffs(
+                    self.s[p * c + combo].map(|x| center_i64(x, CS_MODULUS as i64) as i32),
+                )
+            })
             .collect();
         let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, &s);
-        let digits = &self.data[combo * data_polys..(combo + 1) * data_polys];
+        let data_polys = opening_data_polys(xi, pp.stored_path_len());
+        let digit = |p: usize| &self.data[p * c + combo];
         // the projection is linear over the integers, so it is taken on the
         // unreduced sums; the hash and the path live mod q_hvc
         for (k, expected) in raw.iter().enumerate() {
-            let group = &digits[k * HVC_WIDTH..(k + 1) * HVC_WIDTH];
             let mut projected = [0i32; POLY_N];
             for (j, out) in projected.iter_mut().enumerate() {
                 let mut acc = 0i64;
-                for digit in group.iter().rev() {
-                    acc = acc * TWO_ZETA_PLUS_ONE as i64 + digit[j] as i64;
+                for w in (0..HVC_WIDTH).rev() {
+                    acc = acc * TWO_ZETA_PLUS_ONE as i64 + digit(k * HVC_WIDTH + w)[j] as i64;
                 }
                 *out = center_i64(acc, CS_MODULUS as i64) as i32;
             }
@@ -590,9 +566,8 @@ impl BatchAcc {
                 return false;
             }
         }
-        let reduced: Vec<HVCPoly> = digits
-            .iter()
-            .map(|acc| HVCPoly::from_coeffs(acc.map(|x| center_i32(x, HVC_MODULUS))))
+        let reduced: Vec<HVCPoly> = (0..data_polys)
+            .map(|p| HVCPoly::from_coeffs(digit(p).map(|x| center_i32(x, HVC_MODULUS))))
             .collect();
         let root = HVCPoly::from_coeffs(
             self.root[combo].map(|x| center_i64(x, HVC_MODULUS as i64) as i32),
@@ -600,6 +575,37 @@ impl BatchAcc {
         let leaf_label = pp.leaf_hash.hash(&reduced[..xi * HVC_WIDTH]);
         walk_path(pp, &root, &reduced, xi, path_index, &leaf_label)
     }
+}
+
+/// One slot's accumulators, one per combination, over every opening.
+fn slot_i32<'a>(
+    openings: &[&'a Opening],
+    weights: &[Vec<u16>],
+    poly: impl Fn(&'a Opening) -> &'a [i32; POLY_N],
+) -> Vec<[i32; POLY_N]> {
+    let mut accs = vec![[0i32; POLY_N]; weights.len()];
+    for (i, o) in openings.iter().enumerate() {
+        let coeffs = poly(o);
+        for (acc, row) in accs.iter_mut().zip(weights) {
+            mac_i32(acc, coeffs, row[i] as i32);
+        }
+    }
+    accs
+}
+
+fn slot_i64<'a>(
+    count: usize,
+    weights: &[Vec<u16>],
+    poly: impl Fn(usize) -> &'a [i32; POLY_N],
+) -> Vec<[i64; POLY_N]> {
+    let mut accs = vec![[0i64; POLY_N]; weights.len()];
+    for i in 0..count {
+        let coeffs = poly(i);
+        for (acc, row) in accs.iter_mut().zip(weights) {
+            mac_i64(acc, coeffs, row[i] as i64);
+        }
+    }
+    accs
 }
 
 /// `acc[i] += v[i] · weight`; the caller's bounds keep it in range.
