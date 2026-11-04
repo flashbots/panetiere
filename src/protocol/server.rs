@@ -219,8 +219,10 @@ pub fn run_server_round(
         .zip(opening_refs.par_iter())
         .zip(comm_refs.par_iter())
         .find_map_first(|((cid, op), comm)| {
-            (op.path_index != position || !HidingMerkleCommitment::verify_fresh(cs, comm, op))
-                .then_some(*cid)
+            (op.server_index != position
+                || op.path_index != position
+                || !HidingMerkleCommitment::verify_fresh(cs, comm, op))
+            .then_some(*cid)
         });
     if let Some(cid) = culprit {
         return Err(ServerRoundError::BadOpening(cid));
