@@ -4,7 +4,7 @@ use crate::KahePoly;
 use rand::Rng;
 
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
-use crate::mse::{self, MseEncoding, MseParams};
+use crate::mse::{self, MseEncoding, MseError, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::ProtocolParams;
 
@@ -29,6 +29,9 @@ pub enum ChannelError {
     /// Peeling stalled: the encoding held more elements than `δ` was sized for,
     /// so the round's payloads are unrecoverable.
     PeelStalled,
+    /// The peeling table is not an honest sum: over capacity, or a cell whose
+    /// key does not hash to it.
+    MalformedEncoding(MseError),
     /// The Prony sketch could not be resolved — over capacity, or a malformed
     /// contribution.
     SketchFailed(PronyError),
@@ -62,6 +65,7 @@ impl ChannelParams {
         ChannelParams::Mse(MseParams::new(
             GAMMA,
             delta,
+            rho.max(1) as usize,
             payload_symbols.max(1),
             prf_key,
         ))
@@ -254,7 +258,12 @@ pub fn decode_symbols(
     let elements = match p {
         ChannelParams::Mse(params) => MseEncoding::unpack(params, &plaintext[..need])
             .decode()
-            .map_err(|_| ChannelError::PeelStalled)?,
+            .map_err(|e| match e {
+                MseError::OverCapacity | MseError::KeyMismatch => {
+                    ChannelError::MalformedEncoding(e)
+                }
+                _ => ChannelError::PeelStalled,
+            })?,
         ChannelParams::Prony(params) => PronySketch::unpack(params, &plaintext[..need])
             .decode()
             .map_err(ChannelError::SketchFailed)?,
