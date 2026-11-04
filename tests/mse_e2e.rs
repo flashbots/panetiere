@@ -6,6 +6,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use panetiere::cs::Commitment;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
@@ -85,9 +86,15 @@ fn mse_recovers_through_panetiere() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
@@ -174,9 +181,15 @@ fn cover_clients_do_not_inflate_iblt() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
@@ -264,9 +277,15 @@ fn multi_symbol_cover_through_panetiere() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)

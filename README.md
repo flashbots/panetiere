@@ -129,7 +129,8 @@ sequenceDiagram
     C->>B: ClientBulletinEntry (ciphertext + commitment)
     C->>S: sealed opening — that server's Shamir share of the KAHE key
     B-->>S: canonical client set
-    Note over S: unseal_opening, then run_server_round —<br/>all-or-nothing over the canonical set
+    B-->>S: client commitments
+    Note over S: unseal_opening, then run_server_round —<br/>verify each opening, all-or-nothing over the canonical set
     S->>B: summed share + summed opening
     B-->>R: all client posts + server entries
     Note over R: recover_unverified_direct — verify each opening, drop culprits,<br/>interpolate Σsk from t shares, decrypt Σct
@@ -237,15 +238,27 @@ for callers that need to split or interleave them.
 
 ```rust
 let op = unseal_opening(&server_key, &session, client_id, server_id, sealed)?;  // Option
-let entry = run_server_round(&ServerInbox { server_id, items }, canonical)?;
+let entry = run_server_round(
+    &pp.cs,
+    &ServerInbox { server_id, items },
+    canonical,
+    commitments,                          // each client's commitment, off the bulletin
+)?;
 ```
 
+Before summing, the server checks every canonical client's opening against
+that client's own commitment at the server's position, as the paper's server
+step does. A failing opening returns `ServerRoundError::BadOpening(client)` and
+the server posts nothing, so a misbehaving client can never make an honest
+server's aggregate fail at the recipient; the named client can be dropped and
+the round re-run without it.
+
 The round is **all-or-nothing over `canonical`**: a client in the set with
-nothing in the inbox returns `ServerRoundError::MissingClient` rather than
-summing a smaller set, because $\sum sk$ and $\sum ct$ must cover exactly the same
-clients or decryption yields noise. Extra inbox entries are ignored, so the same
-round can be re-run over any subset of what arrived. `unseal_openings` is the
-batch form.
+nothing in the inbox, or no commitment on the bulletin, returns
+`ServerRoundError::MissingClient` rather than summing a smaller set, because
+$\sum sk$ and $\sum ct$ must cover exactly the same clients or decryption yields
+noise. Extra inbox entries are ignored, so the same round can be re-run over any
+subset of what arrived. `unseal_openings` is the batch form.
 
 A server can double as an erasure-coding lane, in which case it also runs, over
 the same set and under the same all-or-nothing contract, with no key material

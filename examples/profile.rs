@@ -18,6 +18,7 @@
 //! Tip: keep ITERS low under callgrind (it adds ~50× overhead). For perf
 //! sampling, push ITERS to 100+ to dilute startup noise.
 
+use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
@@ -110,9 +111,15 @@ fn main() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let _recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
