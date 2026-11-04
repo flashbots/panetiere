@@ -407,7 +407,30 @@ fn shape_and_norms(pp: &CsParams, o: &Opening, r_bound: u32, tree_bound: u32) ->
 /// `‖coeffs‖∞ ≤ bound`, as a full reduction rather than an early-exit scan
 /// so it compiles to vector absolute-value and max instructions.
 fn norm_within(coeffs: &[i32; POLY_N], bound: u32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { infinity_norm_avx2(coeffs) } <= bound;
+        }
+    }
     coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs())) <= bound
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn infinity_norm_avx2(coeffs: &[i32; POLY_N]) -> u32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let mut m = _mm256_setzero_si256();
+    let mut k = 0;
+    while k < POLY_N {
+        let x = _mm256_loadu_si256(coeffs.as_ptr().add(k) as *const __m256i);
+        m = _mm256_max_epu32(m, _mm256_abs_epi32(x));
+        k += 8;
+    }
+    let mut lanes = [0u32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, m);
+    lanes.into_iter().max().unwrap_or(0)
 }
 
 /// Walk the stored path digits in `data` (laid out as an opening's `data`,
@@ -608,10 +631,35 @@ fn slot_i64<'a>(
     accs
 }
 
-/// `acc[i] += v[i] · weight`; the caller's bounds keep it in range.
+/// `acc[i] += v[i] · weight`; the caller's bounds keep it in range. AVX2 when
+/// available, as the auto-vectoriser only reaches SSE2 on the baseline target.
+#[inline(always)]
 fn mac_i32(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { mac_i32_avx2(acc, v, weight) };
+            return;
+        }
+    }
     for (a, &x) in acc.iter_mut().zip(v) {
         *a += x * weight;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mac_i32_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let w = _mm256_set1_epi32(weight);
+    let mut k = 0;
+    while k < POLY_N {
+        let a_ptr = acc.as_mut_ptr().add(k) as *mut __m256i;
+        let av = _mm256_loadu_si256(a_ptr as *const __m256i);
+        let xv = _mm256_loadu_si256(v.as_ptr().add(k) as *const __m256i);
+        _mm256_storeu_si256(a_ptr, _mm256_add_epi32(av, _mm256_mullo_epi32(xv, w)));
+        k += 8;
     }
 }
 
@@ -1467,6 +1515,32 @@ mod tests {
         assert!(!HidingMerkleCommitment::verify_fresh_batch(
             &pp, &comms, &opens, &weights
         ));
+    }
+
+    #[test]
+    fn simd_kernels_match_scalar() {
+        let mut rng = ChaCha20Rng::from_seed([78u8; 32]);
+        for bound in [1u32, 34, 116, 20_480, 1 << 30] {
+            let mut coeffs = [0i32; POLY_N];
+            for c in coeffs.iter_mut() {
+                *c = rng.gen_range(-(bound as i64)..=bound as i64) as i32;
+            }
+            let scalar = coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs()));
+            assert!(norm_within(&coeffs, scalar));
+            assert_eq!(norm_within(&coeffs, scalar.saturating_sub(1)), scalar == 0);
+            let mut acc = [0i32; POLY_N];
+            let mut expected = [0i32; POLY_N];
+            for weight in [1i32, 7, (1 << 15) - 1] {
+                mac_i32(&mut acc, &coeffs, weight);
+                for (e, &c) in expected.iter_mut().zip(&coeffs) {
+                    *e = e.wrapping_add(c.wrapping_mul(weight));
+                }
+            }
+            assert_eq!(acc, expected);
+        }
+        let extreme = [i32::MIN; POLY_N];
+        assert!(!norm_within(&extreme, (1 << 31) - 1));
+        assert!(norm_within(&extreme, 1 << 31));
     }
 
     #[test]
