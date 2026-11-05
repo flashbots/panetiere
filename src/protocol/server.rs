@@ -2,10 +2,15 @@ use std::collections::HashMap;
 
 use crate::{CsPoly, RsNTTPoly};
 use chipmunk_code::HVCPoly;
+use rand::SeedableRng;
+use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
 use crate::bulletin::{RsNodeBulletinEntry, ServerBulletinEntry};
-use crate::cs::{Commitment, Cs, CsParams, HidingMerkleCommitment, Opening, PackedOpening};
+use crate::cs::{
+    batch_capacity, batch_weights, Commitment, Cs, CsParams, HidingMerkleCommitment, Opening,
+    PackedOpening,
+};
 use crate::hvc_sum::sum_hvc_polys;
 use crate::pke;
 use crate::rs::Share;
@@ -177,6 +182,10 @@ pub fn run_rs_node_round(
     })
 }
 
+/// Random combinations checked per server round: a bad opening slips past
+/// each with probability at most `2^-15`, so eight leave `2^-120`.
+const BATCH_COMBOS: usize = 8;
+
 /// The paper's server step: every canonical client's opening must open that
 /// client's own commitment at this server's position, within the fresh norm
 /// bounds, or the server posts nothing. Only then are the openings summed, so
@@ -214,18 +223,40 @@ pub fn run_server_round(
     }
 
     let position = inbox.server_id.0 as usize;
+    // position, shape and norms per client, then the ring arithmetic once
+    // over random combinations of the whole set; only a failing batch pays
+    // for the per-client check that names the culprit
     let culprit = canonical
         .par_iter()
         .zip(opening_refs.par_iter())
-        .zip(comm_refs.par_iter())
-        .find_map_first(|((cid, op), comm)| {
+        .find_map_first(|(cid, op)| {
             (op.server_index != position
                 || op.path_index != position
-                || !HidingMerkleCommitment::verify_fresh(cs, comm, op))
+                || !HidingMerkleCommitment::check_fresh_shape(cs, op))
             .then_some(*cid)
         });
     if let Some(cid) = culprit {
         return Err(ServerRoundError::BadOpening(cid));
+    }
+    let batched = opening_refs.len() <= batch_capacity(cs) && {
+        let weights = batch_weights(
+            &mut ChaCha20Rng::from_entropy(),
+            BATCH_COMBOS,
+            opening_refs.len(),
+        );
+        HidingMerkleCommitment::verify_fresh_batch(cs, &comm_refs, &opening_refs, &weights)
+    };
+    if !batched {
+        let culprit = canonical
+            .par_iter()
+            .zip(opening_refs.par_iter())
+            .zip(comm_refs.par_iter())
+            .find_map_first(|((cid, op), comm)| {
+                (!HidingMerkleCommitment::verify_fresh(cs, comm, op)).then_some(*cid)
+            });
+        if let Some(cid) = culprit {
+            return Err(ServerRoundError::BadOpening(cid));
+        }
     }
 
     let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs)

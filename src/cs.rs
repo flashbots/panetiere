@@ -37,9 +37,9 @@
 
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
-use crate::rings::center_i32;
+use crate::rings::{center_i32, center_i64};
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
-use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH};
+use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
@@ -248,6 +248,56 @@ impl HidingMerkleCommitment {
         verify_with_bounds(pp, c, o, pp.beta_cs, chipmunk_code::ZETA)
     }
 
+    /// The cheap half of [`Self::verify_fresh`]: shape and the fresh norm
+    /// bounds, no ring arithmetic. What [`Self::verify_fresh_batch`] assumes
+    /// of every opening it is handed.
+    pub fn check_fresh_shape(pp: &CsParams, o: &Opening) -> bool {
+        shape_and_norms(pp, o, pp.beta_cs, chipmunk_code::ZETA)
+    }
+
+    /// [`Self::verify_fresh`] over a whole batch at once. Every equation the
+    /// per-opening check tests is linear in the opening and its root, so a
+    /// random weighted sum of the batch is checked in place of each member:
+    /// `weights[combo][i]` scales opening `i` (and its commitment) in
+    /// combination `combo`, and the batch passes iff every combination does.
+    ///
+    /// The weights must be drawn after the openings are fixed. Then a batch
+    /// containing an opening that fails on its own passes a combination with
+    /// probability at most `2^-15` (the weight has to hit the one value that
+    /// cancels the defect, out of `2^15 − 1`), independently per combination;
+    /// eight rows give `2^-120`. A pass says nothing about which member would
+    /// fail, so a failing batch is re-checked member by member.
+    ///
+    /// Requires `openings.len() ≤ batch_capacity(pp)`, every opening to pass
+    /// [`Self::check_fresh_shape`], and all of them to sit at one position;
+    /// anything else is rejected.
+    pub fn verify_fresh_batch(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> bool {
+        let Some(first) = openings.first() else {
+            return false;
+        };
+        let combos = weights.len();
+        if comms.len() != openings.len()
+            || openings.len() > batch_capacity(pp)
+            || combos == 0
+            || weights.iter().any(|row| row.len() != openings.len())
+            || weights.iter().flatten().any(|&w| w == 0 || w >= 1 << 15)
+            || openings
+                .iter()
+                .any(|o| o.path_index != first.path_index || !Self::check_fresh_shape(pp, o))
+        {
+            return false;
+        }
+        let acc = BatchAcc::accumulate(pp, comms, openings, weights);
+        (0..acc.combos)
+            .into_par_iter()
+            .all(|combo| acc.verify_combo(pp, combo, first.path_index))
+    }
+
     pub fn sum_commitment_refs(cs: &[&Commitment]) -> Commitment {
         let roots: Vec<&HVCPoly> = cs.iter().map(|c| &c.root).collect();
         Commitment {
@@ -310,26 +360,7 @@ fn verify_with_bounds(
     tree_bound: u32,
 ) -> bool {
     // Step 1
-    if o.kappa_cs() != pp.kappa_cs
-        || o.mu_cs() != pp.mu_cs
-        || o.stored_path_len() != pp.stored_path_len()
-    {
-        return false;
-    }
-    // Guard backing buffers before the accessors slice into them.
-    if o.rs.len() != pp.kappa_cs + pp.mu_cs
-        || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
-    {
-        return false;
-    }
-    if !o.r().iter().all(|p| p.infinity_norm() <= r_bound) {
-        return false;
-    }
-    // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
-    // by tree_bound, so a forged opening can't substitute out-of-range digits
-    // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
-    // after aggregation), well within β_agg_hvc = ρ_max·ζ.
-    if !o.data.iter().all(|p| p.infinity_norm() <= tree_bound) {
+    if !shape_and_norms(pp, o, r_bound, tree_bound) {
         return false;
     }
 
@@ -345,22 +376,95 @@ fn verify_with_bounds(
     let leaf_label = pp.leaf_hash.hash(o.u());
 
     // Step 4: chipmunk path above the leaf label.
-    let stored_path_len = o.stored_path_len();
+    walk_path(pp, &c.root, &o.data, o.xi(), o.path_index, &leaf_label)
+}
+
+/// Shape of `o` against `pp`, `‖r‖∞ ≤ r_bound` on the CS ring and
+/// `‖digits‖∞ ≤ tree_bound` on the HVC ring.
+fn shape_and_norms(pp: &CsParams, o: &Opening, r_bound: u32, tree_bound: u32) -> bool {
+    if o.kappa_cs() != pp.kappa_cs
+        || o.mu_cs() != pp.mu_cs
+        || o.stored_path_len() != pp.stored_path_len()
+    {
+        return false;
+    }
+    // Guard backing buffers before the accessors slice into them.
+    if o.rs.len() != pp.kappa_cs + pp.mu_cs
+        || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
+    {
+        return false;
+    }
+    if !o.r().iter().all(|p| norm_within(p.coeffs(), r_bound)) {
+        return false;
+    }
+    // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
+    // by tree_bound, so a forged opening can't substitute out-of-range digits
+    // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
+    // after aggregation), well within β_agg_hvc = ρ_max·ζ.
+    o.data.iter().all(|p| norm_within(p.coeffs(), tree_bound))
+}
+
+/// `‖coeffs‖∞ ≤ bound`, as a full reduction rather than an early-exit scan
+/// so it compiles to vector absolute-value and max instructions.
+fn norm_within(coeffs: &[i32; POLY_N], bound: u32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { infinity_norm_avx2(coeffs) } <= bound;
+        }
+    }
+    coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs())) <= bound
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn infinity_norm_avx2(coeffs: &[i32; POLY_N]) -> u32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let mut m = _mm256_setzero_si256();
+    let mut k = 0;
+    while k < POLY_N {
+        let x = _mm256_loadu_si256(coeffs.as_ptr().add(k) as *const __m256i);
+        m = _mm256_max_epu32(m, _mm256_abs_epi32(x));
+        k += 8;
+    }
+    let mut lanes = [0u32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, m);
+    lanes.into_iter().max().unwrap_or(0)
+}
+
+/// Walk the stored path digits in `data` (laid out as an opening's `data`,
+/// leaf digits first) from `leaf_label` up to `root`.
+fn walk_path(
+    pp: &CsParams,
+    root: &HVCPoly,
+    data: &[HVCPoly],
+    xi: usize,
+    path_index: usize,
+    leaf_label: &HVCPoly,
+) -> bool {
+    let stored_path_len = pp.stored_path_len();
+    let node = |level: usize| {
+        let base = xi * HVC_WIDTH + level * 2 * HVC_WIDTH;
+        (
+            &data[base..base + HVC_WIDTH],
+            &data[base + HVC_WIDTH..base + 2 * HVC_WIDTH],
+        )
+    };
     if stored_path_len == 0 {
-        return c.root == leaf_label;
+        return root == leaf_label;
     }
 
-    let (top_l, top_r) = o.path_node(0);
-    if pp.hasher.hash_separate_inputs(top_l, top_r) != c.root {
+    let (top_l, top_r) = node(0);
+    if pp.hasher.hash_separate_inputs(top_l, top_r) != *root {
         return false;
     }
 
-    let leaf_index = o.path_index;
-    let pos = position_list(leaf_index, stored_path_len);
+    let pos = position_list(path_index, stored_path_len);
     for i in 1..stored_path_len {
-        let (cur_l, cur_r) = o.path_node(i);
+        let (cur_l, cur_r) = node(i);
         let parent = pp.hasher.hash_separate_inputs(cur_l, cur_r);
-        let (prev_l, prev_r) = o.path_node(i - 1);
+        let (prev_l, prev_r) = node(i - 1);
         let expected = if pos[i] {
             HVCPoly::projection_r(prev_r)
         } else {
@@ -372,13 +476,197 @@ fn verify_with_bounds(
     }
 
     let last = stored_path_len - 1;
-    let (last_l, last_r) = o.path_node(last);
+    let (last_l, last_r) = node(last);
     let stored_running = if pos[stored_path_len] {
         HVCPoly::projection_r(last_r)
     } else {
         HVCPoly::projection_r(last_l)
     };
-    stored_running == leaf_label
+    stored_running == *leaf_label
+}
+
+/// Largest batch the fresh check can accumulate in i32: every combination
+/// weight is below `2^15` and every accumulated coefficient is bounded by
+/// `max(β_cs, ζ)`, so `ρ · 2^15 · max(β_cs, ζ)` has to stay under `2^31`.
+pub fn batch_capacity(pp: &CsParams) -> usize {
+    u16::MAX as usize / pp.beta_cs.max(chipmunk_code::ZETA) as usize
+}
+
+/// Weights for one batched fresh check: `combos` independent rows, one
+/// weight per opening, each uniform in `[1, 2^15)`.
+pub fn batch_weights<R: Rng>(rng: &mut R, combos: usize, openings: usize) -> Vec<Vec<u16>> {
+    (0..combos)
+        .map(|_| {
+            (0..openings)
+                .map(|_| rng.gen_range(1..1u16 << 15))
+                .collect()
+        })
+        .collect()
+}
+
+/// Weighted sums of a batch of openings, every slot holding one accumulator
+/// per combination (slot-major). `r`, the digits and the roots stay in i32 or
+/// i64 unreduced; the capacity bound keeps them exact.
+struct BatchAcc {
+    combos: usize,
+    r: Vec<[i32; POLY_N]>,
+    s: Vec<[i64; POLY_N]>,
+    data: Vec<[i32; POLY_N]>,
+    root: Vec<[i64; POLY_N]>,
+}
+
+impl BatchAcc {
+    /// Each slot is accumulated on its own, over every opening and every
+    /// combination at once, so an opening's poly is read from memory once
+    /// and there is nothing to merge afterwards.
+    fn accumulate(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> Self {
+        let combos = weights.len();
+        let kappa = pp.kappa_cs;
+        let mu = pp.mu_cs;
+        let data_polys = opening_data_polys(pp.xi(), pp.stored_path_len());
+        let r: Vec<[i32; POLY_N]> = (0..kappa)
+            .into_par_iter()
+            .flat_map_iter(|p| slot_i32(openings, weights, move |o| o.r()[p].coeffs()))
+            .collect();
+        let data: Vec<[i32; POLY_N]> = (0..data_polys)
+            .into_par_iter()
+            .flat_map_iter(|p| slot_i32(openings, weights, move |o| o.data[p].coeffs()))
+            .collect();
+        let s: Vec<[i64; POLY_N]> = (0..mu)
+            .into_par_iter()
+            .flat_map_iter(|p| {
+                slot_i64(openings.len(), weights, move |i| {
+                    openings[i].s()[p].coeffs()
+                })
+            })
+            .collect();
+        let root = slot_i64(comms.len(), weights, |i| comms[i].root.coeffs());
+        Self {
+            combos,
+            r,
+            s,
+            data,
+            root,
+        }
+    }
+
+    /// Run the fresh check's algebra on combination `combo`: the weighted
+    /// digit sums must project to the weighted leaf block over the integers
+    /// and, reduced mod `q_hvc`, hash and walk to the weighted root.
+    fn verify_combo(&self, pp: &CsParams, combo: usize, path_index: usize) -> bool {
+        let c = self.combos;
+        let xi = pp.xi();
+        let r: Vec<CsPoly> = (0..pp.kappa_cs)
+            .map(|p| CsPoly::from_coeffs(self.r[p * c + combo].map(|x| center_i32(x, CS_MODULUS))))
+            .collect();
+        let s: Vec<CsPoly> = (0..pp.mu_cs)
+            .map(|p| {
+                CsPoly::from_coeffs(
+                    self.s[p * c + combo].map(|x| center_i64(x, CS_MODULUS as i64) as i32),
+                )
+            })
+            .collect();
+        let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, &s);
+        let data_polys = opening_data_polys(xi, pp.stored_path_len());
+        let digit = |p: usize| &self.data[p * c + combo];
+        // the projection is linear over the integers, so it is taken on the
+        // unreduced sums; the hash and the path live mod q_hvc
+        for (k, expected) in raw.iter().enumerate() {
+            let mut projected = [0i32; POLY_N];
+            for (j, out) in projected.iter_mut().enumerate() {
+                let mut acc = 0i64;
+                for w in (0..HVC_WIDTH).rev() {
+                    acc = acc * TWO_ZETA_PLUS_ONE as i64 + digit(k * HVC_WIDTH + w)[j] as i64;
+                }
+                *out = center_i64(acc, CS_MODULUS as i64) as i32;
+            }
+            if CsPoly::from_coeffs(projected) != *expected {
+                return false;
+            }
+        }
+        let reduced: Vec<HVCPoly> = (0..data_polys)
+            .map(|p| HVCPoly::from_coeffs(digit(p).map(|x| center_i32(x, HVC_MODULUS))))
+            .collect();
+        let root = HVCPoly::from_coeffs(
+            self.root[combo].map(|x| center_i64(x, HVC_MODULUS as i64) as i32),
+        );
+        let leaf_label = pp.leaf_hash.hash(&reduced[..xi * HVC_WIDTH]);
+        walk_path(pp, &root, &reduced, xi, path_index, &leaf_label)
+    }
+}
+
+/// One slot's accumulators, one per combination, over every opening.
+fn slot_i32<'a>(
+    openings: &[&'a Opening],
+    weights: &[Vec<u16>],
+    poly: impl Fn(&'a Opening) -> &'a [i32; POLY_N],
+) -> Vec<[i32; POLY_N]> {
+    let mut accs = vec![[0i32; POLY_N]; weights.len()];
+    for (i, o) in openings.iter().enumerate() {
+        let coeffs = poly(o);
+        for (acc, row) in accs.iter_mut().zip(weights) {
+            mac_i32(acc, coeffs, row[i] as i32);
+        }
+    }
+    accs
+}
+
+fn slot_i64<'a>(
+    count: usize,
+    weights: &[Vec<u16>],
+    poly: impl Fn(usize) -> &'a [i32; POLY_N],
+) -> Vec<[i64; POLY_N]> {
+    let mut accs = vec![[0i64; POLY_N]; weights.len()];
+    for i in 0..count {
+        let coeffs = poly(i);
+        for (acc, row) in accs.iter_mut().zip(weights) {
+            mac_i64(acc, coeffs, row[i] as i64);
+        }
+    }
+    accs
+}
+
+/// `acc[i] += v[i] · weight`; the caller's bounds keep it in range. AVX2 when
+/// available, as the auto-vectoriser only reaches SSE2 on the baseline target.
+#[inline(always)]
+fn mac_i32(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { mac_i32_avx2(acc, v, weight) };
+            return;
+        }
+    }
+    for (a, &x) in acc.iter_mut().zip(v) {
+        *a += x * weight;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mac_i32_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let w = _mm256_set1_epi32(weight);
+    let mut k = 0;
+    while k < POLY_N {
+        let a_ptr = acc.as_mut_ptr().add(k) as *mut __m256i;
+        let av = _mm256_loadu_si256(a_ptr as *const __m256i);
+        let xv = _mm256_loadu_si256(v.as_ptr().add(k) as *const __m256i);
+        _mm256_storeu_si256(a_ptr, _mm256_add_epi32(av, _mm256_mullo_epi32(xv, w)));
+        k += 8;
+    }
+}
+
+fn mac_i64(acc: &mut [i64; POLY_N], v: &[i32; POLY_N], weight: i64) {
+    for (a, &x) in acc.iter_mut().zip(v) {
+        *a += x as i64 * weight;
+    }
 }
 
 impl Cs for HidingMerkleCommitment {
@@ -1168,6 +1456,91 @@ mod tests {
         assert!(bytes.len() < POLY_N * 4);
         assert_eq!(Commitment::from_bytes(&bytes).unwrap().root, comm.root);
         assert!(Commitment::from_bytes(&[0u8; 3]).is_none());
+    }
+
+    /// A batch of honest openings at one position passes with any weights;
+    /// a single tampered member — share, randomness, leaf digit, path digit
+    /// or root — fails it.
+    #[test]
+    fn batched_fresh_check_accepts_honest_and_catches_one_bad_member() {
+        let mut rng = ChaCha20Rng::from_seed([77u8; 32]);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let position = 2;
+        let rounds: Vec<(Commitment, Opening)> = (0..12)
+            .map(|_| {
+                let shares = rand_shares(&mut rng, 4, 1);
+                let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+                (c, os.swap_remove(position))
+            })
+            .collect();
+        let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
+        let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
+        let weights = batch_weights(&mut rng, 3, rounds.len());
+        assert!(HidingMerkleCommitment::verify_fresh_batch(
+            &pp, &comms, &opens, &weights
+        ));
+
+        fn unit(i: usize) -> CsPoly {
+            let mut c = [0i32; POLY_N];
+            c[i] = 1;
+            CsPoly::from_coeffs(c)
+        }
+        let tamper: [fn(&mut Commitment, &mut Opening); 5] = [
+            |_, o| o.s_mut()[0] += CsPoly::from_coeffs([1; POLY_N]),
+            |_, o| o.r_mut()[1] += unit(5),
+            |_, o| o.data[0].coeffs_mut()[0] += 1,
+            |_, o| o.data[o.data.len() - 1].coeffs_mut()[7] -= 1,
+            |c, _| c.root.coeffs_mut()[3] += 1,
+        ];
+        for (which, t) in tamper.iter().enumerate() {
+            let mut bad = rounds.clone();
+            let (c, o) = &mut bad[5];
+            t(c, o);
+            assert!(
+                !HidingMerkleCommitment::verify_fresh(&pp, c, o),
+                "tamper {which}"
+            );
+            let comms: Vec<&Commitment> = bad.iter().map(|(c, _)| c).collect();
+            let opens: Vec<&Opening> = bad.iter().map(|(_, o)| o).collect();
+            assert!(
+                !HidingMerkleCommitment::verify_fresh_batch(&pp, &comms, &opens, &weights),
+                "tamper {which} slipped through the batch"
+            );
+        }
+
+        let one_too_many = batch_capacity(&pp) + 1;
+        let comms: Vec<&Commitment> = std::iter::repeat_n(&rounds[0].0, one_too_many).collect();
+        let opens: Vec<&Opening> = std::iter::repeat_n(&rounds[0].1, one_too_many).collect();
+        let weights = batch_weights(&mut rng, 1, one_too_many);
+        assert!(!HidingMerkleCommitment::verify_fresh_batch(
+            &pp, &comms, &opens, &weights
+        ));
+    }
+
+    #[test]
+    fn simd_kernels_match_scalar() {
+        let mut rng = ChaCha20Rng::from_seed([78u8; 32]);
+        for bound in [1u32, 34, 116, 20_480, 1 << 30] {
+            let mut coeffs = [0i32; POLY_N];
+            for c in coeffs.iter_mut() {
+                *c = rng.gen_range(-(bound as i64)..=bound as i64) as i32;
+            }
+            let scalar = coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs()));
+            assert!(norm_within(&coeffs, scalar));
+            assert_eq!(norm_within(&coeffs, scalar.saturating_sub(1)), scalar == 0);
+            let mut acc = [0i32; POLY_N];
+            let mut expected = [0i32; POLY_N];
+            for weight in [1i32, 7, (1 << 15) - 1] {
+                mac_i32(&mut acc, &coeffs, weight);
+                for (e, &c) in expected.iter_mut().zip(&coeffs) {
+                    *e = e.wrapping_add(c.wrapping_mul(weight));
+                }
+            }
+            assert_eq!(acc, expected);
+        }
+        let extreme = [i32::MIN; POLY_N];
+        assert!(!norm_within(&extreme, (1 << 31) - 1));
+        assert!(norm_within(&extreme, 1 << 31));
     }
 
     #[test]
