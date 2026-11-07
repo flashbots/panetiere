@@ -37,7 +37,7 @@
 
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
-use crate::rings::center_i32;
+use crate::rings::{center_i32, center_i64};
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH};
 use rand::{Rng, SeedableRng};
@@ -704,13 +704,14 @@ fn unpack_bits(
     byte_idx
 }
 
-/// Bytes one polynomial occupies when bit-packed against `modulus` — each of
-/// the `N` coefficients in `⌈log₂(2·modulus+1)⌉` bits.
+/// Bytes one polynomial occupies when bit-packed against an odd `modulus` —
+/// each of the `N` coefficients as its centered representative in
+/// `[-(modulus-1)/2, (modulus-1)/2]`, i.e. in `⌈log₂ modulus⌉` bits.
 pub fn poly_packed_len(modulus: i32) -> usize {
-    (POLY_N * bits_for_signed(modulus as u32) as usize).div_ceil(8)
+    (POLY_N * bits_for_signed((modulus / 2) as u32) as usize).div_ceil(8)
 }
 
-/// 64-bit variants for the KAHE ring (q ≈ 2^49.3 → 51 bits per coefficient).
+/// 64-bit variants for the KAHE ring.
 #[inline]
 fn bits_for_signed64(bound: u64) -> u32 {
     let n = 2u128 * bound as u128 + 1;
@@ -718,7 +719,7 @@ fn bits_for_signed64(bound: u64) -> u32 {
 }
 
 pub fn poly_packed_len64(modulus: i64) -> usize {
-    (POLY_N * bits_for_signed64(modulus as u64) as usize).div_ceil(8)
+    (POLY_N * bits_for_signed64((modulus / 2) as u64) as usize).div_ceil(8)
 }
 
 fn pack_bits64(out: &mut Vec<u8>, values: &[i64], bound: u64, bits: u32) {
@@ -776,32 +777,53 @@ fn unpack_bits64(
 
 /// [`pack_poly`] for i64 coefficient arrays (KAHE ring).
 pub(crate) fn pack_poly64(coeffs: &[i64], modulus: i64, out: &mut Vec<u8>) {
-    let bound = modulus as u64;
-    pack_bits64(out, coeffs, bound, bits_for_signed64(bound));
+    debug_assert!(modulus % 2 == 1);
+    let bound = (modulus / 2) as u64;
+    let mut centered = [0i64; POLY_N];
+    for (c, &x) in centered.iter_mut().zip(coeffs) {
+        *c = center_i64(x, modulus);
+    }
+    pack_bits64(
+        out,
+        &centered[..coeffs.len()],
+        bound,
+        bits_for_signed64(bound),
+    );
 }
 
 /// [`unpack_poly`] for i64 coefficient arrays (KAHE ring).
 pub(crate) fn unpack_poly64(input: &[u8], start: usize, modulus: i64) -> ([i64; POLY_N], usize) {
-    let bound = modulus as u64;
+    let bound = (modulus / 2) as u64;
     let mut coeffs = [0i64; POLY_N];
     let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound));
     (coeffs, next)
 }
 
-/// Append one polynomial's coefficients to `out`, packed against `modulus`.
-/// Like the opening's `s`-region packing, values are offset by the full modulus
-/// rather than centered, so any representative in `[-modulus, modulus]` round-
-/// trips to the identical `i32` — commitment/equality checks that depend on the
-/// exact representative are unaffected.
+/// Append one polynomial's coefficients to `out`, packed against an odd
+/// `modulus`. Each coefficient is first reduced to its centered representative
+/// in `[-(modulus-1)/2, (modulus-1)/2]`, so it takes `⌈log₂ modulus⌉` bits and
+/// any input representative is accepted. The wire bytes therefore depend only
+/// on the residues, and unpacking returns the centered representatives, which
+/// compare equal (mod `modulus`) to the packed polynomial.
 pub(crate) fn pack_poly(coeffs: &[i32], modulus: i32, out: &mut Vec<u8>) {
-    let bound = modulus as u32;
-    pack_bits(out, coeffs, bound, bits_for_signed(bound));
+    debug_assert!(modulus % 2 == 1);
+    let bound = (modulus / 2) as u32;
+    let mut centered = [0i32; POLY_N];
+    for (c, &x) in centered.iter_mut().zip(coeffs) {
+        *c = center_i32(x, modulus);
+    }
+    pack_bits(
+        out,
+        &centered[..coeffs.len()],
+        bound,
+        bits_for_signed(bound),
+    );
 }
 
 /// Inverse of [`pack_poly`]: read one polynomial's `N` coefficients starting at
-/// `start`, returning them and the next byte index.
+/// `start`, returning them (centered) and the next byte index.
 pub(crate) fn unpack_poly(input: &[u8], start: usize, modulus: i32) -> ([i32; POLY_N], usize) {
-    let bound = modulus as u32;
+    let bound = (modulus / 2) as u32;
     let mut coeffs = [0i32; POLY_N];
     let next = unpack_bits(input, start, &mut coeffs, bound, bits_for_signed(bound));
     (coeffs, next)
@@ -1355,6 +1377,43 @@ mod tests {
                 assert_eq!(summed.s()[k], shares_a[i][k] + shares_b[i][k]);
             }
             assert!(HidingMerkleCommitment::verify(&pp, &comm_sum, &summed));
+        }
+    }
+
+    /// Polynomials are packed as centered representatives: any input
+    /// representative in (-m, m) round-trips to an equal residue, in
+    /// ⌈log₂ m⌉ bits per coefficient.
+    #[test]
+    fn poly_packing_is_centered_and_tight() {
+        use crate::KAHE_MODULUS;
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        for modulus in [CS_MODULUS, HVC_MODULUS] {
+            let coeffs: [i32; POLY_N] =
+                std::array::from_fn(|_| rng.gen_range(-(modulus - 1)..modulus));
+            let mut out = Vec::new();
+            pack_poly(&coeffs, modulus, &mut out);
+            let bits = 32 - ((modulus - 1) as u32).leading_zeros();
+            assert_eq!(out.len(), (POLY_N * bits as usize).div_ceil(8));
+            assert_eq!(out.len(), poly_packed_len(modulus));
+            let (back, next) = unpack_poly(&out, 0, modulus);
+            assert_eq!(next, out.len());
+            for (&a, &b) in coeffs.iter().zip(&back) {
+                assert_eq!(a.rem_euclid(modulus), b.rem_euclid(modulus));
+                assert!(2 * b.abs() < modulus);
+            }
+        }
+        let coeffs: [i64; POLY_N] =
+            std::array::from_fn(|_| rng.gen_range(-(KAHE_MODULUS - 1)..KAHE_MODULUS));
+        let mut out = Vec::new();
+        pack_poly64(&coeffs, KAHE_MODULUS, &mut out);
+        let bits = 64 - ((KAHE_MODULUS - 1) as u64).leading_zeros();
+        assert_eq!(out.len(), (POLY_N * bits as usize).div_ceil(8));
+        assert_eq!(out.len(), poly_packed_len64(KAHE_MODULUS));
+        let (back, next) = unpack_poly64(&out, 0, KAHE_MODULUS);
+        assert_eq!(next, out.len());
+        for (&a, &b) in coeffs.iter().zip(&back) {
+            assert_eq!(a.rem_euclid(KAHE_MODULUS), b.rem_euclid(KAHE_MODULUS));
+            assert!(2 * b.abs() < KAHE_MODULUS);
         }
     }
 
