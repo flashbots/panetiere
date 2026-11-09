@@ -78,15 +78,31 @@ pub(crate) fn center_canonical_i64(value: i64, modulus: i64) -> i64 {
     value - (modulus & -((value > modulus / 2) as i64))
 }
 
+/// Centered representative of `value` modulo an odd `modulus`, in
+/// `[-(modulus-1)/2, (modulus-1)/2]`.
 #[inline]
 pub(crate) fn center_i64(value: i64, modulus: i64) -> i64 {
-    center_canonical_i64(value.rem_euclid(modulus), modulus)
+    if value <= -modulus || value >= modulus {
+        return center_canonical_i64(value.rem_euclid(modulus), modulus);
+    }
+    // Avoid the division for inputs in (-modulus, modulus), which is what ring
+    // arithmetic leaves behind: `x >> 63` is all ones iff `x < 0`, so subtract
+    // `modulus` iff `value > half`, then add it back iff the result is `< -half`.
+    let half = modulus / 2;
+    let x = value - (modulus & ((half - value) >> 63));
+    x + (modulus & ((x + half) >> 63))
 }
 
+/// [`center_i64`] for `i32`.
 #[inline]
 pub(crate) fn center_i32(value: i32, modulus: i32) -> i32 {
-    let reduced = value.rem_euclid(modulus);
-    reduced - (modulus & -((reduced > modulus / 2) as i32))
+    if value <= -modulus || value >= modulus {
+        let reduced = value.rem_euclid(modulus);
+        return reduced - (modulus & -((reduced > modulus / 2) as i32));
+    }
+    let half = modulus / 2;
+    let x = value - (modulus & ((half - value) >> 31));
+    x + (modulus & ((x + half) >> 31))
 }
 
 #[inline]
@@ -801,6 +817,62 @@ mod rns_conversion_tests {
             let expected_residues = cs.reduce_coeff(input[i] as i128);
             assert_eq!([residues[0][i], residues[1][i]], expected_residues);
             assert_eq!(lifted[i] as i128, cs.lift_centered(expected_residues));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CS_MODULUS, KAHE_MODULUS};
+    use chipmunk_code::HVC_MODULUS;
+
+    #[test]
+    fn centering_matches_rem_euclid() {
+        let m = KAHE_MODULUS;
+        let h = m / 2;
+        for x in [
+            0,
+            1,
+            -1,
+            h,
+            h + 1,
+            -h,
+            -h - 1,
+            m - 1,
+            -(m - 1),
+            m,
+            -m,
+            3 * m + 5,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let r = x.rem_euclid(m);
+            let expected = if r > h { r - m } else { r };
+            assert_eq!(center_i64(x, m), expected, "x = {x}");
+        }
+        for m in [CS_MODULUS, HVC_MODULUS] {
+            let h = m / 2;
+            for x in [
+                0,
+                1,
+                -1,
+                h,
+                h + 1,
+                -h,
+                -h - 1,
+                m - 1,
+                -(m - 1),
+                m,
+                -m,
+                3 * m + 5,
+                i32::MAX,
+                i32::MIN,
+            ] {
+                let r = x.rem_euclid(m);
+                let expected = if r > h { r - m } else { r };
+                assert_eq!(center_i32(x, m), expected, "x = {x}");
+            }
         }
     }
 }

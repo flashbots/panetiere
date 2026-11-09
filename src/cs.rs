@@ -35,6 +35,8 @@
 //! projections are linear, so summing stored digits pointwise keeps
 //! `sum_openings` correct.
 
+use std::borrow::Borrow;
+
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
 use crate::rings::{center_i32, center_i64};
@@ -647,13 +649,20 @@ pub(crate) fn bits_for_signed(bound: u32) -> u32 {
 
 /// Pack signed values in [-bound, bound] into `out` at `bits` bits each
 /// (LSB-first within each byte), offset by `bound` to become unsigned.
-fn pack_bits(out: &mut Vec<u8>, values: &[i32], bound: u32, bits: u32) {
+/// Takes a slice or any iterator, so callers can transform values on the fly.
+fn pack_bits<V: Borrow<i32>>(
+    out: &mut Vec<u8>,
+    values: impl IntoIterator<Item = V>,
+    bound: u32,
+    bits: u32,
+) {
     debug_assert!(bits <= 32);
     let offset = bound as i64;
     let max_u: u64 = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
     let mut acc_bits: u32 = 0;
-    for &v in values {
+    for v in values {
+        let v = *v.borrow();
         debug_assert!(
             v >= -(bound as i32) && v <= bound as i32,
             "pack_bits: value {} outside [{}, {}]",
@@ -722,13 +731,20 @@ pub fn poly_packed_len64(modulus: i64) -> usize {
     (POLY_N * bits_for_signed64((modulus / 2) as u64) as usize).div_ceil(8)
 }
 
-fn pack_bits64(out: &mut Vec<u8>, values: &[i64], bound: u64, bits: u32) {
+/// [`pack_bits`] for `i64` values.
+fn pack_bits64<V: Borrow<i64>>(
+    out: &mut Vec<u8>,
+    values: impl IntoIterator<Item = V>,
+    bound: u64,
+    bits: u32,
+) {
     debug_assert!(bits <= 56, "u64 accumulator supports up to 56-bit symbols");
     let offset = bound as i64;
     let max_u: u64 = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
     let mut acc_bits: u32 = 0;
-    for &v in values {
+    for v in values {
+        let v = *v.borrow();
         debug_assert!(
             v >= -(bound as i64) && v <= bound as i64,
             "pack_bits64: value {v} outside [-{bound}, {bound}]"
@@ -779,16 +795,8 @@ fn unpack_bits64(
 pub(crate) fn pack_poly64(coeffs: &[i64], modulus: i64, out: &mut Vec<u8>) {
     debug_assert!(modulus % 2 == 1);
     let bound = (modulus / 2) as u64;
-    let mut centered = [0i64; POLY_N];
-    for (c, &x) in centered.iter_mut().zip(coeffs) {
-        *c = center_i64(x, modulus);
-    }
-    pack_bits64(
-        out,
-        &centered[..coeffs.len()],
-        bound,
-        bits_for_signed64(bound),
-    );
+    let centered = coeffs.iter().map(|&x| center_i64(x, modulus));
+    pack_bits64(out, centered, bound, bits_for_signed64(bound));
 }
 
 /// [`unpack_poly`] for i64 coefficient arrays (KAHE ring).
@@ -808,16 +816,8 @@ pub(crate) fn unpack_poly64(input: &[u8], start: usize, modulus: i64) -> ([i64; 
 pub(crate) fn pack_poly(coeffs: &[i32], modulus: i32, out: &mut Vec<u8>) {
     debug_assert!(modulus % 2 == 1);
     let bound = (modulus / 2) as u32;
-    let mut centered = [0i32; POLY_N];
-    for (c, &x) in centered.iter_mut().zip(coeffs) {
-        *c = center_i32(x, modulus);
-    }
-    pack_bits(
-        out,
-        &centered[..coeffs.len()],
-        bound,
-        bits_for_signed(bound),
-    );
+    let centered = coeffs.iter().map(|&x| center_i32(x, modulus));
+    pack_bits(out, centered, bound, bits_for_signed(bound));
 }
 
 /// Inverse of [`pack_poly`]: read one polynomial's `N` coefficients starting at
@@ -1386,6 +1386,43 @@ mod tests {
     #[test]
     fn poly_packing_is_centered_and_tight() {
         use crate::KAHE_MODULUS;
+        // edge cases of the centering, and inputs outside (-m, m)
+        for m in [CS_MODULUS, HVC_MODULUS] {
+            let h = m / 2;
+            for extra in [0, 3 * m + 5, i32::MIN + 1] {
+                let mut coeffs = [0i32; POLY_N];
+                for (c, x) in coeffs
+                    .iter_mut()
+                    .zip([h, h + 1, -h, -h - 1, m - 1, -(m - 1), extra])
+                {
+                    *c = x;
+                }
+                let mut out = Vec::new();
+                pack_poly(&coeffs, m, &mut out);
+                let (back, _) = unpack_poly(&out, 0, m);
+                for (&a, &b) in coeffs.iter().zip(&back) {
+                    assert_eq!(a.rem_euclid(m), b.rem_euclid(m));
+                    assert!(2 * b.abs() < m);
+                }
+            }
+        }
+        let (m, h) = (KAHE_MODULUS, KAHE_MODULUS / 2);
+        for extra in [0, 3 * m + 5, i64::MIN + 1] {
+            let mut coeffs = [0i64; POLY_N];
+            for (c, x) in coeffs
+                .iter_mut()
+                .zip([h, h + 1, -h, -h - 1, m - 1, -(m - 1), extra])
+            {
+                *c = x;
+            }
+            let mut out = Vec::new();
+            pack_poly64(&coeffs, m, &mut out);
+            let (back, _) = unpack_poly64(&out, 0, m);
+            for (&a, &b) in coeffs.iter().zip(&back) {
+                assert_eq!(a.rem_euclid(m), b.rem_euclid(m));
+                assert!(2 * b.abs() < m);
+            }
+        }
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
         for modulus in [CS_MODULUS, HVC_MODULUS] {
             let coeffs: [i32; POLY_N] =
