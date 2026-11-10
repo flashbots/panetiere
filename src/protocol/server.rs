@@ -183,8 +183,9 @@ pub fn run_rs_node_round(
 }
 
 /// Random combinations checked per server round: a bad opening slips past
-/// each with probability at most `2^-15`, so eight leave `2^-120`.
-const BATCH_COMBOS: usize = 8;
+/// each with probability at most `2^-15`, so nine leave `2^-135`, the
+/// smallest count past the 128-bit target.
+const BATCH_COMBOS: usize = 9;
 
 /// The paper's server step: every canonical client's opening must open that
 /// client's own commitment at this server's position, within the fresh norm

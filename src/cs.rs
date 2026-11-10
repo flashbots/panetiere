@@ -265,8 +265,11 @@ impl HidingMerkleCommitment {
     /// containing an opening that fails on its own passes a combination with
     /// probability at most `2^-15` (the weight has to hit the one value that
     /// cancels the defect, out of `2^15 − 1`), independently per combination;
-    /// eight rows give `2^-120`. A pass says nothing about which member would
-    /// fail, so a failing batch is re-checked member by member.
+    /// nine rows give `2^-135`, past the 128-bit target. The weight range has
+    /// to fit below both moduli for that to hold, which
+    /// [`BATCH_WEIGHT_BOUND`] asserts at compile time. A pass says nothing
+    /// about which member would fail, so a failing batch is re-checked member
+    /// by member.
     ///
     /// Requires `openings.len() ≤ batch_capacity(pp)`, every opening to pass
     /// [`Self::check_fresh_shape`], and all of them to sit at one position;
@@ -285,7 +288,10 @@ impl HidingMerkleCommitment {
             || openings.len() > batch_capacity(pp)
             || combos == 0
             || weights.iter().any(|row| row.len() != openings.len())
-            || weights.iter().flatten().any(|&w| w == 0 || w >= 1 << 15)
+            || weights
+                .iter()
+                .flatten()
+                .any(|&w| w == 0 || w >= BATCH_WEIGHT_BOUND)
             || openings
                 .iter()
                 .any(|o| o.path_index != first.path_index || !Self::check_fresh_shape(pp, o))
@@ -485,6 +491,24 @@ fn walk_path(
     stored_running == *leaf_label
 }
 
+/// Exclusive upper bound on a batch combination weight: weights are uniform
+/// in `[1, 2^15)`. A defective opening cancels out of a combination only for
+/// one weight value, and only if distinct weights stay distinct modulo both
+/// `q_cs` and `q_hvc`, so the whole range has to sit below the smaller
+/// modulus. The bound also keeps the i32 accumulation of
+/// [`batch_capacity`] exact.
+pub const BATCH_WEIGHT_BOUND: u16 = 1 << 15;
+
+const _: () = assert!(
+    (BATCH_WEIGHT_BOUND as i32) - 1
+        <= if CS_MODULUS < HVC_MODULUS {
+            CS_MODULUS
+        } else {
+            HVC_MODULUS
+        },
+    "batch weights must be distinct modulo both q_cs and q_hvc"
+);
+
 /// Largest batch the fresh check can accumulate in i32: every combination
 /// weight is below `2^15` and every accumulated coefficient is bounded by
 /// `max(β_cs, ζ)`, so `ρ · 2^15 · max(β_cs, ζ)` has to stay under `2^31`.
@@ -493,12 +517,12 @@ pub fn batch_capacity(pp: &CsParams) -> usize {
 }
 
 /// Weights for one batched fresh check: `combos` independent rows, one
-/// weight per opening, each uniform in `[1, 2^15)`.
+/// weight per opening, each uniform in `[1, BATCH_WEIGHT_BOUND)`.
 pub fn batch_weights<R: Rng>(rng: &mut R, combos: usize, openings: usize) -> Vec<Vec<u16>> {
     (0..combos)
         .map(|_| {
             (0..openings)
-                .map(|_| rng.gen_range(1..1u16 << 15))
+                .map(|_| rng.gen_range(1..BATCH_WEIGHT_BOUND))
                 .collect()
         })
         .collect()
@@ -1530,7 +1554,7 @@ mod tests {
             assert_eq!(norm_within(&coeffs, scalar.saturating_sub(1)), scalar == 0);
             let mut acc = [0i32; POLY_N];
             let mut expected = [0i32; POLY_N];
-            for weight in [1i32, 7, (1 << 15) - 1] {
+            for weight in [1i32, 7, BATCH_WEIGHT_BOUND as i32 - 1] {
                 mac_i32(&mut acc, &coeffs, weight);
                 for (e, &c) in expected.iter_mut().zip(&coeffs) {
                     *e = e.wrapping_add(c.wrapping_mul(weight));
