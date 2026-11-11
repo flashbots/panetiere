@@ -275,3 +275,97 @@ pub fn run_server_round(
         agg_share,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SERVERS: usize = 4;
+    const POSITION: u32 = 1;
+
+    /// One client's commitment and its opening at `POSITION`.
+    fn commit_one(rng: &mut ChaCha20Rng, cs: &CsParams) -> (Commitment, Opening) {
+        let shares: Vec<Vec<CsPoly>> = (0..SERVERS)
+            .map(|_| (0..cs.mu_cs).map(|_| CsPoly::rand_poly(rng)).collect())
+            .collect();
+        let (comm, mut openings) = HidingMerkleCommitment::commit(rng, cs, &shares);
+        (comm, openings.swap_remove(POSITION as usize))
+    }
+
+    /// A round of `clients` honest clients, as the server at `POSITION` sees it.
+    fn round(
+        rng: &mut ChaCha20Rng,
+        cs: &CsParams,
+        clients: u32,
+    ) -> (Vec<ClientId>, Vec<(ClientId, Commitment)>, ServerInbox) {
+        let canonical: Vec<ClientId> = (0..clients).map(ClientId).collect();
+        let (commitments, items) = canonical
+            .iter()
+            .map(|&cid| {
+                let (comm, opening) = commit_one(rng, cs);
+                ((cid, comm), (cid, opening))
+            })
+            .unzip();
+        let inbox = ServerInbox {
+            server_id: ServerId(POSITION),
+            items,
+        };
+        (canonical, commitments, inbox)
+    }
+
+    /// A batch that fails falls back to the per-client check, which names
+    /// the client whose opening is bad.
+    #[test]
+    fn failed_batch_names_the_bad_opening() {
+        let mut rng = ChaCha20Rng::from_seed([81u8; 32]);
+        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let (canonical, commitments, mut inbox) = round(&mut rng, &cs, 5);
+        assert!(run_server_round(&cs, &inbox, &canonical, &commitments).is_ok());
+
+        inbox.items[3].1.s_mut()[0] += CsPoly::from_coeffs([1; crate::N]);
+        assert_eq!(
+            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            Some(ServerRoundError::BadOpening(ClientId(3)))
+        );
+    }
+
+    /// An opening with `r` at the aggregate bound is algebraically valid, so
+    /// the batch accepts it; only the per-client shape gate turns it away.
+    #[test]
+    fn oversized_randomness_is_turned_away_before_the_batch() {
+        let mut rng = ChaCha20Rng::from_seed([82u8; 32]);
+        let mut cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let (canonical, mut commitments, mut inbox) = round(&mut rng, &cs, 5);
+
+        let fresh_bound = cs.beta_cs;
+        cs.beta_cs = cs.r_bound;
+        let (comm, opening) = commit_one(&mut rng, &cs);
+        cs.beta_cs = fresh_bound;
+        commitments[2].1 = comm;
+        inbox.items[2].1 = opening;
+        assert_eq!(
+            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            Some(ServerRoundError::BadOpening(ClientId(2)))
+        );
+    }
+
+    /// More clients than one batch holds still verify, and a bad one is
+    /// still named.
+    #[test]
+    fn round_larger_than_a_batch() {
+        let mut rng = ChaCha20Rng::from_seed([83u8; 32]);
+        let mut cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let (canonical, commitments, mut inbox) = round(&mut rng, &cs, 5);
+        // a looser fresh bound still accepts these openings but leaves room
+        // for only two per batch
+        cs.beta_cs = i32::MAX as u32 / (2 * (crate::cs::BATCH_WEIGHT_BOUND as u32 - 1));
+        assert_eq!(batch_capacity(&cs), 2);
+        assert!(run_server_round(&cs, &inbox, &canonical, &commitments).is_ok());
+
+        inbox.items[4].1.s_mut()[0] += CsPoly::from_coeffs([1; crate::N]);
+        assert_eq!(
+            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            Some(ServerRoundError::BadOpening(ClientId(4)))
+        );
+    }
+}
