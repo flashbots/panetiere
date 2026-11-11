@@ -245,7 +245,7 @@ pub fn run_server_round(
             BATCH_COMBOS,
             opening_refs.len(),
         );
-        HidingMerkleCommitment::verify_fresh_batch(cs, &comm_refs, &opening_refs, &weights)
+        HidingMerkleCommitment::verify_fresh_batch_shaped(cs, &comm_refs, &opening_refs, &weights)
     };
     if !batched {
         let culprit = canonical

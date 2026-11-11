@@ -281,6 +281,20 @@ impl HidingMerkleCommitment {
         openings: &[&Opening],
         weights: &[Vec<u16>],
     ) -> bool {
+        openings.iter().all(|o| Self::check_fresh_shape(pp, o))
+            && Self::verify_fresh_batch_shaped(pp, comms, openings, weights)
+    }
+
+    /// [`Self::verify_fresh_batch`] for openings that have already passed
+    /// [`Self::check_fresh_shape`], as the server's per-client gate does.
+    /// The norm bounds are the part a linear combination can't check, so
+    /// skipping them on openings nobody has checked is unsound.
+    pub(crate) fn verify_fresh_batch_shaped(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> bool {
         let Some(first) = openings.first() else {
             return false;
         };
@@ -293,9 +307,7 @@ impl HidingMerkleCommitment {
                 .iter()
                 .flatten()
                 .any(|&w| w == 0 || w >= BATCH_WEIGHT_BOUND)
-            || openings
-                .iter()
-                .any(|o| o.path_index != first.path_index || !Self::check_fresh_shape(pp, o))
+            || openings.iter().any(|o| o.path_index != first.path_index)
         {
             return false;
         }
@@ -1759,6 +1771,22 @@ mod tests {
         };
         assert!(HidingMerkleCommitment::verify(&pp, &comm, &opening));
         assert!(!HidingMerkleCommitment::verify_fresh(&pp, &comm, &opening));
+
+        // the batch algebra can't see the norm either: only the shape gate
+        // keeps this opening out of a batch
+        let weights = batch_weights(&mut rng, 1, 1);
+        assert!(HidingMerkleCommitment::verify_fresh_batch_shaped(
+            &pp,
+            &[&comm],
+            &[&opening],
+            &weights
+        ));
+        assert!(!HidingMerkleCommitment::verify_fresh_batch(
+            &pp,
+            &[&comm],
+            &[&opening],
+            &weights
+        ));
     }
 
     #[test]
