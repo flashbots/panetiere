@@ -320,6 +320,7 @@ struct Rep {
 }
 
 /// Process CPU time (user + system over all threads), microseconds.
+#[cfg(unix)]
 fn cpu_time_us() -> f64 {
     let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: `getrusage` only writes the struct it is handed; no pointer
@@ -332,6 +333,13 @@ fn cpu_time_us() -> f64 {
     let ru = unsafe { ru.assume_init() };
     (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as f64 * 1e6
         + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as f64
+}
+
+/// Process CPU time is only measured on unix; elsewhere it reads as zero, like
+/// the other unavailable resource columns.
+#[cfg(not(unix))]
+fn cpu_time_us() -> f64 {
+    0.0
 }
 
 /// A `/proc/self/status` field in KiB (`VmRSS`, `VmHWM`), 0 where unavailable.
@@ -2983,7 +2991,15 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         if matches!(p.owner, Owner::Agg | Owner::Rs) {
             continue;
         }
-        (p.set)(&mut row, stat(p.name)?);
+        // `verify_total` is newer than the other phases; sweeps written before
+        // it have no such columns and read as zero, like the resource columns
+        let legacy = p.name == "verify_total" && at(&format!("m_{}_us_med", p.name)).is_err();
+        let s = if legacy {
+            Stat::default()
+        } else {
+            stat(p.name)?
+        };
+        (p.set)(&mut row, s);
     }
     Ok(row)
 }
