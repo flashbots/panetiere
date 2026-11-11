@@ -264,11 +264,11 @@ impl HidingMerkleCommitment {
     ///
     /// The weights must be drawn after the openings are fixed. Then a batch
     /// containing an opening that fails on its own passes a combination with
-    /// probability at most `2^-15` (the weight has to hit the one value that
-    /// cancels the defect, out of `2^15 − 1`), independently per combination;
-    /// nine rows give `2^-135`, past the 128-bit target. The weight range has
-    /// to fit below both moduli for that to hold, which
-    /// [`BATCH_WEIGHT_BOUND`] asserts at compile time. A pass says nothing
+    /// probability at most `1/(2^15 − 1)` (the weight has to hit the one value
+    /// that cancels the defect, out of `2^15 − 1`), independently per
+    /// combination; nine rows give `(2^15 − 1)^-9 ≈ 2^-135`, past the 128-bit
+    /// target. The weight range has to fit below both moduli for that to hold,
+    /// which [`BATCH_WEIGHT_BOUND`] asserts at compile time. A pass says nothing
     /// about which member would fail, so a failing batch is re-checked member
     /// by member.
     ///
