@@ -7,6 +7,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use panetiere::channel::ChannelParams;
+use panetiere::cs::Commitment;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
@@ -86,9 +87,15 @@ fn mse_recovers_through_panetiere() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
@@ -175,9 +182,15 @@ fn cover_clients_do_not_inflate_iblt() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
@@ -268,9 +281,15 @@ fn multi_symbol_cover_through_panetiere() {
                 inboxes[idx].items.push((cid, opening));
             }
         }
+        let commitments: Vec<(ClientId, Commitment)> = client_entries
+            .iter()
+            .map(|(cid, e)| (*cid, e.comm.clone()))
+            .collect();
         let outputs: Vec<_> = inboxes
             .iter()
-            .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+            .map(|inb| {
+                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+            })
             .collect();
         let recovered =
             aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
@@ -296,7 +315,7 @@ fn multi_symbol_cover_through_panetiere() {
 #[test]
 fn zero_payload_insert_is_not_cover() {
     let mut rng = ChaCha20Rng::from_seed([0x11u8; 32]);
-    let mse_params = MseParams::new(4, 16, 16, 1, [0xAA; 32]);
+    let mse_params = MseParams::new(4, 16, 2, 1, [0xAA; 32]);
 
     let mut enc = MseEncoding::new(mse_params.clone());
     enc.insert(&mut rng, &[7]);

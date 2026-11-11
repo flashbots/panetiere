@@ -7,6 +7,7 @@
 //! — KAHE, Shamir, CS, the verifier's per-poly sum — is untouched, which is the
 //! point: the sketch is just another additively homomorphic plaintext.
 
+use panetiere::cs::Commitment;
 use panetiere::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use panetiere::pke;
 use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
@@ -72,9 +73,15 @@ fn round_trip(
                     inboxes[idx].items.push((cid, opening));
                 }
             }
+            let commitments: Vec<(ClientId, Commitment)> = client_entries
+                .iter()
+                .map(|(cid, e)| (*cid, e.comm.clone()))
+                .collect();
             let outputs: Vec<_> = inboxes
                 .iter()
-                .map(|inb| run_server_round(inb, &canonical).expect("missing client"))
+                .map(|inb| {
+                    run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+                })
                 .collect();
             let recovered =
                 aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)

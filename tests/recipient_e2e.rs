@@ -2,6 +2,7 @@
 //! rejection reasons it reports.
 
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
+use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
@@ -80,9 +81,13 @@ fn round(seed: u8, n_servers: usize, n_clients: usize) -> Round {
         }
     }
     let canonical = client_ids;
+    let commitments: Vec<(ClientId, Commitment)> = publics
+        .iter()
+        .map(|(cid, e)| (*cid, e.comm.clone()))
+        .collect();
     let outputs = inboxes
         .iter()
-        .map(|inb| run_server_round(inb, &canonical).expect("server round"))
+        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("server round"))
         .collect();
     Round {
         pp,
