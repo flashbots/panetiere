@@ -35,6 +35,13 @@ use rand::Rng;
 use rayon::prelude::*;
 
 /// The sketch's field: the shared prime plaintext modulus.
+///
+/// Keys are single elements of `F_p`, so two of `ρ` clients collide (and the
+/// round fails to decode) with probability about `ρ²/p`: roughly `2^-14.5` at
+/// `ρ = 300`, far above the `2^-20` the IBLT shape is sized for. The paper
+/// instead draws keys from an extension field `F_{t^ω}`, which keeps `t` and
+/// makes the error negligible; that is tracked as issue #27 and not yet
+/// implemented here.
 pub const PRONY_PRIME: u64 = T_MODULUS_DEFAULT;
 
 // ---------------------------------------------------------------
