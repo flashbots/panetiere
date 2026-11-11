@@ -46,10 +46,12 @@ pub fn decode_raw(polys: &[KahePoly]) -> Result<Vec<u8>, CodecError> {
         p.normalize();
         for (i, &c) in p.coeffs().iter().enumerate() {
             // Symbols are `[0, 2^BITS_PER_COEFF)` raw; after KAHE decryption
-            // `poly_mod_t` has centered them, so the upper half of that range
-            // shows up in `[-t/2, 0)`. Anything else is genuine overflow.
+            // `poly_mod_t` has centered them into `[t/2 - t, t/2)`, so the
+            // upper half of the raw range shows up below zero. For odd `t` the
+            // lowest centered value is `-(t/2 + 1)`, hence the bound is written
+            // as `t/2 - t`. Anything outside is genuine overflow.
             let v = if c < 0 { c + t } else { c };
-            if c < -(t / 2) || !(0..SYMBOL_MOD).contains(&v) {
+            if c < t / 2 - t || !(0..SYMBOL_MOD).contains(&v) {
                 return Err(CodecError::CoeffOutOfRange { index: i, value: c });
             }
             coeffs[i] = v as u64;
@@ -177,6 +179,7 @@ pub fn decode_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rings::center_half_open_i64;
 
     #[test]
     fn round_trip_empty() {
@@ -244,6 +247,29 @@ mod tests {
         let out = decode_raw(&summed).unwrap();
         assert_eq!(&out[0..4], b"AAAA");
         assert_eq!(&out[100..104], b"BBBB");
+    }
+
+    /// A symbol equal to `t/2` is centered to `-(t/2 + 1)` for odd `t`; the
+    /// decoder must accept that lower endpoint.
+    #[test]
+    fn raw_round_trip_through_centering_at_midpoint() {
+        let t = T_MODULUS_DEFAULT as i64;
+        let mut buf = vec![0u8; BYTES_PER_POLY];
+        // first 31-bit symbol = t/2 = 0x4000_0005, little-endian bit packing
+        buf[0..4].copy_from_slice(&[0x05, 0x00, 0x00, 0x40]);
+        let polys: Vec<KahePoly> = encode_raw(&buf)
+            .iter()
+            .map(|p| {
+                let mut coeffs = *p.coeffs();
+                assert_eq!(coeffs[0], t / 2);
+                for c in coeffs.iter_mut() {
+                    *c = center_half_open_i64(*c, t);
+                }
+                KahePoly::from_coeffs(coeffs)
+            })
+            .collect();
+        assert_eq!(polys[0].coeffs()[0], t / 2 - t);
+        assert_eq!(decode_raw(&polys).unwrap(), buf);
     }
 
     #[test]
