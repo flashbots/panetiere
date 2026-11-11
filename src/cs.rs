@@ -666,6 +666,10 @@ fn mac_i32(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
             return;
         }
     }
+    mac_i32_scalar(acc, v, weight);
+}
+
+fn mac_i32_scalar(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
     for (a, &x) in acc.iter_mut().zip(v) {
         *a += x * weight;
     }
@@ -1543,28 +1547,55 @@ mod tests {
 
     #[test]
     fn simd_kernels_match_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::is_x86_feature_detected!("avx2");
         let mut rng = ChaCha20Rng::from_seed([78u8; 32]);
-        for bound in [1u32, 34, 116, 20_480, 1 << 30] {
+        let random = |rng: &mut ChaCha20Rng, bound: u32| {
             let mut coeffs = [0i32; POLY_N];
             for c in coeffs.iter_mut() {
                 *c = rng.gen_range(-(bound as i64)..=bound as i64) as i32;
             }
-            let scalar = coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs()));
-            assert!(norm_within(&coeffs, scalar));
-            assert_eq!(norm_within(&coeffs, scalar.saturating_sub(1)), scalar == 0);
-            let mut acc = [0i32; POLY_N];
+            coeffs
+        };
+
+        // the norm gate sees any i32, forged openings included
+        let extreme = [i32::MIN; POLY_N];
+        for coeffs in [1u32, 34, 116, 20_480, 1 << 30]
+            .map(|bound| random(&mut rng, bound))
+            .into_iter()
+            .chain([extreme])
+        {
+            let norm = coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs()));
+            assert!(norm_within(&coeffs, norm));
+            assert_eq!(norm_within(&coeffs, norm.saturating_sub(1)), norm == 0);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                assert_eq!(unsafe { infinity_norm_avx2(&coeffs) }, norm);
+            }
+        }
+
+        // the accumulation only ever sees inputs the batch bounds keep exact
+        // in i32, so neither kernel may overflow here
+        for bound in [1u32, 34, 116, 20_480] {
+            let coeffs = random(&mut rng, bound);
             let mut expected = [0i32; POLY_N];
+            let mut dispatched = [0i32; POLY_N];
+            #[cfg(target_arch = "x86_64")]
+            let mut vectorised = [0i32; POLY_N];
             for weight in [1i32, 7, BATCH_WEIGHT_BOUND as i32 - 1] {
-                mac_i32(&mut acc, &coeffs, weight);
-                for (e, &c) in expected.iter_mut().zip(&coeffs) {
-                    *e = e.wrapping_add(c.wrapping_mul(weight));
+                mac_i32_scalar(&mut expected, &coeffs, weight);
+                mac_i32(&mut dispatched, &coeffs, weight);
+                #[cfg(target_arch = "x86_64")]
+                if avx2 {
+                    unsafe { mac_i32_avx2(&mut vectorised, &coeffs, weight) };
                 }
             }
-            assert_eq!(acc, expected);
+            assert_eq!(dispatched, expected);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                assert_eq!(vectorised, expected);
+            }
         }
-        let extreme = [i32::MIN; POLY_N];
-        assert!(!norm_within(&extreme, (1 << 31) - 1));
-        assert!(norm_within(&extreme, 1 << 31));
     }
 
     #[test]
