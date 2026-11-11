@@ -239,14 +239,18 @@ pub fn run_server_round(
     if let Some(cid) = culprit {
         return Err(ServerRoundError::BadOpening(cid));
     }
-    let batched = opening_refs.len() <= batch_capacity(cs) && {
-        let weights = batch_weights(
-            &mut ChaCha20Rng::from_entropy(),
-            BATCH_COMBOS,
-            opening_refs.len(),
-        );
-        HidingMerkleCommitment::verify_fresh_batch_shaped(cs, &comm_refs, &opening_refs, &weights)
-    };
+    // one batch per `batch_capacity` openings, so a round larger than the i32
+    // accumulators allow is still checked in batches rather than per client
+    let capacity = batch_capacity(cs);
+    let mut rng = ChaCha20Rng::from_entropy();
+    let batched = capacity > 0
+        && opening_refs
+            .chunks(capacity)
+            .zip(comm_refs.chunks(capacity))
+            .all(|(openings, comms)| {
+                let weights = batch_weights(&mut rng, BATCH_COMBOS, openings.len());
+                HidingMerkleCommitment::verify_fresh_batch_shaped(cs, comms, openings, &weights)
+            });
     if !batched {
         let culprit = canonical
             .par_iter()
