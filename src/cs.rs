@@ -532,10 +532,13 @@ const _: () = assert!(
 );
 
 /// Largest batch the fresh check can accumulate in i32: every combination
-/// weight is below `2^15` and every accumulated coefficient is bounded by
-/// `max(β_cs, ζ)`, so `ρ · 2^15 · max(β_cs, ζ)` has to stay under `2^31`.
+/// weight is below [`BATCH_WEIGHT_BOUND`] and every accumulated coefficient is
+/// bounded by `max(β_cs, ζ)`, so `ρ · (BATCH_WEIGHT_BOUND − 1) · max(β_cs, ζ)`
+/// has to stay within `i32::MAX`.
 pub fn batch_capacity(pp: &CsParams) -> usize {
-    u16::MAX as usize / pp.beta_cs.max(chipmunk_code::ZETA) as usize
+    let largest_term =
+        (BATCH_WEIGHT_BOUND as usize - 1) * pp.beta_cs.max(chipmunk_code::ZETA) as usize;
+    i32::MAX as usize / largest_term
 }
 
 /// Weights for one batched fresh check: `combos` independent rows, one
