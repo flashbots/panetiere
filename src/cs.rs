@@ -40,6 +40,7 @@ use crate::hvc_sum::sum_hvc_polys;
 use crate::rings::{center_i32, center_i64};
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
+use negacyclic_rings::arithmetic;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
@@ -419,7 +420,7 @@ fn norm_within(coeffs: &[i32; POLY_N], bound: u32) -> bool {
             return unsafe { infinity_norm_avx2(coeffs) } <= bound;
         }
     }
-    coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs())) <= bound
+    arithmetic::infinity_norm_i32(coeffs) <= bound
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -555,21 +556,26 @@ impl BatchAcc {
         let data_polys = opening_data_polys(pp.xi(), pp.stored_path_len());
         let r: Vec<[i32; POLY_N]> = (0..kappa)
             .into_par_iter()
-            .flat_map_iter(|p| slot_i32(openings, weights, move |o| o.r()[p].coeffs()))
+            .flat_map_iter(|p| {
+                let polys = openings.iter().map(move |o| o.r()[p].coeffs());
+                slot_i32(polys, weights)
+            })
             .collect();
         let data: Vec<[i32; POLY_N]> = (0..data_polys)
             .into_par_iter()
-            .flat_map_iter(|p| slot_i32(openings, weights, move |o| o.data[p].coeffs()))
+            .flat_map_iter(|p| {
+                let polys = openings.iter().map(move |o| o.data[p].coeffs());
+                slot_i32(polys, weights)
+            })
             .collect();
         let s: Vec<[i64; POLY_N]> = (0..mu)
             .into_par_iter()
             .flat_map_iter(|p| {
-                slot_i64(openings.len(), weights, move |i| {
-                    openings[i].s()[p].coeffs()
-                })
+                let polys = openings.iter().map(move |o| o.s()[p].coeffs());
+                slot_i64(polys, weights)
             })
             .collect();
-        let root = slot_i64(comms.len(), weights, |i| comms[i].root.coeffs());
+        let root = slot_i64(comms.iter().map(|c| c.root.coeffs()), weights);
         Self {
             combos,
             r,
@@ -624,15 +630,14 @@ impl BatchAcc {
     }
 }
 
-/// One slot's accumulators, one per combination, over every opening.
+/// One slot's accumulators, one per combination, over that slot's poly in
+/// every opening (or commitment), in batch order.
 fn slot_i32<'a>(
-    openings: &[&'a Opening],
+    polys: impl Iterator<Item = &'a [i32; POLY_N]>,
     weights: &[Vec<u16>],
-    poly: impl Fn(&'a Opening) -> &'a [i32; POLY_N],
 ) -> Vec<[i32; POLY_N]> {
     let mut accs = vec![[0i32; POLY_N]; weights.len()];
-    for (i, o) in openings.iter().enumerate() {
-        let coeffs = poly(o);
+    for (i, coeffs) in polys.enumerate() {
         for (acc, row) in accs.iter_mut().zip(weights) {
             mac_i32(acc, coeffs, row[i] as i32);
         }
@@ -640,14 +645,13 @@ fn slot_i32<'a>(
     accs
 }
 
+/// [`slot_i32`] with i64 accumulators, for the full-range `s` and roots.
 fn slot_i64<'a>(
-    count: usize,
+    polys: impl Iterator<Item = &'a [i32; POLY_N]>,
     weights: &[Vec<u16>],
-    poly: impl Fn(usize) -> &'a [i32; POLY_N],
 ) -> Vec<[i64; POLY_N]> {
     let mut accs = vec![[0i64; POLY_N]; weights.len()];
-    for i in 0..count {
-        let coeffs = poly(i);
+    for (i, coeffs) in polys.enumerate() {
         for (acc, row) in accs.iter_mut().zip(weights) {
             mac_i64(acc, coeffs, row[i] as i64);
         }
@@ -661,6 +665,10 @@ fn slot_i64<'a>(
 fn mac_i32(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
     #[cfg(target_arch = "x86_64")]
     {
+        // checking per call is cheap: each call covers all `POLY_N`
+        // coefficients, so the check and the call into the non-inlinable
+        // avx2 kernel are noise. measurements and disassembly:
+        // https://gist.github.com/come-maiz/276e95df72c33c8ff47466e808998b1b
         if std::is_x86_feature_detected!("avx2") {
             unsafe { mac_i32_avx2(acc, v, weight) };
             return;
@@ -1565,7 +1573,7 @@ mod tests {
             .into_iter()
             .chain([extreme])
         {
-            let norm = coeffs.iter().fold(0u32, |m, &c| m.max(c.unsigned_abs()));
+            let norm = arithmetic::infinity_norm_i32(&coeffs);
             assert!(norm_within(&coeffs, norm));
             assert_eq!(norm_within(&coeffs, norm.saturating_sub(1)), norm == 0);
             #[cfg(target_arch = "x86_64")]
