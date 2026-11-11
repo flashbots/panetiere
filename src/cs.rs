@@ -390,7 +390,7 @@ impl Cs for HidingMerkleCommitment {
     type Opening = Opening;
 
     fn setup<R: Rng>(rng: &mut R, num_servers: usize) -> CsParams {
-        Self::setup_with_dims(rng, num_servers, 1, 5)
+        Self::setup_with_dims(rng, num_servers, 1, 6)
     }
 
     /// Commit per-server share vectors and emit one opening per server.
