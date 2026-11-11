@@ -496,18 +496,39 @@ fn walk_path(
 /// in `[1, 2^15)`. A defective opening cancels out of a combination only for
 /// one weight value, and only if distinct weights stay distinct modulo both
 /// `q_cs` and `q_hvc`, so the whole range has to sit below the smaller
-/// modulus. The bound also keeps the i32 accumulation of
-/// [`batch_capacity`] exact.
+/// modulus. The one value is unique because both moduli are prime, so a
+/// non-zero defect is invertible. The bound also keeps the i32 accumulation
+/// of [`batch_capacity`] exact.
 pub const BATCH_WEIGHT_BOUND: u16 = 1 << 15;
 
+/// Whether every weight in `[1, bound)` is non-zero and distinct modulo both
+/// moduli: the largest weight, `bound − 1`, has to stay below the smaller
+/// one, as a weight equal to a modulus drops its opening out of the
+/// combination.
+const fn batch_weights_distinct(bound: u16, q_cs: i32, q_hvc: i32) -> bool {
+    let smaller = if q_cs < q_hvc { q_cs } else { q_hvc };
+    (bound as i32) - 1 < smaller
+}
+
 const _: () = assert!(
-    (BATCH_WEIGHT_BOUND as i32) - 1
-        <= if CS_MODULUS < HVC_MODULUS {
-            CS_MODULUS
-        } else {
-            HVC_MODULUS
-        },
+    batch_weights_distinct(BATCH_WEIGHT_BOUND, CS_MODULUS, HVC_MODULUS),
     "batch weights must be distinct modulo both q_cs and q_hvc"
+);
+
+const fn is_prime(n: i32) -> bool {
+    let mut d = 2;
+    while d * d <= n {
+        if n % d == 0 {
+            return false;
+        }
+        d += 1;
+    }
+    n > 1
+}
+
+const _: () = assert!(
+    is_prime(CS_MODULUS) && is_prime(HVC_MODULUS),
+    "the batch soundness argument needs prime moduli"
 );
 
 /// Largest batch the fresh check can accumulate in i32: every combination
@@ -1497,6 +1518,22 @@ mod tests {
     /// A batch of honest openings at one position passes with any weights;
     /// a single tampered member — share, randomness, leaf digit, path digit
     /// or root — fails it.
+    /// The top weight may be one below the smaller modulus, never equal to it.
+    #[test]
+    fn batch_weight_bound_stays_below_both_moduli() {
+        assert!(batch_weights_distinct(
+            BATCH_WEIGHT_BOUND,
+            CS_MODULUS,
+            HVC_MODULUS
+        ));
+        assert!(batch_weights_distinct(8, 8, 100));
+        assert!(!batch_weights_distinct(9, 8, 100));
+        assert!(batch_weights_distinct(8, 100, 8));
+        assert!(!batch_weights_distinct(9, 100, 8));
+        assert!(is_prime(2) && is_prime(40961) && is_prime(139301));
+        assert!(!is_prime(1) && !is_prime(4) && !is_prime(40962));
+    }
+
     #[test]
     fn batched_fresh_check_accepts_honest_and_catches_one_bad_member() {
         let mut rng = ChaCha20Rng::from_seed([77u8; 32]);
