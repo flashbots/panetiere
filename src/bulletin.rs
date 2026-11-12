@@ -76,7 +76,7 @@ impl RsClientBulletinEntry {
         comm: &Commitment,
         share_root: &HVCPoly,
     ) -> Vec<u8> {
-        const DOMAIN: &[u8] = b"panetiere/rs-bulletin/v3";
+        const DOMAIN: &[u8] = b"panetiere/rs-bulletin/v4";
         let mut out = Vec::with_capacity(DOMAIN.len() + 36 + 2 * poly_packed_len(HVC_MODULUS));
         out.extend_from_slice(DOMAIN);
         out.extend_from_slice(&sid.0);
