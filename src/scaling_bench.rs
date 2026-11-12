@@ -844,9 +844,12 @@ fn run_cell(
     let ch_polys = ch.n_polys();
     // For `prony` the structural width is the Vandermonde column count, reported
     // in place of the IBLT's cell count.
-    let (iblt_cells, delta) = match &ch {
-        ChannelParams::Mse(p) => (p.total_cells(), p.delta),
-        ChannelParams::Prony(p) => (p.cols(), p.cols()),
+    let (iblt_cells, delta) = match ch.mse() {
+        Some(p) => (p.total_cells(), p.delta),
+        None => {
+            let p = ch.prony().expect("a channel without peeling is a sketch");
+            (p.cols(), p.cols())
+        }
     };
     // Slot alignment matches the codec's packing width, so `active` slots fill
     // the vector exactly and `allocate` never rounds one past the end.

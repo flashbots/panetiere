@@ -1,7 +1,8 @@
 //! Application payload layer over the multiset encodings.
 
 use crate::KahePoly;
-use rand::Rng;
+use rand::{CryptoRng, Rng};
+use sha2::{Digest as _, Sha256};
 
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseError, MseParams};
@@ -24,6 +25,15 @@ const GAMMA: usize = 4;
 /// Buckets per insertion, across all rows.
 const BUCKETS_PER_INSERT: usize = 3;
 
+/// The paper's statistical security target for nonce collisions.
+const SECURITY_BITS: usize = 128;
+
+/// `log₂ Q`, the attacker's budget of random oracle queries.
+const ORACLE_QUERY_BITS: u32 = 64;
+
+/// Separates the masking oracle from every other use of SHA-256 here.
+const ORACLE_DOMAIN: &[u8] = b"panetiere/nonce-mask/v1";
+
 #[derive(Debug, PartialEq)]
 pub enum ChannelError {
     /// Peeling stalled: the encoding held more elements than `δ` was sized for,
@@ -43,12 +53,24 @@ pub enum ChannelError {
     PayloadTooLong { got: usize, max: usize },
 }
 
-/// Sizing and keying for one channel, over either multiset encoding. `Mse`
-/// peels and degrades gracefully; `Prony` is ~3× smaller but all-or-nothing.
+/// The multiset encoding a channel sits on.
 #[derive(Clone, Debug, PartialEq)]
-pub enum ChannelParams {
+enum Encoding {
     Mse(MseParams),
     Prony(PronyParams),
+}
+
+/// Sizing and keying for one channel, over either multiset encoding. `Mse`
+/// peels; `Prony` is ~3× smaller. Both are all-or-nothing.
+///
+/// Every element is `(s, m + RO(s))`: a fresh nonce `s`, then the payload
+/// masked by a random oracle on that nonce, so no client can make its own
+/// element depend on an honest one before the round decodes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelParams {
+    encoding: Encoding,
+    /// Leading symbols of each element that hold the nonce.
+    nonce_symbols: usize,
 }
 
 impl ChannelParams {
@@ -61,14 +83,19 @@ impl ChannelParams {
     /// each. For channels whose payload is already `Z_t` values rather than
     /// bytes — the byte packing of [`encode_message`] does not apply to those.
     pub fn for_symbols(rho: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
-        let delta = (BUCKETS_PER_INSERT * rho.max(1) as usize).div_ceil(GAMMA);
-        ChannelParams::Mse(MseParams::new(
-            GAMMA,
-            delta,
-            rho.max(1) as usize,
-            payload_symbols.max(1),
-            prf_key,
-        ))
+        let rho = rho.max(1) as usize;
+        let nonce_symbols = nonce_symbols(rho, mse::BITS_PER_SYMBOL);
+        let delta = (BUCKETS_PER_INSERT * rho).div_ceil(GAMMA);
+        Self {
+            encoding: Encoding::Mse(MseParams::new(
+                GAMMA,
+                delta,
+                rho,
+                nonce_symbols + payload_symbols.max(1),
+                prf_key,
+            )),
+            nonce_symbols,
+        }
     }
 
     /// Sketch channel for up to `rho` payloads of `message_bytes` each.
@@ -83,69 +110,65 @@ impl ChannelParams {
     }
 
     pub fn prony_for_symbols(rho: u32, payload_symbols: usize) -> Self {
-        Self::from_prony(PronyParams::new(
-            rho.max(1) as usize,
-            payload_symbols.max(1),
-        ))
-    }
-
-    /// Wrap parameters chosen elsewhere (e.g. a fixed-arity token channel).
-    pub fn from_mse(mse: MseParams) -> Self {
-        ChannelParams::Mse(mse)
-    }
-
-    pub fn from_prony(prony: PronyParams) -> Self {
-        assert!(
-            (1u64 << (BYTES_PER_SYMBOL * 8)) < prony.p,
-            "p must exceed the {BYTES_PER_SYMBOL}-byte symbol packing",
-        );
-        ChannelParams::Prony(prony)
-    }
-
-    pub fn mse(&self) -> Option<&MseParams> {
-        match self {
-            ChannelParams::Mse(p) => Some(p),
-            ChannelParams::Prony(_) => None,
+        let rho = rho.max(1) as usize;
+        let nonce_symbols = nonce_symbols(rho, PRONY_PRIME.ilog2() as usize);
+        Self {
+            encoding: Encoding::Prony(PronyParams::new(
+                rho,
+                nonce_symbols + payload_symbols.max(1),
+            )),
+            nonce_symbols,
         }
     }
 
+    /// The peeling parameters underneath, nonce symbols included.
+    pub fn mse(&self) -> Option<&MseParams> {
+        match &self.encoding {
+            Encoding::Mse(p) => Some(p),
+            Encoding::Prony(_) => None,
+        }
+    }
+
+    /// The sketch parameters underneath, nonce symbols included.
     pub fn prony(&self) -> Option<&PronyParams> {
-        match self {
-            ChannelParams::Prony(p) => Some(p),
-            ChannelParams::Mse(_) => None,
+        match &self.encoding {
+            Encoding::Prony(p) => Some(p),
+            Encoding::Mse(_) => None,
         }
     }
 
     /// `KahePoly` width of one packed encoding — every client contributes this
     /// many, real or cover.
     pub fn n_polys(&self) -> usize {
-        match self {
-            ChannelParams::Mse(p) => MseEncoding::n_polys(p),
-            ChannelParams::Prony(p) => PronySketch::n_polys(p),
+        match &self.encoding {
+            Encoding::Mse(p) => MseEncoding::n_polys(p),
+            Encoding::Prony(p) => PronySketch::n_polys(p),
         }
     }
 
+    /// Symbols of payload per element, not counting the nonce.
     pub fn payload_symbols(&self) -> usize {
-        match self {
-            ChannelParams::Mse(p) => p.payload_symbols,
-            ChannelParams::Prony(p) => p.payload_symbols,
-        }
+        let element = match &self.encoding {
+            Encoding::Mse(p) => p.payload_symbols,
+            Encoding::Prony(p) => p.payload_symbols,
+        };
+        element - self.nonce_symbols
     }
 
     /// Payload bits one symbol carries: `⌊log₂ t⌋` in the peeling structure's
     /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — both are 35.
     pub fn bits_per_symbol(&self) -> usize {
-        match self {
-            ChannelParams::Mse(_) => mse::BITS_PER_SYMBOL,
-            ChannelParams::Prony(p) => p.bits_per_symbol(),
+        match &self.encoding {
+            Encoding::Mse(_) => mse::BITS_PER_SYMBOL,
+            Encoding::Prony(p) => p.bits_per_symbol(),
         }
     }
 
     /// KAHE plaintext modulus the symbols live in. The sketch needs a prime.
     pub fn plaintext_modulus(&self) -> u64 {
-        match self {
-            ChannelParams::Mse(_) => T_MODULUS_DEFAULT,
-            ChannelParams::Prony(p) => p.p,
+        match &self.encoding {
+            Encoding::Mse(_) => T_MODULUS_DEFAULT,
+            Encoding::Prony(p) => p.p,
         }
     }
 
@@ -165,6 +188,44 @@ impl ChannelParams {
             self.plaintext_modulus(),
         )
     }
+}
+
+/// Nonce symbols so that `ρ(Q + ρ) / |N| ≤ 2^-SECURITY_BITS`, with `Q`
+/// the attacker's random oracle queries and `|N| = 2^(bits_per_symbol · k)`.
+fn nonce_symbols(rho: usize, bits_per_symbol: usize) -> usize {
+    let rho = rho as u128;
+    let numerator = rho * ((1u128 << ORACLE_QUERY_BITS) + rho);
+    let numerator_bits = (u128::BITS - (numerator - 1).leading_zeros()) as usize;
+    (SECURITY_BITS + numerator_bits).div_ceil(bits_per_symbol)
+}
+
+/// `RO(nonce)` expanded to `len` values uniform in `[0, modulus)`: SHA-256 in
+/// counter mode, with rejection sampling so a prime modulus stays unbiased.
+fn random_oracle(nonce: &[i64], len: usize, modulus: u64) -> Vec<i64> {
+    let bits = u64::BITS - (modulus - 1).leading_zeros();
+    let mask = (1u64 << bits) - 1;
+    let mut prefix = Sha256::new();
+    prefix.update(ORACLE_DOMAIN);
+    prefix.update((nonce.len() as u64).to_le_bytes());
+    for &s in nonce {
+        prefix.update(s.to_le_bytes());
+    }
+    let mut out = Vec::with_capacity(len);
+    let mut counter = 0u64;
+    while out.len() < len {
+        let digest = prefix
+            .clone()
+            .chain_update(counter.to_le_bytes())
+            .finalize();
+        for chunk in digest.chunks_exact(8) {
+            let v = u64::from_le_bytes(chunk.try_into().expect("chunk is eight bytes")) & mask;
+            if v < modulus && out.len() < len {
+                out.push(v as i64);
+            }
+        }
+        counter += 1;
+    }
+    out
 }
 
 fn payload_symbols(message_bytes: usize) -> usize {
@@ -187,7 +248,7 @@ fn symbols_to_bytes(symbols: &[i64]) -> Vec<u8> {
     out
 }
 
-pub fn encode_message<R: Rng>(
+pub fn encode_message<R: CryptoRng + Rng>(
     rng: &mut R,
     p: &ChannelParams,
     payload: &[u8],
@@ -206,25 +267,42 @@ pub fn encode_message<R: Rng>(
     ))
 }
 
-pub fn encode_symbols<R: Rng>(rng: &mut R, p: &ChannelParams, payload: &[i64]) -> Vec<KahePoly> {
-    match p {
-        ChannelParams::Mse(params) => {
+/// Insert `(s, payload + RO(s))` for a fresh nonce `s`.
+pub fn encode_symbols<R: CryptoRng + Rng>(
+    rng: &mut R,
+    p: &ChannelParams,
+    payload: &[i64],
+) -> Vec<KahePoly> {
+    let modulus = p.plaintext_modulus();
+    let nonce: Vec<i64> = (0..p.nonce_symbols)
+        .map(|_| rng.gen_range(0..1i64 << p.bits_per_symbol()))
+        .collect();
+    let mask = random_oracle(&nonce, payload.len(), modulus);
+    let mut element = nonce;
+    element.extend(
+        payload
+            .iter()
+            .zip(&mask)
+            .map(|(&m, &r)| (m + r).rem_euclid(modulus as i64)),
+    );
+    match &p.encoding {
+        Encoding::Mse(params) => {
             let mut enc = MseEncoding::new(params.clone());
-            enc.insert(rng, payload);
+            enc.insert(rng, &element);
             enc.pack()
         }
-        ChannelParams::Prony(params) => {
+        Encoding::Prony(params) => {
             let mut sketch = PronySketch::new(params.clone());
-            sketch.insert(rng, payload);
+            sketch.insert(rng, &element);
             sketch.pack()
         }
     }
 }
 
 pub fn cover(p: &ChannelParams) -> Vec<KahePoly> {
-    match p {
-        ChannelParams::Mse(params) => MseEncoding::cover(params),
-        ChannelParams::Prony(params) => PronySketch::cover(params),
+    match &p.encoding {
+        Encoding::Mse(params) => MseEncoding::cover(params),
+        Encoding::Prony(params) => PronySketch::cover(params),
     }
 }
 
@@ -242,7 +320,8 @@ pub fn decode_messages(
 /// `expect` optionally checks the total decoded item count, not items per client.
 /// Leave it `None` when the active-sender count is unknown (e.g. with cover traffic).
 /// MSE residual and Prony slack checks test decoding consistency, not per-client
-/// input validity or payload authenticity.
+/// input validity or payload authenticity. Each element's nonce is stripped and
+/// its mask removed, so symbols come back in `[0, plaintext_modulus)`.
 pub fn decode_symbols(
     p: &ChannelParams,
     plaintext: &[KahePoly],
@@ -255,8 +334,8 @@ pub fn decode_symbols(
             need,
         });
     }
-    let elements = match p {
-        ChannelParams::Mse(params) => MseEncoding::unpack(params, &plaintext[..need])
+    let elements = match &p.encoding {
+        Encoding::Mse(params) => MseEncoding::unpack(params, &plaintext[..need])
             .decode()
             .map_err(|e| match e {
                 MseError::OverCapacity | MseError::KeyMismatch => {
@@ -264,7 +343,7 @@ pub fn decode_symbols(
                 }
                 _ => ChannelError::PeelStalled,
             })?,
-        ChannelParams::Prony(params) => PronySketch::unpack(params, &plaintext[..need])
+        Encoding::Prony(params) => PronySketch::unpack(params, &plaintext[..need])
             .decode()
             .map_err(ChannelError::SketchFailed)?,
     };
@@ -276,7 +355,20 @@ pub fn decode_symbols(
             });
         }
     }
-    Ok(elements)
+    let modulus = p.plaintext_modulus() as i64;
+    Ok(elements
+        .iter()
+        .map(|element| {
+            let (nonce, masked) = element.split_at(p.nonce_symbols);
+            let nonce: Vec<i64> = nonce.iter().map(|s| s.rem_euclid(modulus)).collect();
+            let mask = random_oracle(&nonce, masked.len(), modulus as u64);
+            masked
+                .iter()
+                .zip(&mask)
+                .map(|(&v, &r)| (v - r).rem_euclid(modulus))
+                .collect()
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -454,6 +546,48 @@ mod tests {
         assert_eq!(p.bits_per_symbol(), 35);
         assert_eq!(p.payload_symbols(), bits.div_ceil(35));
         assert!(p.payload_symbols() * p.bits_per_symbol() >= bits);
+    }
+
+    /// 300 clients need about 201 bits of nonce, which is six 35-bit symbols,
+    /// and the count stays six far beyond any realistic ρ.
+    #[test]
+    fn nonce_sized_for_the_security_target() {
+        assert_eq!(nonce_symbols(300, 35), 6);
+        assert_eq!(nonce_symbols(1, 35), 6);
+        assert_eq!(nonce_symbols(1 << 17, 35), 6);
+        assert_eq!(nonce_symbols(1 << 19, 35), 7);
+        assert_eq!(nonce_symbols(300, 32), 7);
+    }
+
+    #[test]
+    fn oracle_is_deterministic_and_in_range() {
+        for modulus in [T_MODULUS_DEFAULT, PRONY_PRIME] {
+            let a = random_oracle(&[1, 2, 3], 1000, modulus);
+            assert_eq!(a, random_oracle(&[1, 2, 3], 1000, modulus));
+            assert_ne!(a, random_oracle(&[1, 2, 4], 1000, modulus));
+            assert!(a.iter().all(|&v| (0..modulus as i64).contains(&v)));
+        }
+    }
+
+    /// Decoding the encoding underneath, without unmasking, must not reveal the
+    /// payload: what the encoding carries is the nonce and the masked payload.
+    #[test]
+    fn encoding_carries_only_the_masked_payload() {
+        for p in variants(4, 64) {
+            let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
+            let payload = vec![0x42u8; 64];
+            let plain = encode_message(&mut rng, &p, &payload).unwrap();
+            let raw = match (p.mse(), p.prony()) {
+                (Some(params), _) => MseEncoding::unpack(params, &plain).decode().unwrap(),
+                (_, Some(params)) => PronySketch::unpack(params, &plain).decode().unwrap(),
+                (None, None) => unreachable!(),
+            };
+            assert_eq!(raw.len(), 1);
+            let (_, masked) = raw[0].split_at(p.nonce_symbols);
+            let symbols = bytes_to_symbols(&payload, p.payload_symbols());
+            assert!(masked.iter().zip(&symbols).all(|(a, b)| a != b), "{p:?}");
+            assert_eq!(decode_messages(&p, &plain, Some(1)).unwrap(), vec![payload]);
+        }
     }
 
     /// The sketch is the reason to pick it: same payload, far fewer polys.
