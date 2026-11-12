@@ -175,12 +175,10 @@ let msgs: Vec<Vec<u8>> = channel::decode_messages(&ch, &sid, &plaintext, Some(ac
 ```
 
 `channel` implements the paper's one-shot protocol: each element it inserts is
-$(s, m \oplus \mathrm{RO}(s))$ for a nonce $s$ drawn from the operating system,
+$(s, m \oplus \mathrm{RO}(s))$ for a nonce $s$ drawn from the caller's cryptographically secure RNG,
 with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mathit{sid} \| s)$,
 and decoding unmasks every element and returns the messages sorted. Each byte
-message carries a length header, so trailing zero bytes survive the padding. Honest messages stay hidden behind their masks until the
-round decodes, so a malicious client cannot copy one or make its own message
-depend on it. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
+message carries a length header, so trailing zero bytes survive the padding. The masking is what allows the security proof to fix the corrupted clients' inputs before the honest messages are known. The honest messages themselves are hidden by the encryption. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
 $Q = 2^{64}$ oracle queries: six extra symbols per element for any realistic
 $\rho$. This guarantee covers the `channel` path only — polys built with `mse`,
 `prony` or `codec` directly, including slot mode, are not masked.

@@ -1,7 +1,6 @@
 //! Application payload layer over the multiset encodings.
 
 use crate::KahePoly;
-use rand::rngs::OsRng;
 use rand::{CryptoRng, Rng};
 use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
 use sha3::Shake256;
@@ -277,8 +276,8 @@ pub fn encode_message<R: CryptoRng + Rng>(
     encode_symbols(rng, p, sid, &bytes_to_symbols(payload, p.payload_symbols()))
 }
 
-/// Insert `(s, payload ⊕ RO(s))` for a nonce `s` drawn from the operating
-/// system. Every symbol must lie in `[0, 2^bits_per_symbol)`.
+/// Insert `(s, payload ⊕ RO(s))` for a nonce `s` drawn from `rng`. Every
+/// symbol must lie in `[0, 2^bits_per_symbol)`.
 pub fn encode_symbols<R: CryptoRng + Rng>(
     rng: &mut R,
     p: &ChannelParams,
@@ -294,7 +293,7 @@ pub fn encode_symbols<R: CryptoRng + Rng>(
         return Err(ChannelError::SymbolOutOfRange { index, value });
     }
     let nonce: Vec<i64> = (0..p.nonce_symbols)
-        .map(|_| OsRng.gen_range(0..1i64 << bits))
+        .map(|_| rng.gen_range(0..1i64 << bits))
         .collect();
     let mask = random_oracle(sid, &nonce, payload.len(), bits);
     let mut element = nonce;
@@ -624,7 +623,9 @@ mod tests {
     /// Zero padding alone would eat these; the length header keeps them.
     #[test]
     fn trailing_zero_bytes_and_empty_messages_survive() {
-        for p in variants(4, 16) {
+        // rho=8 for 4 inserts, as in `wide_symbols_round_trip`: the peel stalls
+        // on some seeds when delta is sized exactly to rho.
+        for p in variants(8, 16) {
             let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
             let payloads: Vec<Vec<u8>> = vec![vec![], vec![0], vec![1, 0, 0], vec![0; 16]];
             let contributions: Vec<Vec<KahePoly>> = payloads
