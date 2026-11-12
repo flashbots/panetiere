@@ -78,31 +78,15 @@ pub(crate) fn center_canonical_i64(value: i64, modulus: i64) -> i64 {
     value - (modulus & -((value > modulus / 2) as i64))
 }
 
-/// Centered representative of `value` modulo an odd `modulus`, in
-/// `[-(modulus-1)/2, (modulus-1)/2]`.
 #[inline]
 pub(crate) fn center_i64(value: i64, modulus: i64) -> i64 {
-    if value <= -modulus || value >= modulus {
-        return center_canonical_i64(value.rem_euclid(modulus), modulus);
-    }
-    // Avoid the division for inputs in (-modulus, modulus), which is what ring
-    // arithmetic leaves behind: `x >> 63` is all ones iff `x < 0`, so subtract
-    // `modulus` iff `value > half`, then add it back iff the result is `< -half`.
-    let half = modulus / 2;
-    let x = value - (modulus & ((half - value) >> 63));
-    x + (modulus & ((x + half) >> 63))
+    center_canonical_i64(value.rem_euclid(modulus), modulus)
 }
 
-/// [`center_i64`] for `i32`.
 #[inline]
 pub(crate) fn center_i32(value: i32, modulus: i32) -> i32 {
-    if value <= -modulus || value >= modulus {
-        let reduced = value.rem_euclid(modulus);
-        return reduced - (modulus & -((reduced > modulus / 2) as i32));
-    }
-    let half = modulus / 2;
-    let x = value - (modulus & ((half - value) >> 31));
-    x + (modulus & ((x + half) >> 31))
+    let reduced = value.rem_euclid(modulus);
+    reduced - (modulus & -((reduced > modulus / 2) as i32))
 }
 
 #[inline]
