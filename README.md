@@ -169,14 +169,16 @@ each", does the byte↔symbol packing, and derives matching `ProtocolParams`.
 let ch = ChannelParams::for_messages(rho, message_bytes, prf_key);  // peeling
 let pp = ch.protocol_params(&mut rng, n_servers);       // KAHE width == ch.n_polys()
 
-let mine = channel::encode_message(&mut rng, &ch, payload)?;   // or channel::cover(&ch)
+let mine = channel::encode_message(&mut rng, &ch, &sid, payload)?;   // or channel::cover(&ch)
 // ... round ...
-let msgs: Vec<Vec<u8>> = channel::decode_messages(&ch, &plaintext, Some(active))?;
+let msgs: Vec<Vec<u8>> = channel::decode_messages(&ch, &sid, &plaintext, Some(active))?;
 ```
 
 `channel` implements the paper's one-shot protocol: each element it inserts is
-$(s, m + \mathrm{RO}(s))$ for a fresh random nonce $s$, and decoding subtracts
-$\mathrm{RO}(s)$ again. Honest messages stay hidden behind their masks until the
+$(s, m \oplus \mathrm{RO}(s))$ for a nonce $s$ drawn from the operating system,
+with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mathit{sid} \| s)$,
+and decoding unmasks every element and returns the messages sorted. Each byte
+message carries a length header, so trailing zero bytes survive the padding. Honest messages stay hidden behind their masks until the
 round decodes, so a malicious client cannot copy one or make its own message
 depend on it. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
 $Q = 2^{64}$ oracle queries: six extra symbols per element for any realistic

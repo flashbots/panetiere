@@ -1,13 +1,15 @@
 //! Application payload layer over the multiset encodings.
 
 use crate::KahePoly;
+use rand::rngs::OsRng;
 use rand::{CryptoRng, Rng};
-use sha2::{Digest as _, Sha256};
+use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
+use sha3::Shake256;
 
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseError, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
-use crate::protocol::ProtocolParams;
+use crate::protocol::{ProtocolParams, SessionId};
 
 /// Bytes packed into one symbol, little-endian.
 pub const BYTES_PER_SYMBOL: usize = 4;
@@ -31,8 +33,12 @@ const SECURITY_BITS: usize = 128;
 /// `log₂ Q`, the attacker's budget of random oracle queries.
 const ORACLE_QUERY_BITS: u32 = 64;
 
-/// Separates the masking oracle from every other use of SHA-256 here.
-const ORACLE_DOMAIN: &[u8] = b"panetiere/nonce-mask/v1";
+/// Separates the masking oracle from every other use of SHAKE256.
+const ORACLE_DOMAIN: &[u8] = b"panetiere/ro-mask/v1";
+
+/// Leading payload symbol of a byte message that holds its length, so trailing
+/// zero bytes survive the padding.
+const LENGTH_HEADER_SYMBOLS: usize = 1;
 
 #[derive(Debug, PartialEq)]
 pub enum ChannelError {
@@ -51,6 +57,11 @@ pub enum ChannelError {
     CountMismatch { got: usize, expected: usize },
     /// Payload exceeds what `ξ` symbols hold.
     PayloadTooLong { got: usize, max: usize },
+    /// A payload symbol does not fit the channel's `bits_per_symbol`, so
+    /// masking it would leave the plaintext modulus.
+    SymbolOutOfRange { index: usize, value: i64 },
+    /// A decoded message claims more bytes than its element holds.
+    BadLength { claimed: u32, max: usize },
 }
 
 /// The multiset encoding a channel sits on.
@@ -174,7 +185,7 @@ impl ChannelParams {
 
     /// Largest payload [`encode_message`] accepts.
     pub fn max_payload_bytes(&self) -> usize {
-        self.payload_symbols() * BYTES_PER_SYMBOL
+        (self.payload_symbols() - LENGTH_HEADER_SYMBOLS) * BYTES_PER_SYMBOL
     }
 
     /// Protocol parameters whose KAHE width is exactly one packed encoding.
@@ -199,58 +210,61 @@ fn nonce_symbols(rho: usize, bits_per_symbol: usize) -> usize {
     (SECURITY_BITS + numerator_bits).div_ceil(bits_per_symbol)
 }
 
-/// `RO(nonce)` expanded to `len` values uniform in `[0, modulus)`: SHA-256 in
-/// counter mode, with rejection sampling so a prime modulus stays unbiased.
-fn random_oracle(nonce: &[i64], len: usize, modulus: u64) -> Vec<i64> {
-    let bits = u64::BITS - (modulus - 1).leading_zeros();
-    let mask = (1u64 << bits) - 1;
-    let mut prefix = Sha256::new();
-    prefix.update(ORACLE_DOMAIN);
-    prefix.update((nonce.len() as u64).to_le_bytes());
+/// `RO(s)`: the first `len · bits_per_symbol` bits of
+/// `SHAKE256(domain ‖ sid ‖ s)`, one `bits_per_symbol`-bit value per symbol.
+/// The domain, `sid` and nonce all have fixed lengths, so the input is
+/// unambiguous.
+fn random_oracle(sid: &SessionId, nonce: &[i64], len: usize, bits_per_symbol: usize) -> Vec<i64> {
+    let mut hasher = Shake256::default();
+    hasher.update(ORACLE_DOMAIN);
+    hasher.update(&sid.0);
     for &s in nonce {
-        prefix.update(s.to_le_bytes());
+        hasher.update(&s.to_le_bytes());
     }
-    let mut out = Vec::with_capacity(len);
-    let mut counter = 0u64;
-    while out.len() < len {
-        let digest = prefix
-            .clone()
-            .chain_update(counter.to_le_bytes())
-            .finalize();
-        for chunk in digest.chunks_exact(8) {
-            let v = u64::from_le_bytes(chunk.try_into().expect("chunk is eight bytes")) & mask;
-            if v < modulus && out.len() < len {
-                out.push(v as i64);
-            }
-        }
-        counter += 1;
-    }
-    out
+    let mut reader = hasher.finalize_xof();
+    let mask = (1u64 << bits_per_symbol) - 1;
+    (0..len)
+        .map(|_| {
+            let mut buf = [0u8; 8];
+            reader.read(&mut buf);
+            (u64::from_le_bytes(buf) & mask) as i64
+        })
+        .collect()
 }
 
 fn payload_symbols(message_bytes: usize) -> usize {
-    message_bytes.div_ceil(BYTES_PER_SYMBOL).max(1)
+    LENGTH_HEADER_SYMBOLS + message_bytes.div_ceil(BYTES_PER_SYMBOL)
 }
 
+/// The byte length, then the bytes zero-padded to `xi - 1` symbols.
 fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i64> {
-    let mut buf = payload.to_vec();
+    let mut buf = (payload.len() as u32).to_le_bytes().to_vec();
+    buf.extend_from_slice(payload);
     buf.resize(xi * BYTES_PER_SYMBOL, 0);
     buf.chunks(BYTES_PER_SYMBOL)
         .map(|c| u32::from_le_bytes(c.try_into().expect("chunk is BYTES_PER_SYMBOL")) as i64)
         .collect()
 }
 
-fn symbols_to_bytes(symbols: &[i64]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(symbols.len() * BYTES_PER_SYMBOL);
-    for &s in symbols {
+fn symbols_to_bytes(symbols: &[i64]) -> Result<Vec<u8>, ChannelError> {
+    let (header, body) = symbols.split_at(LENGTH_HEADER_SYMBOLS);
+    let claimed = header[0] as u32;
+    let max = body.len() * BYTES_PER_SYMBOL;
+    if claimed as usize > max {
+        return Err(ChannelError::BadLength { claimed, max });
+    }
+    let mut out = Vec::with_capacity(max);
+    for &s in body {
         out.extend_from_slice(&(s as u32).to_le_bytes());
     }
-    out
+    out.truncate(claimed as usize);
+    Ok(out)
 }
 
 pub fn encode_message<R: CryptoRng + Rng>(
     rng: &mut R,
     p: &ChannelParams,
+    sid: &SessionId,
     payload: &[u8],
 ) -> Result<Vec<KahePoly>, ChannelError> {
     let max = p.max_payload_bytes();
@@ -260,32 +274,32 @@ pub fn encode_message<R: CryptoRng + Rng>(
             max,
         });
     }
-    Ok(encode_symbols(
-        rng,
-        p,
-        &bytes_to_symbols(payload, p.payload_symbols()),
-    ))
+    encode_symbols(rng, p, sid, &bytes_to_symbols(payload, p.payload_symbols()))
 }
 
-/// Insert `(s, payload + RO(s))` for a fresh nonce `s`.
+/// Insert `(s, payload ⊕ RO(s))` for a nonce `s` drawn from the operating
+/// system. Every symbol must lie in `[0, 2^bits_per_symbol)`.
 pub fn encode_symbols<R: CryptoRng + Rng>(
     rng: &mut R,
     p: &ChannelParams,
+    sid: &SessionId,
     payload: &[i64],
-) -> Vec<KahePoly> {
-    let modulus = p.plaintext_modulus();
+) -> Result<Vec<KahePoly>, ChannelError> {
+    let bits = p.bits_per_symbol();
+    if let Some((index, &value)) = payload
+        .iter()
+        .enumerate()
+        .find(|(_, &x)| !(0..1i64 << bits).contains(&x))
+    {
+        return Err(ChannelError::SymbolOutOfRange { index, value });
+    }
     let nonce: Vec<i64> = (0..p.nonce_symbols)
-        .map(|_| rng.gen_range(0..1i64 << p.bits_per_symbol()))
+        .map(|_| OsRng.gen_range(0..1i64 << bits))
         .collect();
-    let mask = random_oracle(&nonce, payload.len(), modulus);
+    let mask = random_oracle(sid, &nonce, payload.len(), bits);
     let mut element = nonce;
-    element.extend(
-        payload
-            .iter()
-            .zip(&mask)
-            .map(|(&m, &r)| (m + r).rem_euclid(modulus as i64)),
-    );
-    match &p.encoding {
+    element.extend(payload.iter().zip(&mask).map(|(&m, &r)| m ^ r));
+    Ok(match &p.encoding {
         Encoding::Mse(params) => {
             let mut enc = MseEncoding::new(params.clone());
             enc.insert(rng, &element);
@@ -296,7 +310,7 @@ pub fn encode_symbols<R: CryptoRng + Rng>(
             sketch.insert(rng, &element);
             sketch.pack()
         }
-    }
+    })
 }
 
 pub fn cover(p: &ChannelParams) -> Vec<KahePoly> {
@@ -306,24 +320,29 @@ pub fn cover(p: &ChannelParams) -> Vec<KahePoly> {
     }
 }
 
+/// The round's messages, sorted.
 pub fn decode_messages(
     p: &ChannelParams,
+    sid: &SessionId,
     plaintext: &[KahePoly],
     expect: Option<usize>,
 ) -> Result<Vec<Vec<u8>>, ChannelError> {
-    Ok(decode_symbols(p, plaintext, expect)?
+    let mut messages = decode_symbols(p, sid, plaintext, expect)?
         .iter()
         .map(|s| symbols_to_bytes(s))
-        .collect())
+        .collect::<Result<Vec<_>, _>>()?;
+    messages.sort();
+    Ok(messages)
 }
 
 /// `expect` optionally checks the total decoded item count, not items per client.
 /// Leave it `None` when the active-sender count is unknown (e.g. with cover traffic).
 /// MSE residual and Prony slack checks test decoding consistency, not per-client
-/// input validity or payload authenticity. Each element's nonce is stripped and
-/// its mask removed, so symbols come back in `[0, plaintext_modulus)`.
+/// input validity or payload authenticity. Each element's nonce is stripped,
+/// its mask removed, and the unmasked payloads come back sorted.
 pub fn decode_symbols(
     p: &ChannelParams,
+    sid: &SessionId,
     plaintext: &[KahePoly],
     expect: Option<usize>,
 ) -> Result<Vec<Vec<i64>>, ChannelError> {
@@ -356,19 +375,18 @@ pub fn decode_symbols(
         }
     }
     let modulus = p.plaintext_modulus() as i64;
-    Ok(elements
+    let bits = p.bits_per_symbol();
+    let mut payloads: Vec<Vec<i64>> = elements
         .iter()
         .map(|element| {
-            let (nonce, masked) = element.split_at(p.nonce_symbols);
-            let nonce: Vec<i64> = nonce.iter().map(|s| s.rem_euclid(modulus)).collect();
-            let mask = random_oracle(&nonce, masked.len(), modulus as u64);
-            masked
-                .iter()
-                .zip(&mask)
-                .map(|(&v, &r)| (v - r).rem_euclid(modulus))
-                .collect()
+            let canonical: Vec<i64> = element.iter().map(|s| s.rem_euclid(modulus)).collect();
+            let (nonce, masked) = canonical.split_at(p.nonce_symbols);
+            let mask = random_oracle(sid, nonce, masked.len(), bits);
+            masked.iter().zip(&mask).map(|(&v, &r)| v ^ r).collect()
         })
-        .collect())
+        .collect();
+    payloads.sort();
+    Ok(payloads)
 }
 
 #[cfg(test)]
@@ -376,6 +394,8 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+
+    const SID: SessionId = SessionId([0x11; 32]);
 
     /// Both encodings, same sizing, so every test below runs twice.
     fn variants(rho: u32, bytes: usize) -> Vec<ChannelParams> {
@@ -411,10 +431,10 @@ mod tests {
                 .collect();
             let contributions: Vec<Vec<KahePoly>> = payloads
                 .iter()
-                .map(|m| encode_message(&mut rng, &p, m).unwrap())
+                .map(|m| encode_message(&mut rng, &p, &SID, m).unwrap())
                 .collect();
 
-            let mut got = decode_messages(&p, &sum(&contributions), Some(8)).unwrap();
+            let mut got = decode_messages(&p, &SID, &sum(&contributions), Some(8)).unwrap();
             let mut want = payloads;
             got.sort();
             want.sort();
@@ -427,9 +447,9 @@ mod tests {
         for p in variants(8, 64) {
             let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
             let max = p.max_payload_bytes();
-            assert!(encode_message(&mut rng, &p, &vec![7u8; max]).is_ok());
+            assert!(encode_message(&mut rng, &p, &SID, &vec![7u8; max]).is_ok());
             assert_eq!(
-                encode_message(&mut rng, &p, &vec![7u8; max + 1]),
+                encode_message(&mut rng, &p, &SID, &vec![7u8; max + 1]),
                 Err(ChannelError::PayloadTooLong { got: max + 1, max })
             );
         }
@@ -440,7 +460,9 @@ mod tests {
         for p in variants(8, 32) {
             let covers: Vec<Vec<KahePoly>> = (0..8).map(|_| cover(&p)).collect();
             assert_eq!(
-                decode_messages(&p, &sum(&covers), Some(0)).unwrap().len(),
+                decode_messages(&p, &SID, &sum(&covers), Some(0))
+                    .unwrap()
+                    .len(),
                 0,
                 "{p:?}"
             );
@@ -455,10 +477,10 @@ mod tests {
             let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
             // Sized for 4, given 40.
             let contributions: Vec<Vec<KahePoly>> = (0..40u8)
-                .map(|i| encode_message(&mut rng, &p, &[i, i, i, i]).unwrap())
+                .map(|i| encode_message(&mut rng, &p, &SID, &[i, i, i, i]).unwrap())
                 .collect();
             assert!(
-                decode_messages(&p, &sum(&contributions), None).is_err(),
+                decode_messages(&p, &SID, &sum(&contributions), None).is_err(),
                 "{p:?}"
             );
         }
@@ -469,12 +491,12 @@ mod tests {
         for p in variants(8, 16) {
             let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
             let contributions: Vec<Vec<KahePoly>> = (0..3u8)
-                .map(|i| encode_message(&mut rng, &p, &[i; 4]).unwrap())
+                .map(|i| encode_message(&mut rng, &p, &SID, &[i; 4]).unwrap())
                 .collect();
             let plain = sum(&contributions);
-            assert!(decode_messages(&p, &plain, Some(3)).is_ok(), "{p:?}");
+            assert!(decode_messages(&p, &SID, &plain, Some(3)).is_ok(), "{p:?}");
             assert_eq!(
-                decode_messages(&p, &plain, Some(5)),
+                decode_messages(&p, &SID, &plain, Some(5)),
                 Err(ChannelError::CountMismatch {
                     got: 3,
                     expected: 5
@@ -488,7 +510,7 @@ mod tests {
         for p in variants(8, 16) {
             let need = p.n_polys();
             assert_eq!(
-                decode_messages(&p, &vec![KahePoly::default(); need - 1], None),
+                decode_messages(&p, &SID, &vec![KahePoly::default(); need - 1], None),
                 Err(ChannelError::ShortPlaintext {
                     got: need - 1,
                     need
@@ -526,10 +548,10 @@ mod tests {
                 .collect();
             let contributions: Vec<Vec<KahePoly>> = payloads
                 .iter()
-                .map(|m| encode_symbols(&mut rng, &p, m))
+                .map(|m| encode_symbols(&mut rng, &p, &SID, m).unwrap())
                 .collect();
 
-            let mut got = decode_symbols(&p, &sum(&contributions), Some(4)).unwrap();
+            let mut got = decode_symbols(&p, &SID, &sum(&contributions), Some(4)).unwrap();
             let mut want = payloads;
             got.sort();
             want.sort();
@@ -560,33 +582,113 @@ mod tests {
     }
 
     #[test]
-    fn oracle_is_deterministic_and_in_range() {
-        for modulus in [T_MODULUS_DEFAULT, PRONY_PRIME] {
-            let a = random_oracle(&[1, 2, 3], 1000, modulus);
-            assert_eq!(a, random_oracle(&[1, 2, 3], 1000, modulus));
-            assert_ne!(a, random_oracle(&[1, 2, 4], 1000, modulus));
-            assert!(a.iter().all(|&v| (0..modulus as i64).contains(&v)));
+    fn oracle_is_deterministic_and_separates_sessions() {
+        let a = random_oracle(&SID, &[1, 2, 3], 1000, 35);
+        assert_eq!(a, random_oracle(&SID, &[1, 2, 3], 1000, 35));
+        assert_ne!(a, random_oracle(&SID, &[1, 2, 4], 1000, 35));
+        assert_ne!(
+            a,
+            random_oracle(&SessionId([0x22; 32]), &[1, 2, 3], 1000, 35)
+        );
+        assert!(a.iter().all(|&v| (0..1i64 << 35).contains(&v)));
+    }
+
+    /// The decoded elements of the encoding underneath, before unmasking.
+    fn raw_elements(p: &ChannelParams, plain: &[KahePoly]) -> Vec<Vec<i64>> {
+        match (p.mse(), p.prony()) {
+            (Some(params), _) => MseEncoding::unpack(params, plain).decode().unwrap(),
+            (_, Some(params)) => PronySketch::unpack(params, plain).decode().unwrap(),
+            (None, None) => unreachable!("a channel is peeling or sketch"),
         }
     }
 
-    /// Decoding the encoding underneath, without unmasking, must not reveal the
-    /// payload: what the encoding carries is the nonce and the masked payload.
+    /// The encoding carries the nonce and the masked payload, never the payload.
     #[test]
     fn encoding_carries_only_the_masked_payload() {
         for p in variants(4, 64) {
             let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
             let payload = vec![0x42u8; 64];
-            let plain = encode_message(&mut rng, &p, &payload).unwrap();
-            let raw = match (p.mse(), p.prony()) {
-                (Some(params), _) => MseEncoding::unpack(params, &plain).decode().unwrap(),
-                (_, Some(params)) => PronySketch::unpack(params, &plain).decode().unwrap(),
-                (None, None) => unreachable!(),
-            };
+            let plain = encode_message(&mut rng, &p, &SID, &payload).unwrap();
+            let raw = raw_elements(&p, &plain);
             assert_eq!(raw.len(), 1);
             let (_, masked) = raw[0].split_at(p.nonce_symbols);
             let symbols = bytes_to_symbols(&payload, p.payload_symbols());
             assert!(masked.iter().zip(&symbols).all(|(a, b)| a != b), "{p:?}");
-            assert_eq!(decode_messages(&p, &plain, Some(1)).unwrap(), vec![payload]);
+            assert_eq!(
+                decode_messages(&p, &SID, &plain, Some(1)).unwrap(),
+                vec![payload]
+            );
+        }
+    }
+
+    /// Zero padding alone would eat these; the length header keeps them.
+    #[test]
+    fn trailing_zero_bytes_and_empty_messages_survive() {
+        for p in variants(4, 16) {
+            let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+            let payloads: Vec<Vec<u8>> = vec![vec![], vec![0], vec![1, 0, 0], vec![0; 16]];
+            let contributions: Vec<Vec<KahePoly>> = payloads
+                .iter()
+                .map(|m| encode_message(&mut rng, &p, &SID, m).unwrap())
+                .collect();
+            let mut want = payloads;
+            want.sort();
+            assert_eq!(
+                decode_messages(&p, &SID, &sum(&contributions), Some(4)).unwrap(),
+                want,
+                "{p:?}"
+            );
+        }
+    }
+
+    /// Unmasking under another session's oracle does not give the message back.
+    #[test]
+    fn wrong_session_does_not_unmask() {
+        for p in variants(4, 16) {
+            let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+            let plain = encode_symbols(&mut rng, &p, &SID, &[5, 6, 7, 8, 9]).unwrap();
+            let other = SessionId([0x22; 32]);
+            assert_ne!(
+                decode_symbols(&p, &other, &plain, Some(1)).unwrap(),
+                vec![vec![5, 6, 7, 8, 9]],
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn symbol_out_of_range_rejected() {
+        for p in variants(4, 4) {
+            let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+            let too_wide = 1i64 << p.bits_per_symbol();
+            assert_eq!(
+                encode_symbols(&mut rng, &p, &SID, &[0, too_wide]),
+                Err(ChannelError::SymbolOutOfRange {
+                    index: 1,
+                    value: too_wide
+                })
+            );
+            assert_eq!(
+                encode_symbols(&mut rng, &p, &SID, &[-1, 0]),
+                Err(ChannelError::SymbolOutOfRange {
+                    index: 0,
+                    value: -1
+                })
+            );
+        }
+    }
+
+    /// A malicious client can claim any length; decoding refuses one that
+    /// overruns its element instead of reading past it.
+    #[test]
+    fn overlong_length_header_rejected() {
+        for p in variants(4, 8) {
+            let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
+            let plain = encode_symbols(&mut rng, &p, &SID, &[9, 0, 0]).unwrap();
+            assert_eq!(
+                decode_messages(&p, &SID, &plain, Some(1)),
+                Err(ChannelError::BadLength { claimed: 9, max: 8 })
+            );
         }
     }
 

@@ -934,7 +934,8 @@ fn run_cell(
     let client_polys: Vec<Vec<KahePoly>> = (0..n)
         .map(|i| {
             let mut polys = if i < active {
-                channel::encode_symbols(&mut rng, &ch, &symbol_payloads[i])
+                channel::encode_symbols(&mut rng, &ch, &SESSION, &symbol_payloads[i])
+                    .expect("bench payload symbols are small and fit the symbol width")
             } else {
                 channel::cover(&ch)
             };
@@ -1005,7 +1006,8 @@ fn run_cell(
 
     // [M] per-phase CPU, median of REPS one-party runs each.
     let (enc_app, _) = measure(|| {
-        let mut p = channel::encode_symbols(&mut rng, &ch, &symbol_payloads[0]);
+        let mut p = channel::encode_symbols(&mut rng, &ch, &SESSION, &symbol_payloads[0])
+            .expect("bench payload symbols are small and fit the symbol width");
         if let Some(&(_, off)) = allocated.first() {
             p.extend(codec::encode_at(off, msg_vector_bytes, &byte_payloads[0]));
         }
@@ -1064,7 +1066,7 @@ fn run_cell(
         p
     };
     let check_decode = |rec: &[KahePoly]| -> bool {
-        let elements_ok = channel::decode_symbols(&ch, &rec[..ch_polys], None)
+        let elements_ok = channel::decode_symbols(&ch, &SESSION, &rec[..ch_polys], None)
             .map(|d| d == expected_payloads)
             .unwrap_or(false);
         if sched {
@@ -1083,7 +1085,7 @@ fn run_cell(
         // May Err (PeelStalled) on unrecoverable params — we time the attempt.
         Some(rec) => {
             measure(|| {
-                let _ = channel::decode_symbols(&ch, &rec[..ch_polys], None);
+                let _ = channel::decode_symbols(&ch, &SESSION, &rec[..ch_polys], None);
                 if sched {
                     let _ = codec::decode_ranges(&rec[ch_polys..n_polys], &ranges);
                 }
