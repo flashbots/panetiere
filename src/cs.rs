@@ -264,11 +264,11 @@ impl HidingMerkleCommitment {
     ///
     /// The weights must be drawn after the openings are fixed. Then a batch
     /// containing an opening that fails on its own passes a combination with
-    /// probability at most `1/(2^15 − 1)` (the weight has to hit the one value
-    /// that cancels the defect, out of `2^15 − 1`), independently per
-    /// combination; nine rows give `(2^15 − 1)^-9 ≈ 2^-135`, past the 128-bit
-    /// target. The weight range has to fit below both moduli for that to hold,
-    /// which [`BATCH_WEIGHT_BOUND`] asserts at compile time. A pass says nothing
+    /// probability at most `2^-15` (the weight has to hit the one value that
+    /// cancels the defect, out of `2^15`), independently per combination;
+    /// nine rows give `2^-135`, past the 128-bit target. The weight range has
+    /// to fit below both moduli for that to hold, which
+    /// [`BATCH_WEIGHT_BOUND`] asserts at compile time. A pass says nothing
     /// about which member would fail, so a failing batch is re-checked member
     /// by member.
     ///
@@ -303,10 +303,7 @@ impl HidingMerkleCommitment {
             || openings.len() > batch_capacity(pp)
             || combos == 0
             || weights.iter().any(|row| row.len() != openings.len())
-            || weights
-                .iter()
-                .flatten()
-                .any(|&w| w == 0 || w >= BATCH_WEIGHT_BOUND)
+            || weights.iter().flatten().any(|&w| w >= BATCH_WEIGHT_BOUND)
             || openings.iter().any(|o| o.path_index != first.path_index)
         {
             return false;
@@ -505,18 +502,19 @@ fn walk_path(
 }
 
 /// Exclusive upper bound on a batch combination weight: weights are uniform
-/// in `[1, 2^15)`. A defective opening cancels out of a combination only for
-/// one weight value, and only if distinct weights stay distinct modulo both
-/// `q_cs` and `q_hvc`, so the whole range has to sit below the smaller
-/// modulus. The one value is unique because both moduli are prime, so a
-/// non-zero defect is invertible. The bound also keeps the i32 accumulation
-/// of [`batch_capacity`] exact.
+/// in `[0, 2^15)`, the paper's `W`. A defective opening cancels out of a
+/// combination only for one weight value (zero, if it is the only defective
+/// one), and only if distinct weights stay distinct modulo both `q_cs` and
+/// `q_hvc`, so the whole range has to sit below the smaller modulus. The one
+/// value is unique because both moduli are prime, so a non-zero defect is
+/// invertible. The bound also keeps the i32 accumulation of
+/// [`batch_capacity`] exact.
 pub const BATCH_WEIGHT_BOUND: u16 = 1 << 15;
 
-/// Whether every weight in `[1, bound)` is non-zero and distinct modulo both
+/// Whether the weights in `[0, bound)` are pairwise distinct modulo both
 /// moduli: the largest weight, `bound − 1`, has to stay below the smaller
-/// one, as a weight equal to a modulus drops its opening out of the
-/// combination.
+/// one, or two weights would share a residue and the cancelling residue
+/// could be hit twice.
 const fn batch_weights_distinct(bound: u16, q_cs: i32, q_hvc: i32) -> bool {
     let smaller = if q_cs < q_hvc { q_cs } else { q_hvc };
     (bound as i32) - 1 < smaller
@@ -554,12 +552,12 @@ pub fn batch_capacity(pp: &CsParams) -> usize {
 }
 
 /// Weights for one batched fresh check: `combos` independent rows, one
-/// weight per opening, each uniform in `[1, BATCH_WEIGHT_BOUND)`.
+/// weight per opening, each uniform in `[0, BATCH_WEIGHT_BOUND)`.
 pub fn batch_weights<R: Rng>(rng: &mut R, combos: usize, openings: usize) -> Vec<Vec<u16>> {
     (0..combos)
         .map(|_| {
             (0..openings)
-                .map(|_| rng.gen_range(1..BATCH_WEIGHT_BOUND))
+                .map(|_| rng.gen_range(0..BATCH_WEIGHT_BOUND))
                 .collect()
         })
         .collect()
@@ -1642,7 +1640,7 @@ mod tests {
             let mut dispatched = [0i32; POLY_N];
             #[cfg(target_arch = "x86_64")]
             let mut vectorised = [0i32; POLY_N];
-            for weight in [1i32, 7, BATCH_WEIGHT_BOUND as i32 - 1] {
+            for weight in [0i32, 1, 7, BATCH_WEIGHT_BOUND as i32 - 1] {
                 mac_i32_scalar(&mut expected, &coeffs, weight);
                 mac_i32(&mut dispatched, &coeffs, weight);
                 #[cfg(target_arch = "x86_64")]
