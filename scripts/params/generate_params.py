@@ -12,7 +12,10 @@
 # The search only uses the built-in hardness estimates.  Sage is only needed for
 # --confirm-with-estimator, which re-checks the final parameters with the lattice
 # estimator: run as  sage -python generate_params.py --confirm-with-estimator ...
-# with the estimator importable (e.g. from this directory).
+# with the lattice estimator (https://github.com/malb/lattice-estimator) on PYTHONPATH.
+#
+# Tags such as thm:broadcast are labels in the paper's LaTeX source; README.md maps
+# them to the theorem and section numbers of the current draft.
 #
 # Every constraint enforced below is tagged with the statement it comes from:
 #   [KAHE]   Theorem thm:kahe_secure (Lemmas lem:kahe_add_correct, lem:kahe_add_private;

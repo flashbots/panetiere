@@ -25,11 +25,11 @@ the target to pass the confidence test, so for small theta (where the union
 bound is nearly tight) the provable delta can even be smaller.
 
 The number of trials per tested shape is trials-factor * 2^eps, so this is only
-feasible up to eps of about 25-30.  For larger eps, use iblt_extrapolate.py for
-an estimate, or --no-sim for the provable shapes only.
+feasible up to eps of about 25-30.  For larger eps, use --no-sim for the
+provable shapes only.
 
 As a library, empirical_shape() returns the best empirical shape (used by
-generate_params.py --empirical simulate).
+generate_params.py --empirical).
 
 Usage examples:
     python3 iblt_empirical.py --rho 300 --eps 20
@@ -167,8 +167,8 @@ def main():
         print("warning: no C compiler found, using the slow pure-Python simulator", file=sys.stderr)
     trials = math.ceil(args.trials_factor / args.target)
     if trials > 1e9 and not args.no_sim:
-        print(f"warning: {trials:.2e} trials per tested shape; consider iblt_extrapolate.py, "
-              f"--no-sim or a smaller eps", file=sys.stderr)
+        print(f"warning: {trials:.2e} trials per tested shape; consider --no-sim or a "
+              f"smaller eps", file=sys.stderr)
     sim = Simulator(args.workers, args.seed)
     try:
         if args.check:

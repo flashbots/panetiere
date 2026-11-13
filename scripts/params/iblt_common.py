@@ -1,4 +1,4 @@
-"""Shared code for iblt_empirical.py and iblt_extrapolate.py.
+"""Shared IBLT code for generate_params.py and iblt_empirical.py.
 
 Model: the IBLT used in the paper (sec:mse_iblt).  Each of the rho elements is
 inserted into one uniformly random cell in each of the theta rows (the cells
@@ -561,7 +561,7 @@ def provable_shape(rho, target, thetas=None, quiet=True):
 
 
 def common_arguments(ap):
-    """Options shared by iblt_empirical.py and iblt_extrapolate.py."""
+    """Command-line options of iblt_empirical.py."""
     ap.add_argument("--rho", type=int, required=True, help="number of elements (capacity)")
     ap.add_argument("--eps", type=float, default=20,
                     help="target decoding failure probability 2^-eps (default 20)")
