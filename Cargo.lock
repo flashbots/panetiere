@@ -741,6 +741,7 @@ dependencies = [
 name = "panetiere"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "chipmunk_code",
  "criterion",

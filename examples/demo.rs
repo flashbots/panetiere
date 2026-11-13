@@ -41,7 +41,7 @@ fn main() {
     // The payload layer comes first: it sizes the multiset encoding for "this
     // many messages of this many bytes", and that fixes the KAHE width every
     // client must contribute.
-    let ch = ChannelParams::for_messages(messages.len() as u32, MESSAGE_BYTES, [0x5C; 32]);
+    let ch = ChannelParams::for_messages(&mut rng, messages.len() as u32, MESSAGE_BYTES);
     let mut pp = ch.protocol_params(&mut rng, N_SERVERS);
     pp.min_clients = MIN_CLIENTS;
 
