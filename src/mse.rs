@@ -45,13 +45,30 @@ pub struct MseParams {
 }
 
 impl MseParams {
-    /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity` elements.
+    /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity`
+    /// elements, with a freshly sampled PRF key. For whoever sets up the
+    /// session; the key then travels to the other parties with the rest of
+    /// the parameters.
     pub fn new<R: Rng>(
         rng: &mut R,
         gamma: usize,
         delta: usize,
         capacity: usize,
         payload_symbols: usize,
+    ) -> Self {
+        let mut prf_key = [0u8; PRF_KEY_BYTES];
+        rng.fill(&mut prf_key);
+        Self::with_key(gamma, delta, capacity, payload_symbols, prf_key)
+    }
+
+    /// Same layout under a PRF key received from the session's setup. Every
+    /// party must hold the same key or their bucket positions disagree.
+    pub fn with_key(
+        gamma: usize,
+        delta: usize,
+        capacity: usize,
+        payload_symbols: usize,
+        prf_key: [u8; PRF_KEY_BYTES],
     ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
@@ -61,8 +78,6 @@ impl MseParams {
             "capacity must be below the modulus t"
         );
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
-        let mut prf_key = [0u8; PRF_KEY_BYTES];
-        rng.fill(&mut prf_key);
         Self {
             gamma,
             delta,

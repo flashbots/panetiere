@@ -84,28 +84,58 @@ pub struct ChannelParams {
 }
 
 impl ChannelParams {
-    /// Peeling channel for up to `rho` inserted payloads of `message_bytes` each.
+    /// Peeling channel for up to `rho` inserted payloads of `message_bytes`
+    /// each, with a freshly sampled PRF key. For whoever sets up the session.
     pub fn for_messages<R: Rng>(rng: &mut R, rho: u32, message_bytes: usize) -> Self {
         Self::for_symbols(rng, rho, payload_symbols(message_bytes))
     }
 
+    /// [`Self::for_messages`] under a PRF key received from the session's
+    /// setup, for the other parties of that session.
+    pub fn for_messages_with_key(
+        rho: u32,
+        message_bytes: usize,
+        prf_key: [u8; mse::PRF_KEY_BYTES],
+    ) -> Self {
+        Self::for_symbols_with_key(rho, payload_symbols(message_bytes), prf_key)
+    }
+
     /// Peeling channel for up to `rho` payloads of `payload_symbols` symbols
-    /// each. For channels whose payload is already `Z_t` values rather than
-    /// bytes — the byte packing of [`encode_message`] does not apply to those.
+    /// each, with a freshly sampled PRF key. For channels whose payload is
+    /// already `Z_t` values rather than bytes — the byte packing of
+    /// [`encode_message`] does not apply to those.
     pub fn for_symbols<R: Rng>(rng: &mut R, rho: u32, payload_symbols: usize) -> Self {
+        let mut prf_key = [0u8; mse::PRF_KEY_BYTES];
+        rng.fill(&mut prf_key);
+        Self::for_symbols_with_key(rho, payload_symbols, prf_key)
+    }
+
+    /// [`Self::for_symbols`] under a PRF key received from the session's
+    /// setup, for the other parties of that session.
+    pub fn for_symbols_with_key(
+        rho: u32,
+        payload_symbols: usize,
+        prf_key: [u8; mse::PRF_KEY_BYTES],
+    ) -> Self {
         let rho = rho.max(1) as usize;
         let nonce_symbols = nonce_symbols(rho, mse::BITS_PER_SYMBOL);
         let delta = (BUCKETS_PER_INSERT * rho).div_ceil(GAMMA);
         Self {
-            encoding: Encoding::Mse(MseParams::new(
-                rng,
+            encoding: Encoding::Mse(MseParams::with_key(
                 GAMMA,
                 delta,
                 rho,
                 nonce_symbols + payload_symbols.max(1),
+                prf_key,
             )),
             nonce_symbols,
         }
+    }
+
+    /// The PRF key of a peeling channel, to send to the session's other
+    /// parties. `None` for a sketch channel, which has no key.
+    pub fn prf_key(&self) -> Option<[u8; mse::PRF_KEY_BYTES]> {
+        self.mse().map(|p| p.prf_key)
     }
 
     /// Sketch channel for up to `rho` payloads of `message_bytes` each.
@@ -403,6 +433,22 @@ mod tests {
             ChannelParams::for_messages(&mut rng, rho, bytes),
             ChannelParams::prony_for_messages(rho, bytes),
         ]
+    }
+
+    /// A party that receives the setup's key rebuilds the identical channel,
+    /// so its bucket positions agree with everyone else's.
+    #[test]
+    fn receiver_rebuilds_channel_from_key() {
+        let mut rng = ChaCha20Rng::from_seed([0x3A; 32]);
+        let setup = ChannelParams::for_messages(&mut rng, 8, 64);
+        let key = setup.prf_key().expect("peeling channel has a key");
+        assert_eq!(ChannelParams::for_messages_with_key(8, 64, key), setup);
+
+        let setup = ChannelParams::for_symbols(&mut rng, 8, 3);
+        let key = setup.prf_key().expect("peeling channel has a key");
+        assert_eq!(ChannelParams::for_symbols_with_key(8, 3, key), setup);
+
+        assert_eq!(ChannelParams::prony_for_messages(8, 64).prf_key(), None);
     }
 
     /// Sum `n` contributions positionally, as the protocol's aggregation does.
