@@ -85,24 +85,24 @@ pub struct ChannelParams {
 
 impl ChannelParams {
     /// Peeling channel for up to `rho` inserted payloads of `message_bytes` each.
-    pub fn for_messages(rho: u32, message_bytes: usize, prf_key: [u8; 32]) -> Self {
-        Self::for_symbols(rho, payload_symbols(message_bytes), prf_key)
+    pub fn for_messages<R: Rng>(rng: &mut R, rho: u32, message_bytes: usize) -> Self {
+        Self::for_symbols(rng, rho, payload_symbols(message_bytes))
     }
 
     /// Peeling channel for up to `rho` payloads of `payload_symbols` symbols
     /// each. For channels whose payload is already `Z_t` values rather than
     /// bytes — the byte packing of [`encode_message`] does not apply to those.
-    pub fn for_symbols(rho: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
+    pub fn for_symbols<R: Rng>(rng: &mut R, rho: u32, payload_symbols: usize) -> Self {
         let rho = rho.max(1) as usize;
         let nonce_symbols = nonce_symbols(rho, mse::BITS_PER_SYMBOL);
         let delta = (BUCKETS_PER_INSERT * rho).div_ceil(GAMMA);
         Self {
             encoding: Encoding::Mse(MseParams::new(
+                rng,
                 GAMMA,
                 delta,
                 rho,
                 nonce_symbols + payload_symbols.max(1),
-                prf_key,
             )),
             nonce_symbols,
         }
@@ -398,8 +398,9 @@ mod tests {
 
     /// Both encodings, same sizing, so every test below runs twice.
     fn variants(rho: u32, bytes: usize) -> Vec<ChannelParams> {
+        let mut rng = ChaCha20Rng::from_seed([0x5C; 32]);
         vec![
-            ChannelParams::for_messages(rho, bytes, [0x5C; 32]),
+            ChannelParams::for_messages(&mut rng, rho, bytes),
             ChannelParams::prony_for_messages(rho, bytes),
         ]
     }
@@ -533,8 +534,9 @@ mod tests {
     fn wide_symbols_round_trip() {
         // rho=8 for 4 inserts: this test is about symbol width, and the peel
         // stalls on ~8% of seeds when delta is sized exactly to rho.
+        let mut key_rng = ChaCha20Rng::from_seed([0x77; 32]);
         for p in [
-            ChannelParams::for_symbols(8, 3, [0x77; 32]),
+            ChannelParams::for_symbols(&mut key_rng, 8, 3),
             ChannelParams::prony_for_symbols(4, 3),
         ] {
             let mut rng = ChaCha20Rng::from_seed([6u8; 32]);

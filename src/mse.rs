@@ -4,14 +4,15 @@
 //!   r ← Z_{t^L}                            (per-element randomness)
 //!   r_ℓ := (r / t^ℓ) mod t                 (ℓ ∈ [L])
 //!   for i ∈ [γ]:
-//!     j := PRF(prf_key, (i, r)) mod δ
+//!     j := AES-128_{prf_key}(i ‖ r) mod δ
 //!     C[i,j] += 1; K_ℓ[i,j] += r_ℓ
 //!     V_s[i,j] += x_s                      (s ∈ [ξ])
 //! ```
 
 use crate::{KahePoly, N};
+use aes::cipher::{BlockEncrypt as _, KeyInit as _};
+use aes::Aes128;
 use rand::Rng;
-use sha2::{Digest, Sha256};
 
 use crate::kahe::T_MODULUS_DEFAULT;
 
@@ -21,6 +22,12 @@ const T_OVER_TWO: i64 = T / 2;
 pub const K_LIMBS: usize = 2;
 /// Bits of payload carried per symbol.
 pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
+/// AES-128 key length for the position PRF.
+pub const PRF_KEY_BYTES: usize = 16;
+/// Bytes of the AES block that carry the row index; `r` takes the rest.
+const ROW_BYTES: usize = 4;
+/// `r` must fit the remainder of a single AES block.
+const _: () = assert!(K_LIMBS * BITS_PER_SYMBOL <= (16 - ROW_BYTES) * 8);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
@@ -31,17 +38,20 @@ pub struct MseParams {
     /// its work on a forged table.
     pub capacity: usize,
     pub payload_symbols: usize,
-    pub prf_key: [u8; 32],
+    /// AES-128 key for the bucket positions. Sampled uniformly at setup and
+    /// shared with every client and the recipient; it may be public but must
+    /// not be chosen by anyone.
+    pub prf_key: [u8; PRF_KEY_BYTES],
 }
 
 impl MseParams {
     /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity` elements.
-    pub fn new(
+    pub fn new<R: Rng>(
+        rng: &mut R,
         gamma: usize,
         delta: usize,
         capacity: usize,
         payload_symbols: usize,
-        prf_key: [u8; 32],
     ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
@@ -51,6 +61,8 @@ impl MseParams {
             "capacity must be below the modulus t"
         );
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
+        let mut prf_key = [0u8; PRF_KEY_BYTES];
+        rng.fill(&mut prf_key);
         Self {
             gamma,
             delta,
@@ -126,14 +138,16 @@ fn to_canonical(x: i64) -> u128 {
     x.rem_euclid(T) as u128
 }
 
-fn prf_bucket(key: &[u8; 32], row: usize, r: u128, delta: usize) -> usize {
-    let mut h = Sha256::new();
-    h.update(key);
-    h.update((row as u32).to_le_bytes());
-    h.update(r.to_le_bytes());
-    let digest = h.finalize();
-    let v = u64::from_le_bytes(digest[..8].try_into().unwrap());
-    (v % delta as u64) as usize
+/// Bucket of the element with randomness `r` in `row`: AES-128 under the
+/// session key on the single block `row ‖ r`, reduced mod `δ`. The key is
+/// used for nothing else, so no domain separation is needed.
+fn prf_bucket(key: &[u8; PRF_KEY_BYTES], row: usize, r: u128, delta: usize) -> usize {
+    let mut block = [0u8; 16];
+    block[..ROW_BYTES].copy_from_slice(&(row as u32).to_le_bytes());
+    block[ROW_BYTES..].copy_from_slice(&r.to_le_bytes()[..16 - ROW_BYTES]);
+    let cipher = Aes128::new(key.as_slice().into());
+    cipher.encrypt_block((&mut block).into());
+    (u128::from_le_bytes(block) % delta as u128) as usize
 }
 
 impl MseEncoding {
@@ -354,7 +368,8 @@ mod tests {
     fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> MseParams {
         // sized the way `channel` does: γ·δ = 3ρ cells hold ρ elements
         let capacity = (gamma * delta).div_ceil(3);
-        MseParams::new(gamma, delta, capacity, payload_symbols, [seed; 32])
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        MseParams::new(&mut rng, gamma, delta, capacity, payload_symbols)
     }
 
     /// An honest table with one element, whose cell keys are then moved so
@@ -380,7 +395,7 @@ mod tests {
     #[test]
     fn over_capacity_rejected() {
         let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let pp = MseParams::new(4, 64, 3, 1, [9; 32]);
+        let pp = MseParams::new(&mut rng, 4, 64, 3, 1);
         let mut enc = MseEncoding::new(pp);
         for x in [1, 2, 3, 4] {
             enc.insert(&mut rng, &[x]);
