@@ -40,3 +40,13 @@ jobs:
       - run: rustup update stable --no-self-update && rustup default stable
       - run: rustup target add aarch64-unknown-linux-gnu
       - run: cargo check --target aarch64-unknown-linux-gnu
+
+  params:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mpmath sympy tabulate jsonschema
+      - run: python3 scripts/params/generate_params.py --check-only scripts/params/reference.json

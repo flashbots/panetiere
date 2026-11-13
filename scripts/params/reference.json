@@ -1,0 +1,42 @@
+{
+  "setting": {
+    "rho": 300,
+    "gamma": 8192,
+    "n": 2048,
+    "secpar": 128,
+    "msg_bytes": 1048576,
+    "eps_kahe": 100,
+    "eps_mse": 40,
+    "mse": "NG"
+  },
+  "kahe": {
+    "t": 17183014913,
+    "q": 70230058844161,
+    "mu": 36143,
+    "sigma": 6.8,
+    "nu": 1955,
+    "mse": {
+      "rho": 300,
+      "omega": 2,
+      "xi": 123365,
+      "chunk_bits": 34,
+      "xi_nonce": 3
+    }
+  },
+  "leaf": {
+    "p": 150413,
+    "beta": 120,
+    "beta_agg": 36000,
+    "kappa": 5,
+    "mu": 1
+  },
+  "chipmunk": {
+    "q": 557057,
+    "eta": 395,
+    "kappa": 2,
+    "kappa_prime": 2,
+    "beta_agg": 118500,
+    "tau": 13,
+    "xi": 2
+  }
+}
