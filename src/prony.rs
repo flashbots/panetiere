@@ -25,20 +25,24 @@
 //!    solve: `x_{i,s} = (Σ_m b_{i,m} W[s][m]) / Λ'(z_i)` where
 //!    `Λ(X)/(X − z_i) = Σ_m b_{i,m} X^m`.
 //!
-//! Cost of the swap: **`p` must be prime.** `T_MODULUS_DEFAULT` is a power of
-//! two, and Newton's identities divide by `1..k`. [`PRONY_PRIME`] matches the
-//! plaintext width instead. A 36-bit `p` would break the KAHE budget
-//! `t·8σ_e·√ρ + ρ·t/2 < q_kahe/2`, so
-//! the budget is unchanged and the codec's 32-bit symbols still fit.
-//! `KaheParams::t_modulus` is already a free `u64`.
+//! Newton's identities divide by `1..k`, so the field must be prime. The KAHE
+//! plaintext modulus [`T_MODULUS_DEFAULT`] is, and the sketch uses it directly.
 
+use crate::kahe::T_MODULUS_DEFAULT;
 use crate::rings::center_canonical_half_open_i64;
 use crate::{KahePoly, N};
 use rand::Rng;
 use rayon::prelude::*;
 
-/// 35-bit: a 36-bit `p` exceeds the KAHE budget at q = 2^47.995.
-pub const PRONY_PRIME: u64 = (32_788u64 << 20) + 1;
+/// The sketch's field: the shared prime plaintext modulus.
+///
+/// Keys are single elements of `F_p`, so two of `ρ` clients collide (and the
+/// round fails to decode) with probability about `ρ²/p`: roughly `2^-14.5` at
+/// `ρ = 300`, far above the `2^-20` the IBLT shape is sized for. The paper
+/// instead draws keys from an extension field `F_{t^ω}`, which keeps `t` and
+/// makes the error negligible; that is tracked as issue #27 and not yet
+/// implemented here.
+pub const PRONY_PRIME: u64 = T_MODULUS_DEFAULT;
 
 // ---------------------------------------------------------------
 // F_p scalars
@@ -523,7 +527,7 @@ impl PronyParams {
     }
 
     /// Bits of payload per symbol: every `⌊log₂ p⌋`-bit pattern is a distinct
-    /// residue. 35 at `PRONY_PRIME`, against `mse::BITS_PER_SYMBOL = 36`.
+    /// residue. Equal to `mse::BITS_PER_SYMBOL`, since both encodings use `t`.
     pub fn bits_per_symbol(&self) -> usize {
         self.p.ilog2() as usize
     }

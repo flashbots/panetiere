@@ -342,7 +342,7 @@ pub fn aggregate_and_decrypt_rs(
     tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Each lane's post is its own proof: `A·share_sum` must open the summed
-    // signed roots at that lane's position in both channels.
+    // signed roots at that lane's position.
     let now = Instant::now();
     let bad: Vec<NodeId> = node_outputs
         .par_iter()

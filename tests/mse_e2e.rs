@@ -6,6 +6,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use panetiere::channel::ChannelParams;
 use panetiere::cs::Commitment;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
@@ -220,7 +221,10 @@ fn multi_symbol_cover_through_panetiere() {
     let n_total = n_active + n_cover;
     let xi = 32usize;
 
-    let mse_params = MseParams::new(4, (3 * n_active).div_ceil(4), n_active, xi, [0xAA; 32]);
+    let mse_params = ChannelParams::for_symbols(n_active as u32, xi, [0xAA; 32])
+        .mse()
+        .expect("peeling channel")
+        .clone();
 
     let payloads: Vec<Vec<i64>> = (0..n_active)
         .map(|i| {

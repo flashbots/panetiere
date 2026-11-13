@@ -19,8 +19,8 @@ const T: i64 = T_MODULUS_DEFAULT as i64;
 const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
-/// Bits of payload carried per symbol.
-pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
+/// Bits of payload carried per symbol: `⌊log₂ t⌋`.
+pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.ilog2() as usize;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
@@ -76,7 +76,7 @@ impl MseParams {
         (1 + K_LIMBS + self.payload_symbols) * self.total_cells()
     }
 
-    /// `t^K_LIMBS`, the size of the randomness space. `t^2 = 2^72`, so u128.
+    /// `t^K_LIMBS`, the size of the randomness space.
     pub fn r_space(&self) -> u128 {
         let t = T_MODULUS_DEFAULT as u128;
         let mut p: u128 = 1;
@@ -228,6 +228,9 @@ impl MseEncoding {
             if c[idx] != 1 {
                 continue;
             }
+            if emitted.len() == self.params.capacity {
+                return Err(MseError::OverCapacity);
+            }
             let mut r_star: u128 = 0;
             let mut place: u128 = 1;
             for ell in 0..K_LIMBS {
@@ -247,7 +250,7 @@ impl MseEncoding {
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
             }
-            emitted.push(x_star_buf.clone());
+            emitted.push(x_star_buf.iter().map(|&x| to_canonical(x) as i64).collect());
             for i in 0..self.params.gamma {
                 let j = prf_bucket(&self.params.prf_key, i, r_star, self.params.delta);
                 let cell = i * self.params.delta + j;
@@ -388,6 +391,15 @@ mod tests {
         assert_eq!(enc.decode(), Err(MseError::OverCapacity));
     }
 
+    /// Decoded symbols are canonical in `[0, t)`, whatever the input's sign.
+    #[test]
+    fn decoded_symbols_are_canonical() {
+        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let mut enc = MseEncoding::new(params_for(4, 16, 1, 9));
+        enc.insert(&mut rng, &[-1]);
+        assert_eq!(enc.decode(), Ok(vec![vec![T - 1]]));
+    }
+
     #[test]
     fn single_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
@@ -509,13 +521,13 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → 15 symbols at BITS_PER_SYMBOL=35 (t=2^35). Smaller
-    /// multiset but exercises the fat-payload code path end-to-end.
+    /// 512-bit message → `⌈512 / BITS_PER_SYMBOL⌉` symbols. Smaller multiset
+    /// but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = MseParams::payload_symbols_for_bits(512);
-        assert_eq!(xi, 15);
+        assert_eq!(xi, 512usize.div_ceil(BITS_PER_SYMBOL));
         let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..5)
