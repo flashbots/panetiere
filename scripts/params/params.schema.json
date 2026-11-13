@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Panetiere parameter set",
+  "description": "Parameter set written by generate_params.py --json and read by generate_params.py --check-only. Not expressible here and checked by the script instead: kahe.sigma is a multiple of 0.01, and chipmunk.tau is the tree depth for setting.gamma servers.",
+  "type": "object",
+  "required": ["setting", "kahe", "leaf", "chipmunk"],
+  "additionalProperties": false,
+  "properties": {
+    "generated": {"type": "string", "description": "time the file was written (ISO 8601)"},
+    "command": {"type": "string", "description": "command line that wrote the file"},
+    "setting": {
+      "type": "object",
+      "required": ["rho", "gamma", "n", "secpar", "msg_bytes", "eps_kahe", "eps_mse", "mse"],
+      "additionalProperties": false,
+      "properties": {
+        "rho": {"type": "integer", "description": "number of clients"},
+        "capacity": {"type": "integer", "minimum": 2, "description": "MSE capacity C <= rho, the maximum number of senders with cover traffic (sec:cover); omitted: C = rho"},
+        "gamma": {"type": "integer", "description": "number of servers"},
+        "n": {"type": "integer", "description": "ring dimension of R = Z[X]/(X^n+1)"},
+        "secpar": {"type": "integer", "description": "security parameter lambda"},
+        "msg_bytes": {"type": "integer", "description": "message size in bytes"},
+        "eps_kahe": {"type": "integer", "description": "KAHE decryption failure probability 2^-eps_kahe"},
+        "eps_mse": {"type": "integer", "description": "MSE decoding failure probability 2^-eps_mse (+ PRF advantage)"},
+        "mse": {"enum": ["IBLT", "NG"], "description": "multiset encoding; determines the fields of kahe.mse"}
+      }
+    },
+    "kahe": {
+      "type": "object",
+      "required": ["t", "q", "mu", "sigma", "nu", "mse"],
+      "additionalProperties": false,
+      "properties": {
+        "t": {"type": "integer", "description": "plaintext modulus, messages in R_t^mu"},
+        "q": {"type": "integer", "description": "ciphertext modulus, ciphertexts in R_q^mu"},
+        "mu": {"type": "integer", "description": "ring elements per ciphertext"},
+        "sigma": {"type": "number", "exclusiveMinimum": 0, "description": "Gaussian width of keys and errors (a multiple of 0.01)"},
+        "nu": {"type": "integer", "description": "norm bound on sums of keys"},
+        "mse": {"type": "object", "description": "multiset encoding; mse_iblt or mse_ng, depending on setting.mse"}
+      }
+    },
+    "leaf": {
+      "type": "object",
+      "required": ["p", "beta", "beta_agg", "kappa", "mu"],
+      "additionalProperties": false,
+      "properties": {
+        "p": {"type": "integer", "description": "modulus; Shamir field Z_p, vector commitment message space R_p"},
+        "beta": {"type": "integer", "description": "randomness norm bound"},
+        "beta_agg": {"type": "integer", "description": "aggregated randomness norm bound (rho beta)"},
+        "kappa": {"type": "integer", "description": "randomness length (ring elements)"},
+        "mu": {"type": "integer", "description": "message length (ring elements)"}
+      }
+    },
+    "chipmunk": {
+      "type": "object",
+      "required": ["q", "eta", "kappa", "kappa_prime", "beta_agg", "tau", "xi"],
+      "additionalProperties": false,
+      "properties": {
+        "q": {"type": "integer", "description": "modulus"},
+        "eta": {"type": "integer", "description": "decomposition base 2 eta + 1"},
+        "kappa": {"type": "integer", "description": "limbs per element of R_q"},
+        "kappa_prime": {"type": "integer", "description": "limbs per element of R_p"},
+        "beta_agg": {"type": "integer", "description": "aggregated opening norm bound (rho eta)"},
+        "tau": {"type": "integer", "description": "tree depth (2^tau leaves)"},
+        "xi": {"type": "integer", "description": "leaf length (ring elements of R_p) = leaf.mu + 1"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["setting"], "properties": {"setting": {"required": ["mse"], "properties": {"mse": {"const": "IBLT"}}}}},
+      "then": {"properties": {"kahe": {"properties": {"mse": {"$ref": "#/$defs/mse_iblt"}}}}}
+    },
+    {
+      "if": {"required": ["setting"], "properties": {"setting": {"required": ["mse"], "properties": {"mse": {"const": "NG"}}}}},
+      "then": {"properties": {"kahe": {"properties": {"mse": {"$ref": "#/$defs/mse_ng"}}}}}
+    }
+  ],
+  "$defs": {
+    "mse_iblt": {
+      "description": "IBLT multiset encoding (thm:multisetencoding)",
+      "type": "object",
+      "required": ["theta", "delta", "omega", "xi", "chunk_bits", "xi_nonce"],
+      "additionalProperties": false,
+      "properties": {
+        "theta": {"type": "integer", "description": "number of hash functions (rows)"},
+        "delta": {"type": "integer", "description": "cells per row"},
+        "omega": {"type": "integer", "description": "key length (elements of Z_t)"},
+        "xi": {"type": "integer", "description": "element length (elements of Z_t): xi_nonce nonce chunks + message chunks"},
+        "chunk_bits": {"type": "integer", "description": "message bits per element of Z_t"},
+        "xi_nonce": {"type": "integer", "description": "nonce chunks (elements of Z_t)"}
+      }
+    },
+    "mse_ng": {
+      "description": "Newton-Girard multiset encoding over F = F_{t^omega} (thm:mse_newton)",
+      "type": "object",
+      "required": ["rho", "omega", "xi", "chunk_bits", "xi_nonce"],
+      "additionalProperties": false,
+      "properties": {
+        "rho": {"type": "integer", "description": "capacity, must equal setting.capacity (setting.rho if omitted)"},
+        "omega": {"type": "integer", "description": "extension degree; keys and chunks are elements of F"},
+        "xi": {"type": "integer", "description": "element length (elements of F): xi_nonce nonce chunks + message chunks"},
+        "chunk_bits": {"type": "integer", "description": "message bits per coordinate in Z_t"},
+        "xi_nonce": {"type": "integer", "description": "nonce chunks (elements of F)"}
+      }
+    }
+  }
+}
