@@ -25,12 +25,6 @@ const N_COVER: usize = 2;
 const MIN_CLIENTS: usize = 4;
 const MESSAGE_BYTES: usize = 32;
 
-/// Trim the zero padding `channel` leaves in place — framing is the caller's.
-fn unpad(payload: &[u8]) -> &[u8] {
-    let len = payload.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    &payload[..len]
-}
-
 fn main() {
     let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
 
@@ -88,7 +82,7 @@ fn main() {
     for i in 0..n_clients {
         let cid = ClientId(i as u32);
         let contribution = match messages.get(i) {
-            Some(m) => channel::encode_message(&mut rng, &ch, m).expect("payload fits"),
+            Some(m) => channel::encode_message(&mut rng, &ch, &session, m).expect("payload fits"),
             None => channel::cover(&ch),
         };
         let round = run_client_round(&mut rng, &pp, &session, cid, contribution, &servers);
@@ -138,7 +132,8 @@ fn main() {
     .expect("recover");
 
     let payloads =
-        channel::decode_messages(&ch, &recovered.plaintext, Some(messages.len())).expect("peel");
+        channel::decode_messages(&ch, &session, &recovered.plaintext, Some(messages.len()))
+            .expect("peel");
 
     println!(
         "\nanonymity set {}, servers excluded {:?}",
@@ -146,19 +141,15 @@ fn main() {
         recovered.culprits,
     );
     println!(
-        "recovered {} messages, in encoding order — it says nothing about who sent what:",
+        "recovered {} messages, sorted — the order says nothing about who sent what:",
         payloads.len(),
     );
     for p in &payloads {
-        println!(
-            "  {:?}",
-            std::str::from_utf8(unpad(p)).unwrap_or("<non-utf8>")
-        );
+        println!("  {:?}", std::str::from_utf8(p).unwrap_or("<non-utf8>"));
     }
 
-    let mut got: Vec<&[u8]> = payloads.iter().map(|p| unpad(p)).collect();
+    let got: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
     let mut want: Vec<&[u8]> = messages.to_vec();
-    got.sort();
     want.sort();
     assert_eq!(got, want);
     println!("\nok: every message recovered from the summed ciphertext");
