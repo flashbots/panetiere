@@ -7,11 +7,11 @@
 //! the client-signed roots: the post is its own correctness proof.
 //!
 //! **Hash, then decompose the hash.** Leaf `j` is not the share but the
-//! base-769 digits of its Ajtai hash `A·s_j` over the share ring, six digits
+//! base-791 digits of its Ajtai hash `A·s_j` over the share ring, six digits
 //! per coefficient. Two binding layers:
 //!
 //! - The HVC tree binds `Σ labels` (digits short by construction, sums
-//!   `ρ_max·ζ = 115 200 < q_hvc/2`-bounded, asserted at setup).
+//!   `ρ_max·ζ = 118 500 < q_hvc/2`-bounded, asserted at setup).
 //! - `A` binds a lane's posted sum to `Σ labels` mod `q_kahe`.
 //!   Re-encoding names any inconsistent lane.
 //!
@@ -30,7 +30,7 @@ use crate::hvc_stream::StreamingHvcDot;
 use crate::rings::{center_canonical_i64, center_i32};
 use crate::rs::Share;
 use crate::{pointwise_dot_rs, RsNTTPoly, KAHE_MODULUS, N as POLY_N};
-/// Six balanced base-769 digits cover a KAHE coefficient: `769^6 ≈ 2^57.5 > q`.
+/// Six balanced base-791 digits cover a KAHE coefficient: `791^6 ≈ 2^57.8 > q`.
 pub const DGT_WIDTH: usize = 6;
 
 /// Ajtai-hash output width.
@@ -47,7 +47,7 @@ fn decompose_step(value: i64) -> (i32, i64) {
     ((value - next * BASE) as i32, next)
 }
 
-/// Balanced base-769 digits of the canonical NTT-domain coefficients, centered
+/// Balanced base-791 digits of the canonical NTT-domain coefficients, centered
 /// first. Digit coefficients ∈ [−ζ, ζ], little-endian.
 pub fn decompose_share_poly(p: &RsNTTPoly) -> [HVCPoly; DGT_WIDTH] {
     let mut out = [HVCPoly::default(); DGT_WIDTH];
@@ -72,8 +72,8 @@ fn decompose_into(p: &RsNTTPoly, out: &mut [HVCPoly]) {
 }
 
 /// Left-inverse of [`decompose_share_poly`], linear in the digits. i128
-/// Horner: aggregated digits reach `ρ_max·ζ = 115 200`, and
-/// `115 200·769⁵ ≈ 2^65` overflows i64. Reduced mod `q_kahe`.
+/// Horner: aggregated digits reach `ρ_max·ζ = 118 500`, and
+/// `118 500·791⁵ ≈ 2^65` overflows i64. Reduced mod `q_kahe`.
 pub fn project_share_poly(digits: &[HVCPoly]) -> RsNTTPoly {
     debug_assert_eq!(digits.len(), DGT_WIDTH);
     let mut raw = [0u64; POLY_N];

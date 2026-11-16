@@ -9,13 +9,21 @@ use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 pub const N: usize = chipmunk_code::N;
-pub const CS_MODULUS: i32 = 57_637;
+/// Most clients one round aggregates. The reference parameter set
+/// (`scripts/params/reference.json`) is generated for this many, and every
+/// bound it satisfies only loosens for fewer.
+pub(crate) const RHO_MAX: u32 = 300;
+
+/// Leaf commitment modulus `p` of the reference parameter set; also the
+/// Shamir field. `p ≡ 5 mod 8`.
+pub const CS_MODULUS: i32 = 150_413;
 pub const CS_MODULUS_OVER_TWO: i32 = (CS_MODULUS - 1) / 2;
 
-/// KAHE ciphertext modulus: the prime the paper's parameter generator picks
-/// at 300 clients, 16 KiB messages and σ = 6.70 (`q ≈ 2^46.2`, `q ≡ 1 mod 2N`
-/// for the NTT). Smaller messages only loosen the bound it satisfies.
-pub const KAHE_MODULUS: i64 = 79_718_129_102_849;
+/// KAHE ciphertext modulus of the reference parameter set: the prime the
+/// paper's parameter generator picks at 300 clients, 1 MiB messages and
+/// σ = 6.80 (`q ≈ 2^46.0`, `q ≡ 1 mod 2N` for the NTT). Fewer clients and
+/// smaller messages only loosen the bound it satisfies.
+pub const KAHE_MODULUS: i64 = 70_230_058_844_161;
 pub const KAHE_MODULUS_OVER_TWO: i64 = (KAHE_MODULUS - 1) / 2;
 
 const CS_AUX_RNS_MODULI: [u32; 2] = [1_073_692_673, 1_073_668_097];

@@ -2,10 +2,11 @@
 //! failure probability (the stopping-set union bound of the paper, Theorem
 //! `thm:multisetencoding`) is at most the target.
 //!
-//! For capacity `ρ`, `θ` rows and `δ` cells per row, the bound is
+//! For capacity `C` (the most elements one round inserts), `θ` rows and `δ`
+//! cells per row, the bound is
 //!
 //! ```text
-//!   Σ_{s=2}^{ρ} C(ρ, s) · φ_δ(s)^θ
+//!   Σ_{s=2}^{C} C(C, s) · φ_δ(s)^θ
 //! ```
 //!
 //! where `φ_δ(s)` is the probability that `s` balls thrown uniformly into `δ`
@@ -18,20 +19,22 @@
 //! repository and agrees with the exact integer bound to about `1e-12` in
 //! `log2`.
 
-/// Stopping-set budget: `2^-20`, less the `1/16` the paper reserves for key
-/// collisions.
-fn target_log2() -> f64 {
-    -20.0 + (15.0f64 / 16.0).log2()
+/// Stopping-set budget: `2^-eps_mse`, less the `1/16` the paper reserves for
+/// key collisions.
+fn target_log2(eps_mse: u32) -> f64 {
+    -f64::from(eps_mse) + (15.0f64 / 16.0).log2()
 }
 
-/// Largest row count tried; beyond this the tables only grow.
-const MAX_THETA: usize = 15;
+/// Largest row count tried. Small capacities want many rows at a `2^-40`
+/// target (26 at capacity 2); beyond this the tables only grow.
+const MAX_THETA: usize = 32;
 const MIN_THETA: usize = 3;
 
-/// `(θ, δ)` minimising `θ·δ` for capacity `rho` under the target bound.
-pub(crate) fn iblt_shape(rho: usize) -> (usize, usize) {
-    let rho = rho.max(2);
-    let target = target_log2();
+/// `(θ, δ)` minimising `θ·δ` for `capacity` elements, with decoding failing
+/// with probability at most `2^-eps_mse`.
+pub(crate) fn iblt_shape(capacity: usize, eps_mse: u32) -> (usize, usize) {
+    let rho = capacity.max(2);
+    let target = target_log2(eps_mse);
     let mut table = Bound::new(rho);
     let pair_log2 = log2_binomial(&table.log_factorial, rho, 2);
     let mut best: Option<(usize, usize)> = None;
@@ -157,10 +160,27 @@ mod tests {
     use super::*;
 
     /// Shapes from the paper's exact-integer search
-    /// (`generate_params.find_iblt_shape`) at the same target.
+    /// (`generate_params.find_iblt_shape`) at the same targets.
     #[test]
     fn matches_paper_shapes() {
-        for (rho, theta, delta) in [
+        for (capacity, theta, delta) in [
+            (2, 26, 3),
+            (3, 27, 3),
+            (5, 28, 3),
+            (10, 20, 5),
+            (20, 16, 8),
+            (50, 13, 17),
+            (100, 11, 31),
+            (200, 10, 59),
+            (300, 9, 89),
+        ] {
+            assert_eq!(
+                iblt_shape(capacity, 40),
+                (theta, delta),
+                "capacity = {capacity}"
+            );
+        }
+        for (capacity, theta, delta) in [
             (2, 13, 3),
             (5, 15, 3),
             (10, 15, 4),
@@ -170,20 +190,24 @@ mod tests {
             (200, 6, 68),
             (300, 6, 101),
         ] {
-            assert_eq!(iblt_shape(rho), (theta, delta), "rho = {rho}");
+            assert_eq!(
+                iblt_shape(capacity, 20),
+                (theta, delta),
+                "capacity = {capacity}"
+            );
         }
     }
 
     #[test]
     fn bound_at_paper_shape() {
         let mut b = Bound::new(300);
-        let v = b.union_bound_log2(6, 101);
-        assert!((v - -23.92).abs() < 0.05, "{v}");
+        let v = b.union_bound_log2(9, 89);
+        assert!((v - -42.79).abs() < 0.05, "{v}");
     }
 
     #[test]
     fn tiny_capacity_clamps_to_two() {
-        assert_eq!(iblt_shape(0), iblt_shape(2));
-        assert_eq!(iblt_shape(1), iblt_shape(2));
+        assert_eq!(iblt_shape(0, 40), iblt_shape(2, 40));
+        assert_eq!(iblt_shape(1, 40), iblt_shape(2, 40));
     }
 }

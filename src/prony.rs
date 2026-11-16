@@ -37,8 +37,8 @@ use rayon::prelude::*;
 /// The sketch's field: the shared prime plaintext modulus.
 ///
 /// Keys are single elements of `F_p`, so two of `ρ` clients collide (and the
-/// round fails to decode) with probability about `ρ²/p`: roughly `2^-14.5` at
-/// `ρ = 300`, far above the `2^-20` the IBLT shape is sized for. The paper
+/// round fails to decode) with probability about `ρ²/p`: roughly `2^-17.5` at
+/// `ρ = 300`, far above the `2^-40` the IBLT shape is sized for. The paper
 /// instead draws keys from an extension field `F_{t^ω}`, which keeps `t` and
 /// makes the error negligible; that is tracked as issue #27 and not yet
 /// implemented here.
@@ -998,7 +998,7 @@ mod tests {
         let cap = 32;
         let mut sk = PronySketch::new(PronyParams::new(cap, 3));
         let mut msgs: Vec<Vec<i64>> = (0..cap)
-            .map(|i| vec![i as i64 * 7 + 1, i as i64 * 11, 1 << 31])
+            .map(|i| vec![i as i64 * 7 + 1, i as i64 * 11, 1 << 33])
             .collect();
         for m in &msgs {
             sk.insert(&mut rng, m);

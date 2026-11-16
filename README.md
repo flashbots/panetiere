@@ -61,7 +61,7 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `pke` / `sig` | ML-KEM-768 + AES-GCM envelopes for the key shares / P-256 post signatures |
 | `bulletin` | published entry types and their byte encodings |
 | `protocol::*` | the round drivers, verifier, recipient policy |
-| `channel` | recommended payload layer: sizes either encoding for $\rho$ messages of $n$ bytes |
+| `channel` | recommended payload layer: sizes either encoding for up to $C$ messages of $n$ bytes |
 | `mse` / `prony` | the two multiset encodings (peeling; MDS sketch) |
 | `codec` | raw byte↔poly packing and beacon-driven slot reservation |
 | `scaling_bench` | harness behind `panetiere_scaling` / `panetiere_merge` |
@@ -162,11 +162,15 @@ a forged signature only matters before the post is made.
 This fixes $\mu_\mathrm{kahe}$. Every client contributes exactly `message_polys(pp)`
 polys, real or cover — `zero_message(pp)` is the trivial cover.
 
-`channel` is the default: it sizes an encoding from "$\rho$ clients, $n$ bytes
-each", does the byte↔symbol packing, and derives matching `ProtocolParams`.
+`channel` is the default: it sizes an encoding from "at most $C$ senders, $n$
+bytes each", does the byte↔symbol packing, and derives matching
+`ProtocolParams`. The capacity $C$ is the most messages one round can carry:
+the number of clients, or fewer when some of them only send cover traffic. The
+peeling table is the smallest one whose decoding fails with probability at most
+$2^{-40}$ at that capacity.
 
 ```rust
-let ch = ChannelParams::for_messages(rho, message_bytes, prf_key);  // peeling
+let ch = ChannelParams::for_messages(capacity, message_bytes, prf_key);  // peeling
 let pp = ch.protocol_params(&mut rng, n_servers);       // KAHE width == ch.n_polys()
 
 let mine = channel::encode_message(&mut rng, &ch, &sid, payload)?;   // or channel::cover(&ch)
@@ -179,8 +183,8 @@ $(s, m \oplus \mathrm{RO}(s))$ for a nonce $s$ drawn from the caller's cryptogra
 with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mathit{sid} \| s)$,
 and decoding unmasks every element and returns the messages sorted. Each byte
 message carries a length header, so trailing zero bytes survive the padding. The masking is what allows the security proof to fix the corrupted clients' inputs before the honest messages are known. The honest messages themselves are hidden by the encryption. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
-$Q = 2^{64}$ oracle queries: six extra symbols per element for any realistic
-$\rho$. This guarantee covers the `channel` path only — polys built with `mse`,
+$Q = 2^{64}$ oracle queries at the largest round of $\rho = 300$ clients: six
+extra 34-bit symbols per element. This guarantee covers the `channel` path only — polys built with `mse`,
 `prony` or `codec` directly, including slot mode, are not masked.
 
 `ChannelParams` covers both multiset encodings behind that one interface:

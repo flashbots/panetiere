@@ -249,7 +249,8 @@ fn multi_symbol_cover_through_panetiere() {
     let n_polys = MseEncoding::n_polys(&mse_params);
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
-    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, n_polys);
+    // one poly per round below, as in the tests above
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
         .map(|_| pke::PrivateKey::generate(&mut rng))

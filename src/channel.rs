@@ -11,12 +11,17 @@ use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseError, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::{ProtocolParams, SessionId};
+use crate::rings::RHO_MAX;
 
 /// Message bits packed into one symbol: `⌊log₂ t⌋`, so every chunk is a
 /// distinct residue of the plaintext modulus both encodings share.
 pub const BITS_PER_CHUNK: usize = mse::BITS_PER_SYMBOL;
 
 const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PRONY_PRIME);
+
+/// The paper's `ε_MSE`: a round's encoding fails to decode with probability at
+/// most `2^-EPS_MSE`.
+const EPS_MSE: u32 = 40;
 
 /// The paper's statistical security target for nonce collisions.
 const SECURITY_BITS: usize = 128;
@@ -76,23 +81,26 @@ pub struct ChannelParams {
 }
 
 impl ChannelParams {
-    /// Peeling channel for up to `rho` inserted payloads of `message_bytes` each.
-    pub fn for_messages(rho: u32, message_bytes: usize, prf_key: [u8; 32]) -> Self {
-        Self::for_symbols(rho, payload_symbols(message_bytes), prf_key)
+    /// Peeling channel for up to `capacity` inserted payloads of
+    /// `message_bytes` each. The capacity is the most senders in one round;
+    /// with cover traffic that is fewer than the number of clients.
+    pub fn for_messages(capacity: u32, message_bytes: usize, prf_key: [u8; 32]) -> Self {
+        Self::for_symbols(capacity, payload_symbols(message_bytes), prf_key)
     }
 
-    /// Peeling channel for up to `rho` payloads of `payload_symbols` symbols
-    /// each. For channels whose payload is already `Z_t` values rather than
-    /// bytes — the byte packing of [`encode_message`] does not apply to those.
-    pub fn for_symbols(rho: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
-        let rho = rho.max(1) as usize;
-        let nonce_symbols = nonce_symbols(rho, mse::BITS_PER_SYMBOL);
-        let (theta, delta) = iblt_shape(rho);
+    /// Peeling channel for up to `capacity` payloads of `payload_symbols`
+    /// symbols each. For channels whose payload is already `Z_t` values rather
+    /// than bytes — the byte packing of [`encode_message`] does not apply to
+    /// those.
+    pub fn for_symbols(capacity: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
+        let capacity = capacity.max(1) as usize;
+        let nonce_symbols = nonce_symbols(mse::BITS_PER_SYMBOL);
+        let (theta, delta) = iblt_shape(capacity, EPS_MSE);
         Self {
             encoding: Encoding::Mse(MseParams::new(
                 theta,
                 delta,
-                rho,
+                capacity,
                 nonce_symbols + payload_symbols.max(1),
                 prf_key,
             )),
@@ -100,23 +108,26 @@ impl ChannelParams {
         }
     }
 
-    /// Sketch channel for up to `rho` payloads of `message_bytes` each.
-    pub fn prony_for_messages(rho: u32, message_bytes: usize) -> Self {
-        Self::prony_for_symbols(rho, payload_symbols(message_bytes))
+    /// Sketch channel for up to `capacity` payloads of `message_bytes` each.
+    pub fn prony_for_messages(capacity: u32, message_bytes: usize) -> Self {
+        Self::prony_for_symbols(capacity, payload_symbols(message_bytes))
     }
 
     /// Sketch channel carrying `payload_bits` per element, sized at the
     /// sketch's own symbol width rather than the peeling structure's.
-    pub fn prony_for_bits(rho: u32, payload_bits: usize) -> Self {
-        Self::prony_for_symbols(rho, payload_bits.div_ceil(PRONY_PRIME.ilog2() as usize))
+    pub fn prony_for_bits(capacity: u32, payload_bits: usize) -> Self {
+        Self::prony_for_symbols(
+            capacity,
+            payload_bits.div_ceil(PRONY_PRIME.ilog2() as usize),
+        )
     }
 
-    pub fn prony_for_symbols(rho: u32, payload_symbols: usize) -> Self {
-        let rho = rho.max(1) as usize;
-        let nonce_symbols = nonce_symbols(rho, PRONY_PRIME.ilog2() as usize);
+    pub fn prony_for_symbols(capacity: u32, payload_symbols: usize) -> Self {
+        let capacity = capacity.max(1) as usize;
+        let nonce_symbols = nonce_symbols(PRONY_PRIME.ilog2() as usize);
         Self {
             encoding: Encoding::Prony(PronyParams::new(
-                rho,
+                capacity,
                 nonce_symbols + payload_symbols.max(1),
             )),
             nonce_symbols,
@@ -194,8 +205,10 @@ impl ChannelParams {
 
 /// Nonce symbols so that `ρ(Q + ρ) / |N| ≤ 2^-SECURITY_BITS`, with `Q`
 /// the attacker's random oracle queries and `|N| = 2^(bits_per_symbol · k)`.
-fn nonce_symbols(rho: usize, bits_per_symbol: usize) -> usize {
-    let rho = rho as u128;
+/// `ρ` is the most clients a round can have, not the channel's capacity, so
+/// the nonce length is the same for every channel.
+fn nonce_symbols(bits_per_symbol: usize) -> usize {
+    let rho = u128::from(RHO_MAX);
     let numerator = rho * ((1u128 << ORACLE_QUERY_BITS) + rho);
     let numerator_bits = (u128::BITS - (numerator - 1).leading_zeros()) as usize;
     (SECURITY_BITS + numerator_bits).div_ceil(bits_per_symbol)
@@ -557,15 +570,15 @@ mod tests {
         assert!(p.payload_symbols() * p.bits_per_symbol() >= bits);
     }
 
-    /// 300 clients need about 201 bits of nonce, which is six 35-bit symbols,
-    /// and the count stays six far beyond any realistic ρ.
+    /// 300 clients need about 201 bits of nonce, which is six 34-bit symbols:
+    /// the reference parameter set's nonce length.
     #[test]
     fn nonce_sized_for_the_security_target() {
-        assert_eq!(nonce_symbols(300, 35), 6);
-        assert_eq!(nonce_symbols(1, 35), 6);
-        assert_eq!(nonce_symbols(1 << 17, 35), 6);
-        assert_eq!(nonce_symbols(1 << 19, 35), 7);
-        assert_eq!(nonce_symbols(300, 32), 7);
+        assert_eq!(mse::BITS_PER_SYMBOL, 34);
+        assert_eq!(nonce_symbols(34), 6);
+        assert_eq!(nonce_symbols(33), 7);
+        assert_eq!(nonce_symbols(201), 1);
+        assert_eq!(nonce_symbols(200), 2);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Key-additive homomorphic encryption
 //!
-//! Lives on the prime ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^46.2).
+//! Lives on the prime ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^46.0).
 //! The modulus is chosen for headroom in the noise budget.
 //!
 //! Per-poly form:
@@ -12,8 +12,8 @@
 //!
 //! Parameters:
 //! - `a ∈ R_{q_kahe}^μ` — public vector.
-//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 6.70).
-//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 6.70).
+//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 6.80).
+//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 6.80).
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
@@ -200,8 +200,8 @@ pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
     KahePoly::from_signed_coeffs(&coeffs)
 }
 
-/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 6.70,
-/// `‖·‖_∞ ≤ 8σ_s ≈ 126`) into a `CsPoly` by centered-rep re-interpretation.
+/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 6.80,
+/// `‖·‖_∞ ≤ ⌈8σ_s⌉ = 55`) into a `CsPoly` by centered-rep re-interpretation.
 /// Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client side to feed Shamir
 /// sharing, which operates over `R_{q_cs}`.
 pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
@@ -315,13 +315,15 @@ impl Kahe {
     }
 }
 
-pub const SIGMA_S_DEFAULT: f64 = 6.70;
-pub const SIGMA_E_DEFAULT: f64 = 6.70;
-/// Plaintext modulus: the smallest prime above `2^31`, shared by both multiset
-/// encodings. The paper needs `t` prime and above the capacity, since the
-/// peeling counters and Newton's identities both live in `Z_t`. Messages are
-/// chunked into `⌊log₂ t⌋ = 31` bits per coordinate.
-pub const T_MODULUS_DEFAULT: u64 = (1 << 31) + 11;
+pub const SIGMA_S_DEFAULT: f64 = 6.80;
+pub const SIGMA_E_DEFAULT: f64 = 6.80;
+/// Plaintext modulus of the reference parameter set: the smallest prime above
+/// `2^34` with `t ≡ 1 mod 2^20`, shared by both multiset encodings. The paper
+/// needs `t` prime and above the capacity, since the peeling counters and
+/// Newton's identities both live in `Z_t`; the congruence gives `Z_t` NTTs up
+/// to length `2^20`. Messages are chunked into `⌊log₂ t⌋ = 34` bits per
+/// coordinate.
+pub const T_MODULUS_DEFAULT: u64 = 17_183_014_913;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -330,7 +332,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=6.70, `t = 2^31 + 11` at q_kahe ≈ 2^46.2.
+    /// `μ = 1`, σ_s=σ_e=6.80, `t = 17183014913` at q_kahe ≈ 2^46.0.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }

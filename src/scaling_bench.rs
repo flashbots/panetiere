@@ -49,8 +49,8 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! DERIVED FROM INPUTS (computed per cell — not knobs)
 //! ──────────────────────────────────────────────────────────────────────
-//!  θ × δ          = `iblt_shape(active)`: smallest table under the paper's
-//!                   provable 2^-20 stopping-set bound
+//!  θ × δ          = `iblt_shape(active, 40)`: smallest table under the
+//!                   paper's provable 2^-40 stopping-set bound
 //!  μ_kahe         = n_polys — one key covers the whole plaintext
 //!  total_cells    = γ · δ
 //!  Shamir threshold, κ_cs, β, β_agg, block_size — chosen by
@@ -59,14 +59,14 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
 //! ──────────────────────────────────────────────────────────────────────
-//!  src/rings.rs: N = 2048, q_cs = 57_637, q_kahe = 79_718_129_102_849
+//!  src/rings.rs: N = 2048, q_cs = 150_413, q_kahe = 70_230_058_844_161
 //!  chipmunk param.rs: q_hvc = 557_057, HVC_WIDTH = 2
-//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^31 + 11, σ_s = σ_e = 6.70
+//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 17_183_014_913, σ_s = σ_e = 6.80
 //!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
 //!                — reported per cell as `eps`, the exponent that condition
 //!                actually buys at that (ρ, μ). It falls with √ρ and with
 //!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
-//!  src/mse.rs:   BITS_PER_SYMBOL = 31, K_LIMBS = 2
+//!  src/mse.rs:   BITS_PER_SYMBOL = 34, K_LIMBS = 2
 //!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
 //!                  over (S, ρ, active, ξ, flow, message_bytes), so cells never
 //!                  share a stream
@@ -156,8 +156,8 @@ const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
 /// Aggregation ceiling for the RNS share commitment.
 const RS_RHO_MAX: usize = 300;
 
-// Per-client element size = ξ symbols · 31 bits: 1058 ⇒ 4 KiB, 4229 ⇒ 16 KiB.
-const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[1058, 4229];
+// Per-client element size = ξ symbols · 34 bits: 964 ⇒ 4 KiB, 3856 ⇒ 16 KiB.
+const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[964, 3856];
 
 // ── env sweep knobs (fall back to the consts above) ─────────────────────────
 

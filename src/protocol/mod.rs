@@ -7,7 +7,7 @@ pub mod verify;
 use crate::KahePoly;
 use rand::Rng;
 
-use crate::cs::{Cs, HidingMerkleCommitment};
+use crate::cs::{Cs, HidingMerkleCommitment, KAPPA_CS, MU_CS};
 use crate::kahe::{
     Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT,
 };
@@ -193,12 +193,6 @@ pub fn round_wire_sizes(n_servers: usize, ctxt_polys: usize, rho: u32) -> RoundW
     }
 }
 
-/// One committed value per server: the Shamir share of the single KAHE key
-const MU_CS: usize = 1;
-
-/// BDLOP randomness width
-const KAPPA_CS: usize = 6;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,7 +218,7 @@ mod tests {
             1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT * 128,
+            T_MODULUS_DEFAULT * 2,
         );
         assert!(pp.max_clients > 0 && pp.max_clients < 300);
         let budget = |rho: usize| {

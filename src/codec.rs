@@ -255,8 +255,8 @@ mod tests {
     fn raw_round_trip_through_centering_at_midpoint() {
         let t = T_MODULUS_DEFAULT as i64;
         let mut buf = vec![0u8; BYTES_PER_POLY];
-        // first 31-bit symbol = t/2 = 0x4000_0005, little-endian bit packing
-        buf[0..4].copy_from_slice(&[0x05, 0x00, 0x00, 0x40]);
+        // first 34-bit symbol = t/2 = 0x2_0018_0000, little-endian bit packing
+        buf[0..5].copy_from_slice(&[0x00, 0x00, 0x18, 0x00, 0x02]);
         let polys: Vec<KahePoly> = encode_raw(&buf)
             .iter()
             .map(|p| {
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn decode_rejects_oob_coeff() {
         let mut coeffs = [0i64; N];
-        coeffs[0] = 1 << 33; // ≥ 2^32
+        coeffs[0] = SYMBOL_MOD; // one past the largest symbol
         let polys = vec![KahePoly::from_coeffs(coeffs)];
         match decode(&polys) {
             Err(CodecError::CoeffOutOfRange { .. }) => {}
