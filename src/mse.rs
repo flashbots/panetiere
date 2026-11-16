@@ -12,7 +12,7 @@
 use crate::{KahePoly, N};
 use aes::cipher::{BlockEncrypt as _, KeyInit as _};
 use aes::Aes128;
-use rand::Rng;
+use rand::{CryptoRng, Rng};
 
 use crate::kahe::T_MODULUS_DEFAULT;
 
@@ -26,8 +26,20 @@ pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
 pub const PRF_KEY_BYTES: usize = 16;
 /// Bytes of the AES block that carry the row index; `r` takes the rest.
 const ROW_BYTES: usize = 4;
-/// `r` must fit the remainder of a single AES block.
-const _: () = assert!(K_LIMBS * BITS_PER_SYMBOL <= (16 - ROW_BYTES) * 8);
+/// `t^K_LIMBS`, the size of the randomness space. `t^2 = 2^72`, so u128.
+const R_SPACE: u128 = {
+    let t = T_MODULUS_DEFAULT as u128;
+    let mut p: u128 = 1;
+    let mut i = 0;
+    while i < K_LIMBS {
+        p *= t;
+        i += 1;
+    }
+    p
+};
+/// Every `r` must fit the remainder of a single AES block, or distinct values
+/// of `r` would be truncated onto the same positions.
+const _: () = assert!(R_SPACE <= 1u128 << ((16 - ROW_BYTES) * 8));
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
@@ -49,7 +61,7 @@ impl MseParams {
     /// elements, with a freshly sampled PRF key. For whoever sets up the
     /// session; the key then travels to the other parties with the rest of
     /// the parameters.
-    pub fn new<R: Rng>(
+    pub fn new<R: CryptoRng + Rng>(
         rng: &mut R,
         gamma: usize,
         delta: usize,
@@ -105,12 +117,7 @@ impl MseParams {
 
     /// `t^K_LIMBS`, the size of the randomness space. `t^2 = 2^72`, so u128.
     pub fn r_space(&self) -> u128 {
-        let t = T_MODULUS_DEFAULT as u128;
-        let mut p: u128 = 1;
-        for _ in 0..K_LIMBS {
-            p *= t;
-        }
-        p
+        R_SPACE
     }
 }
 
@@ -153,14 +160,19 @@ fn to_canonical(x: i64) -> u128 {
     x.rem_euclid(T) as u128
 }
 
+/// The position PRF with its key schedule expanded once, so the `γ` lookups
+/// of an insertion or a peel share it.
+fn prf_cipher(key: &[u8; PRF_KEY_BYTES]) -> Aes128 {
+    Aes128::new(key.as_slice().into())
+}
+
 /// Bucket of the element with randomness `r` in `row`: AES-128 under the
 /// session key on the single block `row ‖ r`, reduced mod `δ`. The key is
 /// used for nothing else, so no domain separation is needed.
-fn prf_bucket(key: &[u8; PRF_KEY_BYTES], row: usize, r: u128, delta: usize) -> usize {
+fn prf_bucket(cipher: &Aes128, row: usize, r: u128, delta: usize) -> usize {
     let mut block = [0u8; 16];
     block[..ROW_BYTES].copy_from_slice(&(row as u32).to_le_bytes());
     block[ROW_BYTES..].copy_from_slice(&r.to_le_bytes()[..16 - ROW_BYTES]);
-    let cipher = Aes128::new(key.as_slice().into());
     cipher.encrypt_block((&mut block).into());
     (u128::from_le_bytes(block) % delta as u128) as usize
 }
@@ -205,8 +217,9 @@ impl MseEncoding {
             acc /= t;
         }
         let payload_reduced: Vec<i64> = payload.iter().map(|&x| reduce(x)).collect();
+        let cipher = prf_cipher(&self.params.prf_key);
         for row in 0..self.params.gamma {
-            let col = prf_bucket(&self.params.prf_key, row, r, self.params.delta);
+            let col = prf_bucket(&cipher, row, r, self.params.delta);
             let idx = self.idx(row, col);
             self.c[idx] = reduce(self.c[idx] + 1);
             for ell in 0..K_LIMBS {
@@ -252,6 +265,7 @@ impl MseEncoding {
         let mut limb_signed = [0i64; K_LIMBS];
         let mut x_star_buf = vec![0i64; self.params.payload_symbols];
         let t_u128 = T_MODULUS_DEFAULT as u128;
+        let cipher = prf_cipher(&self.params.prf_key);
         while let Some((row, col)) = queue.pop() {
             let idx = row * self.params.delta + col;
             if c[idx] != 1 {
@@ -270,7 +284,7 @@ impl MseEncoding {
             if emitted.len() >= self.params.capacity {
                 return Err(MseError::OverCapacity);
             }
-            if prf_bucket(&self.params.prf_key, row, r_star, self.params.delta) != col {
+            if prf_bucket(&cipher, row, r_star, self.params.delta) != col {
                 return Err(MseError::KeyMismatch);
             }
             for s in 0..self.params.payload_symbols {
@@ -278,7 +292,7 @@ impl MseEncoding {
             }
             emitted.push(x_star_buf.clone());
             for i in 0..self.params.gamma {
-                let j = prf_bucket(&self.params.prf_key, i, r_star, self.params.delta);
+                let j = prf_bucket(&cipher, i, r_star, self.params.delta);
                 let cell = i * self.params.delta + j;
                 c[cell] = reduce(c[cell] - 1);
                 for ell in 0..K_LIMBS {

@@ -86,7 +86,7 @@ pub struct ChannelParams {
 impl ChannelParams {
     /// Peeling channel for up to `rho` inserted payloads of `message_bytes`
     /// each, with a freshly sampled PRF key. For whoever sets up the session.
-    pub fn for_messages<R: Rng>(rng: &mut R, rho: u32, message_bytes: usize) -> Self {
+    pub fn for_messages<R: CryptoRng + Rng>(rng: &mut R, rho: u32, message_bytes: usize) -> Self {
         Self::for_symbols(rng, rho, payload_symbols(message_bytes))
     }
 
@@ -104,7 +104,7 @@ impl ChannelParams {
     /// each, with a freshly sampled PRF key. For channels whose payload is
     /// already `Z_t` values rather than bytes — the byte packing of
     /// [`encode_message`] does not apply to those.
-    pub fn for_symbols<R: Rng>(rng: &mut R, rho: u32, payload_symbols: usize) -> Self {
+    pub fn for_symbols<R: CryptoRng + Rng>(rng: &mut R, rho: u32, payload_symbols: usize) -> Self {
         let mut prf_key = [0u8; mse::PRF_KEY_BYTES];
         rng.fill(&mut prf_key);
         Self::for_symbols_with_key(rho, payload_symbols, prf_key)
