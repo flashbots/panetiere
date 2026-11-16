@@ -219,12 +219,13 @@ fn multi_symbol_cover_through_panetiere() {
     let n_active: usize = 4;
     let n_cover = 2;
     let n_total = n_active + n_cover;
-    let xi = 32usize;
 
-    let mse_params = ChannelParams::for_symbols(n_active as u32, xi, [0xAA; 32])
+    let mse_params = ChannelParams::for_symbols(n_active as u32, 32, [0xAA; 32])
         .mse()
         .expect("peeling channel")
         .clone();
+    // the channel's elements carry its nonce symbols ahead of the 32 payload ones
+    let xi = mse_params.payload_symbols;
 
     let payloads: Vec<Vec<i64>> = (0..n_active)
         .map(|i| {
