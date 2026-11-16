@@ -169,16 +169,25 @@ each", does the byte↔symbol packing, and derives matching `ProtocolParams`.
 let ch = ChannelParams::for_messages(rho, message_bytes, prf_key);  // peeling
 let pp = ch.protocol_params(&mut rng, n_servers);       // KAHE width == ch.n_polys()
 
-let mine = channel::encode_message(&mut rng, &ch, payload)?;   // or channel::cover(&ch)
+let mine = channel::encode_message(&mut rng, &ch, &sid, payload)?;   // or channel::cover(&ch)
 // ... round ...
-let msgs: Vec<Vec<u8>> = channel::decode_messages(&ch, &plaintext, Some(active))?;
+let msgs: Vec<Vec<u8>> = channel::decode_messages(&ch, &sid, &plaintext, Some(active))?;
 ```
 
+`channel` implements the paper's one-shot protocol: each element it inserts is
+$(s, m \oplus \mathrm{RO}(s))$ for a nonce $s$ drawn from the caller's cryptographically secure RNG,
+with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mathit{sid} \| s)$,
+and decoding unmasks every element and returns the messages sorted. Each byte
+message carries a length header, so trailing zero bytes survive the padding. The masking is what allows the security proof to fix the corrupted clients' inputs before the honest messages are known. The honest messages themselves are hidden by the encryption. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
+$Q = 2^{64}$ oracle queries: six extra symbols per element for any realistic
+$\rho$. This guarantee covers the `channel` path only — polys built with `mse`,
+`prony` or `codec` directly, including slot mode, are not masked.
+
 `ChannelParams` covers both multiset encodings behind that one interface:
-`for_messages` / `for_symbols` / `from_mse` build the peeling variant,
-`prony_for_messages` / `prony_for_symbols` / `from_prony` the Vandermonde
-sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to move,
-but recovery is all-or-nothing rather than gracefully degrading; it also needs a
+`for_messages` / `for_symbols` build the peeling variant,
+`prony_for_messages` / `prony_for_symbols` the Vandermonde
+sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to move;
+recovery is all-or-nothing for both. The sketch also needs a
 prime plaintext modulus, which `protocol_params` handles by selecting
 `PRONY_PRIME` for that variant. `mse` / `prony` directly when you want to choose
 $\gamma$, $\delta$, $\xi$, capacity or slack yourself. `codec` for non-multiset layouts (disjoint
