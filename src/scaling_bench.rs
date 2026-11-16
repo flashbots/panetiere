@@ -37,6 +37,9 @@
 //!           SWEEP_PAYLOAD_SYMBOLS  "2048,10240"       overrides CONFIGS ξ
 //!           SWEEP_SCHED_BYTES      "409600,2097152"   overrides SCHED_MESSAGE_BYTES
 //!                                  ("" = skip the scheduled section)
+//!           SWEEP_THRESHOLD        "majority" (default) = ⌊S/2⌋ + 1, or "S-K" =
+//!                                  max(⌊S/2⌋ + 1, S − K) ("S-2" was the
+//!                                  default before #21)
 //!           SWEEP_APPEND=1         append to the csv instead of overwriting
 //!                                  (dedup on the param columns, not `id`)
 //!           BENCH_BUDGET_SECS      default 300
@@ -48,7 +51,8 @@
 //!  δ              = ⌈3·active/γ⌉ IBLT buckets per MSE row
 //!  μ_kahe         = n_polys — one key covers the whole plaintext
 //!  total_cells    = γ · δ
-//!  Shamir threshold, κ_cs, β, β_agg, block_size — chosen by
+//!  Shamir threshold — from SWEEP_THRESHOLD (default: the honest-majority ⌊S/2⌋ + 1)
+//!  κ_cs, β, β_agg, block_size — chosen by
 //!  `ProtocolParams::setup_with_kahe_dims_full(s, μ_kahe, κ_kahe, …)`
 //!
 //! ──────────────────────────────────────────────────────────────────────
@@ -100,7 +104,7 @@ use crate::protocol::verify::{
     aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate,
     RsVerifyTimings, VerifyError, VerifyTimings,
 };
-use crate::protocol::ProtocolParams;
+use crate::protocol::{honest_majority_threshold, ProtocolParams};
 use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
 use crate::rs::Rs;
 use crate::share_commitment::{
@@ -163,6 +167,47 @@ fn env_list<T: std::str::FromStr>(key: &str) -> Option<Vec<T>> {
     match parsed {
         Ok(v) => Some(v),
         Err(_) => panic!("bad {key}: {raw:?}"),
+    }
+}
+
+/// Shamir threshold per server count `S`, from `SWEEP_THRESHOLD`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThresholdRule {
+    /// `⌊S/2⌋ + 1`: anonymity and output delivery against any corrupt minority.
+    HonestMajority,
+    /// `max(⌊S/2⌋ + 1, S − K)`: output delivery tolerates only `K` faulty
+    /// servers, anonymity up to `S − K − 1` corrupt ones.
+    AllBut(usize),
+}
+
+impl ThresholdRule {
+    fn from_env() -> Self {
+        match std::env::var("SWEEP_THRESHOLD") {
+            Err(_) => Self::HonestMajority,
+            Ok(raw) => Self::parse(&raw)
+                .unwrap_or_else(|| panic!("bad SWEEP_THRESHOLD {raw:?} (want majority or S-K)")),
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "" | "majority" => Some(Self::HonestMajority),
+            r => r.strip_prefix("S-")?.parse().ok().map(Self::AllBut),
+        }
+    }
+
+    fn threshold(self, s: usize) -> usize {
+        match self {
+            Self::HonestMajority => honest_majority_threshold(s),
+            Self::AllBut(k) => honest_majority_threshold(s).max(s.saturating_sub(k)),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::HonestMajority => "⌊S/2⌋ + 1 (honest majority)".into(),
+            Self::AllBut(k) => format!("max(⌊S/2⌋ + 1, S − {k})"),
+        }
     }
 }
 
@@ -395,6 +440,8 @@ struct RsPlan {
 
 struct Row {
     s: usize,
+    /// Shamir threshold.
+    threshold: usize,
     n: usize, // ρ — total clients = anonymity set
     active: usize,
     cover: usize,
@@ -582,11 +629,26 @@ fn correctness_epsilon(rho: usize, mu: usize, t_modulus: u64) -> f64 {
 mod csv_tests {
     use super::*;
 
+    #[test]
+    fn threshold_rule_parses_and_applies() {
+        use ThresholdRule::{AllBut, HonestMajority};
+        assert_eq!(ThresholdRule::parse("majority"), Some(HonestMajority));
+        assert_eq!(ThresholdRule::parse(""), Some(HonestMajority));
+        assert_eq!(ThresholdRule::parse(" S-2 "), Some(AllBut(2)));
+        assert_eq!(ThresholdRule::parse("S-"), None);
+        assert_eq!(ThresholdRule::parse("14"), None);
+        let t = |rule: ThresholdRule| [4, 8, 16, 64].map(|s| rule.threshold(s));
+        assert_eq!(t(HonestMajority), [3, 5, 9, 33]);
+        // The rule before #21.
+        assert_eq!(t(AllBut(2)), [3, 6, 14, 62]);
+    }
+
     /// Every phase gets a distinct value so a swapped column shows up as a
     /// mismatch rather than passing by coincidence.
     fn sample_row() -> Row {
         let mut r = Row {
             s: 8,
+            threshold: 5,
             n: 300,
             active: 100,
             cover: 200,
@@ -865,6 +927,7 @@ fn run_cell(
     let mu_kahe = n_polys;
     let t_modulus = ch.plaintext_modulus();
 
+    let threshold = ThresholdRule::from_env().threshold(s);
     let pp = ProtocolParams::setup_with_kahe_dims_full(
         &mut rng,
         s,
@@ -872,7 +935,8 @@ fn run_cell(
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
         t_modulus,
-    );
+    )
+    .with_threshold(threshold);
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..s)
         .map(|_| pke::PrivateKey::generate(&mut rng))
@@ -1152,7 +1216,8 @@ fn run_cell(
             let mut rrng = ChaCha20Rng::from_seed(rs_seed(&seed, k, n_nodes));
             let pp_rs = ProtocolParams::setup_rs_mode(
                 &mut rrng, s, n_polys, k, n_nodes, t_modulus, RS_RHO_MAX, [0x42; 32],
-            );
+            )
+            .with_threshold(threshold);
             let rs_keys: Vec<pke::PrivateKey> = (0..s)
                 .map(|_| pke::PrivateKey::generate(&mut rrng))
                 .collect();
@@ -1368,6 +1433,7 @@ fn run_cell(
 
     Row {
         s,
+        threshold,
         n,
         active,
         cover,
@@ -1668,14 +1734,15 @@ fn print_tables(rows: &[Row]) {
 
     println!("── cells ───────────────────────────────────────────────────────────────────");
     println!(
-        "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  recovered",
-        "id", "S", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "polys", "μ", "cells"
+        "{:<4}{:>4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  recovered",
+        "id", "S", "thr", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "polys", "μ", "cells"
     );
     for (i, r) in rows.iter().enumerate() {
         println!(
-            "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  {}",
+            "{:<4}{:>4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  {}",
             cell_id(i),
             r.s,
+            r.threshold,
             r.n,
             r.active,
             r.cover,
@@ -2368,7 +2435,7 @@ fn write_csv(rows: &[Row]) {
     let phases = PHASES;
 
     let mut header = String::new();
-    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
+    header.push_str("id,s,threshold,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
     for p in phases {
         write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", p.name).unwrap();
     }
@@ -2397,7 +2464,7 @@ fn write_csv(rows: &[Row]) {
     let param_key = |line: &str| -> String {
         line.split(',')
             .skip(1)
-            .take(12)
+            .take(13)
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -2407,9 +2474,10 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
+            r.threshold,
             r.n,
             r.active,
             r.cover,
@@ -2652,6 +2720,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
 
     let mut row = Row {
         s: idx("s")?,
+        threshold: idx("threshold")?,
         n,
         active: idx("active")?,
         cover: idx("cover")?,
@@ -2712,8 +2781,9 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
 /// a `host` row for the same cell match each other.
 fn cell_key(r: &Row) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{}",
         r.s,
+        r.threshold,
         r.n,
         r.active,
         r.cover,
@@ -2946,6 +3016,10 @@ pub fn run() {
     println!("            [D] derived    — exact byte arithmetic from packing formulas");
     println!("            [C] composed   — model wall = fixed + payload over [M] medians");
     println!("            [P] projected  — extrapolation / synthetic network sim");
+    println!(
+        "shamir threshold: {} (SWEEP_THRESHOLD)",
+        ThresholdRule::from_env().describe()
+    );
     println!("useful = delivered · ξ · log₂(t) bits/round (cover clients carry no payload, and");
     println!("         nor does a scheduled client whose reservation lost a rand collision)");
     println!();
