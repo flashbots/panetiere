@@ -1,1 +1,5 @@
 /target
+
+# parameter script: simulator build cache and bytecode
+/scripts/params/.iblt_sim_*
+__pycache__/
