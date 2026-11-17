@@ -746,4 +746,57 @@ mod tests {
     fn rho_beyond_the_digit_budget_is_rejected_at_setup() {
         params(4, 16, 603);
     }
+
+    // the fold refuses a lane beyond the roster, a path filed under another
+    // lane and a share of the wrong length, each on its own
+    #[test]
+    fn open_share_checks_lane_path_and_length() {
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        let (block_len, n_lanes) = (3usize, 5usize);
+        let pp = params(block_len, n_lanes, 300);
+        let shares: Vec<Share> = (0..n_lanes)
+            .map(|_| rand_share(&mut rng, block_len))
+            .collect();
+        let (_, paths) = commit_shares(&pp, &shares);
+        assert!(open_share(&pp, 2, &shares[2], &paths[2]).is_some());
+
+        let mut beyond = paths[2].clone();
+        beyond.lane_index = n_lanes;
+        assert!(open_share(&pp, n_lanes, &shares[2], &beyond).is_none());
+        assert!(open_share(&pp, 2, &shares[2], &paths[3]).is_none());
+        assert!(open_share(&pp, 2, &shares[2][..block_len - 1], &paths[2]).is_none());
+        let mut long = shares[2].clone();
+        long.push(RsNTTPoly::default());
+        assert!(open_share(&pp, 2, &long, &paths[2]).is_none());
+    }
+
+    // an opening that claims a different path length, or carries extra
+    // polys, neither verifies nor packs
+    #[test]
+    fn misshapen_share_opening_rejected() {
+        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+        let (block_len, n_lanes) = (3usize, 5usize);
+        let pp = params(block_len, n_lanes, 300);
+        let shares: Vec<Share> = (0..n_lanes)
+            .map(|_| rand_share(&mut rng, block_len))
+            .collect();
+        let (root, paths) = commit_shares(&pp, &shares);
+        let good = ingest_share(&pp, &root, 2, &shares[2], &paths[2]).expect("honest share");
+        assert!(verify_aggregated(&pp, &root, &shares[2], &good));
+        assert!(good.to_bytes(&pp).is_some());
+
+        let mut taller = good.clone();
+        taller.path_len += 1;
+        let mut padded = good.clone();
+        let mut data = padded.data.to_vec();
+        data.push(HVCPoly::default());
+        padded.data = data.into_boxed_slice();
+        for (which, bad) in [taller, padded].iter().enumerate() {
+            assert!(
+                !verify_aggregated(&pp, &root, &shares[2], bad),
+                "shape {which}"
+            );
+            assert!(bad.to_bytes(&pp).is_none(), "shape {which}");
+        }
+    }
 }

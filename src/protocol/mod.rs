@@ -249,4 +249,60 @@ mod tests {
             assert_eq!(pp.max_clients, rho_max.min(300));
         }
     }
+
+    // the default threshold is max(n/2 + 1, n - 2) in every setup
+    #[test]
+    fn default_threshold_follows_the_server_count() {
+        let mut rng = ChaCha20Rng::from_seed([95; 32]);
+        for (n, t) in [
+            (1usize, 1usize),
+            (2, 2),
+            (3, 2),
+            (4, 3),
+            (5, 3),
+            (6, 4),
+            (7, 5),
+            (8, 6),
+            (16, 14),
+        ] {
+            assert_eq!(ProtocolParams::setup(&mut rng, n).shamir.t, t, "n={n}");
+            assert_eq!(
+                ProtocolParams::setup_with_kahe_dims(&mut rng, n, 2)
+                    .shamir
+                    .t,
+                t,
+                "n={n}, wide"
+            );
+            let lanes = n.max(2);
+            let pp = ProtocolParams::setup_rs_mode(
+                &mut rng,
+                n,
+                1,
+                lanes - 1,
+                lanes,
+                T_MODULUS_DEFAULT,
+                300,
+                [96; 32],
+            );
+            assert_eq!(pp.shamir.t, t, "n={n}, erasure-coded");
+            assert_eq!(pp.shamir.n, n);
+        }
+    }
+
+    // with noise to spare, the commitment bounds alone cap the set
+    #[test]
+    fn commitment_bounds_cap_the_set_when_noise_does_not() {
+        let mut rng = ChaCha20Rng::from_seed([97; 32]);
+        let pp = ProtocolParams::setup_with_kahe_dims_full(
+            &mut rng,
+            4,
+            1,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            2,
+        );
+        assert_eq!(pp.cs.r_bound / pp.cs.beta_cs, 300);
+        assert_eq!(pp.cs.beta_agg_hvc / chipmunk_code::ZETA, 300);
+        assert_eq!(pp.max_clients, 300);
+    }
 }

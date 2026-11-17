@@ -604,4 +604,155 @@ mod tests {
             }
         }
     }
+
+    fn mean_and_variance(samples: &[i64]) -> (f64, f64) {
+        let n = samples.len() as f64;
+        let mean = samples.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let variance = samples
+            .iter()
+            .map(|&x| (x as f64 - mean).powi(2))
+            .sum::<f64>()
+            / n;
+        (mean, variance)
+    }
+
+    // a rounded gaussian of width σ has variance σ² + 1/12
+    fn assert_gaussian(samples: &[i64], sigma: f64, tolerance: f64) {
+        let (mean, variance) = mean_and_variance(samples);
+        let expected = sigma * sigma + 1.0 / 12.0;
+        assert!(mean.abs() < tolerance * sigma, "mean {mean}");
+        assert!(
+            (variance / expected - 1.0).abs() < tolerance,
+            "variance {variance}, expected {expected}"
+        );
+        let tail = (8.0 * sigma).ceil() as i64;
+        let largest = samples.iter().map(|x| x.abs()).max().unwrap_or(0);
+        assert!(largest <= tail, "sample {largest} past the tail cut {tail}");
+        assert!(
+            largest as f64 > 3.0 * sigma,
+            "no sample beyond three widths"
+        );
+    }
+
+    // the sampler is a rounded gaussian of the requested width, cut at eight
+    // widths; the seed is fixed, so this cannot flake
+    #[test]
+    fn gaussian_sampler_has_the_requested_width() {
+        let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
+        for sigma in [SIGMA_S_DEFAULT, 3.2] {
+            let samples: Vec<i64> = (0..200_000).map(|_| sample_dg(&mut rng, sigma)).collect();
+            assert_gaussian(&samples, sigma, 0.02);
+        }
+    }
+
+    // a fresh key is a gaussian poly of width σ_s, new on every call
+    #[test]
+    fn fresh_key_is_a_gaussian_poly() {
+        let mut rng = ChaCha20Rng::from_seed([44u8; 32]);
+        let pp = Kahe::setup(&mut rng);
+        let keys: Vec<KaheKey> = (0..32).map(|_| Kahe::gen(&mut rng, &pp)).collect();
+        let mut coeffs = Vec::new();
+        for k in &keys {
+            let mut p = *k.inner();
+            p.normalize();
+            coeffs.extend_from_slice(p.coeffs());
+        }
+        assert_gaussian(&coeffs, pp.sigma_s, 0.1);
+        assert!(keys[0].inner() != keys[1].inner());
+    }
+
+    // `c − m − pad` is `t·e` for a gaussian `e` of width σ_e
+    fn assert_scaled_noise(pp: &KaheParams, unmasked: &[KahePoly]) {
+        let t = pp.t_modulus as i64;
+        let mut noise = Vec::new();
+        for poly in unmasked {
+            let mut p = *poly;
+            p.normalize();
+            for &x in p.coeffs() {
+                assert_eq!(x % t, 0, "not a multiple of t");
+                noise.push(x / t);
+            }
+        }
+        assert_gaussian(&noise, pp.sigma_e, 0.1);
+    }
+
+    fn pad_for(pp: &KaheParams, k: &KaheKey, i: usize) -> KaheNTTPoly {
+        let sk_ntt = KaheNTTPoly::from(k.inner());
+        pointwise_dot_kahe(
+            std::slice::from_ref(&pp.a_ntt[i]),
+            std::slice::from_ref(&sk_ntt),
+        )
+    }
+
+    // the paper's ciphertext is `m + a·sk + t·e`: the pad puts it far from
+    // the message, and removing the pad leaves gaussian noise scaled by t
+    #[test]
+    fn ciphertext_is_message_plus_pad_plus_scaled_noise() {
+        let mut rng = ChaCha20Rng::from_seed([45u8; 32]);
+        let pp = Kahe::setup_with_dims(
+            &mut rng,
+            16,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
+        let k = Kahe::gen(&mut rng, &pp);
+        let m: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+            .collect();
+        let c = Kahe::enc(&mut rng, &pp, &k, &m);
+
+        let mut unmasked = Vec::new();
+        for i in 0..pp.mu_kahe {
+            let mut masked = c[i] - m[i];
+            masked.normalize();
+            let far = masked
+                .coeffs()
+                .iter()
+                .filter(|x| x.abs() > crate::KAHE_MODULUS / 8)
+                .count();
+            assert!(far > N / 2, "position {i} is not masked: {far} of {N}");
+            unmasked.push(c[i] - m[i] - KahePoly::from(&pad_for(&pp, &k, i)));
+        }
+        assert_scaled_noise(&pp, &unmasked);
+    }
+
+    // the same shape for the ntt-domain encryption the erasure-coded mode uses
+    #[test]
+    fn ntt_ciphertext_is_message_plus_pad_plus_scaled_noise() {
+        let mut rng = ChaCha20Rng::from_seed([46u8; 32]);
+        let pp = Kahe::setup_with_dims(
+            &mut rng,
+            16,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
+        let k = Kahe::gen(&mut rng, &pp);
+        let m: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
+            .collect();
+        let c = Kahe::enc_ntt(&mut rng, &pp, &k, &m);
+        assert_eq!(c.len(), m.len());
+
+        let unmasked: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|i| KahePoly::from(c[i] - pad_for(&pp, &k, i)) - m[i])
+            .collect();
+        assert_scaled_noise(&pp, &unmasked);
+
+        let agg = Kahe::agg_key(std::slice::from_ref(&k));
+        assert_eq!(Kahe::dec_ntt(&pp, &c, &agg), m);
+    }
+
+    // two encryptions of one message under one key differ: the noise is fresh
+    #[test]
+    fn encryption_noise_is_fresh() {
+        let mut rng = ChaCha20Rng::from_seed([47u8; 32]);
+        let pp = Kahe::setup(&mut rng);
+        let k = Kahe::gen(&mut rng, &pp);
+        let m = vec![rand_message_poly(&mut rng, pp.t_modulus)];
+        let first = Kahe::enc(&mut rng, &pp, &k, &m);
+        let second = Kahe::enc(&mut rng, &pp, &k, &m);
+        assert!(first != second);
+    }
 }

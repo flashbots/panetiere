@@ -357,3 +357,195 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         Err(VerifyError::TooManyClients { got: 4, max: 3 })
     ));
 }
+
+// a server that reports twice, or under an id outside the roster, voids the
+// attempt instead of counting towards the threshold
+#[test]
+fn duplicate_or_unknown_server_is_rejected() {
+    let r = round(14, 5, 4);
+    let mut twice = r.outputs.clone();
+    twice[1] = twice[0].clone();
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &r.publics, &twice),
+        Err(VerifyError::BadServerCoverage)
+    );
+    let mut unknown = r.outputs.clone();
+    unknown[1].server_id = ServerId(5);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &r.publics, &unknown),
+        Err(VerifyError::BadServerCoverage)
+    );
+}
+
+// the same roster checks, and the ciphertext length bounds, on the
+// already-summed path
+#[test]
+fn summed_recovery_checks_servers_and_ciphertext_length() {
+    use panetiere::protocol::verify::decrypt_unverified_aggregate;
+
+    // one client, so its own post is the sum
+    let r = round(15, 5, 1);
+    let entry = &r.publics[0].1;
+    let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    assert_eq!(
+        decrypt_unverified_aggregate(&r.pp, &entry.ctxt, &entry.comm, &r.outputs),
+        Ok(want)
+    );
+
+    let mut twice = r.outputs.clone();
+    twice[1] = twice[0].clone();
+    assert_eq!(
+        decrypt_unverified_aggregate(&r.pp, &entry.ctxt, &entry.comm, &twice),
+        Err(VerifyError::BadServerCoverage)
+    );
+    let mut unknown = r.outputs.clone();
+    unknown[1].server_id = ServerId(5);
+    assert_eq!(
+        decrypt_unverified_aggregate(&r.pp, &entry.ctxt, &entry.comm, &unknown),
+        Err(VerifyError::BadServerCoverage)
+    );
+
+    let bad_len = Err(VerifyError::InconsistentCiphertextLen(
+        r.outputs[0].server_id,
+    ));
+    assert_eq!(
+        decrypt_unverified_aggregate(&r.pp, &[], &entry.comm, &r.outputs),
+        bad_len
+    );
+    let mut long = entry.ctxt.clone();
+    long.push(entry.ctxt[0]);
+    assert!(long.len() > r.pp.kahe.mu_kahe);
+    assert_eq!(
+        decrypt_unverified_aggregate(&r.pp, &long, &entry.comm, &r.outputs),
+        bad_len
+    );
+}
+
+// every client's ciphertext has the same length, and none is longer than
+// the parameters allow
+#[test]
+fn ciphertext_lengths_must_agree_and_fit() {
+    let r = round(16, 4, 3);
+    let extra = r.publics[0].1.ctxt[0];
+    let bad_len = Err(VerifyError::InconsistentCiphertextLen(
+        r.outputs[0].server_id,
+    ));
+
+    let mut ragged = r.publics.clone();
+    ragged[1].1.ctxt.push(extra);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &ragged, &r.outputs),
+        bad_len
+    );
+
+    let mut long = r.publics.clone();
+    for (_, entry) in &mut long {
+        entry.ctxt.push(extra);
+    }
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &long, &r.outputs),
+        bad_len
+    );
+}
+
+// a set exactly at the anonymity floor, served by exactly the threshold of
+// servers, decodes on both recipient paths; one server fewer does not
+#[test]
+fn exactly_the_floor_and_the_threshold_are_enough() {
+    let mut r = round(17, 5, 4);
+    assert_eq!(r.pp.shamir.t, 3);
+    r.pp.min_clients = 4;
+    let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    let groups: Vec<_> = r
+        .publics
+        .iter()
+        .map(|(cid, entry)| (vec![*cid], entry.clone()))
+        .collect();
+    let policy = SetPolicy::anchored(&r.canonical, 4, NO_CAP);
+
+    let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..3]).unwrap();
+    assert_eq!(direct.plaintext, want);
+    assert!(direct.culprits.is_empty());
+    let aggregate = recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs[..3]).unwrap();
+    assert_eq!(aggregate.plaintext, want);
+    assert!(aggregate.culprits.is_empty());
+
+    assert_eq!(
+        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs[..2]).unwrap_err(),
+        RecipientError::BelowShareThreshold { have: 2, need: 3 }
+    );
+}
+
+// the groups an aggregator hands over cover the canonical set exactly: a
+// missing client is named, and an extra one is a mismatch
+#[test]
+fn groups_must_cover_exactly_the_canonical_set() {
+    let r = round(18, 4, 4);
+    let groups: Vec<_> = r
+        .publics
+        .iter()
+        .map(|(cid, entry)| (vec![*cid], entry.clone()))
+        .collect();
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+
+    let mut missing = groups.clone();
+    missing.remove(2);
+    assert_eq!(
+        recover_unverified_aggregate(&r.pp, &policy, &missing, &r.outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::GroupAggregateMissing {
+            group_of: ClientId(2)
+        })
+    );
+
+    let mut extra = groups.clone();
+    extra[0].0.push(ClientId(99));
+    assert_eq!(
+        recover_unverified_aggregate(&r.pp, &policy, &extra, &r.outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::GroupMembershipMismatch {
+            got: 5,
+            expected: 4
+        })
+    );
+}
+
+// unsealing a whole inbox gives what unsealing one envelope at a time
+// gives, in order, with a damaged envelope left out rather than failing all
+#[test]
+fn unseal_openings_matches_one_at_a_time() {
+    use panetiere::protocol::server::unseal_openings;
+
+    let mut rng = ChaCha20Rng::from_seed([19u8; 32]);
+    let pp = ProtocolParams::setup(&mut rng, 3);
+    let keys: Vec<pke::PrivateKey> = (0..3)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (ServerId(i as u32), k.public()))
+        .collect();
+    let me = ServerId(1);
+    let mut sealed: Vec<(ClientId, Vec<u8>)> = (0..3u32)
+        .map(|c| {
+            let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
+            let mut r = run_client_round(&mut rng, &pp, &SESSION, ClientId(c), vec![m], &servers);
+            let (sid, bytes) = r.sealed_openings.swap_remove(1);
+            assert_eq!(sid, me);
+            (ClientId(c), bytes)
+        })
+        .collect();
+    let last = sealed[1].1.len() - 1;
+    sealed[1].1[last] ^= 1;
+
+    let got = unseal_openings(&keys[1], &SESSION, me, &sealed);
+    assert_eq!(got.len(), 3);
+    assert!(got[1].is_none());
+    for i in [0usize, 2] {
+        let (cid, bytes) = &sealed[i];
+        let one = unseal_opening(&keys[1], &SESSION, *cid, me, bytes).expect("unseal");
+        let batch = got[i].as_ref().expect("unseal");
+        assert_eq!(batch.s(), one.s());
+        assert_eq!(batch.r(), one.r());
+        assert_eq!(batch.server_index, 1);
+    }
+}

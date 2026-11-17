@@ -202,6 +202,7 @@ mod tests {
                 },
             };
             let bytes = entry.to_bytes();
+            assert_eq!(bytes.len(), ClientBulletinEntry::packed_len(mu_kahe));
             let back = ClientBulletinEntry::from_bytes(&bytes).unwrap();
             assert_eq!(back.ctxt, entry.ctxt);
             assert_eq!(back.comm.root, entry.comm.root);
