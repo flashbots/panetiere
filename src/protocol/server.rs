@@ -313,6 +313,40 @@ mod tests {
         (canonical, commitments, inbox)
     }
 
+    /// A server's entry survives its wire form: it parses back to the same
+    /// bytes, still verifies against the summed commitments, and has the
+    /// predicted length. Truncated or extended bytes do not parse.
+    #[test]
+    fn server_entry_round_trips_through_its_wire_form() {
+        let mut rng = ChaCha20Rng::from_seed([80u8; 32]);
+        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        for clients in [1u32, 5] {
+            let (canonical, commitments, inbox) = round(&mut rng, &cs, clients);
+            let entry = run_server_round(&cs, &inbox, &canonical, &commitments).unwrap();
+            let bytes = entry.to_bytes(&cs);
+            assert_eq!(bytes.len(), ServerBulletinEntry::packed_len(&cs, clients));
+
+            let parsed = ServerBulletinEntry::from_bytes(&bytes).expect("entry parses");
+            assert_eq!(parsed.server_id, entry.server_id);
+            assert_eq!(parsed.clients, entry.clients);
+            assert_eq!(parsed.agg_share.coeffs(), entry.agg_share.coeffs());
+            assert_eq!(parsed.to_bytes(&cs), bytes);
+            let refs: Vec<&Commitment> = commitments.iter().map(|(_, c)| c).collect();
+            let summed = HidingMerkleCommitment::sum_commitment_refs(&refs);
+            assert!(HidingMerkleCommitment::verify(
+                &cs,
+                &summed,
+                &parsed.agg_open
+            ));
+
+            assert!(ServerBulletinEntry::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+            let mut longer = bytes.clone();
+            longer.push(0);
+            assert!(ServerBulletinEntry::from_bytes(&longer).is_none());
+            assert!(ServerBulletinEntry::from_bytes(&bytes[..7]).is_none());
+        }
+    }
+
     /// A batch that fails falls back to the per-client check, which names
     /// the client whose opening is bad.
     #[test]
