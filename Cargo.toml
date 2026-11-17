@@ -8,6 +8,7 @@ chipmunk_code = { git = "https://github.com/Ruteri/Chipmunk", rev = "dd5e8287c90
 negacyclic-rings = { git = "https://github.com/Ruteri/negacyclic-rings", branch = "main" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 ml-kem = "0.3"
+aes = "0.8"
 aes-gcm = "0.10"
 rand = "0.8"
 rand_chacha = "0.3"
