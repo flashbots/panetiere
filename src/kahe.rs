@@ -18,7 +18,7 @@
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
 use crate::rings::boxed_i64_coeffs;
-use crate::rings::{center_half_open_i64, center_i64};
+use crate::rings::{center_half_open_i64, center_i64, MU_MAX};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
@@ -230,6 +230,10 @@ impl Kahe {
         t_modulus: u64,
     ) -> KaheParams {
         assert!(mu_kahe >= 1, "μ_kahe must be ≥ 1");
+        assert!(
+            mu_kahe <= MU_MAX,
+            "μ_kahe must be ≤ {MU_MAX}, the widest ciphertext q is chosen for"
+        );
         assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
         // Sample directly NTT-resident — uniform-in-NTT slot is statistically
         // equivalent to NTT(uniform coeff poly) and saves `μ` forward NTTs.
@@ -529,6 +533,19 @@ mod tests {
         assert_eq!(c.len(), pp.mu_kahe);
         let agg = Kahe::agg_key(std::slice::from_ref(&k));
         assert_eq!(Kahe::dec(&pp, &c, &agg), m);
+    }
+
+    #[test]
+    #[should_panic(expected = "μ_kahe must be ≤")]
+    fn setup_rejects_mu_above_max() {
+        let mut rng = ChaCha20Rng::from_seed([14u8; 32]);
+        Kahe::setup_with_dims(
+            &mut rng,
+            MU_MAX + 1,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
     }
 
     /// A message shorter than `μ` is legal — the trailing positions are unused.

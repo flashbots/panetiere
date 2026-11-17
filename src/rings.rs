@@ -13,6 +13,10 @@ pub const N: usize = chipmunk_code::N;
 /// (`scripts/params/reference.json`) is generated for this many, and every
 /// bound it satisfies only loosens for fewer.
 pub(crate) const RHO_MAX: u32 = 300;
+/// Most ring elements one KAHE ciphertext may have. The reference parameter
+/// set's `q` covers ciphertexts up to this width; its correctness bound grows
+/// with `n · µ`.
+pub(crate) const MU_MAX: usize = 36_143;
 
 /// Leaf commitment modulus `p` of the reference parameter set; also the
 /// Shamir field. `p ≡ 5 mod 8`.
