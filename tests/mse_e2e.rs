@@ -6,6 +6,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use panetiere::channel::ChannelParams;
 use panetiere::cs::Commitment;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
@@ -218,9 +219,13 @@ fn multi_symbol_cover_through_panetiere() {
     let n_active: usize = 4;
     let n_cover = 2;
     let n_total = n_active + n_cover;
-    let xi = 32usize;
 
-    let mse_params = MseParams::new(&mut rng, 4, (3 * n_active).div_ceil(4), n_active, xi);
+    let mse_params = ChannelParams::for_symbols(&mut rng, n_active as u32, 32)
+        .mse()
+        .expect("peeling channel")
+        .clone();
+    // the channel's elements carry its nonce symbols ahead of the 32 payload ones
+    let xi = mse_params.payload_symbols;
 
     let payloads: Vec<Vec<i64>> = (0..n_active)
         .map(|i| {
@@ -244,7 +249,8 @@ fn multi_symbol_cover_through_panetiere() {
     let n_polys = MseEncoding::n_polys(&mse_params);
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
-    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, n_polys);
+    // one poly per round below, as in the tests above
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
         .map(|_| pke::PrivateKey::generate(&mut rng))

@@ -4,14 +4,14 @@
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
 //! `r ∈ B^{κ_cs}_{β_cs,q_cs}`. `a` is a length-`κ_cs` row vector, `B` is a
 //! `μ_cs × κ_cs` matrix. All BDLOP arithmetic lives on the **CS ring**
-//! `R_{q_cs}` (`CsPoly`, q_cs = 139301), decoupled from the HVC
-//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 40961).
+//! `R_{q_cs}` (`CsPoly`, q_cs = 150413), decoupled from the HVC
+//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 557057).
 //!
 //! **CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span
 //! `[-q_cs/2, q_cs/2]`, larger than `q_hvc`. To feed it into the HVC tree hash
-//! we base-`(2ζ+1)=69` decompose each leaf element into `HVC_WIDTH = 3`
+//! we base-`(2ζ+1)=791` decompose each leaf element into `HVC_WIDTH = 2`
 //! `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); the digits are tiny
-//! (`|·| ≤ ζ = 34 ≪ q_hvc`) so they embed losslessly. The left-inverse
+//! (`|·| ≤ ζ = 395 ≪ q_hvc`) so they embed losslessly. The left-inverse
 //! `CsPoly::project_r_from_hvc` is linear in the digits, so summed opening
 //! digits project to the summed leaf — keeping `sum_openings` correct.
 //!
@@ -37,7 +37,7 @@
 
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
-use crate::rings::{center_i32, center_i64};
+use crate::rings::{center_i32, center_i64, RHO_MAX};
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use negacyclic_rings::arithmetic;
@@ -98,7 +98,7 @@ pub struct CsParams {
     pub r_bound: u32,
     /// Aggregated bound on the base-(2η+1) decomposition digits of the HVC
     /// tree opening. Each digit-coefficient ∈ [−η, η] fresh, [−ρη, ρη] after
-    /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·34 = 10200). Checked
+    /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·395 = 118500). Checked
     /// in `verify` so a forged opening can't use out-of-range digits.
     pub beta_agg_hvc: u32,
     /// Labels a leaf from its `ξ·HVC_WIDTH` bridged digits.
@@ -748,7 +748,7 @@ impl Cs for HidingMerkleCommitment {
     type Opening = Opening;
 
     fn setup<R: Rng>(rng: &mut R, num_servers: usize) -> CsParams {
-        Self::setup_with_dims(rng, num_servers, 1, 5)
+        Self::setup_with_dims(rng, num_servers, MU_CS, KAPPA_CS)
     }
 
     /// Commit per-server share vectors and emit one opening per server.
@@ -993,8 +993,8 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 //
 // Tight pack uses just enough bits per coefficient for each region's bound:
 //   r:    ⌈log₂(2·r_bound + 1)⌉ bits
-//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 139301)
-//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(69)⌉ = 7 bits
+//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 150413)
+//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(791)⌉ = 10 bits
 
 /// Number of bits to encode signed values in [-bound, bound].
 #[inline]
@@ -1457,13 +1457,17 @@ fn aggregated_opening_pack_bounds_raw(
     (r, CS_MODULUS as u32, tree)
 }
 
+/// One committed value per server: the Shamir share of the single KAHE key
+pub(crate) const MU_CS: usize = 1;
+/// BDLOP randomness width
+pub(crate) const KAPPA_CS: usize = 5;
 /// Fresh per-opening randomness radius.
-pub const BETA_CS: u32 = 116;
+pub const BETA_CS: u32 = 120;
 /// Aggregate verify bound: `ρ_max·β_cs` at `ρ_max = 300`.
-pub const R_BOUND: u32 = 34_800;
+pub const R_BOUND: u32 = RHO_MAX * BETA_CS;
 /// Aggregated HVC digit bound: `ρ_max·ζ`.
 pub fn beta_agg_hvc() -> u32 {
-    300 * chipmunk_code::ZETA
+    RHO_MAX * chipmunk_code::ZETA
 }
 
 /// [`CsParams::aggregated_server_crypto_len`] from dimensions alone, so a caller
@@ -1708,7 +1712,7 @@ mod tests {
         let pp = HidingMerkleCommitment::setup(&mut rng, 4);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 69650 ≫ r_bound = 34800.
+        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 75206 ≫ r_bound = 36000.
         openings[1].r_mut()[0] = CsPoly::rand_poly(&mut rng);
         assert!(!HidingMerkleCommitment::verify(&pp, &comm, &openings[1]));
     }
@@ -1928,7 +1932,10 @@ mod tests {
     #[test]
     fn opening_size_unchanged_at_mu_1() {
         for path in 0usize..5 {
-            assert_eq!(opening_data_polys(2, path), 6 + 6 * path);
+            assert_eq!(
+                opening_data_polys(2, path),
+                2 * HVC_WIDTH + 2 * HVC_WIDTH * path
+            );
         }
     }
 
@@ -1969,7 +1976,7 @@ mod tests {
 
     /// `N = 2048` is a multiple of 8, so no region pads and the body is exactly
     /// its bit budget — a tighter pin than a ratio, which moves with the region
-    /// mix (`s` packs 18/32, digits 7/32).
+    /// mix (`s` packs 18/32, digits 10/32).
     #[test]
     fn pack_size_reduction() {
         let mut rng = ChaCha20Rng::from_seed([102u8; 32]);
@@ -1991,8 +1998,8 @@ mod tests {
                 / 8;
             assert_eq!(packed_bytes, expected, "μ_cs={mu_cs}");
             assert!(
-                packed_bytes * 3 <= in_mem_bytes,
-                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 3"
+                packed_bytes * 2 <= in_mem_bytes,
+                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 2"
             );
         }
     }
