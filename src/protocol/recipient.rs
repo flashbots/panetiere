@@ -71,10 +71,11 @@ pub enum RejectReason {
         agreeing: usize,
         need: usize,
     },
-    MissingClientPublics {
-        have: usize,
-        need: usize,
-    },
+    /// No post from this client, the first in the set's order without one.
+    MissingClientPost(ClientId),
+    /// This client's ciphertext does not have exactly `μ` ring elements; the
+    /// first such client in the set's order.
+    WrongCiphertextLength(ClientId),
     GroupAggregateMissing {
         group_of: ClientId,
     },
@@ -211,20 +212,31 @@ where
     let (canonical, agreeing) = anchored_set(policy, server_outputs);
     admit(pp, policy, &canonical, agreeing.len()).map_err(RecipientError::Rejected)?;
 
-    let entries: Vec<(ClientId, ClientBulletinEntry)> = canonical
-        .iter()
-        .filter_map(|cid| publics(*cid).map(|p| (*cid, p)))
-        .collect();
-    if entries.len() != canonical.len() {
-        return Err(RecipientError::Rejected(
-            RejectReason::MissingClientPublics {
-                have: entries.len(),
-                need: canonical.len(),
-            },
-        ));
+    // The posts are summed once: the sum does not depend on which servers are
+    // excluded below. The first client in the set's order whose post is
+    // missing or has the wrong length is named.
+    let mu = pp.kahe.mu_kahe;
+    let mut entries: Vec<ClientBulletinEntry> = Vec::with_capacity(canonical.len());
+    for &cid in &canonical {
+        let reject = |why| RecipientError::Rejected(why);
+        let post = publics(cid).ok_or(reject(RejectReason::MissingClientPost(cid)))?;
+        if post.ctxt.len() != mu {
+            return Err(reject(RejectReason::WrongCiphertextLength(cid)));
+        }
+        entries.push(post);
     }
+    // An empty set sums to zero.
+    let ctxt = if entries.is_empty() {
+        vec![KahePoly::default(); mu]
+    } else {
+        let ctxts: Vec<&[KahePoly]> = entries.iter().map(|e| e.ctxt.as_slice()).collect();
+        Kahe::agg_ctxt_refs(&ctxts)
+    };
+    let comms: Vec<&Commitment> = entries.iter().map(|e| &e.comm).collect();
+    let comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
+    drop(entries);
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
-        aggregate_and_decrypt_unverified(pp, &canonical, &entries, outs)
+        decrypt_unverified_aggregate(pp, &ctxt, &comm, outs)
     })
     .map_err(RecipientError::Rejected)?;
     Ok(Recovered {

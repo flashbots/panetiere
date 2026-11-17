@@ -193,7 +193,7 @@ fn missing_client_public_is_rejected() {
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
-        RecipientError::Rejected(RejectReason::MissingClientPublics { have: 4, need: 5 })
+        RecipientError::Rejected(RejectReason::MissingClientPost(ClientId(2)))
     );
 }
 
@@ -356,4 +356,58 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         aggregate_and_decrypt_rs(&pp, &SESSION, &r.canonical, &[], &r.outputs, &[]),
         Err(VerifyError::TooManyClients { got: 4, max: 3 })
     ));
+}
+
+/// Each client ciphertext has exactly `μ` ring elements. With several
+/// misbehaving clients, the first in the set's order is named, whatever the
+/// kind of fault.
+#[test]
+fn the_first_misbehaving_client_is_named() {
+    let r = round(33, 4, 5);
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    let longer = |cid: u32| {
+        let (_, e) = &r.publics[cid as usize];
+        ClientBulletinEntry {
+            ctxt: [e.ctxt.clone(), e.ctxt.clone()].concat(),
+            comm: e.comm.clone(),
+        }
+    };
+    let direct = |missing: &[u32], long: &[u32]| {
+        let lookup = |cid: ClientId| {
+            if missing.contains(&cid.0) {
+                None
+            } else if long.contains(&cid.0) {
+                Some(longer(cid.0))
+            } else {
+                r.lookup()(cid)
+            }
+        };
+        match recover_unverified_direct(&r.pp, &policy, lookup, &r.outputs) {
+            Err(RecipientError::Rejected(reason)) => reason,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        direct(&[3, 1], &[]),
+        RejectReason::MissingClientPost(ClientId(1))
+    );
+    assert_eq!(
+        direct(&[], &[4, 2]),
+        RejectReason::WrongCiphertextLength(ClientId(2))
+    );
+    assert_eq!(
+        direct(&[3], &[1]),
+        RejectReason::WrongCiphertextLength(ClientId(1))
+    );
+    assert_eq!(
+        direct(&[1], &[3]),
+        RejectReason::MissingClientPost(ClientId(1))
+    );
+
+    let mut publics = r.publics.clone();
+    publics[2].1 = longer(2);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &publics, &r.outputs),
+        Err(VerifyError::WrongCiphertextLength(ClientId(2)))
+    );
 }
