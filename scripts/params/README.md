@@ -42,6 +42,8 @@ To verify a concrete configuration, write `reference.json` with the derived valu
 
 ## Requirements
 
+`requirements.txt` pins the versions CI checks with (`pip install -r requirements.txt`).
+
 - Python 3 with `mpmath`, `sympy` and `tabulate` (`pip install mpmath sympy tabulate`).
 - `numpy` (optional) makes the IBLT shape search much faster for large ρ.
 - `jsonschema` is needed for `--check-only` only (`pip install jsonschema`). Writing JSON does not need it.
