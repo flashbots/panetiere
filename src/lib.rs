@@ -17,6 +17,8 @@ pub mod mse;
 pub mod pke;
 pub mod prony;
 pub mod protocol;
+#[cfg(test)]
+mod reference_params;
 pub mod rings;
 pub mod rs;
 pub mod scaling_bench;
