@@ -1,6 +1,6 @@
 //! Key-additive homomorphic encryption
 //!
-//! Lives on its own two-limb RNS ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^47.995).
+//! Lives on the prime ring `R_{q_kahe}` (`KahePoly`; q ≈ 2^46.0).
 //! The modulus is chosen for headroom in the noise budget.
 //!
 //! Per-poly form:
@@ -12,13 +12,13 @@
 //!
 //! Parameters:
 //! - `a ∈ R_{q_kahe}^μ` — public vector.
-//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 15.72).
-//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 15.72).
+//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 6.80).
+//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 6.80).
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
 use crate::rings::boxed_i64_coeffs;
-use crate::rings::{center_half_open_i64, center_i64};
+use crate::rings::{center_half_open_i64, center_i64, MU_MAX};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
@@ -200,8 +200,8 @@ pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
     KahePoly::from_signed_coeffs(&coeffs)
 }
 
-/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 15.72,
-/// `‖·‖_∞ ≤ 8σ_s ≈ 126`) into a `CsPoly` by centered-rep re-interpretation.
+/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 6.80,
+/// `‖·‖_∞ ≤ ⌈8σ_s⌉ = 55`) into a `CsPoly` by centered-rep re-interpretation.
 /// Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client side to feed Shamir
 /// sharing, which operates over `R_{q_cs}`.
 pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
@@ -230,6 +230,10 @@ impl Kahe {
         t_modulus: u64,
     ) -> KaheParams {
         assert!(mu_kahe >= 1, "μ_kahe must be ≥ 1");
+        assert!(
+            mu_kahe <= MU_MAX,
+            "μ_kahe must be ≤ {MU_MAX}, the widest ciphertext q is chosen for"
+        );
         assert!(t_modulus >= 2, "t_modulus must be ≥ 2");
         // Sample directly NTT-resident — uniform-in-NTT slot is statistically
         // equivalent to NTT(uniform coeff poly) and saves `μ` forward NTTs.
@@ -315,10 +319,15 @@ impl Kahe {
     }
 }
 
-pub const SIGMA_S_DEFAULT: f64 = 15.72;
-pub const SIGMA_E_DEFAULT: f64 = 15.72;
-/// Largest power of two satisfying `t·(8σ_e·√ρ + ρ/2) < q_kahe/2` at ρ = 300.
-pub const T_MODULUS_DEFAULT: u64 = 1 << 35;
+pub const SIGMA_S_DEFAULT: f64 = 6.80;
+pub const SIGMA_E_DEFAULT: f64 = 6.80;
+/// Plaintext modulus of the reference parameter set: the smallest prime above
+/// `2^34` with `t ≡ 1 mod 2^20`, shared by both multiset encodings. The paper
+/// needs `t` prime and above the capacity, since the peeling counters and
+/// Newton's identities both live in `Z_t`; the congruence gives `Z_t` NTTs up
+/// to length `2^20`. Messages are chunked into `⌊log₂ t⌋ = 34` bits per
+/// coordinate.
+pub const T_MODULUS_DEFAULT: u64 = 17_183_014_913;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -327,7 +336,7 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=15.72, `t = 2^35` at q_kahe ≈ 2^48.
+    /// `μ = 1`, σ_s=σ_e=6.80, `t = 17183014913` at q_kahe ≈ 2^46.0.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
         Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
     }
@@ -524,6 +533,19 @@ mod tests {
         assert_eq!(c.len(), pp.mu_kahe);
         let agg = Kahe::agg_key(std::slice::from_ref(&k));
         assert_eq!(Kahe::dec(&pp, &c, &agg), m);
+    }
+
+    #[test]
+    #[should_panic(expected = "μ_kahe must be ≤")]
+    fn setup_rejects_mu_above_max() {
+        let mut rng = ChaCha20Rng::from_seed([14u8; 32]);
+        Kahe::setup_with_dims(
+            &mut rng,
+            MU_MAX + 1,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            T_MODULUS_DEFAULT,
+        );
     }
 
     /// A message shorter than `μ` is legal — the trailing positions are unused.

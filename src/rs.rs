@@ -1,11 +1,16 @@
-//! Systematic Reed–Solomon for sharding ingress ciphertexts. It codes the two
-//! KAHE prime channels independently and keeps every polynomial in NTT form.
+//! Systematic Reed–Solomon for sharding ingress ciphertexts, over the KAHE
+//! ring's prime modulus. Every polynomial stays in NTT form.
 
-use crate::rings::KAHE_RNS_MODULI;
-use crate::{RsNTTPoly, N};
+use crate::{RsNTTPoly, KAHE_MODULUS, N};
 use rayon::prelude::*;
 
 use crate::bulletin::rs_poly_packed_len;
+
+const Q: u64 = KAHE_MODULUS as u64;
+
+/// Bytes per NTT-domain coefficient on the wire.
+pub(crate) const RS_COEFF_BYTES: usize = 6;
+const _: () = assert!(Q < 1 << (8 * RS_COEFF_BYTES));
 
 pub type Share = Vec<RsNTTPoly>;
 
@@ -13,13 +18,10 @@ pub type Share = Vec<RsNTTPoly>;
 /// per poly.
 pub fn pack_share(share: &[RsNTTPoly], out: &mut Vec<u8>) {
     out.reserve(share.len() * rs_poly_packed_len());
-    for limb in 0..2 {
-        for p in share {
-            for &c in &p.residues()[limb] {
-                debug_assert!(c < KAHE_RNS_MODULI[limb]);
-                let bytes = c.to_le_bytes();
-                out.extend_from_slice(&bytes[..3]);
-            }
+    for p in share {
+        for &c in p.coeffs() {
+            debug_assert!(c < Q);
+            out.extend_from_slice(&c.to_le_bytes()[..RS_COEFF_BYTES]);
         }
     }
 }
@@ -29,24 +31,17 @@ pub fn unpack_share(bytes: &[u8], n_polys: usize) -> Option<Share> {
     if bytes.len() != n_polys.checked_mul(rs_poly_packed_len())? {
         return None;
     }
-    let mut polys = vec![[[0u32; N]; 2]; n_polys];
-    let (chunks, rest) = bytes.as_chunks::<3>();
-    let mut chunks = chunks.iter();
-    for limb in 0..2 {
-        for poly in &mut polys {
-            for c in &mut poly[limb] {
-                let b = chunks.next()?;
-                *c = u32::from_le_bytes([b[0], b[1], b[2], 0]);
-                if *c >= KAHE_RNS_MODULI[limb] {
-                    return None;
-                }
-            }
+    let mut out = Vec::with_capacity(n_polys);
+    for chunk in bytes.chunks_exact(rs_poly_packed_len()) {
+        let mut coeffs = [0u64; N];
+        for (c, b) in coeffs.iter_mut().zip(chunk.as_chunks::<RS_COEFF_BYTES>().0) {
+            let mut word = [0u8; 8];
+            word[..RS_COEFF_BYTES].copy_from_slice(b);
+            *c = u64::from_le_bytes(word);
         }
+        out.push(RsNTTPoly::from_canonical(coeffs)?);
     }
-    if !rest.is_empty() {
-        return None;
-    }
-    polys.into_iter().map(RsNTTPoly::from_residues).collect()
+    Some(out)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,10 +64,7 @@ impl RsParams {
     pub fn new(k: usize, n: usize) -> Self {
         assert!(k >= 1, "k must be ≥ 1");
         assert!(n >= k, "n must be ≥ k");
-        assert!(
-            n < KAHE_RNS_MODULI.into_iter().min().unwrap() as usize,
-            "points 1..=n must be distinct in every RNS channel"
-        );
+        assert!((n as u64) < Q, "points 1..=n must be distinct mod q");
         Self { k, n }
     }
 
@@ -82,63 +74,105 @@ impl RsParams {
     }
 }
 
-fn pow_channel(base: u32, mut exp: u32, q: u32) -> u32 {
-    let mut acc = 1u64;
-    let mut b = base as u64;
-    while exp > 0 {
-        if exp & 1 == 1 {
-            acc = acc * b % q as u64;
-        }
-        b = b * b % q as u64;
-        exp >>= 1;
-    }
-    acc as u32
+#[inline]
+fn mul_q(a: u64, b: u64) -> u64 {
+    ((a as u128 * b as u128) % Q as u128) as u64
 }
 
-fn lagrange_at(xs: &[u32], x: u32) -> Vec<[u32; 2]> {
-    xs.iter()
-        .enumerate()
-        .map(|(i, &xi)| {
-            core::array::from_fn(|limb| {
-                let q = KAHE_RNS_MODULI[limb];
-                let mut num = 1u64;
-                let mut den = 1u64;
-                for (j, &xj) in xs.iter().enumerate() {
-                    if j == i {
-                        continue;
-                    }
-                    num = num * ((x + q - xj) % q) as u64 % q as u64;
-                    den = den * ((xi + q - xj) % q) as u64 % q as u64;
+#[inline]
+fn sub_q(a: u64, b: u64) -> u64 {
+    if a >= b {
+        a - b
+    } else {
+        a + Q - b
+    }
+}
+
+fn pow_q(base: u64, mut exp: u64) -> u64 {
+    let mut acc = 1u64;
+    let mut b = base % Q;
+    while exp > 0 {
+        if exp & 1 == 1 {
+            acc = mul_q(acc, b);
+        }
+        b = mul_q(b, b);
+        exp >>= 1;
+    }
+    acc
+}
+
+/// `q` is prime, so Fermat gives the inverse.
+#[inline]
+fn inv_q(x: u64) -> u64 {
+    debug_assert!(!x.is_multiple_of(Q), "inverse of zero");
+    pow_q(x, Q - 2)
+}
+
+/// Shoup precomputation `⌊w·2^64/q⌋`, valid because `q < 2^62`.
+#[inline]
+fn shoup_precomp(w: u64) -> u64 {
+    (((w as u128) << 64) / Q as u128) as u64
+}
+
+/// `x·w mod q` given `w_shoup = ⌊w·2^64/q⌋`, for `x, w < q`.
+#[inline(always)]
+fn shoup_mul(x: u64, w: u64, w_shoup: u64) -> u64 {
+    let q_hat = ((x as u128 * w_shoup as u128) >> 64) as u64;
+    let r = x.wrapping_mul(w).wrapping_sub(q_hat.wrapping_mul(Q));
+    if r >= Q {
+        r - Q
+    } else {
+        r
+    }
+}
+
+/// Lagrange basis for the points `xs`, evaluated at `x`.
+fn lagrange_at(xs: &[u64], x: u64) -> Vec<u64> {
+    (0..xs.len())
+        .map(|i| {
+            let mut num = 1u64;
+            let mut den = 1u64;
+            for (j, &xj) in xs.iter().enumerate() {
+                if j == i {
+                    continue;
                 }
-                let inv = pow_channel(den as u32, q - 2, q);
-                (num * inv as u64 % q as u64) as u32
-            })
+                num = mul_q(num, sub_q(x, xj));
+                den = mul_q(den, sub_q(xs[i], xj));
+            }
+            mul_q(num, inv_q(den))
         })
         .collect()
 }
 
-fn combine(blocks: &[&[RsNTTPoly]], coefs: &[[u32; 2]], block_len: usize) -> Vec<RsNTTPoly> {
+/// `Σ_b coefs[b] · blocks[b]`, positionally over `block_len` polys. Inputs are
+/// canonical in `[0, q)`, so this is a bare Shoup multiply-accumulate and
+/// `acc + p < 2q < 2^63` never overflows.
+fn combine(blocks: &[&[RsNTTPoly]], coefs: &[u64], block_len: usize) -> Vec<RsNTTPoly> {
+    let shoup: Vec<u64> = coefs.iter().map(|&w| shoup_precomp(w)).collect();
     (0..block_len)
         .into_par_iter()
         .map(|pos| {
-            let mut out = [[0u32; N]; 2];
-            for limb in 0..2 {
-                let q = KAHE_RNS_MODULI[limb] as u64;
-                for (block, coef) in blocks.iter().zip(coefs) {
-                    let w = coef[limb] as u64;
-                    let src = &block[pos].residues()[limb];
-                    for i in 0..N {
-                        out[limb][i] = ((out[limb][i] as u64 + src[i] as u64 * w) % q) as u32;
-                    }
+            let mut acc = [0u64; N];
+            for (b, blk) in blocks.iter().enumerate() {
+                let w = coefs[b];
+                if w == 0 {
+                    continue;
+                }
+                let ws = shoup[b];
+                let src = blk[pos].coeffs();
+                for i in 0..N {
+                    let s = acc[i] + shoup_mul(src[i], w, ws);
+                    acc[i] = if s >= Q { s - Q } else { s };
                 }
             }
-            RsNTTPoly::from_residues(out).unwrap()
+            // Each step reduces back under q, so the sum stays canonical.
+            RsNTTPoly::from_canonical(acc).expect("combine keeps coefficients canonical")
         })
         .collect()
 }
 
-fn data_points(k: usize) -> Vec<u32> {
-    (1..=k as u32).collect()
+fn data_points(k: usize) -> Vec<u64> {
+    (1..=k as u64).collect()
 }
 
 pub struct Rs;
@@ -169,7 +203,7 @@ impl Rs {
             .map(|j| {
                 combine(
                     &refs,
-                    &lagrange_at(&data_points(params.k), (j + 1) as _),
+                    &lagrange_at(&data_points(params.k), (j + 1) as u64),
                     bl,
                 )
             })
@@ -208,10 +242,10 @@ impl Rs {
         let mut flat: Vec<RsNTTPoly> = if used.iter().enumerate().all(|(b, (idx, _))| *idx == b) {
             used.iter().flat_map(|(_, s)| s.iter().copied()).collect()
         } else {
-            let xs: Vec<u32> = used.iter().map(|(idx, _)| (*idx + 1) as u32).collect();
+            let xs: Vec<u64> = used.iter().map(|(idx, _)| (*idx + 1) as u64).collect();
             let shares: Vec<&[RsNTTPoly]> = used.iter().map(|(_, s)| *s).collect();
             (0..k)
-                .flat_map(|b| combine(&shares, &lagrange_at(&xs, (b + 1) as _), bl))
+                .flat_map(|b| combine(&shares, &lagrange_at(&xs, (b + 1) as u64), bl))
                 .collect()
         };
         flat.truncate(ctxt_len);
@@ -330,7 +364,7 @@ mod tests {
         let share = rand_ctxt(&mut rng, 1);
         let mut bytes = Vec::new();
         pack_share(&share, &mut bytes);
-        bytes[..3].copy_from_slice(&KAHE_RNS_MODULI[0].to_le_bytes()[..3]);
+        bytes[..RS_COEFF_BYTES].copy_from_slice(&Q.to_le_bytes()[..RS_COEFF_BYTES]);
         assert!(unpack_share(&bytes, 1).is_none());
     }
 

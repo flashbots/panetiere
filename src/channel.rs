@@ -5,26 +5,23 @@ use rand::{CryptoRng, Rng};
 use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
 use sha3::Shake256;
 
+use crate::chunking;
+use crate::iblt_shape::iblt_shape;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{self, MseEncoding, MseError, MseParams};
 use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::{ProtocolParams, SessionId};
+use crate::rings::RHO_MAX;
 
-/// Bytes packed into one symbol, little-endian.
-pub const BYTES_PER_SYMBOL: usize = 4;
+/// Message bits packed into one symbol: `⌊log₂ t⌋`, so every chunk is a
+/// distinct residue of the plaintext modulus both encodings share.
+pub const BITS_PER_CHUNK: usize = mse::BITS_PER_SYMBOL;
 
-/// A symbol must not fill its `Z_t` cell — the slack is the mod-`t` summation
-/// headroom. Breaks the build if `t` is ever lowered under the packing.
-const _: () = assert!(BYTES_PER_SYMBOL * 8 < mse::BITS_PER_SYMBOL);
-/// Prony needs every packed symbol to be a distinct residue mod `p`.
-const _: () = assert!((1u64 << (BYTES_PER_SYMBOL * 8)) < PRONY_PRIME);
+const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PRONY_PRIME);
 
-/// Rows in the peeling structure. 2 is the correctness floor; 4 is the usual
-/// operating point.
-const GAMMA: usize = 4;
-
-/// Buckets per insertion, across all rows.
-const BUCKETS_PER_INSERT: usize = 3;
+/// The paper's `ε_MSE`: a round's encoding fails to decode with probability at
+/// most `2^-EPS_MSE`.
+const EPS_MSE: u32 = 40;
 
 /// The paper's statistical security target for nonce collisions.
 const SECURITY_BITS: usize = 128;
@@ -84,23 +81,57 @@ pub struct ChannelParams {
 }
 
 impl ChannelParams {
-    /// Peeling channel for up to `rho` inserted payloads of `message_bytes` each.
-    pub fn for_messages(rho: u32, message_bytes: usize, prf_key: [u8; 32]) -> Self {
-        Self::for_symbols(rho, payload_symbols(message_bytes), prf_key)
+    /// Peeling channel for up to `capacity` inserted payloads of
+    /// `message_bytes` each, with a freshly sampled PRF key. For whoever sets
+    /// up the session. The capacity is the most senders in one round; with
+    /// cover traffic that is fewer than the number of clients.
+    pub fn for_messages<R: CryptoRng + Rng>(
+        rng: &mut R,
+        capacity: u32,
+        message_bytes: usize,
+    ) -> Self {
+        Self::for_symbols(rng, capacity, payload_symbols(message_bytes))
     }
 
-    /// Peeling channel for up to `rho` payloads of `payload_symbols` symbols
-    /// each. For channels whose payload is already `Z_t` values rather than
-    /// bytes — the byte packing of [`encode_message`] does not apply to those.
-    pub fn for_symbols(rho: u32, payload_symbols: usize, prf_key: [u8; 32]) -> Self {
-        let rho = rho.max(1) as usize;
-        let nonce_symbols = nonce_symbols(rho, mse::BITS_PER_SYMBOL);
-        let delta = (BUCKETS_PER_INSERT * rho).div_ceil(GAMMA);
+    /// [`Self::for_messages`] under a PRF key received from the session's
+    /// setup, for the other parties of that session.
+    pub fn for_messages_with_key(
+        capacity: u32,
+        message_bytes: usize,
+        prf_key: [u8; mse::PRF_KEY_BYTES],
+    ) -> Self {
+        Self::for_symbols_with_key(capacity, payload_symbols(message_bytes), prf_key)
+    }
+
+    /// Peeling channel for up to `capacity` payloads of `payload_symbols`
+    /// symbols each, with a freshly sampled PRF key. For channels whose
+    /// payload is already `Z_t` values rather than bytes — the byte packing of
+    /// [`encode_message`] does not apply to those.
+    pub fn for_symbols<R: CryptoRng + Rng>(
+        rng: &mut R,
+        capacity: u32,
+        payload_symbols: usize,
+    ) -> Self {
+        let mut prf_key = [0u8; mse::PRF_KEY_BYTES];
+        rng.fill(&mut prf_key);
+        Self::for_symbols_with_key(capacity, payload_symbols, prf_key)
+    }
+
+    /// [`Self::for_symbols`] under a PRF key received from the session's
+    /// setup, for the other parties of that session.
+    pub fn for_symbols_with_key(
+        capacity: u32,
+        payload_symbols: usize,
+        prf_key: [u8; mse::PRF_KEY_BYTES],
+    ) -> Self {
+        let capacity = capacity.max(1) as usize;
+        let nonce_symbols = nonce_symbols(mse::BITS_PER_SYMBOL);
+        let (theta, delta) = iblt_shape(capacity, EPS_MSE);
         Self {
-            encoding: Encoding::Mse(MseParams::new(
-                GAMMA,
+            encoding: Encoding::Mse(MseParams::with_key(
+                theta,
                 delta,
-                rho,
+                capacity,
                 nonce_symbols + payload_symbols.max(1),
                 prf_key,
             )),
@@ -108,23 +139,32 @@ impl ChannelParams {
         }
     }
 
-    /// Sketch channel for up to `rho` payloads of `message_bytes` each.
-    pub fn prony_for_messages(rho: u32, message_bytes: usize) -> Self {
-        Self::prony_for_symbols(rho, payload_symbols(message_bytes))
+    /// The PRF key of a peeling channel, to send to the session's other
+    /// parties. `None` for a sketch channel, which has no key.
+    pub fn prf_key(&self) -> Option<[u8; mse::PRF_KEY_BYTES]> {
+        self.mse().map(|p| p.prf_key)
+    }
+
+    /// Sketch channel for up to `capacity` payloads of `message_bytes` each.
+    pub fn prony_for_messages(capacity: u32, message_bytes: usize) -> Self {
+        Self::prony_for_symbols(capacity, payload_symbols(message_bytes))
     }
 
     /// Sketch channel carrying `payload_bits` per element, sized at the
     /// sketch's own symbol width rather than the peeling structure's.
-    pub fn prony_for_bits(rho: u32, payload_bits: usize) -> Self {
-        Self::prony_for_symbols(rho, payload_bits.div_ceil(PRONY_PRIME.ilog2() as usize))
+    pub fn prony_for_bits(capacity: u32, payload_bits: usize) -> Self {
+        Self::prony_for_symbols(
+            capacity,
+            payload_bits.div_ceil(PRONY_PRIME.ilog2() as usize),
+        )
     }
 
-    pub fn prony_for_symbols(rho: u32, payload_symbols: usize) -> Self {
-        let rho = rho.max(1) as usize;
-        let nonce_symbols = nonce_symbols(rho, PRONY_PRIME.ilog2() as usize);
+    pub fn prony_for_symbols(capacity: u32, payload_symbols: usize) -> Self {
+        let capacity = capacity.max(1) as usize;
+        let nonce_symbols = nonce_symbols(PRONY_PRIME.ilog2() as usize);
         Self {
             encoding: Encoding::Prony(PronyParams::new(
-                rho,
+                capacity,
                 nonce_symbols + payload_symbols.max(1),
             )),
             nonce_symbols,
@@ -166,7 +206,7 @@ impl ChannelParams {
     }
 
     /// Payload bits one symbol carries: `⌊log₂ t⌋` in the peeling structure's
-    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — both are 35.
+    /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — the same `t`.
     pub fn bits_per_symbol(&self) -> usize {
         match &self.encoding {
             Encoding::Mse(_) => mse::BITS_PER_SYMBOL,
@@ -184,7 +224,7 @@ impl ChannelParams {
 
     /// Largest payload [`encode_message`] accepts.
     pub fn max_payload_bytes(&self) -> usize {
-        (self.payload_symbols() - LENGTH_HEADER_SYMBOLS) * BYTES_PER_SYMBOL
+        (self.payload_symbols() - LENGTH_HEADER_SYMBOLS) * BITS_PER_CHUNK / 8
     }
 
     /// Protocol parameters whose KAHE width is exactly one packed encoding.
@@ -202,8 +242,10 @@ impl ChannelParams {
 
 /// Nonce symbols so that `ρ(Q + ρ) / |N| ≤ 2^-SECURITY_BITS`, with `Q`
 /// the attacker's random oracle queries and `|N| = 2^(bits_per_symbol · k)`.
-fn nonce_symbols(rho: usize, bits_per_symbol: usize) -> usize {
-    let rho = rho as u128;
+/// `ρ` is the most clients a round can have, not the channel's capacity, so
+/// the nonce length is the same for every channel.
+fn nonce_symbols(bits_per_symbol: usize) -> usize {
+    let rho = u128::from(RHO_MAX);
     let numerator = rho * ((1u128 << ORACLE_QUERY_BITS) + rho);
     let numerator_bits = (u128::BITS - (numerator - 1).leading_zeros()) as usize;
     (SECURITY_BITS + numerator_bits).div_ceil(bits_per_symbol)
@@ -232,30 +274,29 @@ fn random_oracle(sid: &SessionId, nonce: &[i64], len: usize, bits_per_symbol: us
 }
 
 fn payload_symbols(message_bytes: usize) -> usize {
-    LENGTH_HEADER_SYMBOLS + message_bytes.div_ceil(BYTES_PER_SYMBOL)
+    LENGTH_HEADER_SYMBOLS + (message_bytes * 8).div_ceil(BITS_PER_CHUNK)
 }
 
-/// The byte length, then the bytes zero-padded to `xi - 1` symbols.
+/// The byte length, then the bytes chunked into `xi - 1` symbols.
 fn bytes_to_symbols(payload: &[u8], xi: usize) -> Vec<i64> {
-    let mut buf = (payload.len() as u32).to_le_bytes().to_vec();
-    buf.extend_from_slice(payload);
-    buf.resize(xi * BYTES_PER_SYMBOL, 0);
-    buf.chunks(BYTES_PER_SYMBOL)
-        .map(|c| u32::from_le_bytes(c.try_into().expect("chunk is BYTES_PER_SYMBOL")) as i64)
-        .collect()
+    let mut symbols = vec![payload.len() as i64];
+    symbols.extend(
+        chunking::pack(payload, BITS_PER_CHUNK, xi - LENGTH_HEADER_SYMBOLS)
+            .into_iter()
+            .map(|s| s as i64),
+    );
+    symbols
 }
 
 fn symbols_to_bytes(symbols: &[i64]) -> Result<Vec<u8>, ChannelError> {
     let (header, body) = symbols.split_at(LENGTH_HEADER_SYMBOLS);
-    let claimed = header[0] as u32;
-    let max = body.len() * BYTES_PER_SYMBOL;
+    let claimed = u32::try_from(header[0]).unwrap_or(u32::MAX);
+    let max = body.len() * BITS_PER_CHUNK / 8;
     if claimed as usize > max {
         return Err(ChannelError::BadLength { claimed, max });
     }
-    let mut out = Vec::with_capacity(max);
-    for &s in body {
-        out.extend_from_slice(&(s as u32).to_le_bytes());
-    }
+    let canonical: Vec<u64> = body.iter().map(|&s| s as u64).collect();
+    let mut out = chunking::unpack(&canonical, BITS_PER_CHUNK, max);
     out.truncate(claimed as usize);
     Ok(out)
 }
@@ -398,10 +439,27 @@ mod tests {
 
     /// Both encodings, same sizing, so every test below runs twice.
     fn variants(rho: u32, bytes: usize) -> Vec<ChannelParams> {
+        let mut rng = ChaCha20Rng::from_seed([0x5C; 32]);
         vec![
-            ChannelParams::for_messages(rho, bytes, [0x5C; 32]),
+            ChannelParams::for_messages(&mut rng, rho, bytes),
             ChannelParams::prony_for_messages(rho, bytes),
         ]
+    }
+
+    /// A party that receives the setup's key rebuilds the identical channel,
+    /// so its bucket positions agree with everyone else's.
+    #[test]
+    fn receiver_rebuilds_channel_from_key() {
+        let mut rng = ChaCha20Rng::from_seed([0x3A; 32]);
+        let setup = ChannelParams::for_messages(&mut rng, 8, 64);
+        let key = setup.prf_key().expect("peeling channel has a key");
+        assert_eq!(ChannelParams::for_messages_with_key(8, 64, key), setup);
+
+        let setup = ChannelParams::for_symbols(&mut rng, 8, 3);
+        let key = setup.prf_key().expect("peeling channel has a key");
+        assert_eq!(ChannelParams::for_symbols_with_key(8, 3, key), setup);
+
+        assert_eq!(ChannelParams::prony_for_messages(8, 64).prf_key(), None);
     }
 
     /// Sum `n` contributions positionally, as the protocol's aggregation does.
@@ -419,7 +477,7 @@ mod tests {
     fn round_trip_at_capacity() {
         for p in variants(8, 64) {
             let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
-            assert_eq!(p.max_payload_bytes(), 64);
+            assert!(p.max_payload_bytes() >= 64);
 
             let payloads: Vec<Vec<u8>> = (0..8u8)
                 .map(|i| {
@@ -527,21 +585,19 @@ mod tests {
         }
     }
 
-    /// The symbol path carries the channel's full `bits_per_symbol`, so values
-    /// above the `BYTES_PER_SYMBOL` byte packing round-trip through it.
+    /// The symbol path carries the channel's full `bits_per_symbol`, so the
+    /// top of the chunk range round-trips through it.
     #[test]
     fn wide_symbols_round_trip() {
         // rho=8 for 4 inserts: this test is about symbol width, and the peel
         // stalls on ~8% of seeds when delta is sized exactly to rho.
+        let mut key_rng = ChaCha20Rng::from_seed([0x77; 32]);
         for p in [
-            ChannelParams::for_symbols(8, 3, [0x77; 32]),
+            ChannelParams::for_symbols(&mut key_rng, 8, 3),
             ChannelParams::prony_for_symbols(4, 3),
         ] {
             let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
-            // Quarter of the channel's own plaintext modulus, so the value stays
-            // inside `[-t/2, t/2)` whatever `t` the feature set selects.
-            let wide = (p.plaintext_modulus() as i64 / 4) + 12_345;
-            assert!(wide > (1 << (BYTES_PER_SYMBOL * 8)));
+            let wide = (1i64 << BITS_PER_CHUNK) - 12_345;
             let payloads: Vec<Vec<i64>> = (0..4)
                 .map(|i| vec![wide - i, i + 1, wide / (i + 2)])
                 .collect();
@@ -564,20 +620,20 @@ mod tests {
     fn prony_for_bits_sizes_at_the_sketch_width() {
         let bits = 911 * mse::BITS_PER_SYMBOL;
         let p = ChannelParams::prony_for_bits(300, bits);
-        assert_eq!(p.bits_per_symbol(), 35);
-        assert_eq!(p.payload_symbols(), bits.div_ceil(35));
+        assert_eq!(p.bits_per_symbol(), mse::BITS_PER_SYMBOL);
+        assert_eq!(p.payload_symbols(), bits.div_ceil(mse::BITS_PER_SYMBOL));
         assert!(p.payload_symbols() * p.bits_per_symbol() >= bits);
     }
 
-    /// 300 clients need about 201 bits of nonce, which is six 35-bit symbols,
-    /// and the count stays six far beyond any realistic ρ.
+    /// 300 clients need about 201 bits of nonce, which is six 34-bit symbols:
+    /// the reference parameter set's nonce length.
     #[test]
     fn nonce_sized_for_the_security_target() {
-        assert_eq!(nonce_symbols(300, 35), 6);
-        assert_eq!(nonce_symbols(1, 35), 6);
-        assert_eq!(nonce_symbols(1 << 17, 35), 6);
-        assert_eq!(nonce_symbols(1 << 19, 35), 7);
-        assert_eq!(nonce_symbols(300, 32), 7);
+        assert_eq!(mse::BITS_PER_SYMBOL, 34);
+        assert_eq!(nonce_symbols(34), 6);
+        assert_eq!(nonce_symbols(33), 7);
+        assert_eq!(nonce_symbols(201), 1);
+        assert_eq!(nonce_symbols(200), 2);
     }
 
     #[test]
@@ -647,11 +703,12 @@ mod tests {
     fn wrong_session_does_not_unmask() {
         for p in variants(4, 16) {
             let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
-            let plain = encode_symbols(&mut rng, &p, &SID, &[5, 6, 7, 8, 9]).unwrap();
+            let symbols: Vec<i64> = (0..p.payload_symbols() as i64).map(|i| i + 5).collect();
+            let plain = encode_symbols(&mut rng, &p, &SID, &symbols).unwrap();
             let other = SessionId([0x22; 32]);
             assert_ne!(
                 decode_symbols(&p, &other, &plain, Some(1)).unwrap(),
-                vec![vec![5, 6, 7, 8, 9]],
+                vec![symbols],
                 "{p:?}"
             );
         }
@@ -685,10 +742,16 @@ mod tests {
     fn overlong_length_header_rejected() {
         for p in variants(4, 8) {
             let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-            let plain = encode_symbols(&mut rng, &p, &SID, &[9, 0, 0]).unwrap();
+            let max = p.max_payload_bytes();
+            let mut symbols = vec![0i64; p.payload_symbols()];
+            symbols[0] = max as i64 + 1;
+            let plain = encode_symbols(&mut rng, &p, &SID, &symbols).unwrap();
             assert_eq!(
                 decode_messages(&p, &SID, &plain, Some(1)),
-                Err(ChannelError::BadLength { claimed: 9, max: 8 })
+                Err(ChannelError::BadLength {
+                    claimed: max as u32 + 1,
+                    max
+                })
             );
         }
     }
