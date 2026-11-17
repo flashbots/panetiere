@@ -67,9 +67,9 @@
 //!                actually buys at that (ρ, μ). It falls with √ρ and with
 //!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
 //!  src/mse.rs:   BITS_PER_SYMBOL = 34, K_LIMBS = 2
-//!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
-//!                  over (S, ρ, active, ξ, flow, message_bytes), so cells never
-//!                  share a stream
+//!  bench-internal: per-cell ChaCha20 seed = SHA-256 over (S, ρ, active, ξ,
+//!                  flow, message_bytes), so cells never share a stream; the
+//!                  MSE PRF key is drawn from that stream
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
 //!  asserted per cell: agg_open + agg_share == CsParams::aggregated_server_crypto_len
 //!
@@ -1029,15 +1029,15 @@ fn run_cell(
     let sched = flow == "sched";
 
     // Channel sized to active (cover adds nothing). `mse` inserts the ξ-element;
-    // `prony` re-derives ξ so its element carries the same bytes at 35 rather
-    // than 36 bits per symbol; `sched` inserts a (rand,size) reservation
+    // `prony` re-derives ξ from the same payload bits, which both encodings
+    // carry at 34 bits per symbol; `sched` inserts a (rand,size) reservation
     // token and appends a message vector to the same plaintext.
     let ch = match flow {
-        "mse" => ChannelParams::for_symbols(active as u32, cfg.payload_symbols, [0xAA; 32]),
+        "mse" => ChannelParams::for_symbols(&mut rng, active as u32, cfg.payload_symbols),
         "prony" => {
             ChannelParams::prony_for_bits(active as u32, cfg.payload_symbols * BITS_PER_SYMBOL)
         }
-        "sched" => ChannelParams::for_symbols(active as u32, SCHED_TOKEN_SYMBOLS, [0xAA; 32]),
+        "sched" => ChannelParams::for_symbols(&mut rng, active as u32, SCHED_TOKEN_SYMBOLS),
         other => panic!("unknown flow {other:?}"),
     };
     let ch_polys = ch.n_polys();
