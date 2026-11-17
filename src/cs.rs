@@ -1071,13 +1071,14 @@ fn unpack_bits(
         "unpack_bits: width {bits} outside 1..=32"
     );
     let offset = bound as i64;
-    unpack_fields(input, start_byte, values, bound as u64, bits, |u| {
-        (u as i64 - offset) as i32
+    unpack_fields(input, start_byte, values, bound as u64, bits, |v, u| {
+        *v = (u as i64 - offset) as i32
     })
 }
 
 /// Shared body of [`unpack_bits`] and [`unpack_bits64`]: decodes each field
-/// `u` of up to 56 bits, checks `u <= 2 * bound` and stores `convert(u)`.
+/// `u` of up to 56 bits, checks `u <= 2 * bound` and hands `u` to `apply`
+/// with its slot in `values`, which stores it there or adds it in.
 ///
 /// Every field is read with one unaligned 8-byte little-endian load at its
 /// byte, shifted down by its bit offset and masked; a field of up to 56 bits
@@ -1092,7 +1093,7 @@ fn unpack_fields<T>(
     values: &mut [T],
     bound: u64,
     bits: u32,
-    convert: impl Fn(u64) -> T,
+    apply: impl Fn(&mut T, u64),
 ) -> Option<usize> {
     let end = start_byte + (values.len() * bits as usize).div_ceil(8);
     assert!(end <= input.len(), "input ends before the last value");
@@ -1103,7 +1104,7 @@ fn unpack_fields<T>(
         ((room * 8 + 7) / bits as usize + 1).min(values.len())
     });
     let (head, tail) = values.split_at_mut(direct);
-    let mut in_range = decode_fields(bytes, 0, head, bound, bits, &convert);
+    let mut in_range = decode_fields(bytes, 0, head, bound, bits, &apply);
     if !tail.is_empty() {
         let first = direct * bits as usize;
         // The rest of `input` from the first such field: at most 7 bytes, and
@@ -1111,13 +1112,13 @@ fn unpack_fields<T>(
         let rest = &bytes[first / 8..];
         let mut padded = [0u8; 16];
         padded[..rest.len()].copy_from_slice(rest);
-        in_range &= decode_fields(&padded, first % 8, tail, bound, bits, &convert);
+        in_range &= decode_fields(&padded, first % 8, tail, bound, bits, &apply);
     }
     in_range.then_some(end)
 }
 
 /// Decode `values.len()` fields of `bits` bits from `bytes`, the first at bit
-/// `bit0`, into `convert(u)`. Each field's 8-byte window must lie inside
+/// `bit0`, into `apply`. Each field's 8-byte window must lie inside
 /// `bytes`. Returns whether every field is at most `2 * bound`.
 #[inline(always)]
 fn decode_fields<T>(
@@ -1126,7 +1127,7 @@ fn decode_fields<T>(
     values: &mut [T],
     bound: u64,
     bits: u32,
-    convert: &impl Fn(u64) -> T,
+    apply: &impl Fn(&mut T, u64),
 ) -> bool {
     let mask = (1u64 << bits) - 1;
     let max_u = 2 * bound;
@@ -1136,7 +1137,7 @@ fn decode_fields<T>(
         let window: [u8; 8] = bytes[bit / 8..bit / 8 + 8].try_into().expect("8 bytes");
         let u = (u64::from_le_bytes(window) >> (bit % 8)) & mask;
         in_range &= u <= max_u;
-        *v = convert(u);
+        apply(v, u);
     }
     in_range
 }
@@ -1232,8 +1233,8 @@ fn unpack_bits64(
         "unpack_bits64: width {bits} outside 1..=56"
     );
     let offset = bound as i64;
-    unpack_fields(input, start_byte, values, bound, bits, |u| {
-        u as i64 - offset
+    unpack_fields(input, start_byte, values, bound, bits, |v, u| {
+        *v = u as i64 - offset
     })
 }
 
@@ -1254,6 +1255,28 @@ pub(crate) fn unpack_poly64(
     let mut coeffs = [0i64; POLY_N];
     let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound))?;
     Some((coeffs, next))
+}
+
+/// [`unpack_poly64`], but adding each coefficient into `acc` instead of
+/// returning the polynomial, so a sum of packed polynomials never holds them
+/// individually. `None` under the same condition as [`unpack_poly64`]; `acc`
+/// then already holds the sum including this polynomial's decoded values.
+pub(crate) fn add_unpacked_poly64(
+    input: &[u8],
+    start: usize,
+    modulus: i64,
+    acc: &mut [i64; POLY_N],
+) -> Option<usize> {
+    let bound = (modulus / 2) as u64;
+    let offset = bound as i64;
+    unpack_fields(
+        input,
+        start,
+        acc,
+        bound,
+        bits_for_signed64(bound),
+        |x, u| *x += u as i64 - offset,
+    )
 }
 
 /// Append one polynomial's coefficients to `out`, packed against an odd
@@ -1708,6 +1731,40 @@ mod tests {
     fn unpack_panics_on_short_input() {
         let mut values = [0i64; 4];
         unpack_bits64(&[0u8; 22], 0, &mut values, 1 << 44, 46);
+    }
+
+    /// Adding a packed polynomial into a sum gives the same sum as unpacking
+    /// it and adding the result, ends at the same byte, and rejects the same
+    /// non-canonical field.
+    #[test]
+    fn add_unpacked_matches_unpack_then_add() {
+        let mut rng = ChaCha20Rng::from_seed([109u8; 32]);
+        let q = KAHE_MODULUS;
+        let polys: Vec<[i64; POLY_N]> = (0..3)
+            .map(|_| core::array::from_fn(|_| rng.gen_range(-q..=q)))
+            .collect();
+        let mut bytes = vec![0xA5u8; 3];
+        for p in &polys {
+            pack_poly64(p, q, &mut bytes);
+        }
+        let (mut want, mut got) = ([0i64; POLY_N], [0i64; POLY_N]);
+        let (mut s1, mut s2) = (3, 3);
+        for _ in &polys {
+            let (p, next) = unpack_poly64(&bytes, s1, q).unwrap();
+            for (w, c) in want.iter_mut().zip(p) {
+                *w += c;
+            }
+            s1 = next;
+            s2 = add_unpacked_poly64(&bytes, s2, q, &mut got).unwrap();
+        }
+        assert_eq!(got, want);
+        assert_eq!((s1, s2), (bytes.len(), bytes.len()));
+
+        // A field holding q decodes to (q + 1) / 2 ≡ -(q - 1) / 2 and is rejected.
+        let bits = bits_for_signed64((q / 2) as u64);
+        set_field(&mut bytes, 3 * 8 + 7 * bits as usize, bits, q as u64);
+        assert!(unpack_poly64(&bytes, 3, q).is_none());
+        assert!(add_unpacked_poly64(&bytes, 3, q, &mut [0; POLY_N]).is_none());
     }
 
     #[test]
