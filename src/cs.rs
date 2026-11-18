@@ -1335,6 +1335,8 @@ pub enum OpeningDecodeError {
     BadHeader,
     /// `bytes` is shorter than the declared regions require.
     Truncated,
+    /// `bytes` is longer than the declared regions require.
+    TrailingBytes,
 }
 
 /// Upper bound on any single opening dimension; rejects adversarial headers
@@ -1405,8 +1407,12 @@ impl Opening {
         let total_bits = (kappa_cs * POLY_N) * r_bits as usize
             + (mu_cs * POLY_N) * s_bits as usize
             + (data_polys * POLY_N) * tree_bits as usize;
-        if p.bytes.len() < total_bits.div_ceil(8) {
+        let body_len = total_bits.div_ceil(8);
+        if p.bytes.len() < body_len {
             return Err(OpeningDecodeError::Truncated);
+        }
+        if p.bytes.len() > body_len {
+            return Err(OpeningDecodeError::TrailingBytes);
         }
 
         let mut rs: Vec<CsPoly> = vec![CsPoly::default(); kappa_cs + mu_cs];
@@ -1989,6 +1995,32 @@ mod tests {
                 assert_eq!(r0, r1);
             }
         }
+    }
+
+    /// A packed opening decodes only from exactly the body `pack` wrote: one
+    /// byte fewer or one byte more is rejected.
+    #[test]
+    fn unpack_requires_the_exact_body_length() {
+        let mut rng = ChaCha20Rng::from_seed([104u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_b, s_b, t_b);
+        assert!(Opening::from_packed(&packed).is_ok());
+
+        let mut short = packed.clone();
+        short.bytes.pop();
+        assert_eq!(
+            Opening::from_packed(&short).err(),
+            Some(OpeningDecodeError::Truncated)
+        );
+        let mut long = packed;
+        long.bytes.push(0);
+        assert_eq!(
+            Opening::from_packed(&long).err(),
+            Some(OpeningDecodeError::TrailingBytes)
+        );
     }
 
     #[test]
