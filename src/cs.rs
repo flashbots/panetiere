@@ -1055,27 +1055,29 @@ fn pack_bits<V: Borrow<i32>>(
 }
 
 /// Inverse of `pack_bits`. Reads `values.len()` signed integers each `bits`
-/// wide from `input` starting at `start_byte`; returns the next byte index.
-/// Panics if `input` ends before the last value.
+/// wide from `input` starting at `start_byte`; returns the next byte index,
+/// or `None` if a value lies outside `[-bound, bound]`, which `pack_bits`
+/// never writes. Either way, `values` holds every decoded value. Panics if
+/// `input` ends before the last value.
 fn unpack_bits(
     input: &[u8],
     start_byte: usize,
     values: &mut [i32],
     bound: u32,
     bits: u32,
-) -> usize {
+) -> Option<usize> {
     assert!(
         (1..=32).contains(&bits),
         "unpack_bits: width {bits} outside 1..=32"
     );
     let offset = bound as i64;
-    unpack_fields(input, start_byte, values, bits, |u| {
+    unpack_fields(input, start_byte, values, bound as u64, bits, |u| {
         (u as i64 - offset) as i32
     })
 }
 
 /// Shared body of [`unpack_bits`] and [`unpack_bits64`]: decodes each field
-/// `u` of up to 56 bits and stores `convert(u)`.
+/// `u` of up to 56 bits, checks `u <= 2 * bound` and stores `convert(u)`.
 ///
 /// Every field is read with one unaligned 8-byte little-endian load at its
 /// byte, shifted down by its bit offset and masked; a field of up to 56 bits
@@ -1088,9 +1090,10 @@ fn unpack_fields<T>(
     input: &[u8],
     start_byte: usize,
     values: &mut [T],
+    bound: u64,
     bits: u32,
     convert: impl Fn(u64) -> T,
-) -> usize {
+) -> Option<usize> {
     let end = start_byte + (values.len() * bits as usize).div_ceil(8);
     assert!(end <= input.len(), "input ends before the last value");
     let bytes = &input[start_byte..];
@@ -1100,7 +1103,7 @@ fn unpack_fields<T>(
         ((room * 8 + 7) / bits as usize + 1).min(values.len())
     });
     let (head, tail) = values.split_at_mut(direct);
-    decode_fields(bytes, 0, head, bits, &convert);
+    let mut in_range = decode_fields(bytes, 0, head, bound, bits, &convert);
     if !tail.is_empty() {
         let first = direct * bits as usize;
         // The rest of `input` from the first such field: at most 7 bytes, and
@@ -1108,29 +1111,34 @@ fn unpack_fields<T>(
         let rest = &bytes[first / 8..];
         let mut padded = [0u8; 16];
         padded[..rest.len()].copy_from_slice(rest);
-        decode_fields(&padded, first % 8, tail, bits, &convert);
+        in_range &= decode_fields(&padded, first % 8, tail, bound, bits, &convert);
     }
-    end
+    in_range.then_some(end)
 }
 
 /// Decode `values.len()` fields of `bits` bits from `bytes`, the first at bit
 /// `bit0`, into `convert(u)`. Each field's 8-byte window must lie inside
-/// `bytes`.
+/// `bytes`. Returns whether every field is at most `2 * bound`.
 #[inline(always)]
 fn decode_fields<T>(
     bytes: &[u8],
     bit0: usize,
     values: &mut [T],
+    bound: u64,
     bits: u32,
     convert: &impl Fn(u64) -> T,
-) {
+) -> bool {
     let mask = (1u64 << bits) - 1;
+    let max_u = 2 * bound;
+    let mut in_range = true;
     for (i, v) in values.iter_mut().enumerate() {
         let bit = bit0 + i * bits as usize;
         let window: [u8; 8] = bytes[bit / 8..bit / 8 + 8].try_into().expect("8 bytes");
         let u = (u64::from_le_bytes(window) >> (bit % 8)) & mask;
+        in_range &= u <= max_u;
         *v = convert(u);
     }
+    in_range
 }
 
 // Centered packing (`pack_poly`, `pack_poly64`, `poly_packed_len*`) is exact
@@ -1218,13 +1226,15 @@ fn unpack_bits64(
     values: &mut [i64],
     bound: u64,
     bits: u32,
-) -> usize {
+) -> Option<usize> {
     assert!(
         (1..=MAX_BITS64).contains(&bits),
         "unpack_bits64: width {bits} outside 1..=56"
     );
     let offset = bound as i64;
-    unpack_fields(input, start_byte, values, bits, |u| u as i64 - offset)
+    unpack_fields(input, start_byte, values, bound, bits, |u| {
+        u as i64 - offset
+    })
 }
 
 /// [`pack_poly`] for i64 coefficient arrays (KAHE ring).
@@ -1235,11 +1245,15 @@ pub(crate) fn pack_poly64(coeffs: &[i64], modulus: i64, out: &mut Vec<u8>) {
 }
 
 /// [`unpack_poly`] for i64 coefficient arrays (KAHE ring).
-pub(crate) fn unpack_poly64(input: &[u8], start: usize, modulus: i64) -> ([i64; POLY_N], usize) {
+pub(crate) fn unpack_poly64(
+    input: &[u8],
+    start: usize,
+    modulus: i64,
+) -> Option<([i64; POLY_N], usize)> {
     let bound = (modulus / 2) as u64;
     let mut coeffs = [0i64; POLY_N];
-    let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound));
-    (coeffs, next)
+    let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound))?;
+    Some((coeffs, next))
 }
 
 /// Append one polynomial's coefficients to `out`, packed against an odd
@@ -1255,12 +1269,18 @@ pub(crate) fn pack_poly(coeffs: &[i32], modulus: i32, out: &mut Vec<u8>) {
 }
 
 /// Inverse of [`pack_poly`]: read one polynomial's `N` coefficients starting at
-/// `start`, returning them (centered) and the next byte index.
-pub(crate) fn unpack_poly(input: &[u8], start: usize, modulus: i32) -> ([i32; POLY_N], usize) {
+/// `start`, returning them (centered) and the next byte index. `None` if a
+/// field holds a value above `modulus - 1`, i.e. a second encoding of a
+/// residue, so every polynomial has exactly one encoding.
+pub(crate) fn unpack_poly(
+    input: &[u8],
+    start: usize,
+    modulus: i32,
+) -> Option<([i32; POLY_N], usize)> {
     let bound = (modulus / 2) as u32;
     let mut coeffs = [0i32; POLY_N];
-    let next = unpack_bits(input, start, &mut coeffs, bound, bits_for_signed(bound));
-    (coeffs, next)
+    let next = unpack_bits(input, start, &mut coeffs, bound, bits_for_signed(bound))?;
+    Some((coeffs, next))
 }
 
 /// Wire size of a digit vector: `bits_for_signed(bound)` bits per coefficient,
@@ -1289,16 +1309,14 @@ pub(crate) fn unpack_digits(bytes: &[u8], n_polys: usize, bound: u32) -> Option<
         return None;
     }
     let mut flat = vec![0i32; n_polys * POLY_N];
-    unpack_bits(bytes, 0, &mut flat, bound, bits_for_signed(bound));
-    flat.as_chunks::<POLY_N>()
-        .0
-        .iter()
-        .map(|chunk| {
-            let p = HVCPoly::from_coeffs(*chunk);
-            // Offset decoding spans [−bound, −bound + 2^bits − 1].
-            (p.infinity_norm() <= bound).then_some(p)
-        })
-        .collect()
+    unpack_bits(bytes, 0, &mut flat, bound, bits_for_signed(bound))?;
+    Some(
+        flat.as_chunks::<POLY_N>()
+            .0
+            .iter()
+            .map(|chunk| HVCPoly::from_coeffs(*chunk))
+            .collect(),
+    )
 }
 
 impl Commitment {
@@ -1315,7 +1333,7 @@ impl Commitment {
         if bytes.len() != poly_packed_len(HVC_MODULUS) {
             return None;
         }
-        let (coeffs, _) = unpack_poly(bytes, 0, HVC_MODULUS);
+        let (coeffs, _) = unpack_poly(bytes, 0, HVC_MODULUS)?;
         Some(Commitment {
             root: HVCPoly::from_coeffs(coeffs),
         })
@@ -1341,7 +1359,7 @@ pub fn unpack_cs_shares(bytes: &[u8], count: usize) -> Option<Vec<CsPoly>> {
     let mut out = Vec::with_capacity(count);
     let mut start = 0;
     for _ in 0..count {
-        let (coeffs, next) = unpack_poly(bytes, start, CS_MODULUS);
+        let (coeffs, next) = unpack_poly(bytes, start, CS_MODULUS)?;
         start = next;
         out.push(CsPoly::from_coeffs(coeffs));
     }
@@ -1424,6 +1442,8 @@ pub enum OpeningDecodeError {
     Truncated,
     /// `bytes` is longer than the declared regions require.
     TrailingBytes,
+    /// A coefficient lies outside its region's bound, which `pack` never writes.
+    OutOfRange,
 }
 
 /// Upper bound on any single opening dimension; rejects adversarial headers
@@ -1514,12 +1534,14 @@ impl Opening {
         let mut tmp = [0i32; POLY_N];
         // Unpack r (CS)
         for poly in rs[..kappa_cs].iter_mut() {
-            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.r_bound, r_bits);
+            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.r_bound, r_bits)
+                .ok_or(OpeningDecodeError::OutOfRange)?;
             *poly = CsPoly::from_coeffs(tmp);
         }
         // Unpack s (CS)
         for poly in rs[kappa_cs..kappa_cs + mu_cs].iter_mut() {
-            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.s_bound, s_bits);
+            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.s_bound, s_bits)
+                .ok_or(OpeningDecodeError::OutOfRange)?;
             *poly = CsPoly::from_coeffs(tmp);
         }
         // Unpack leaf digits + path (HVC)
@@ -1530,7 +1552,8 @@ impl Opening {
                 poly.coeffs_mut(),
                 p.tree_bound,
                 tree_bits,
-            );
+            )
+            .ok_or(OpeningDecodeError::OutOfRange)?;
         }
         Ok(Opening {
             server_index: p.server_index as usize,
@@ -1650,7 +1673,9 @@ mod tests {
                     let len = start + (n * bits as usize).div_ceil(8);
                     let input: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
                     let bound = (1u64 << (bits - 1)) - 1;
-                    let (expected, expected_end) = unpack_reference(&input, start, n, bound, bits);
+                    let (expected, end) = unpack_reference(&input, start, n, bound, bits);
+                    // The decoders reject any value outside [-bound, bound].
+                    let expected_end = expected.iter().all(|&v| v <= bound as i64).then_some(end);
 
                     for trailing in [0usize, 1, 7, 8, 20] {
                         let mut buf = input.clone();
@@ -2155,7 +2180,7 @@ mod tests {
                 }
                 let mut out = Vec::new();
                 pack_poly(&coeffs, m, &mut out);
-                let (back, _) = unpack_poly(&out, 0, m);
+                let (back, _) = unpack_poly(&out, 0, m).unwrap();
                 for (&a, &b) in coeffs.iter().zip(&back) {
                     assert_eq!(a.rem_euclid(m), b.rem_euclid(m));
                     assert!(2 * b.abs() < m);
@@ -2173,7 +2198,7 @@ mod tests {
             }
             let mut out = Vec::new();
             pack_poly64(&coeffs, m, &mut out);
-            let (back, _) = unpack_poly64(&out, 0, m);
+            let (back, _) = unpack_poly64(&out, 0, m).unwrap();
             for (&a, &b) in coeffs.iter().zip(&back) {
                 assert_eq!(a.rem_euclid(m), b.rem_euclid(m));
                 assert!(2 * b.abs() < m);
@@ -2188,7 +2213,7 @@ mod tests {
             let bits = 32 - ((modulus - 1) as u32).leading_zeros();
             assert_eq!(out.len(), (POLY_N * bits as usize).div_ceil(8));
             assert_eq!(out.len(), poly_packed_len(modulus));
-            let (back, next) = unpack_poly(&out, 0, modulus);
+            let (back, next) = unpack_poly(&out, 0, modulus).unwrap();
             assert_eq!(next, out.len());
             for (&a, &b) in coeffs.iter().zip(&back) {
                 assert_eq!(a.rem_euclid(modulus), b.rem_euclid(modulus));
@@ -2202,7 +2227,7 @@ mod tests {
         let bits = 64 - ((KAHE_MODULUS - 1) as u64).leading_zeros();
         assert_eq!(out.len(), (POLY_N * bits as usize).div_ceil(8));
         assert_eq!(out.len(), poly_packed_len64(KAHE_MODULUS));
-        let (back, next) = unpack_poly64(&out, 0, KAHE_MODULUS);
+        let (back, next) = unpack_poly64(&out, 0, KAHE_MODULUS).unwrap();
         assert_eq!(next, out.len());
         for (&a, &b) in coeffs.iter().zip(&back) {
             assert_eq!(a.rem_euclid(KAHE_MODULUS), b.rem_euclid(KAHE_MODULUS));
@@ -2294,6 +2319,101 @@ mod tests {
                 Some(OpeningDecodeError::BadHeader)
             );
         }
+    }
+
+    /// Overwrite the `bits`-wide field at bit offset `at` of `bytes` with `u`.
+    fn set_field(bytes: &mut [u8], at: usize, bits: u32, u: u64) {
+        for k in 0..bits as usize {
+            let (byte, bit) = ((at + k) / 8, (at + k) % 8);
+            bytes[byte] = (bytes[byte] & !(1 << bit)) | ((((u >> k) & 1) as u8) << bit);
+        }
+    }
+
+    /// A field holding `u + m` instead of `u` decodes to the same residue, so
+    /// without a range check a polynomial would have several encodings. The
+    /// decoders accept the largest canonical value `m - 1` and reject `m`.
+    #[test]
+    fn unpack_poly_rejects_non_canonical_encodings() {
+        let mut rng = ChaCha20Rng::from_seed([107u8; 32]);
+        for m in [CS_MODULUS, HVC_MODULUS] {
+            let h = m / 2;
+            let bits = bits_for_signed(h as u32);
+            let mut coeffs: [i32; POLY_N] = std::array::from_fn(|_| rng.gen_range(-h..=h));
+            coeffs[5] = -h; // field value u = 0, whose second encoding is m
+            let mut good = Vec::new();
+            pack_poly(&coeffs, m, &mut good);
+            assert!(unpack_poly(&good, 0, m).is_some());
+
+            let mut largest = good.clone();
+            set_field(&mut largest, 5 * bits as usize, bits, (m - 1) as u64);
+            let (back, _) = unpack_poly(&largest, 0, m).expect("m - 1 is canonical");
+            assert_eq!(back[5], h);
+
+            let mut second = good.clone();
+            set_field(&mut second, 5 * bits as usize, bits, m as u64);
+            assert!(unpack_poly(&second, 0, m).is_none(), "m = {m}");
+        }
+        let (m, h) = (KAHE_MODULUS, KAHE_MODULUS / 2);
+        let bits = bits_for_signed64(h as u64);
+        let mut coeffs: [i64; POLY_N] = std::array::from_fn(|_| rng.gen_range(-h..=h));
+        coeffs[5] = -h;
+        let mut good = Vec::new();
+        pack_poly64(&coeffs, m, &mut good);
+        assert!(unpack_poly64(&good, 0, m).is_some());
+        let mut largest = good.clone();
+        set_field(&mut largest, 5 * bits as usize, bits, (m - 1) as u64);
+        assert_eq!(
+            unpack_poly64(&largest, 0, m).expect("m - 1 is canonical").0[5],
+            h
+        );
+        let mut second = good;
+        set_field(&mut second, 5 * bits as usize, bits, m as u64);
+        assert!(unpack_poly64(&second, 0, m).is_none());
+
+        // The public decoders pass the rejection on.
+        let comm = Commitment {
+            root: HVCPoly::from_coeffs(std::array::from_fn(|i| {
+                if i == 0 {
+                    -(HVC_MODULUS / 2)
+                } else {
+                    0
+                }
+            })),
+        };
+        let mut bytes = comm.to_bytes();
+        assert!(Commitment::from_bytes(&bytes).is_some());
+        set_field(
+            &mut bytes,
+            0,
+            bits_for_signed((HVC_MODULUS / 2) as u32),
+            HVC_MODULUS as u64,
+        );
+        assert!(Commitment::from_bytes(&bytes).is_none());
+    }
+
+    /// An opening's coefficients lie within the bounds in its header; a field
+    /// above `2 · bound` is rejected instead of decoded.
+    #[test]
+    fn unpack_rejects_opening_values_outside_the_header_bounds() {
+        let mut rng = ChaCha20Rng::from_seed([108u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_b, s_b, t_b);
+        assert!(Opening::from_packed(&packed).is_ok());
+        let r_bits = bits_for_signed(r_b);
+        let all_ones = (1u64 << r_bits) - 1;
+        assert!(
+            all_ones > 2 * r_b as u64,
+            "the field has room above 2 · r_bound"
+        );
+        let mut bad = packed;
+        set_field(&mut bad.bytes, 0, r_bits, all_ones);
+        assert_eq!(
+            Opening::from_packed(&bad).err(),
+            Some(OpeningDecodeError::OutOfRange)
+        );
     }
 
     #[test]
