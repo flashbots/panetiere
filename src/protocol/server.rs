@@ -57,9 +57,6 @@ pub enum ServerRoundError {
     /// The lane's aggregate does not open although every client's share does —
     /// the roster exceeds `ρ_max`, so the digit sums left the bound.
     AggregateOverCapacity,
-    /// Some client's opening disagrees with the others on shape or position, so
-    /// the set cannot be summed.
-    MalformedOpening,
     /// This client's opening does not open its own commitment at this server's
     /// position. The server posts nothing for the round, as in the paper, and
     /// the client is named so the round can be re-run without it.
@@ -264,8 +261,11 @@ pub fn run_server_round(
         }
     }
 
-    let agg_open = HidingMerkleCommitment::sum_openings(&opening_refs)
-        .ok_or(ServerRoundError::MalformedOpening)?;
+    // Every opening passed the shape and position checks above, so the sum
+    // cannot fail. An empty set gives the zero opening, as in the paper, where
+    // each server starts from d_i = 0 and posts it if I is empty.
+    let agg_open = HidingMerkleCommitment::sum_openings(cs, position, &opening_refs)
+        .expect("every opening passed the shape and position checks");
     let agg_share: CsPoly = agg_open.s()[0];
 
     Ok(ServerBulletinEntry {
@@ -381,6 +381,32 @@ mod tests {
             run_server_round(&cs, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(2)))
         );
+    }
+
+    /// An empty round posts the zero opening, as the paper's server does for
+    /// an empty I (d_i = 0), and that opening verifies against the empty sum
+    /// of commitments with the zero share.
+    #[test]
+    fn empty_round_posts_the_zero_opening() {
+        let mut rng = ChaCha20Rng::from_seed([84u8; 32]);
+        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let inbox = ServerInbox {
+            server_id: ServerId(POSITION),
+            items: Vec::new(),
+        };
+        let entry = run_server_round(&cs, &inbox, &[], &[]).expect("an empty round is valid");
+        assert!(entry.clients.is_empty());
+        assert_eq!(entry.agg_share, CsPoly::default());
+        assert_eq!(entry.agg_open.server_index, POSITION as usize);
+        let empty_sum = HidingMerkleCommitment::sum_commitment_refs(&[]);
+        assert!(HidingMerkleCommitment::verify(
+            &cs,
+            &empty_sum,
+            &entry.agg_open
+        ));
+        // but not against an actual commitment
+        let (comm, _) = commit_one(&mut rng, &cs);
+        assert!(!HidingMerkleCommitment::verify(&cs, &comm, &entry.agg_open));
     }
 
     /// More clients than one batch holds still verify, and a bad one is

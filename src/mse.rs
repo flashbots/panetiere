@@ -4,14 +4,15 @@
 //!   r ← Z_{t^L}                            (per-element randomness)
 //!   r_ℓ := (r / t^ℓ) mod t                 (ℓ ∈ [L])
 //!   for i ∈ [γ]:
-//!     j := PRF(prf_key, (i, r)) mod δ
+//!     j := AES-128_{prf_key}(i ‖ r) mod δ
 //!     C[i,j] += 1; K_ℓ[i,j] += r_ℓ
 //!     V_s[i,j] += x_s                      (s ∈ [ξ])
 //! ```
 
 use crate::{KahePoly, N};
-use rand::Rng;
-use sha2::{Digest, Sha256};
+use aes::cipher::{BlockEncrypt as _, KeyInit as _};
+use aes::Aes128;
+use rand::{CryptoRng, Rng};
 
 use crate::kahe::T_MODULUS_DEFAULT;
 
@@ -19,8 +20,26 @@ const T: i64 = T_MODULUS_DEFAULT as i64;
 const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
-/// Bits of payload carried per symbol.
-pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.trailing_zeros() as usize;
+/// Bits of payload carried per symbol: `⌊log₂ t⌋`.
+pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.ilog2() as usize;
+/// AES-128 key length for the position PRF.
+pub const PRF_KEY_BYTES: usize = 16;
+/// Bytes of the AES block that carry the row index; `r` takes the rest.
+const ROW_BYTES: usize = 4;
+/// `t^K_LIMBS`, the size of the randomness space. `t^2 ≈ 2^68`, so u128.
+const R_SPACE: u128 = {
+    let t = T_MODULUS_DEFAULT as u128;
+    let mut p: u128 = 1;
+    let mut i = 0;
+    while i < K_LIMBS {
+        p *= t;
+        i += 1;
+    }
+    p
+};
+/// Every `r` must fit the remainder of a single AES block, or distinct values
+/// of `r` would be truncated onto the same positions.
+const _: () = assert!(R_SPACE <= 1u128 << ((16 - ROW_BYTES) * 8));
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct MseParams {
@@ -31,17 +50,37 @@ pub struct MseParams {
     /// its work on a forged table.
     pub capacity: usize,
     pub payload_symbols: usize,
-    pub prf_key: [u8; 32],
+    /// AES-128 key for the bucket positions. Sampled uniformly at setup and
+    /// shared with every client and the recipient; it may be public but must
+    /// not be chosen by anyone.
+    pub prf_key: [u8; PRF_KEY_BYTES],
 }
 
 impl MseParams {
-    /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity` elements.
-    pub fn new(
+    /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity`
+    /// elements, with a freshly sampled PRF key. For whoever sets up the
+    /// session; the key then travels to the other parties with the rest of
+    /// the parameters.
+    pub fn new<R: CryptoRng + Rng>(
+        rng: &mut R,
         gamma: usize,
         delta: usize,
         capacity: usize,
         payload_symbols: usize,
-        prf_key: [u8; 32],
+    ) -> Self {
+        let mut prf_key = [0u8; PRF_KEY_BYTES];
+        rng.fill(&mut prf_key);
+        Self::with_key(gamma, delta, capacity, payload_symbols, prf_key)
+    }
+
+    /// Same layout under a PRF key received from the session's setup. Every
+    /// party must hold the same key or their bucket positions disagree.
+    pub fn with_key(
+        gamma: usize,
+        delta: usize,
+        capacity: usize,
+        payload_symbols: usize,
+        prf_key: [u8; PRF_KEY_BYTES],
     ) -> Self {
         assert!(gamma >= 2, "γ must be ≥ 2 (Theorem 3 needs γ ≥ 2)");
         assert!(delta >= 1, "δ must be ≥ 1");
@@ -76,14 +115,9 @@ impl MseParams {
         (1 + K_LIMBS + self.payload_symbols) * self.total_cells()
     }
 
-    /// `t^K_LIMBS`, the size of the randomness space. `t^2 = 2^72`, so u128.
+    /// `t^K_LIMBS`, the size of the randomness space.
     pub fn r_space(&self) -> u128 {
-        let t = T_MODULUS_DEFAULT as u128;
-        let mut p: u128 = 1;
-        for _ in 0..K_LIMBS {
-            p *= t;
-        }
-        p
+        R_SPACE
     }
 }
 
@@ -126,14 +160,21 @@ fn to_canonical(x: i64) -> u128 {
     x.rem_euclid(T) as u128
 }
 
-fn prf_bucket(key: &[u8; 32], row: usize, r: u128, delta: usize) -> usize {
-    let mut h = Sha256::new();
-    h.update(key);
-    h.update((row as u32).to_le_bytes());
-    h.update(r.to_le_bytes());
-    let digest = h.finalize();
-    let v = u64::from_le_bytes(digest[..8].try_into().unwrap());
-    (v % delta as u64) as usize
+/// The position PRF with its key schedule expanded once, so the `γ` lookups
+/// of an insertion or a peel share it.
+fn prf_cipher(key: &[u8; PRF_KEY_BYTES]) -> Aes128 {
+    Aes128::new(key.as_slice().into())
+}
+
+/// Bucket of the element with randomness `r` in `row`: AES-128 under the
+/// session key on the single block `row ‖ r`, reduced mod `δ`. The key is
+/// used for nothing else, so no domain separation is needed.
+fn prf_bucket(cipher: &Aes128, row: usize, r: u128, delta: usize) -> usize {
+    let mut block = [0u8; 16];
+    block[..ROW_BYTES].copy_from_slice(&(row as u32).to_le_bytes());
+    block[ROW_BYTES..].copy_from_slice(&r.to_le_bytes()[..16 - ROW_BYTES]);
+    cipher.encrypt_block((&mut block).into());
+    (u128::from_le_bytes(block) % delta as u128) as usize
 }
 
 impl MseEncoding {
@@ -176,8 +217,9 @@ impl MseEncoding {
             acc /= t;
         }
         let payload_reduced: Vec<i64> = payload.iter().map(|&x| reduce(x)).collect();
+        let cipher = prf_cipher(&self.params.prf_key);
         for row in 0..self.params.gamma {
-            let col = prf_bucket(&self.params.prf_key, row, r, self.params.delta);
+            let col = prf_bucket(&cipher, row, r, self.params.delta);
             let idx = self.idx(row, col);
             self.c[idx] = reduce(self.c[idx] + 1);
             for ell in 0..K_LIMBS {
@@ -223,6 +265,7 @@ impl MseEncoding {
         let mut limb_signed = [0i64; K_LIMBS];
         let mut x_star_buf = vec![0i64; self.params.payload_symbols];
         let t_u128 = T_MODULUS_DEFAULT as u128;
+        let cipher = prf_cipher(&self.params.prf_key);
         while let Some((row, col)) = queue.pop() {
             let idx = row * self.params.delta + col;
             if c[idx] != 1 {
@@ -241,15 +284,15 @@ impl MseEncoding {
             if emitted.len() >= self.params.capacity {
                 return Err(MseError::OverCapacity);
             }
-            if prf_bucket(&self.params.prf_key, row, r_star, self.params.delta) != col {
+            if prf_bucket(&cipher, row, r_star, self.params.delta) != col {
                 return Err(MseError::KeyMismatch);
             }
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
             }
-            emitted.push(x_star_buf.clone());
+            emitted.push(x_star_buf.iter().map(|&x| to_canonical(x) as i64).collect());
             for i in 0..self.params.gamma {
-                let j = prf_bucket(&self.params.prf_key, i, r_star, self.params.delta);
+                let j = prf_bucket(&cipher, i, r_star, self.params.delta);
                 let cell = i * self.params.delta + j;
                 c[cell] = reduce(c[cell] - 1);
                 for ell in 0..K_LIMBS {
@@ -354,7 +397,8 @@ mod tests {
     fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> MseParams {
         // sized the way `channel` does: γ·δ = 3ρ cells hold ρ elements
         let capacity = (gamma * delta).div_ceil(3);
-        MseParams::new(gamma, delta, capacity, payload_symbols, [seed; 32])
+        let mut rng = ChaCha20Rng::from_seed([seed; 32]);
+        MseParams::new(&mut rng, gamma, delta, capacity, payload_symbols)
     }
 
     /// An honest table with one element, whose cell keys are then moved so
@@ -380,12 +424,21 @@ mod tests {
     #[test]
     fn over_capacity_rejected() {
         let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let pp = MseParams::new(4, 64, 3, 1, [9; 32]);
+        let pp = MseParams::new(&mut rng, 4, 64, 3, 1);
         let mut enc = MseEncoding::new(pp);
         for x in [1, 2, 3, 4] {
             enc.insert(&mut rng, &[x]);
         }
         assert_eq!(enc.decode(), Err(MseError::OverCapacity));
+    }
+
+    /// Decoded symbols are canonical in `[0, t)`, whatever the input's sign.
+    #[test]
+    fn decoded_symbols_are_canonical() {
+        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let mut enc = MseEncoding::new(params_for(4, 16, 1, 9));
+        enc.insert(&mut rng, &[-1]);
+        assert_eq!(enc.decode(), Ok(vec![vec![T - 1]]));
     }
 
     #[test]
@@ -509,13 +562,13 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → 15 symbols at BITS_PER_SYMBOL=35 (t=2^35). Smaller
-    /// multiset but exercises the fat-payload code path end-to-end.
+    /// 512-bit message → `⌈512 / BITS_PER_SYMBOL⌉` symbols. Smaller multiset
+    /// but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = MseParams::payload_symbols_for_bits(512);
-        assert_eq!(xi, 15);
+        assert_eq!(xi, 512usize.div_ceil(BITS_PER_SYMBOL));
         let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..5)

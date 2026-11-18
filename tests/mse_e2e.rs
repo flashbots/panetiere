@@ -6,6 +6,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
+use panetiere::channel::ChannelParams;
 use panetiere::cs::Commitment;
 use panetiere::mse::{MseEncoding, MseParams};
 use panetiere::pke;
@@ -36,7 +37,7 @@ fn mse_recovers_through_panetiere() {
     let n_clients: usize = 6;
 
     // Pick γ = 4 (paper Theorem 3 sweet spot), δ = ⌈0.75·ρ⌉, ξ = 1.
-    let mse_params = MseParams::new(4, (3 * n_clients).div_ceil(4), n_clients, 1, [0xAA; 32]);
+    let mse_params = MseParams::new(&mut rng, 4, (3 * n_clients).div_ceil(4), n_clients, 1);
 
     // Each client picks a unique element x ∈ Z_q with small magnitude.
     let elements: Vec<i64> = (0..n_clients).map(|i| 1000 + i as i64).collect();
@@ -130,7 +131,7 @@ fn cover_clients_do_not_inflate_iblt() {
     let n_total = n_active + n_cover;
 
     // IBLT sized to the active count, not the anonymity set.
-    let mse_params = MseParams::new(4, (3 * n_active).div_ceil(4), n_active, 1, [0xAA; 32]);
+    let mse_params = MseParams::new(&mut rng, 4, (3 * n_active).div_ceil(4), n_active, 1);
 
     let elements: Vec<i64> = (0..n_active).map(|i| 1000 + i as i64).collect();
     let client_polys: Vec<Vec<KahePoly>> = (0..n_total)
@@ -213,14 +214,18 @@ fn cover_clients_do_not_inflate_iblt() {
 /// concurrent active clients plus cover, through the full protocol.
 #[test]
 fn multi_symbol_cover_through_panetiere() {
-    let mut rng = ChaCha20Rng::from_seed([0xC0u8; 32]);
+    let mut rng = ChaCha20Rng::from_seed([0xC1u8; 32]);
     let n_servers = 3;
     let n_active: usize = 4;
     let n_cover = 2;
     let n_total = n_active + n_cover;
-    let xi = 32usize;
 
-    let mse_params = MseParams::new(4, (3 * n_active).div_ceil(4), n_active, xi, [0xAA; 32]);
+    let mse_params = ChannelParams::for_symbols(&mut rng, n_active as u32, 32)
+        .mse()
+        .expect("peeling channel")
+        .clone();
+    // the channel's elements carry its nonce symbols ahead of the 32 payload ones
+    let xi = mse_params.payload_symbols;
 
     let payloads: Vec<Vec<i64>> = (0..n_active)
         .map(|i| {
@@ -244,7 +249,8 @@ fn multi_symbol_cover_through_panetiere() {
     let n_polys = MseEncoding::n_polys(&mse_params);
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
-    let pp = ProtocolParams::setup_with_kahe_dims(&mut rng, n_servers, n_polys);
+    // one poly per round below, as in the tests above
+    let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
         .map(|_| pke::PrivateKey::generate(&mut rng))
@@ -311,7 +317,7 @@ fn multi_symbol_cover_through_panetiere() {
 #[test]
 fn zero_payload_insert_is_not_cover() {
     let mut rng = ChaCha20Rng::from_seed([0x11u8; 32]);
-    let mse_params = MseParams::new(4, 16, 2, 1, [0xAA; 32]);
+    let mse_params = MseParams::new(&mut rng, 4, 16, 2, 1);
 
     let mut enc = MseEncoding::new(mse_params.clone());
     enc.insert(&mut rng, &[7]);

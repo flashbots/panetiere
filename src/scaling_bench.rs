@@ -5,9 +5,13 @@
 //! provenance-tagged tables (one row per cell) plus `scaling_sweep.csv`
 //! with every number including min/max spread:
 //!
-//!   [M] measured  — per-phase CPU, median of REPS one-party runs through the
-//!                   same APIs the protocol uses; plus wire sizes read off
-//!                   real packed bytes (sealed opening envelope, server entry)
+//!   [M] measured  — per-phase wall time, median of REPS one-party runs through
+//!                   the same APIs the protocol uses; per phase also the
+//!                   process CPU time (user+sys over all threads, median) and
+//!                   the peak heap growth (counting allocator: peak live bytes
+//!                   minus live bytes at phase start, max over reps); plus
+//!                   wire sizes read off real packed bytes (sealed opening
+//!                   envelope, server entry)
 //!   [D] derived   — exact byte arithmetic from packing formulas
 //!   [C] composed  — cost model `wall = fixed + payload` over [M] medians;
 //!                   one client → one server → verifier, summed as a serial
@@ -37,6 +41,9 @@
 //!           SWEEP_PAYLOAD_SYMBOLS  "2048,10240"       overrides CONFIGS ξ
 //!           SWEEP_SCHED_BYTES      "409600,2097152"   overrides SCHED_MESSAGE_BYTES
 //!                                  ("" = skip the scheduled section)
+//!           SWEEP_THRESHOLD        "majority" (default) = ⌊S/2⌋ + 1, or "S-K" =
+//!                                  max(⌊S/2⌋ + 1, S − K) ("S-2" was the
+//!                                  default before #21)
 //!           SWEEP_APPEND=1         append to the csv instead of overwriting
 //!                                  (dedup on the param columns, not `id`)
 //!           BENCH_BUDGET_SECS      default 300
@@ -45,26 +52,28 @@
 //! ──────────────────────────────────────────────────────────────────────
 //! DERIVED FROM INPUTS (computed per cell — not knobs)
 //! ──────────────────────────────────────────────────────────────────────
-//!  δ              = ⌈3·active/γ⌉ IBLT buckets per MSE row
+//!  θ × δ          = `iblt_shape(active, 40)`: smallest table under the
+//!                   paper's provable 2^-40 stopping-set bound
 //!  μ_kahe         = n_polys — one key covers the whole plaintext
 //!  total_cells    = γ · δ
-//!  Shamir threshold, κ_cs, β, β_agg, block_size — chosen by
+//!  Shamir threshold — from SWEEP_THRESHOLD (default: the honest-majority ⌊S/2⌋ + 1)
+//!  κ_cs, β, β_agg, block_size — chosen by
 //!  `ProtocolParams::setup_with_kahe_dims_full(s, μ_kahe, κ_kahe, …)`
 //!
 //! ──────────────────────────────────────────────────────────────────────
 //! CONSTANTS (pinned upstream — the sources are authoritative)
 //! ──────────────────────────────────────────────────────────────────────
-//!  src/rings.rs: N = 2048, q_cs = 139_301, q_kahe = 347_280_875_347_969
-//!  chipmunk param.rs: q_hvc = 40_961, HVC_WIDTH = 3
-//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 2^35, σ_s = σ_e = 15.72
+//!  src/rings.rs: N = 2048, q_cs = 150_413, q_kahe = 70_230_058_844_161
+//!  chipmunk param.rs: q_hvc = 557_057, HVC_WIDTH = 2
+//!  src/kahe.rs:  t = T_MODULUS_DEFAULT = 17_183_014_913, σ_s = σ_e = 6.80
 //!                correctness needs q ≥ tρ + tσ√(8ρ(ln2 − ln(1 − (1−2^−ε)^(1/nμ))))
 //!                — reported per cell as `eps`, the exponent that condition
 //!                actually buys at that (ρ, μ). It falls with √ρ and with
 //!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
-//!  src/mse.rs:   BITS_PER_SYMBOL = 36, K_LIMBS = 2
-//!  bench-internal: MSE PRF key = [0xAA; 32]; per-cell ChaCha20 seed = SHA-256
-//!                  over (S, ρ, active, ξ, flow, message_bytes), so cells never
-//!                  share a stream
+//!  src/mse.rs:   BITS_PER_SYMBOL = 34, K_LIMBS = 2
+//!  bench-internal: per-cell ChaCha20 seed = SHA-256 over (S, ρ, active, ξ,
+//!                  flow, message_bytes), so cells never share a stream; the
+//!                  MSE PRF key is drawn from that stream
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
 //!  asserted per cell: agg_open + agg_share == CsParams::aggregated_server_crypto_len
 //!
@@ -72,7 +81,9 @@
 //!   RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep
 //!   BENCH_BUDGET_SECS=600 cargo bench --bench protocol_sweep
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -80,7 +91,7 @@ use rayon::prelude::*;
 use crate::bulletin::rs_poly_packed_len;
 use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::channel::{self, ChannelParams};
-use crate::codec::{self, BYTES_PER_COEFF, BYTES_PER_POLY};
+use crate::codec::{self, BYTES_PER_POLY};
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
@@ -100,7 +111,7 @@ use crate::protocol::verify::{
     aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate,
     RsVerifyTimings, VerifyError, VerifyTimings,
 };
-use crate::protocol::ProtocolParams;
+use crate::protocol::{honest_majority_threshold, ProtocolParams};
 use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
 use crate::rs::Rs;
 use crate::share_commitment::{
@@ -149,8 +160,8 @@ const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
 /// Aggregation ceiling for the RNS share commitment.
 const RS_RHO_MAX: usize = 300;
 
-// Per-client element size = ξ symbols · 36 bits: 911 ⇒ 4 KiB, 3641 ⇒ 16 KiB.
-const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[911, 3641];
+// Per-client element size = ξ symbols · 34 bits: 964 ⇒ 4 KiB, 3856 ⇒ 16 KiB.
+const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[964, 3856];
 
 // ── env sweep knobs (fall back to the consts above) ─────────────────────────
 
@@ -163,6 +174,47 @@ fn env_list<T: std::str::FromStr>(key: &str) -> Option<Vec<T>> {
     match parsed {
         Ok(v) => Some(v),
         Err(_) => panic!("bad {key}: {raw:?}"),
+    }
+}
+
+/// Shamir threshold per server count `S`, from `SWEEP_THRESHOLD`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThresholdRule {
+    /// `⌊S/2⌋ + 1`: anonymity and output delivery against any corrupt minority.
+    HonestMajority,
+    /// `max(⌊S/2⌋ + 1, S − K)`: output delivery tolerates only `K` faulty
+    /// servers, anonymity up to `S − K − 1` corrupt ones.
+    AllBut(usize),
+}
+
+impl ThresholdRule {
+    fn from_env() -> Self {
+        match std::env::var("SWEEP_THRESHOLD") {
+            Err(_) => Self::HonestMajority,
+            Ok(raw) => Self::parse(&raw)
+                .unwrap_or_else(|| panic!("bad SWEEP_THRESHOLD {raw:?} (want majority or S-K)")),
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "" | "majority" => Some(Self::HonestMajority),
+            r => r.strip_prefix("S-")?.parse().ok().map(Self::AllBut),
+        }
+    }
+
+    fn threshold(self, s: usize) -> usize {
+        match self {
+            Self::HonestMajority => honest_majority_threshold(s),
+            Self::AllBut(k) => honest_majority_threshold(s).max(s.saturating_sub(k)),
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::HonestMajority => "⌊S/2⌋ + 1 (honest majority)".into(),
+            Self::AllBut(k) => format!("max(⌊S/2⌋ + 1, S − {k})"),
+        }
     }
 }
 
@@ -284,6 +336,13 @@ struct Stat {
     med: f64,
     min: f64,
     max: f64,
+    /// Process CPU time (user + system, all threads) per rep, median, µs.
+    /// Zero for phases timed inside the protocol rather than by `measure`.
+    cpu: f64,
+    /// Peak heap growth during a rep (peak live bytes − live bytes at start,
+    /// from [`CountingAlloc`]), max over reps, KiB. Zero where not measured or
+    /// when the binary does not install the counting allocator.
+    mem_kib: f64,
 }
 
 fn stat(mut v: Vec<f64>) -> Stat {
@@ -292,21 +351,153 @@ fn stat(mut v: Vec<f64>) -> Stat {
         med: v[v.len() / 2],
         min: v[0],
         max: *v.last().unwrap(),
+        cpu: 0.0,
+        mem_kib: 0.0,
     }
 }
 
+/// One instrumented run of a phase.
+#[derive(Clone, Copy)]
+struct Rep {
+    wall_us: f64,
+    cpu_us: f64,
+    mem_kib: f64,
+}
+
+/// Process CPU time (user + system over all threads), microseconds.
+#[cfg(unix)]
+fn cpu_time_us() -> f64 {
+    let mut ru = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    // SAFETY: `getrusage` only writes the struct it is handed; no pointer
+    // outlives the call.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+    if rc != 0 {
+        return 0.0;
+    }
+    // SAFETY: a zero return means the struct was fully written.
+    let ru = unsafe { ru.assume_init() };
+    (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) as f64 * 1e6
+        + (ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) as f64
+}
+
+/// Process CPU time is only measured on unix; elsewhere it reads as zero, like
+/// the other unavailable resource columns.
+#[cfg(not(unix))]
+fn cpu_time_us() -> f64 {
+    0.0
+}
+
+/// A `/proc/self/status` field in KiB (`VmRSS`, `VmHWM`), 0 where unavailable.
+fn proc_status_kib(key: &str) -> f64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/status") else {
+        return 0.0;
+    };
+    text.lines()
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(|rest| rest.trim_start_matches(':').split_whitespace().next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0.0)
+}
+
+/// Reset the peak-RSS watermark to the current RSS (Linux ≥ 4.0; a no-op
+/// elsewhere, where the cell peak then reports the lifetime peak).
+fn reset_peak_rss() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
+}
+
+/// Heap accounting for the bench binaries: live bytes and a resettable peak.
+/// Installed with `#[global_allocator]` by `protocol_sweep` and
+/// `panetiere_scaling`; without it the counters stay at zero and `mem_kib`
+/// reads as unmeasured. Counting bytes rather than resident pages is what
+/// makes per-phase numbers meaningful: after the first rep the allocator
+/// reuses freed pages, so RSS stops growing while the phase's working set
+/// does not shrink.
+pub struct CountingAlloc;
+
+static HEAP_LIVE: AtomicUsize = AtomicUsize::new(0);
+static HEAP_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: delegates every operation to `System` and only touches two atomics.
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let p = System.alloc(layout);
+        if !p.is_null() {
+            let live = HEAP_LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            HEAP_PEAK.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        HEAP_LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        System.dealloc(ptr, layout);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let p = System.realloc(ptr, layout, new_size);
+        if !p.is_null() {
+            let live = if new_size >= layout.size() {
+                HEAP_LIVE.fetch_add(new_size - layout.size(), Ordering::Relaxed) + new_size
+                    - layout.size()
+            } else {
+                HEAP_LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed) + new_size
+                    - layout.size()
+            };
+            HEAP_PEAK.fetch_max(live, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+fn heap_live() -> usize {
+    HEAP_LIVE.load(Ordering::Relaxed)
+}
+
+fn heap_reset_peak() -> usize {
+    let live = heap_live();
+    HEAP_PEAK.store(live, Ordering::Relaxed);
+    live
+}
+
+fn timed_rep<R>(f: impl FnOnce() -> R) -> (Rep, R) {
+    let live0 = heap_reset_peak();
+    let cpu0 = cpu_time_us();
+    let t = Instant::now();
+    let r = f();
+    let wall_us = t.elapsed().as_secs_f64() * 1e6;
+    let cpu_us = cpu_time_us() - cpu0;
+    let mem_kib = HEAP_PEAK.load(Ordering::Relaxed).saturating_sub(live0) as f64 / 1024.0;
+    (
+        Rep {
+            wall_us,
+            cpu_us,
+            mem_kib,
+        },
+        r,
+    )
+}
+
+fn stat_of_reps(reps: &[Rep]) -> Stat {
+    if reps.is_empty() {
+        return Stat::default();
+    }
+    let mut st = stat(reps.iter().map(|r| r.wall_us).collect());
+    st.cpu = stat(reps.iter().map(|r| r.cpu_us).collect()).med;
+    st.mem_kib = reps.iter().map(|r| r.mem_kib).fold(0.0, f64::max);
+    st
+}
+
 fn measure<R>(mut f: impl FnMut() -> R) -> (Stat, R) {
-    let mut times = Vec::with_capacity(REPS);
+    let mut reps = Vec::with_capacity(REPS);
     let mut out = None;
     for _ in 0..REPS {
-        let t = Instant::now();
-        let r = f();
-        times.push(t.elapsed().as_secs_f64() * 1e6);
+        let (rep, r) = timed_rep(&mut f);
+        reps.push(rep);
         // Assign after stopping the clock: dropping the previous rep's result
         // (a multi-MB ciphertext at large ξ) must not land inside the window.
         out = Some(r);
     }
-    (stat(times), out.unwrap())
+    (stat_of_reps(&reps), out.unwrap())
 }
 
 fn fmt_us(us: f64) -> String {
@@ -395,6 +586,8 @@ struct RsPlan {
 
 struct Row {
     s: usize,
+    /// Shamir threshold.
+    threshold: usize,
     n: usize, // ρ — total clients = anonymity set
     active: usize,
     cover: usize,
@@ -413,6 +606,11 @@ struct Row {
     threads: usize,
     affinity: String,
     recovered_ok: bool,
+    /// [M] highest resident set the process reached while running this cell,
+    /// KiB. The bench holds every party's state at once (all ρ clients' posts,
+    /// every lane's shares, the aggregation tree), so this is the harness's
+    /// footprint, an upper bound on any one role's.
+    peak_rss_kib: f64,
     // [M] CPU, per-round totals for one party.
     enc_app: Stat,
     kahe_keygen: Stat,
@@ -431,6 +629,10 @@ struct Row {
     /// One fresh opening against one commitment — the per-opening `VC.Vf` unit,
     /// as distinct from `v_open`, which times the S-way parallel verify.
     v_one_open: Stat,
+    /// The whole recipient verify-and-decrypt call (`v_agg_ctxt` … `v_kahe_dec`
+    /// are its internal splits, timed inside the protocol): the only place the
+    /// recipient's CPU time and working set are measured.
+    verify: Stat,
     // [M] wire: real ML-KEM-sealed opening envelope (client → one server).
     open_env_b: usize,
     // [D] wire components (bytes).
@@ -582,11 +784,26 @@ fn correctness_epsilon(rho: usize, mu: usize, t_modulus: u64) -> f64 {
 mod csv_tests {
     use super::*;
 
+    #[test]
+    fn threshold_rule_parses_and_applies() {
+        use ThresholdRule::{AllBut, HonestMajority};
+        assert_eq!(ThresholdRule::parse("majority"), Some(HonestMajority));
+        assert_eq!(ThresholdRule::parse(""), Some(HonestMajority));
+        assert_eq!(ThresholdRule::parse(" S-2 "), Some(AllBut(2)));
+        assert_eq!(ThresholdRule::parse("S-"), None);
+        assert_eq!(ThresholdRule::parse("14"), None);
+        let t = |rule: ThresholdRule| [4, 8, 16, 64].map(|s| rule.threshold(s));
+        assert_eq!(t(HonestMajority), [3, 5, 9, 33]);
+        // The rule before #21.
+        assert_eq!(t(AllBut(2)), [3, 6, 14, 62]);
+    }
+
     /// Every phase gets a distinct value so a swapped column shows up as a
     /// mismatch rather than passing by coincidence.
     fn sample_row() -> Row {
         let mut r = Row {
             s: 8,
+            threshold: 5,
             n: 300,
             active: 100,
             cover: 200,
@@ -601,6 +818,7 @@ mod csv_tests {
             threads: 8,
             affinity: "0-7".into(),
             recovered_ok: true,
+            peak_rss_kib: 0.0,
             enc_app: Stat::default(),
             kahe_keygen: Stat::default(),
             kahe_enc: Stat::default(),
@@ -616,6 +834,7 @@ mod csv_tests {
             v_kahe_dec: Stat::default(),
             dec_app: Stat::default(),
             v_one_open: Stat::default(),
+            verify: Stat::default(),
             open_env_b: 57862,
             comm_client_b: 4352,
             ctxt_client_b: 1715200,
@@ -670,6 +889,8 @@ mod csv_tests {
                     med: base,
                     min: base - 10.0,
                     max: base + 10.0,
+                    cpu: base * 4.0,
+                    mem_kib: base,
                 },
             );
         }
@@ -768,6 +989,45 @@ fn recipient_us(r: &Row) -> f64 {
         + r.dec_app.med
 }
 
+/// CPU-seconds per role, the same phase grouping as the wall totals. The
+/// recipient's verify splits are timed inside the protocol, so its CPU comes
+/// from the whole-call `verify` measurement instead.
+fn client_cpu_us(r: &Row) -> f64 {
+    r.enc_app.cpu + r.kahe_keygen.cpu + r.kahe_enc.cpu + r.share.cpu + r.cs.cpu + r.seal.cpu
+}
+
+fn server_cpu_us(r: &Row) -> f64 {
+    r.unseal.cpu + r.server.cpu
+}
+
+fn recipient_cpu_us(r: &Row) -> f64 {
+    r.verify.cpu + r.dec_app.cpu
+}
+
+/// Peak heap growth per role: the largest single phase, since phases run one
+/// after another and release their scratch in between.
+fn client_mem_kib(r: &Row) -> f64 {
+    [
+        &r.enc_app,
+        &r.kahe_keygen,
+        &r.kahe_enc,
+        &r.share,
+        &r.cs,
+        &r.seal,
+    ]
+    .iter()
+    .map(|s| s.mem_kib)
+    .fold(0.0, f64::max)
+}
+
+fn server_mem_kib(r: &Row) -> f64 {
+    r.unseal.mem_kib.max(r.server.mem_kib)
+}
+
+fn recipient_mem_kib(r: &Row) -> f64 {
+    r.verify.mem_kib.max(r.dec_app.mem_kib)
+}
+
 /// The S sealed openings, addressed to the servers. Depends on S alone — not on
 /// the message.
 fn client_to_server_b(r: &Row) -> usize {
@@ -825,20 +1085,21 @@ fn run_cell(
     roles: Roles,
 ) -> Row {
     let cover = n - active;
+    reset_peak_rss();
     let seed = cell_seed(s, n, active, cfg.payload_symbols, flow, message_bytes);
     let mut rng = ChaCha20Rng::from_seed(seed);
     let sched = flow == "sched";
 
     // Channel sized to active (cover adds nothing). `mse` inserts the ξ-element;
-    // `prony` re-derives ξ so its element carries the same bytes at 35 rather
-    // than 36 bits per symbol; `sched` inserts a (rand,size) reservation
+    // `prony` re-derives ξ from the same payload bits, which both encodings
+    // carry at 34 bits per symbol; `sched` inserts a (rand,size) reservation
     // token and appends a message vector to the same plaintext.
     let ch = match flow {
-        "mse" => ChannelParams::for_symbols(active as u32, cfg.payload_symbols, [0xAA; 32]),
+        "mse" => ChannelParams::for_symbols(&mut rng, active as u32, cfg.payload_symbols),
         "prony" => {
             ChannelParams::prony_for_bits(active as u32, cfg.payload_symbols * BITS_PER_SYMBOL)
         }
-        "sched" => ChannelParams::for_symbols(active as u32, SCHED_TOKEN_SYMBOLS, [0xAA; 32]),
+        "sched" => ChannelParams::for_symbols(&mut rng, active as u32, SCHED_TOKEN_SYMBOLS),
         other => panic!("unknown flow {other:?}"),
     };
     let ch_polys = ch.n_polys();
@@ -851,10 +1112,10 @@ fn run_cell(
             (p.cols(), p.cols())
         }
     };
-    // Slot alignment matches the codec's packing width, so `active` slots fill
-    // the vector exactly and `allocate` never rounds one past the end.
+    // Slots are byte-granular: chunks straddle bytes, but disjoint slots have
+    // disjoint bits, so the summed vector still decodes exactly.
     let slot_bytes = if sched {
-        (message_bytes / active.max(1)).next_multiple_of(BYTES_PER_COEFF)
+        (message_bytes / active.max(1)).max(1)
     } else {
         0
     };
@@ -865,6 +1126,7 @@ fn run_cell(
     let mu_kahe = n_polys;
     let t_modulus = ch.plaintext_modulus();
 
+    let threshold = ThresholdRule::from_env().threshold(s);
     let pp = ProtocolParams::setup_with_kahe_dims_full(
         &mut rng,
         s,
@@ -872,7 +1134,8 @@ fn run_cell(
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
         t_modulus,
-    );
+    )
+    .with_threshold(threshold);
     let server_ids: Vec<ServerId> = (0..s as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..s)
         .map(|_| pke::PrivateKey::generate(&mut rng))
@@ -1033,15 +1296,19 @@ fn run_cell(
     // Recovery is ATTEMPTED, not asserted: a decode to garbage still yields
     // timings; an Err on every rep leaves the verifier phases at zero.
     let mut vts: Vec<VerifyTimings> = Vec::with_capacity(REPS);
+    let mut verify_reps: Vec<Rep> = Vec::with_capacity(REPS);
     let mut recovered: Option<Vec<KahePoly>> = None;
     for _ in 0..REPS {
-        if let Ok((rec, vt)) =
+        let (rep, result) = timed_rep(|| {
             aggregate_and_decrypt_unverified_timed(&pp, &canonical, &client_entries, &outputs)
-        {
+        });
+        if let Ok((rec, vt)) = result {
             vts.push(vt);
+            verify_reps.push(rep);
             recovered = Some(rec);
         }
     }
+    let verify = stat_of_reps(&verify_reps);
     if vts.is_empty() {
         eprintln!("  verify errored on all {REPS} reps; verifier phases recorded as zero");
     }
@@ -1152,7 +1419,8 @@ fn run_cell(
             let mut rrng = ChaCha20Rng::from_seed(rs_seed(&seed, k, n_nodes));
             let pp_rs = ProtocolParams::setup_rs_mode(
                 &mut rrng, s, n_polys, k, n_nodes, t_modulus, RS_RHO_MAX, [0x42; 32],
-            );
+            )
+            .with_threshold(threshold);
             let rs_keys: Vec<pke::PrivateKey> = (0..s)
                 .map(|_| pke::PrivateKey::generate(&mut rrng))
                 .collect();
@@ -1368,6 +1636,7 @@ fn run_cell(
 
     Row {
         s,
+        threshold,
         n,
         active,
         cover,
@@ -1382,6 +1651,7 @@ fn run_cell(
         threads: rayon::current_num_threads(),
         affinity: affinity(),
         recovered_ok,
+        peak_rss_kib: proc_status_kib("VmHWM"),
         // Every phase is measured; only the ones this run owns are recorded, so a
         // split run and a whole run execute identical code.
         enc_app: owned(roles.client, enc_app),
@@ -1399,6 +1669,7 @@ fn run_cell(
         v_kahe_dec: owned(roles.verifier, v_kahe_dec),
         dec_app: owned(roles.verifier, dec_app),
         v_one_open: owned(roles.verifier, v_one_open),
+        verify: owned(roles.verifier, verify),
         open_env_b,
         comm_client_b,
         ctxt_client_b,
@@ -1668,14 +1939,15 @@ fn print_tables(rows: &[Row]) {
 
     println!("── cells ───────────────────────────────────────────────────────────────────");
     println!(
-        "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  recovered",
-        "id", "S", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "polys", "μ", "cells"
+        "{:<4}{:>4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  recovered",
+        "id", "S", "thr", "ρ", "act", "cov", "flow", "payload/cl", "δ", "ξ", "polys", "μ", "cells"
     );
     for (i, r) in rows.iter().enumerate() {
         println!(
-            "{:<4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  {}",
+            "{:<4}{:>4}{:>4}{:>6}{:>6}{:>6}  {:<6}{:>12}{:>6}{:>7}{:>8}{:>7}{:>7}  {}",
             cell_id(i),
             r.s,
+            r.threshold,
             r.n,
             r.active,
             r.cover,
@@ -1800,6 +2072,58 @@ fn print_tables(rows: &[Row]) {
             fmt_us(r.dec_app.med),
         );
     }
+    println!();
+
+    println!(
+        "── [M] resources — cpu-seconds (user+sys, all threads) and peak heap growth, one party each ──"
+    );
+    println!(
+        "{:4}{:─^32} {:─^32} {:─^32}",
+        "", " client ", " server ", " recipient "
+    );
+    println!(
+        "{:<4}{:>10}{:>9}{:>13} {:>10}{:>9}{:>13} {:>10}{:>9}{:>13}  {:>12}{:>14}",
+        "id",
+        "cpu",
+        "cpu/wall",
+        "mem",
+        "cpu",
+        "cpu/wall",
+        "mem",
+        "cpu",
+        "cpu/wall",
+        "mem",
+        "ρ·ctxt [D]",
+        "process peak"
+    );
+    let ratio = |cpu: f64, wall: f64| {
+        if wall > 0.0 {
+            format!("{:.2}x", cpu / wall)
+        } else {
+            "-".into()
+        }
+    };
+    for (i, r) in rows.iter().enumerate() {
+        println!(
+            "{:<4}{:>10}{:>9}{:>13} {:>10}{:>9}{:>13} {:>10}{:>9}{:>13}  {:>12}{:>14}",
+            cell_id(i),
+            fmt_us(client_cpu_us(r)),
+            ratio(client_cpu_us(r), client_us(r)),
+            fmt_bytes(client_mem_kib(r) * 1024.0),
+            fmt_us(server_cpu_us(r)),
+            ratio(server_cpu_us(r), server_us(r)),
+            fmt_bytes(server_mem_kib(r) * 1024.0),
+            fmt_us(recipient_cpu_us(r)),
+            ratio(recipient_cpu_us(r), r.verify.med + r.dec_app.med),
+            fmt_bytes(recipient_mem_kib(r) * 1024.0),
+            fmt_bytes(r.wire_ctxt_b),
+            fmt_bytes(r.peak_rss_kib * 1024.0),
+        );
+    }
+    println!(
+        "    (mem = largest per-phase heap growth; ρ·ctxt = what a recipient holds to sum the \
+         round; process peak = the whole harness, every party's state at once)"
+    );
     println!();
 
     println!("── [M] cpu — aggregated flow (per aggregator / leader) ──────────────────────");
@@ -2200,6 +2524,12 @@ const PHASES: &[PhaseCol] = &[
         set: |r, s| r.dec_app = s,
     },
     PhaseCol {
+        name: "verify_total",
+        owner: Owner::Verifier,
+        get: |r| r.verify,
+        set: |r, s| r.verify = s,
+    },
+    PhaseCol {
         name: "agg1_level",
         owner: Owner::Agg,
         get: |r| r.agg.agg_cpu,
@@ -2368,9 +2698,14 @@ fn write_csv(rows: &[Row]) {
     let phases = PHASES;
 
     let mut header = String::new();
-    header.push_str("id,s,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
+    header.push_str("id,s,threshold,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
     for p in phases {
-        write!(header, ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max", p.name).unwrap();
+        write!(
+            header,
+            ",m_{0}_us_med,m_{0}_us_min,m_{0}_us_max,m_{0}_cpu_us,m_{0}_mem_kib",
+            p.name
+        )
+        .unwrap();
     }
     header.push_str(
         ",m_open_env_b\
@@ -2380,6 +2715,8 @@ fn write_csv(rows: &[Row]) {
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
          ,d_rs_share_b,d_rs_path_b,d_rs_lane_post_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
          ,c_client_us,c_server_us,c_recipient_us\
+         ,c_client_cpu_us,c_server_cpu_us,c_recipient_cpu_us\
+         ,m_client_mem_kib,m_server_mem_kib,m_recipient_mem_kib,m_peak_rss_kib\
          ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
     );
     for prof in NETWORKS {
@@ -2397,7 +2734,7 @@ fn write_csv(rows: &[Row]) {
     let param_key = |line: &str| -> String {
         line.split(',')
             .skip(1)
-            .take(12)
+            .take(13)
             .collect::<Vec<_>>()
             .join(",")
     };
@@ -2407,9 +2744,10 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
+            r.threshold,
             r.n,
             r.active,
             r.cover,
@@ -2433,7 +2771,12 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
         for p in phases {
             let st = (p.get)(r);
-            write!(out, ",{:.3},{:.3},{:.3}", st.med, st.min, st.max).unwrap();
+            write!(
+                out,
+                ",{:.3},{:.3},{:.3},{:.3},{:.0}",
+                st.med, st.min, st.max, st.cpu, st.mem_kib
+            )
+            .unwrap();
         }
         write!(
             out,
@@ -2483,10 +2826,17 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
         write!(
             out,
-            ",{:.3},{:.3},{:.3}",
+            ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.0},{:.0},{:.0},{:.0}",
             client_us(r),
             server_us(r),
             recipient_us(r),
+            client_cpu_us(r),
+            server_cpu_us(r),
+            recipient_cpu_us(r),
+            client_mem_kib(r),
+            server_mem_kib(r),
+            recipient_mem_kib(r),
+            r.peak_rss_kib,
         )
         .unwrap();
         write!(
@@ -2587,11 +2937,20 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
     };
     let idx = |name: &str| -> Result<usize, String> { Ok(num(name)? as usize) };
     let flag = |name: &str| -> Result<bool, String> { Ok(at(name)? == "true") };
+    // Resource columns are newer than the timing ones; older sweeps read as zero.
+    let opt_num = |name: &str| -> Result<f64, String> {
+        match at(name) {
+            Ok(_) => num(name),
+            Err(_) => Ok(0.0),
+        }
+    };
     let stat = |name: &str| -> Result<Stat, String> {
         Ok(Stat {
             med: num(&format!("m_{name}_us_med"))?,
             min: num(&format!("m_{name}_us_min"))?,
             max: num(&format!("m_{name}_us_max"))?,
+            cpu: opt_num(&format!("m_{name}_cpu_us"))?,
+            mem_kib: opt_num(&format!("m_{name}_mem_kib"))?,
         })
     };
 
@@ -2652,6 +3011,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
 
     let mut row = Row {
         s: idx("s")?,
+        threshold: idx("threshold")?,
         n,
         active: idx("active")?,
         cover: idx("cover")?,
@@ -2666,6 +3026,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         threads: idx("m_threads")?,
         affinity: at("m_affinity")?.to_string(),
         recovered_ok: flag("recovered")?,
+        peak_rss_kib: opt_num("m_peak_rss_kib")?,
         enc_app: Stat::default(),
         kahe_keygen: Stat::default(),
         kahe_enc: Stat::default(),
@@ -2681,6 +3042,7 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         v_kahe_dec: Stat::default(),
         dec_app: Stat::default(),
         v_one_open: Stat::default(),
+        verify: Stat::default(),
         open_env_b: idx("m_open_env_b")?,
         comm_client_b: idx("d_comm_client_b")?,
         ctxt_client_b: idx("d_ctxt_client_b")?,
@@ -2703,7 +3065,15 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         if matches!(p.owner, Owner::Agg | Owner::Rs) {
             continue;
         }
-        (p.set)(&mut row, stat(p.name)?);
+        // `verify_total` is newer than the other phases; sweeps written before
+        // it have no such columns and read as zero, like the resource columns
+        let legacy = p.name == "verify_total" && at(&format!("m_{}_us_med", p.name)).is_err();
+        let s = if legacy {
+            Stat::default()
+        } else {
+            stat(p.name)?
+        };
+        (p.set)(&mut row, s);
     }
     Ok(row)
 }
@@ -2712,8 +3082,9 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
 /// a `host` row for the same cell match each other.
 fn cell_key(r: &Row) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{}",
         r.s,
+        r.threshold,
         r.n,
         r.active,
         r.cover,
@@ -2946,6 +3317,10 @@ pub fn run() {
     println!("            [D] derived    — exact byte arithmetic from packing formulas");
     println!("            [C] composed   — model wall = fixed + payload over [M] medians");
     println!("            [P] projected  — extrapolation / synthetic network sim");
+    println!(
+        "shamir threshold: {} (SWEEP_THRESHOLD)",
+        ThresholdRule::from_env().describe()
+    );
     println!("useful = delivered · ξ · log₂(t) bits/round (cover clients carry no payload, and");
     println!("         nor does a scheduled client whose reservation lost a rand collision)");
     println!();

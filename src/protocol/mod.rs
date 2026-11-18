@@ -7,7 +7,7 @@ pub mod verify;
 use crate::KahePoly;
 use rand::Rng;
 
-use crate::cs::{Cs, HidingMerkleCommitment};
+use crate::cs::{Cs, HidingMerkleCommitment, KAPPA_CS, MU_CS};
 use crate::kahe::{
     Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT,
 };
@@ -50,6 +50,19 @@ pub fn zero_message(pp: &ProtocolParams) -> Vec<KahePoly> {
     vec![KahePoly::default(); message_polys(pp)]
 }
 
+/// The Shamir threshold `⌊γ/2⌋ + 1` for `γ = n_servers`, under which both
+/// anonymity and guaranteed output delivery hold as long as the honest servers
+/// are a majority.
+///
+/// A threshold `t` gives anonymity against up to `t − 1` corrupt servers and
+/// guaranteed output delivery against up to `min(t − 1, γ − t)`. For
+/// `t = ⌊γ/2⌋ + 1` these are `⌊γ/2⌋` and `⌈γ/2⌉ − 1`, i.e. every corrupt
+/// minority. This is the threshold `t_s` of the paper. A larger `t` trades output
+/// delivery for anonymity; see [`ProtocolParams::with_threshold`].
+pub fn honest_majority_threshold(n_servers: usize) -> usize {
+    n_servers / 2 + 1
+}
+
 /// Bundle of public parameters carried through one protocol session.
 pub struct ProtocolParams {
     pub kahe: KaheParams,
@@ -64,10 +77,10 @@ pub struct ProtocolParams {
 }
 
 impl ProtocolParams {
-    /// Build params with `n_servers` servers and threshold `t = max(⌊n/2⌋ + 1, n − 2)`.
+    /// Build params with `n_servers` servers and the honest-majority threshold
+    /// ([`honest_majority_threshold`]).
     pub fn setup<R: Rng>(rng: &mut R, n_servers: usize) -> Self {
-        let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
-        Self::setup_with_threshold(rng, n_servers, t)
+        Self::setup_with_threshold(rng, n_servers, honest_majority_threshold(n_servers))
     }
 
     pub fn setup_with_threshold<R: Rng>(rng: &mut R, n_servers: usize, t: usize) -> Self {
@@ -104,7 +117,7 @@ impl ProtocolParams {
         sigma_e: f64,
         t_modulus: u64,
     ) -> Self {
-        let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
+        let t = honest_majority_threshold(n_servers);
         let kahe = Kahe::setup_with_dims(rng, mu_kahe, sigma_s, sigma_e, t_modulus);
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         let shamir = ShamirParams::new(t, n_servers);
@@ -121,6 +134,13 @@ impl ProtocolParams {
 }
 
 impl ProtocolParams {
+    /// Replace the Shamir threshold, keeping everything else. Every `setup*`
+    /// uses [`honest_majority_threshold`]; this sets any other `1 ≤ t ≤ n_servers`.
+    pub fn with_threshold(mut self, t: usize) -> Self {
+        self.shamir = ShamirParams::new(t, self.shamir.n);
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn setup_rs_mode<R: Rng>(
         rng: &mut R,
@@ -137,7 +157,7 @@ impl ProtocolParams {
             n_nodes >= n_servers,
             "every threshold server is also a lane; n_nodes ≥ n_servers"
         );
-        let t = (n_servers / 2 + 1).max(n_servers.saturating_sub(2));
+        let t = honest_majority_threshold(n_servers);
         let kahe = Kahe::setup_with_dims(
             rng,
             payload_polys,
@@ -193,17 +213,54 @@ pub fn round_wire_sizes(n_servers: usize, ctxt_polys: usize, rho: u32) -> RoundW
     }
 }
 
-/// One committed value per server: the Shamir share of the single KAHE key
-const MU_CS: usize = 1;
-
-/// BDLOP randomness width
-const KAPPA_CS: usize = 5;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
+
+    #[test]
+    fn every_setup_uses_the_honest_majority_threshold() {
+        let mut rng = ChaCha20Rng::from_seed([93; 32]);
+        for (gamma, t) in [
+            (1, 1),
+            (2, 2),
+            (3, 2),
+            (4, 3),
+            (7, 4),
+            (8, 5),
+            (16, 9),
+            (64, 33),
+        ] {
+            assert_eq!(honest_majority_threshold(gamma), t);
+        }
+        for gamma in [7, 8] {
+            let t = honest_majority_threshold(gamma);
+            assert_eq!(ProtocolParams::setup(&mut rng, gamma).shamir.t, t);
+            let pp = ProtocolParams::setup_with_kahe_dims_full(
+                &mut rng,
+                gamma,
+                1,
+                SIGMA_S_DEFAULT,
+                SIGMA_E_DEFAULT,
+                T_MODULUS_DEFAULT,
+            );
+            assert_eq!(pp.shamir.t, t);
+            let pp = ProtocolParams::setup_rs_mode(
+                &mut rng,
+                gamma,
+                1,
+                gamma - 2,
+                gamma,
+                T_MODULUS_DEFAULT,
+                300,
+                [94; 32],
+            );
+            assert_eq!(pp.shamir.t, t);
+            let pp = pp.with_threshold(gamma - 1);
+            assert_eq!((pp.shamir.t, pp.shamir.n), (gamma - 1, gamma));
+        }
+    }
 
     #[test]
     fn aggregate_capacity_tracks_parameter_bounds() {
@@ -224,7 +281,7 @@ mod tests {
             1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT * 4,
+            T_MODULUS_DEFAULT * 2,
         );
         assert!(pp.max_clients > 0 && pp.max_clients < 300);
         let budget = |rho: usize| {
