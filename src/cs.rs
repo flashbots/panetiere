@@ -1056,6 +1056,7 @@ fn pack_bits<V: Borrow<i32>>(
 
 /// Inverse of `pack_bits`. Reads `values.len()` signed integers each `bits`
 /// wide from `input` starting at `start_byte`; returns the next byte index.
+/// Panics if `input` ends before the last value.
 fn unpack_bits(
     input: &[u8],
     start_byte: usize,
@@ -1063,23 +1064,70 @@ fn unpack_bits(
     bound: u32,
     bits: u32,
 ) -> usize {
+    debug_assert!((1..=32).contains(&bits));
     let offset = bound as i64;
-    let mask: u64 = (1u64 << bits) - 1;
-    let mut acc: u64 = 0;
-    let mut acc_bits: u32 = 0;
-    let mut byte_idx = start_byte;
-    for v in values.iter_mut() {
-        while acc_bits < bits {
-            acc |= (input[byte_idx] as u64) << acc_bits;
-            byte_idx += 1;
-            acc_bits += 8;
-        }
-        let u = (acc & mask) as i64;
-        *v = (u - offset) as i32;
-        acc >>= bits;
-        acc_bits -= bits;
+    unpack_fields(input, start_byte, values, bits, |u| {
+        (u as i64 - offset) as i32
+    })
+}
+
+/// Shared body of [`unpack_bits`] and [`unpack_bits64`]: decodes each field
+/// `u` of up to 56 bits and stores `convert(u)`.
+///
+/// Every field is read with one unaligned 8-byte little-endian load at its
+/// byte, shifted down by its bit offset and masked; a field of up to 56 bits
+/// starting at bit `bit % 8 < 8` always fits in that word. The window may
+/// extend past `end` into whatever follows in `input`; those bits are masked
+/// off. Only fields whose window would run past the end of `input` itself
+/// read from a zero-padded copy of its last bytes.
+#[inline(always)]
+fn unpack_fields<T>(
+    input: &[u8],
+    start_byte: usize,
+    values: &mut [T],
+    bits: u32,
+    convert: impl Fn(u64) -> T,
+) -> usize {
+    let end = start_byte + (values.len() * bits as usize).div_ceil(8);
+    assert!(end <= input.len(), "input ends before the last value");
+    let bytes = &input[start_byte..];
+    // Fields whose whole window lies inside `bytes`: field i starts at byte
+    // ⌊i·bits/8⌋, which must be at most `bytes.len() - 8`.
+    let direct = bytes.len().checked_sub(8).map_or(0, |room| {
+        ((room * 8 + 7) / bits as usize + 1).min(values.len())
+    });
+    let (head, tail) = values.split_at_mut(direct);
+    decode_fields(bytes, 0, head, bits, &convert);
+    if !tail.is_empty() {
+        let first = direct * bits as usize;
+        // The rest of `input` from the first such field: at most 7 bytes, and
+        // every window then starts within the first 8 bytes of `padded`.
+        let rest = &bytes[first / 8..];
+        let mut padded = [0u8; 16];
+        padded[..rest.len()].copy_from_slice(rest);
+        decode_fields(&padded, first % 8, tail, bits, &convert);
     }
-    byte_idx
+    end
+}
+
+/// Decode `values.len()` fields of `bits` bits from `bytes`, the first at bit
+/// `bit0`, into `convert(u)`. Each field's 8-byte window must lie inside
+/// `bytes`.
+#[inline(always)]
+fn decode_fields<T>(
+    bytes: &[u8],
+    bit0: usize,
+    values: &mut [T],
+    bits: u32,
+    convert: &impl Fn(u64) -> T,
+) {
+    let mask = (1u64 << bits) - 1;
+    for (i, v) in values.iter_mut().enumerate() {
+        let bit = bit0 + i * bits as usize;
+        let window: [u8; 8] = bytes[bit / 8..bit / 8 + 8].try_into().expect("8 bytes");
+        let u = (u64::from_le_bytes(window) >> (bit % 8)) & mask;
+        *v = convert(u);
+    }
 }
 
 // Centered packing (`pack_poly`, `pack_poly64`, `poly_packed_len*`) is exact
@@ -1141,6 +1189,7 @@ fn pack_bits64<V: Borrow<i64>>(
     }
 }
 
+/// [`unpack_bits`] for `i64` values of up to 56 bits.
 fn unpack_bits64(
     input: &[u8],
     start_byte: usize,
@@ -1148,24 +1197,9 @@ fn unpack_bits64(
     bound: u64,
     bits: u32,
 ) -> usize {
+    debug_assert!((1..=56).contains(&bits));
     let offset = bound as i64;
-    let mask: u128 = (1u128 << bits) - 1;
-    // u128: acc_bits can reach bits-1+8 = 58 before draining, so byte shifts
-    // exceed the u64 range.
-    let mut acc: u128 = 0;
-    let mut acc_bits: u32 = 0;
-    let mut byte_idx = start_byte;
-    for v in values.iter_mut() {
-        while acc_bits < bits {
-            acc |= (input[byte_idx] as u128) << acc_bits;
-            byte_idx += 1;
-            acc_bits += 8;
-        }
-        *v = (acc & mask) as i64 - offset;
-        acc >>= bits;
-        acc_bits -= bits;
-    }
-    byte_idx
+    unpack_fields(input, start_byte, values, bits, |u| u as i64 - offset)
 }
 
 /// [`pack_poly`] for i64 coefficient arrays (KAHE ring).
@@ -1545,6 +1579,79 @@ mod tests {
 
     fn rand_shares<R: Rng>(rng: &mut R, n: usize, mu: usize) -> Vec<Vec<CsPoly>> {
         (0..n).map(|_| rand_share_vec(rng, mu)).collect()
+    }
+
+    /// The byte-at-a-time decoder `unpack_bits` and `unpack_bits64` used to
+    /// be, kept as the reference they must agree with.
+    fn unpack_reference(
+        input: &[u8],
+        start: usize,
+        n: usize,
+        bound: u64,
+        bits: u32,
+    ) -> (Vec<i64>, usize) {
+        let mut out = Vec::with_capacity(n);
+        let (mut acc, mut acc_bits, mut idx) = (0u128, 0u32, start);
+        for _ in 0..n {
+            while acc_bits < bits {
+                acc |= (input[idx] as u128) << acc_bits;
+                idx += 1;
+                acc_bits += 8;
+            }
+            out.push((acc & ((1u128 << bits) - 1)) as i64 - bound as i64);
+            acc >>= bits;
+            acc_bits -= bits;
+        }
+        (out, idx)
+    }
+
+    /// The word-at-a-time decoders agree with the byte-at-a-time reference at
+    /// every width, start offset and length: when the region ends exactly at
+    /// the end of the input, so its last values go through the zero-padded
+    /// copy, and when other bytes follow it, which the 8-byte windows read
+    /// into but must not affect the result.
+    #[test]
+    fn unpack_matches_the_bytewise_reference() {
+        let mut rng = ChaCha20Rng::from_seed([105u8; 32]);
+        for bits in [1u32, 7, 8, 9, 17, 31, 32, 33, 46, 47, 55, 56] {
+            for start in [0usize, 1, 3] {
+                for n in [0usize, 1, 7, 8, 9, 2048] {
+                    let len = start + (n * bits as usize).div_ceil(8);
+                    let input: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+                    let bound = (1u64 << (bits - 1)) - 1;
+                    let (expected, expected_end) = unpack_reference(&input, start, n, bound, bits);
+
+                    for trailing in [0usize, 1, 7, 8, 20] {
+                        let mut buf = input.clone();
+                        buf.extend((0..trailing).map(|_| rng.gen::<u8>()));
+                        let case = format!("bits={bits} start={start} n={n} trailing={trailing}");
+
+                        let mut got64 = vec![0i64; n];
+                        let end = unpack_bits64(&buf, start, &mut got64, bound, bits);
+                        assert_eq!((got64, end), (expected.clone(), expected_end), "64: {case}");
+
+                        if bits <= 32 {
+                            let mut got32 = vec![0i32; n];
+                            let end = unpack_bits(&buf, start, &mut got32, bound as u32, bits);
+                            let got32: Vec<i64> = got32.into_iter().map(i64::from).collect();
+                            assert_eq!(
+                                (got32, end),
+                                (expected.clone(), expected_end),
+                                "32: {case}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Input that ends before the last value panics before decoding.
+    #[test]
+    #[should_panic(expected = "input ends before the last value")]
+    fn unpack_panics_on_short_input() {
+        let mut values = [0i64; 4];
+        unpack_bits64(&[0u8; 22], 0, &mut values, 1 << 44, 46);
     }
 
     #[test]
