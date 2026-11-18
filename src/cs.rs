@@ -1025,7 +1025,7 @@ fn pack_bits<V: Borrow<i32>>(
     bound: u32,
     bits: u32,
 ) {
-    debug_assert!(bits <= 32);
+    assert!(bits <= 32, "u64 accumulator supports up to 32-bit values");
     let offset = bound as i64;
     let max_u: u64 = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
@@ -1064,7 +1064,10 @@ fn unpack_bits(
     bound: u32,
     bits: u32,
 ) -> usize {
-    debug_assert!((1..=32).contains(&bits));
+    assert!(
+        (1..=32).contains(&bits),
+        "unpack_bits: width {bits} outside 1..=32"
+    );
     let offset = bound as i64;
     unpack_fields(input, start_byte, values, bits, |u| {
         (u as i64 - offset) as i32
@@ -1147,10 +1150,26 @@ pub fn poly_packed_len(modulus: i32) -> usize {
 
 /// 64-bit variants for the KAHE ring.
 #[inline]
-fn bits_for_signed64(bound: u64) -> u32 {
+const fn bits_for_signed64(bound: u64) -> u32 {
     let n = 2u128 * bound as u128 + 1;
-    (128 - n.leading_zeros()).max(1)
+    let bits = 128 - n.leading_zeros();
+    if bits == 0 {
+        1
+    } else {
+        bits
+    }
 }
+
+/// Widest value the 64-bit packers support: `pack_bits64` keeps up to 7
+/// leftover bits in a `u64` next to the incoming value.
+const MAX_BITS64: u32 = 56;
+
+/// KAHE coefficients are packed as centered representatives, with bound
+/// `(q-1)/2`, so they must fit the 64-bit packers: `q < 2^56`.
+const _: () = assert!(
+    bits_for_signed64((KAHE_MODULUS / 2) as u64) <= MAX_BITS64,
+    "KAHE_MODULUS is too large to pack: coefficients would need more than 56 bits"
+);
 
 pub fn poly_packed_len64(modulus: i64) -> usize {
     (POLY_N * bits_for_signed64((modulus / 2) as u64) as usize).div_ceil(8)
@@ -1163,7 +1182,10 @@ fn pack_bits64<V: Borrow<i64>>(
     bound: u64,
     bits: u32,
 ) {
-    debug_assert!(bits <= 56, "u64 accumulator supports up to 56-bit symbols");
+    assert!(
+        bits <= MAX_BITS64,
+        "u64 accumulator supports up to 56-bit values"
+    );
     let offset = bound as i64;
     let max_u: u64 = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
@@ -1197,7 +1219,10 @@ fn unpack_bits64(
     bound: u64,
     bits: u32,
 ) -> usize {
-    debug_assert!((1..=56).contains(&bits));
+    assert!(
+        (1..=MAX_BITS64).contains(&bits),
+        "unpack_bits64: width {bits} outside 1..=56"
+    );
     let offset = bound as i64;
     unpack_fields(input, start_byte, values, bits, |u| u as i64 - offset)
 }
@@ -1452,11 +1477,17 @@ impl Opening {
         let mu_cs = p.mu_cs as usize;
         let stored_path_len = p.stored_path_len as usize;
 
+        // The bounds come from the sender too. Values decode into `i32`, so a
+        // bound must fit one; larger ones would ask the decoder for more than
+        // 32 bits per value.
         if kappa_cs == 0
             || mu_cs == 0
             || kappa_cs > MAX_OPENING_DIM
             || mu_cs > MAX_OPENING_DIM
             || stored_path_len > MAX_OPENING_DIM
+            || [p.r_bound, p.s_bound, p.tree_bound]
+                .iter()
+                .any(|&b| b > i32::MAX as u32)
         {
             return Err(OpeningDecodeError::BadHeader);
         }
@@ -2229,6 +2260,40 @@ mod tests {
             Opening::from_packed(&long).err(),
             Some(OpeningDecodeError::TrailingBytes)
         );
+    }
+
+    /// The bounds in a packed opening's header come from the sender. A bound
+    /// that does not fit an `i32` is a bad header, not a panic in the decoder.
+    #[test]
+    fn unpack_rejects_bounds_wider_than_32_bits() {
+        let mut rng = ChaCha20Rng::from_seed([106u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_b, s_b, t_b);
+        for forge in [
+            |p: &mut PackedOpening| p.r_bound = u32::MAX,
+            |p: &mut PackedOpening| p.s_bound = i32::MAX as u32 + 1,
+            |p: &mut PackedOpening| p.tree_bound = u32::MAX,
+        ] {
+            let mut bad = packed.clone();
+            forge(&mut bad);
+            // Give the body the length the forged widths ask for, so the
+            // length check passes and only the bounds check stands between
+            // the header and the decoder.
+            let body_bits = (bad.kappa_cs as usize * POLY_N)
+                * bits_for_signed(bad.r_bound) as usize
+                + (bad.mu_cs as usize * POLY_N) * bits_for_signed(bad.s_bound) as usize
+                + (opening_data_polys(1 + bad.mu_cs as usize, bad.stored_path_len as usize)
+                    * POLY_N)
+                    * bits_for_signed(bad.tree_bound) as usize;
+            bad.bytes.resize(body_bits.div_ceil(8), 0);
+            assert_eq!(
+                Opening::from_packed(&bad).err(),
+                Some(OpeningDecodeError::BadHeader)
+            );
+        }
     }
 
     #[test]
