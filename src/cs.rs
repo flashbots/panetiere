@@ -40,7 +40,7 @@ use std::borrow::Borrow;
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
 use crate::rings::{center_i32, center_i64, RHO_MAX};
-use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
+use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, KAHE_MODULUS, N as POLY_N};
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use negacyclic_rings::arithmetic;
 use rand::{Rng, SeedableRng};
@@ -1071,6 +1071,14 @@ fn unpack_bits(
     byte_idx
 }
 
+// Centered packing (`pack_poly`, `pack_poly64`, `poly_packed_len*`) is exact
+// only for an odd modulus: then every residue has exactly one centered
+// representative in `[-(m-1)/2, (m-1)/2]`. Every caller passes one of these.
+const _: () = assert!(
+    CS_MODULUS % 2 == 1 && HVC_MODULUS % 2 == 1 && KAHE_MODULUS % 2 == 1,
+    "centered packing needs odd moduli"
+);
+
 /// Bytes one polynomial occupies when bit-packed against an odd `modulus` —
 /// each of the `N` coefficients as its centered representative in
 /// `[-(modulus-1)/2, (modulus-1)/2]`, i.e. in `⌈log₂ modulus⌉` bits.
@@ -1151,7 +1159,6 @@ fn unpack_bits64(
 
 /// [`pack_poly`] for i64 coefficient arrays (KAHE ring).
 pub(crate) fn pack_poly64(coeffs: &[i64], modulus: i64, out: &mut Vec<u8>) {
-    debug_assert!(modulus % 2 == 1);
     let bound = (modulus / 2) as u64;
     let centered = coeffs.iter().map(|&x| center_i64(x, modulus));
     pack_bits64(out, centered, bound, bits_for_signed64(bound));
@@ -1172,7 +1179,6 @@ pub(crate) fn unpack_poly64(input: &[u8], start: usize, modulus: i64) -> ([i64; 
 /// on the residues, and unpacking returns the centered representatives, which
 /// compare equal (mod `modulus`) to the packed polynomial.
 pub(crate) fn pack_poly(coeffs: &[i32], modulus: i32, out: &mut Vec<u8>) {
-    debug_assert!(modulus % 2 == 1);
     let bound = (modulus / 2) as u32;
     let centered = coeffs.iter().map(|&x| center_i32(x, modulus));
     pack_bits(out, centered, bound, bits_for_signed(bound));
@@ -1891,7 +1897,6 @@ mod tests {
     /// ⌈log₂ m⌉ bits per coefficient.
     #[test]
     fn poly_packing_is_centered_and_tight() {
-        use crate::KAHE_MODULUS;
         // edge cases of the centering, and inputs outside (-m, m)
         for m in [CS_MODULUS, HVC_MODULUS] {
             let h = m / 2;
