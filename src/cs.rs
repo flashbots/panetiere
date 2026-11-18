@@ -4,14 +4,14 @@
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
 //! `r ∈ B^{κ_cs}_{β_cs,q_cs}`. `a` is a length-`κ_cs` row vector, `B` is a
 //! `μ_cs × κ_cs` matrix. All BDLOP arithmetic lives on the **CS ring**
-//! `R_{q_cs}` (`CsPoly`, q_cs = 139301), decoupled from the HVC
-//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 40961).
+//! `R_{q_cs}` (`CsPoly`, q_cs = 150413), decoupled from the HVC
+//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 557057).
 //!
 //! **CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span
 //! `[-q_cs/2, q_cs/2]`, larger than `q_hvc`. To feed it into the HVC tree hash
-//! we base-`(2ζ+1)=69` decompose each leaf element into `HVC_WIDTH = 3`
+//! we base-`(2ζ+1)=791` decompose each leaf element into `HVC_WIDTH = 2`
 //! `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); the digits are tiny
-//! (`|·| ≤ ζ = 34 ≪ q_hvc`) so they embed losslessly. The left-inverse
+//! (`|·| ≤ ζ = 395 ≪ q_hvc`) so they embed losslessly. The left-inverse
 //! `CsPoly::project_r_from_hvc` is linear in the digits, so summed opening
 //! digits project to the summed leaf — keeping `sum_openings` correct.
 //!
@@ -37,7 +37,7 @@
 
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
-use crate::rings::{center_i32, center_i64};
+use crate::rings::{center_i32, center_i64, RHO_MAX};
 use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
 use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use negacyclic_rings::arithmetic;
@@ -59,9 +59,25 @@ pub trait Cs {
     ) -> (Self::Commitment, Vec<Self::Opening>);
     fn verify(pp: &Self::Params, c: &Self::Commitment, o: &Self::Opening) -> bool;
     fn sum_commitments(cs: &[Self::Commitment]) -> Self::Commitment;
-    /// Take borrowed slices to avoid cloning openings (each can be ~100s of KB).
-    /// `None` when the set cannot be summed (empty, or mismatched shapes).
-    fn sum_openings(os: &[&Self::Opening]) -> Option<Self::Opening>;
+    /// Sum of the openings at `position`; the empty sum is the zero opening.
+    /// Takes borrowed slices to avoid cloning openings (each can be ~100s of
+    /// KB). Fails if an opening does not have the shape `pp` prescribes or is
+    /// for another position.
+    fn sum_openings(
+        pp: &Self::Params,
+        position: usize,
+        os: &[&Self::Opening],
+    ) -> Result<Self::Opening, SumError>;
+}
+
+/// Why a set of openings cannot be summed. Openings come from mutually
+/// distrusting clients, so this is a rejection, not an invariant violation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SumError {
+    /// Opening `index` does not have the shape the parameters prescribe.
+    WrongShape { index: usize },
+    /// Opening `index` is for another position.
+    WrongPosition { index: usize },
 }
 
 /// `g ∈ R_{q_hvc}^{ξ·HVC_WIDTH}`: the Ajtai hash labelling one vector-commitment
@@ -98,7 +114,7 @@ pub struct CsParams {
     pub r_bound: u32,
     /// Aggregated bound on the base-(2η+1) decomposition digits of the HVC
     /// tree opening. Each digit-coefficient ∈ [−η, η] fresh, [−ρη, ρη] after
-    /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·34 = 10200). Checked
+    /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·395 = 118500). Checked
     /// in `verify` so a forged opening can't use out-of-range digits.
     pub beta_agg_hvc: u32,
     /// Labels a leaf from its `ξ·HVC_WIDTH` bridged digits.
@@ -748,7 +764,7 @@ impl Cs for HidingMerkleCommitment {
     type Opening = Opening;
 
     fn setup<R: Rng>(rng: &mut R, num_servers: usize) -> CsParams {
-        Self::setup_with_dims(rng, num_servers, 1, 5)
+        Self::setup_with_dims(rng, num_servers, MU_CS, KAPPA_CS)
     }
 
     /// Commit per-server share vectors and emit one opening per server.
@@ -846,28 +862,23 @@ impl Cs for HidingMerkleCommitment {
         Self::sum_commitment_refs(&refs)
     }
 
-    /// `None` if the set is empty or the openings disagree on shape or
-    /// position — each is a separate client's untrusted post, so a mismatch is
-    /// a rejection, not an invariant violation.
-    fn sum_openings(os: &[&Opening]) -> Option<Opening> {
-        let first = os.first()?;
-        let idx = first.server_index;
-        let kappa_cs = first.kappa_cs();
-        let mu_cs = first.mu_cs();
-        let stored_path_len = first.stored_path_len();
-        let path_index = first.path_index;
-        let total = first.data.len();
-        let rs_len = first.rs.len();
-        for o in os {
-            if o.server_index != idx
-                || o.kappa_cs() != kappa_cs
+    fn sum_openings(pp: &CsParams, position: usize, os: &[&Opening]) -> Result<Opening, SumError> {
+        // the shape every opening must have, from the parameters
+        let (kappa_cs, mu_cs) = (pp.kappa_cs, pp.mu_cs);
+        let stored_path_len = pp.stored_path_len();
+        let rs_len = kappa_cs + mu_cs;
+        let total = opening_data_polys(pp.xi(), stored_path_len);
+        for (index, o) in os.iter().enumerate() {
+            if o.server_index != position || o.path_index != position {
+                return Err(SumError::WrongPosition { index });
+            }
+            if o.kappa_cs() != kappa_cs
                 || o.mu_cs() != mu_cs
                 || o.stored_path_len() != stored_path_len
-                || o.path_index != path_index
                 || o.data.len() != total
                 || o.rs.len() != rs_len
             {
-                return None;
+                return Err(SumError::WrongShape { index });
             }
         }
 
@@ -935,9 +946,9 @@ impl Cs for HidingMerkleCommitment {
             }
         }
 
-        Some(Opening {
-            server_index: idx,
-            path_index,
+        Ok(Opening {
+            server_index: position,
+            path_index: position,
             kappa_cs,
             mu_cs,
             stored_path_len,
@@ -993,8 +1004,8 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 //
 // Tight pack uses just enough bits per coefficient for each region's bound:
 //   r:    ⌈log₂(2·r_bound + 1)⌉ bits
-//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 139301)
-//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(69)⌉ = 7 bits
+//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 150413)
+//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(791)⌉ = 10 bits
 
 /// Number of bits to encode signed values in [-bound, bound].
 #[inline]
@@ -1457,13 +1468,17 @@ fn aggregated_opening_pack_bounds_raw(
     (r, CS_MODULUS as u32, tree)
 }
 
+/// One committed value per server: the Shamir share of the single KAHE key
+pub(crate) const MU_CS: usize = 1;
+/// BDLOP randomness width
+pub(crate) const KAPPA_CS: usize = 5;
 /// Fresh per-opening randomness radius.
-pub const BETA_CS: u32 = 116;
+pub const BETA_CS: u32 = 120;
 /// Aggregate verify bound: `ρ_max·β_cs` at `ρ_max = 300`.
-pub const R_BOUND: u32 = 34_800;
+pub const R_BOUND: u32 = RHO_MAX * BETA_CS;
 /// Aggregated HVC digit bound: `ρ_max·ζ`.
 pub fn beta_agg_hvc() -> u32 {
-    300 * chipmunk_code::ZETA
+    RHO_MAX * chipmunk_code::ZETA
 }
 
 /// [`CsParams::aggregated_server_crypto_len`] from dimensions alone, so a caller
@@ -1708,7 +1723,7 @@ mod tests {
         let pp = HidingMerkleCommitment::setup(&mut rng, 4);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 69650 ≫ r_bound = 34800.
+        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 75206 ≫ r_bound = 36000.
         openings[1].r_mut()[0] = CsPoly::rand_poly(&mut rng);
         assert!(!HidingMerkleCommitment::verify(&pp, &comm, &openings[1]));
     }
@@ -1809,14 +1824,16 @@ mod tests {
         let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
         let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
         for i in 0..n_servers {
-            let summed = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+            let summed =
+                HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
             assert_eq!(summed.s()[0], shares_a[i][0] + shares_b[i][0]);
             assert!(HidingMerkleCommitment::verify(&pp, &comm_sum, &summed));
         }
     }
 
     /// Openings arrive from mutually distrusting clients, so a set that cannot
-    /// be summed is rejected rather than panicking the server.
+    /// be summed is rejected rather than panicking the server, and the error
+    /// names the first opening that does not fit.
     #[test]
     fn sum_openings_rejects_a_mismatched_set() {
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
@@ -1826,19 +1843,106 @@ mod tests {
         let shares_b = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let (_, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
         let (_, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
-        assert!(HidingMerkleCommitment::sum_openings(&[]).is_none());
-        assert!(
-            HidingMerkleCommitment::sum_openings(&[&opens_a[0], &opens_b[1]]).is_none(),
-            "openings for different server positions must not sum"
+        let sum = |os: &[&Opening]| HidingMerkleCommitment::sum_openings(&pp, 0, os).err();
+        assert_eq!(
+            sum(&[&opens_a[0], &opens_b[0]]),
+            None,
+            "matching openings sum"
         );
 
-        let wide = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, pp.mu_cs + 1, 5);
-        let shares_wide = rand_shares(&mut rng, n_servers, wide.mu_cs);
-        let (_, opens_wide) = HidingMerkleCommitment::commit(&mut rng, &wide, &shares_wide);
-        assert!(
-            HidingMerkleCommitment::sum_openings(&[&opens_a[0], &opens_wide[0]]).is_none(),
-            "openings of different μ_cs must not sum"
+        // position: an opening for another server, or with only one of its
+        // two indices wrong, first or second in the set
+        assert_eq!(
+            sum(&[&opens_a[0], &opens_b[1]]),
+            Some(SumError::WrongPosition { index: 1 })
         );
+        assert_eq!(
+            sum(&[&opens_b[1], &opens_a[0]]),
+            Some(SumError::WrongPosition { index: 0 })
+        );
+        let mut wrong_server = opens_b[0].clone();
+        wrong_server.server_index = 1;
+        assert_eq!(
+            sum(&[&opens_a[0], &wrong_server]),
+            Some(SumError::WrongPosition { index: 1 })
+        );
+        let mut wrong_path = opens_b[0].clone();
+        wrong_path.path_index = 1;
+        assert_eq!(
+            sum(&[&opens_a[0], &wrong_path]),
+            Some(SumError::WrongPosition { index: 1 })
+        );
+
+        // shape, one field at a time: an opening whose declared dimensions or
+        // buffer lengths do not match the parameters, e.g. a forged one
+        type Tamper = fn(&mut Opening);
+        let tampered: [(&str, Tamper); 5] = [
+            ("κ_cs", |o| o.kappa_cs += 1),
+            ("μ_cs", |o| o.mu_cs += 1),
+            ("path length", |o| o.stored_path_len += 1),
+            ("r ‖ s length", |o| {
+                let mut rs = o.rs.to_vec();
+                rs.pop();
+                o.rs = rs.into_boxed_slice();
+            }),
+            ("data length", |o| {
+                let mut data = o.data.to_vec();
+                data.pop();
+                o.data = data.into_boxed_slice();
+            }),
+        ];
+        for (what, tamper) in tampered {
+            let mut bad = opens_b[0].clone();
+            tamper(&mut bad);
+            assert_eq!(
+                sum(&[&opens_a[0], &bad]),
+                Some(SumError::WrongShape { index: 1 }),
+                "{what}"
+            );
+        }
+
+        // shape: openings made with other parameters (another μ_cs, another
+        // κ_cs, another tree depth)
+        for (mu_cs, kappa_cs, servers) in [
+            (pp.mu_cs + 1, pp.kappa_cs, n_servers),
+            (pp.mu_cs, pp.kappa_cs + 1, n_servers),
+            (pp.mu_cs, pp.kappa_cs, 2 * n_servers),
+        ] {
+            let other = HidingMerkleCommitment::setup_with_dims(&mut rng, servers, mu_cs, kappa_cs);
+            let shares = rand_shares(&mut rng, servers, other.mu_cs);
+            let (_, opens) = HidingMerkleCommitment::commit(&mut rng, &other, &shares);
+            assert_eq!(
+                sum(&[&opens_a[0], &opens[0]]),
+                Some(SumError::WrongShape { index: 1 }),
+                "μ_cs = {mu_cs}, κ_cs = {kappa_cs}, {servers} servers"
+            );
+            assert_eq!(
+                sum(&[&opens[0], &opens_a[0]]),
+                Some(SumError::WrongShape { index: 0 }),
+                "μ_cs = {mu_cs}, κ_cs = {kappa_cs}, {servers} servers"
+            );
+        }
+    }
+
+    /// The empty sum is the zero opening, which opens the empty sum of
+    /// commitments (the zero commitment) to the zero share.
+    #[test]
+    fn empty_sum_is_the_zero_opening() {
+        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+        let n_servers = 4;
+        let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+        for position in 0..n_servers {
+            let zero = HidingMerkleCommitment::sum_openings(&pp, position, &[]).unwrap();
+            assert_eq!(zero.server_index, position);
+            assert!(zero.s().iter().all(|p| *p == CsPoly::default()));
+            let empty = HidingMerkleCommitment::sum_commitment_refs(&[]);
+            assert!(HidingMerkleCommitment::verify(&pp, &empty, &zero));
+        }
+        // but it does not open an actual commitment
+        let shares = rand_shares(&mut rng, n_servers, pp.mu_cs);
+        let (comm, _) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let zero = HidingMerkleCommitment::sum_openings(&pp, 0, &[]).unwrap();
+        assert!(!HidingMerkleCommitment::verify(&pp, &comm, &zero));
     }
 
     #[test]
@@ -1852,7 +1956,8 @@ mod tests {
         let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
         let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
         for i in 0..n_servers {
-            let summed = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+            let summed =
+                HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
             for k in 0..pp.mu_cs {
                 assert_eq!(summed.s()[k], shares_a[i][k] + shares_b[i][k]);
             }
@@ -1896,7 +2001,8 @@ mod tests {
         let (_, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
         let (_, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
         for i in 0..n_servers {
-            let agg = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+            let agg =
+                HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
             // ρ = 2; tree nodes bounded by ρ·ZETA, r by 2·β_cs.
             let packed = agg.pack(
                 2 * pp.beta_cs,
@@ -1928,7 +2034,10 @@ mod tests {
     #[test]
     fn opening_size_unchanged_at_mu_1() {
         for path in 0usize..5 {
-            assert_eq!(opening_data_polys(2, path), 6 + 6 * path);
+            assert_eq!(
+                opening_data_polys(2, path),
+                2 * HVC_WIDTH + 2 * HVC_WIDTH * path
+            );
         }
     }
 
@@ -1955,7 +2064,8 @@ mod tests {
             let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
             for i in 0..n_servers {
                 let summed =
-                    HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+                    HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]])
+                        .unwrap();
                 for k in 0..mu_cs {
                     assert_eq!(summed.s()[k], shares_a[i][k] + shares_b[i][k]);
                 }
@@ -1969,7 +2079,7 @@ mod tests {
 
     /// `N = 2048` is a multiple of 8, so no region pads and the body is exactly
     /// its bit budget — a tighter pin than a ratio, which moves with the region
-    /// mix (`s` packs 18/32, digits 7/32).
+    /// mix (`s` packs 18/32, digits 10/32).
     #[test]
     fn pack_size_reduction() {
         let mut rng = ChaCha20Rng::from_seed([102u8; 32]);
@@ -1991,8 +2101,8 @@ mod tests {
                 / 8;
             assert_eq!(packed_bytes, expected, "μ_cs={mu_cs}");
             assert!(
-                packed_bytes * 3 <= in_mem_bytes,
-                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 3"
+                packed_bytes * 2 <= in_mem_bytes,
+                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 2"
             );
         }
     }

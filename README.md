@@ -56,12 +56,12 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `kahe` | key-additive homomorphic encryption, plus the CS↔KAHE bridge |
 | `sss` | Shamir *t*-of-*n* (and additive) sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
-| `rs` | systematic Reed–Solomon erasure coding over the KAHE RNS channels |
+| `rs` | systematic Reed–Solomon erasure coding over the KAHE ring |
 | `share_commitment` | commitment to the $n$ coded shares, one tree leaf per lane |
 | `pke` / `sig` | ML-KEM-768 + AES-GCM envelopes for the key shares / P-256 post signatures |
 | `bulletin` | published entry types and their byte encodings |
 | `protocol::*` | the round drivers, verifier, recipient policy |
-| `channel` | recommended payload layer: sizes either encoding for $\rho$ messages of $n$ bytes |
+| `channel` | recommended payload layer: sizes either encoding for up to $C$ messages of $n$ bytes |
 | `mse` / `prony` | the two multiset encodings (peeling; MDS sketch) |
 | `codec` | raw byte↔poly packing and beacon-driven slot reservation |
 | `scaling_bench` | harness behind `panetiere_scaling` / `panetiere_merge` |
@@ -168,11 +168,15 @@ a forged signature only matters before the post is made.
 This fixes $\mu_\mathrm{kahe}$. Every client contributes exactly `message_polys(pp)`
 polys, real or cover — `zero_message(pp)` is the trivial cover.
 
-`channel` is the default: it sizes an encoding from "$\rho$ clients, $n$ bytes
-each", does the byte↔symbol packing, and derives matching `ProtocolParams`.
+`channel` is the default: it sizes an encoding from "at most $C$ senders, $n$
+bytes each", does the byte↔symbol packing, and derives matching
+`ProtocolParams`. The capacity $C$ is the most messages one round can carry:
+the number of clients, or fewer when some of them only send cover traffic. The
+peeling table is the smallest one whose decoding fails with probability at most
+$2^{-40}$ at that capacity.
 
 ```rust
-let ch = ChannelParams::for_messages(rho, message_bytes, prf_key);  // peeling
+let ch = ChannelParams::for_messages(capacity, message_bytes, prf_key);  // peeling
 let pp = ch.protocol_params(&mut rng, n_servers);       // KAHE width == ch.n_polys()
 
 let mine = channel::encode_message(&mut rng, &ch, &sid, payload)?;   // or channel::cover(&ch)
@@ -185,8 +189,8 @@ $(s, m \oplus \mathrm{RO}(s))$ for a nonce $s$ drawn from the caller's cryptogra
 with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mathit{sid} \| s)$,
 and decoding unmasks every element and returns the messages sorted. Each byte
 message carries a length header, so trailing zero bytes survive the padding. The masking is what allows the security proof to fix the corrupted clients' inputs before the honest messages are known. The honest messages themselves are hidden by the encryption. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
-$Q = 2^{64}$ oracle queries: six extra symbols per element for any realistic
-$\rho$. This guarantee covers the `channel` path only — polys built with `mse`,
+$Q = 2^{64}$ oracle queries at the largest round of $\rho = 300$ clients: six
+extra 34-bit symbols per element. This guarantee covers the `channel` path only — polys built with `mse`,
 `prony` or `codec` directly, including slot mode, are not masked.
 
 `ChannelParams` covers both multiset encodings behind that one interface:
@@ -406,9 +410,10 @@ RAYON_NUM_THREADS=8 cargo test -j 8
 RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep   # (S, ρ) × encoding sweep
 ```
 
-KAHE and the CS auxiliary domain use two-prime RNS parameter sets from
-`src/rings.rs`. Their 32-bit NTT channels dispatch to scalar, AVX2, or NEON.
-CS and Prony retain their semantic prime fields.
+KAHE runs on a single 64-bit NTT over its prime modulus; the CS auxiliary
+domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
+channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their semantic
+prime fields.
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
 slot mode, *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
