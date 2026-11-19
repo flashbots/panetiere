@@ -92,10 +92,9 @@ use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
 };
-use crate::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::kahe::{Kahe, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::mse::BITS_PER_SYMBOL;
 use crate::pke;
-use crate::protocol::aggregator::run_aggregator_round;
 use crate::protocol::client::{
     cs_commit, kahe_encrypt, kahe_keygen, run_client_round, run_client_round_rs, seal_openings,
     shamir_share,
@@ -104,8 +103,8 @@ use crate::protocol::server::{
     run_rs_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
 };
 use crate::protocol::verify::{
-    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, decrypt_unverified_aggregate,
-    RsVerifyTimings, VerifyError, VerifyTimings,
+    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, RsVerifyTimings, VerifyError,
+    VerifyTimings,
 };
 use crate::protocol::{honest_majority_threshold, ProtocolParams};
 use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
@@ -243,7 +242,7 @@ fn sweep_configs() -> Vec<Config> {
 
 /// Network sim profile: per-message one-way latency = `lat_ms + U[0, jitter_ms)`
 /// (parallel arrivals take the max draw). Three link classes: client links
-/// (residential, the slow side), server links (relays and aggregators), and the
+/// (residential, the slow side), server links (relays), and the
 /// bulletin/recipient link — the one endpoint that ingests every client's post
 /// and is read in full by the verifier, so it saturates first. Each endpoint
 /// serializes its own bytes at its class rate, both directions.
@@ -529,15 +528,6 @@ fn cell_id(i: usize) -> String {
     }
 }
 
-// One aggregation layer: `n_l1` groups of `group_size`, leader sums the rest.
-struct AggPlan {
-    group_size: usize,
-    n_l1: usize,
-    agg_cpu: Stat,
-    leader: Stat,
-    recovered: bool,
-}
-
 /// One live RS-sharded round. `reconstruct` is the identity-set path (nodes
 /// `0..k` hold the blocks, so it is a concatenation); `reconstruct_lagrange` is
 /// the same with the sample set shifted by one, i.e. what a lane outage costs.
@@ -640,14 +630,7 @@ struct Row {
     wire_comm_b: f64,
     wire_opening_b: f64,
     wire_server_b: f64,
-    agg: AggPlan,
     rs_plans: Vec<RsPlan>,
-}
-
-/// Group size balancing both fan-ins at ⌈√ρ⌉. Pure in `n`, so a row rebuilt
-/// from CSV reproduces the same topology as the run that wrote it.
-fn agg_group_size(n: usize) -> usize {
-    ((n as f64).sqrt().ceil() as usize).max(2)
 }
 
 /// Which phases a run's timings are authoritative for. Setup and the live round
@@ -658,12 +641,11 @@ struct Roles {
     client: bool,
     server: bool,
     verifier: bool,
-    agg: bool,
     rs: bool,
 }
 
 impl Roles {
-    /// `BENCH_ROLES=client`, `=server,verifier,agg,rs`, or absent for everything.
+    /// `BENCH_ROLES=client`, `=server,verifier,rs`, or absent for everything.
     fn from_env() -> Self {
         match std::env::var("BENCH_ROLES") {
             Err(_) => Self::all(),
@@ -679,7 +661,6 @@ impl Roles {
             client: false,
             server: false,
             verifier: false,
-            agg: false,
             rs: false,
         };
         for name in raw.split(',').map(str::trim) {
@@ -687,11 +668,10 @@ impl Roles {
                 "client" => roles.client = true,
                 "server" => roles.server = true,
                 "verifier" => roles.verifier = true,
-                "agg" => roles.agg = true,
                 "rs" => roles.rs = true,
                 other => panic!(
                     "bad BENCH_ROLES entry {other:?} \
-                     (want client|server|verifier|agg|rs|all)"
+                     (want client|server|verifier|rs|all)"
                 ),
             }
         }
@@ -703,7 +683,6 @@ impl Roles {
             client: true,
             server: true,
             verifier: true,
-            agg: true,
             rs: true,
         }
     }
@@ -837,13 +816,6 @@ mod csv_tests {
             wire_comm_b: 1.3e6,
             wire_opening_b: 1.4e8,
             wire_server_b: 8.9e5,
-            agg: AggPlan {
-                group_size: agg_group_size(300),
-                n_l1: 300usize.div_ceil(agg_group_size(300)),
-                agg_cpu: Stat::default(),
-                leader: Stat::default(),
-                recovered: true,
-            },
             rs_plans: vec![RsPlan {
                 k: 14,
                 n_nodes: 16,
@@ -919,9 +891,6 @@ mod csv_tests {
         assert_eq!(b.rs_plans[0].lane_lie_caught, "lane-proof");
         assert_eq!(b.rs_plans[0].path_b, row.rs_plans[0].path_b);
         assert_eq!(b.rs_plans[0].lane_post_b, row.rs_plans[0].lane_post_b);
-        // Topology is recomputed, not stored — it must land on the same values.
-        assert_eq!(b.agg.group_size, row.agg.group_size);
-        assert_eq!(b.agg.n_l1, row.agg.n_l1);
 
         for p in PHASES {
             let (want, got) = ((p.get)(&row), (p.get)(b));
@@ -948,7 +917,6 @@ mod csv_tests {
                 Owner::Client => all.client,
                 Owner::Server => all.server,
                 Owner::Verifier => all.verifier,
-                Owner::Agg => all.agg,
                 Owner::Rs => all.rs,
             };
             assert!(owned_by_all, "{} unreachable", p.name);
@@ -1266,42 +1234,6 @@ fn run_cell(
         }
     };
 
-    // Aggregated flow, measured live: one layer of ⌈√ρ⌉-sized groups, then the
-    // leader sums the group aggregates and decrypts. Recovery is re-checked
-    // end-to-end through the tree.
-    let agg = {
-        let g = agg_group_size(n);
-        let n_l1 = n.div_ceil(g);
-        let l1_groups: Vec<Vec<_>> = (0..n_l1)
-            .map(|grp| {
-                client_entries
-                    .iter()
-                    .filter(|(cid, _)| cid.0 as usize % n_l1 == grp)
-                    .cloned()
-                    .collect()
-            })
-            .collect();
-        let (agg_cpu, _) = measure(|| run_aggregator_round(&l1_groups[0]));
-        let l1: Vec<_> = l1_groups.iter().map(|g| run_aggregator_round(g)).collect();
-        let ctxts: Vec<Vec<KahePoly>> = l1.iter().map(|a| a.summed_ctxt.clone()).collect();
-        let comms: Vec<Commitment> = l1.iter().map(|a| a.summed_comm.clone()).collect();
-
-        let (leader, res) = measure(|| {
-            let total_ctxt = Kahe::agg_ctxt(&ctxts);
-            let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
-            decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &outputs)
-        });
-        let recovered = res.map(|rec| check_decode(&rec)).unwrap_or(false);
-
-        AggPlan {
-            group_size: g,
-            n_l1,
-            agg_cpu,
-            leader,
-            recovered,
-        }
-    };
-
     // RS-sharded ingress, measured live: its own `pp` (μ = n_polys + 1, the
     // extra slot holding Enc(H(m))), its own client rounds, one node round per
     // lane, and the full verify. The ciphertext never reaches the bulletin, so
@@ -1589,11 +1521,6 @@ fn run_cell(
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
-        agg: AggPlan {
-            agg_cpu: owned(roles.agg, agg.agg_cpu),
-            leader: owned(roles.agg, agg.leader),
-            ..agg
-        },
         rs_plans: rs_plans
             .into_iter()
             .map(|mut p| {
@@ -1661,9 +1588,8 @@ struct Model {
     wall_us: f64,
     wire_total_b: f64,
     efficiency: f64,
-    post_b: f64,        // one client bulletin post = comm + ctxt
-    client_open_b: f64, // one client's S sealed openings
-    agg_cpu_us: f64,
+    post_b: f64,         // one client bulletin post = comm + ctxt
+    client_open_b: f64,  // one client's S sealed openings
     rs_cpu_us: Vec<f64>, // per RsPlan
 }
 
@@ -1682,10 +1608,6 @@ fn model(r: &Row) -> Model {
         r.enc_app.med + r.kahe_enc.med + r.v_agg_ctxt.med + r.v_kahe_dec.med + r.dec_app.med;
     let wall_us = fixed_us + payload_us;
     let wire_total_b = r.wire_ctxt_b + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
-    // Aggregated flow replaces the leader's direct ingest phases with the tree.
-    let cpu_base_agg_us = (fixed_us - r.v_open.med - r.v_interp.med - r.v_sum_comm.med)
-        + (payload_us - r.v_agg_ctxt.med - r.v_kahe_dec.med);
-    let agg_cpu_us = cpu_base_agg_us + r.agg.leader.med;
     // RS flow: client pays app-encode + encrypt + RS-encode + key work; one
     // node sums its lane; the verifier no longer sums ciphertexts at all.
     let rs_cpu_us = r
@@ -1724,7 +1646,6 @@ fn model(r: &Row) -> Model {
         efficiency: r.useful_b / wire_total_b,
         post_b: (r.wire_comm_b + r.wire_ctxt_b) / r.n as f64,
         client_open_b: r.wire_opening_b / r.n as f64,
-        agg_cpu_us,
         rs_cpu_us,
     }
 }
@@ -1744,7 +1665,6 @@ fn model(r: &Row) -> Model {
 struct NetPoint {
     direct_net_us: f64,
     direct_e2e_us: f64,
-    agg: (f64, f64),     // (net_us, e2e_us)
     rs: Vec<(f64, f64)>, // (net_us, e2e_us) per RsPlan
 }
 
@@ -1767,24 +1687,6 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
         .max(maxlat(r.s) + xfer_bul(r.wire_server_b)); // bulletin ingest
     let c = maxlat(1) + xfer_bul(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b);
     let direct_net_us = a + b + c;
-
-    // Aggregated flow: ctxt+comm go to aggregators (not broadcast), which sum g
-    // posts each and forward one aggregate to the leader. Openings→servers and
-    // the server post are unchanged. Conservative (no overlap).
-    let agg = {
-        let g = r.agg.group_size as f64;
-        let a = (maxlat(r.n) + xfer_cl(m.post_b + m.client_open_b)) // client uplink
-            .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
-            .max(maxlat(r.agg.n_l1) + xfer_srv(g * m.post_b)); // aggregator ingest
-        let hop = r.agg.agg_cpu.med
-            + (maxlat(r.agg.n_l1) + xfer_srv(m.post_b)) // aggregator uplink
-                .max(maxlat(1) + xfer_bul(r.agg.n_l1 as f64 * m.post_b)); // leader ingest
-        let b = (maxlat(r.s) + xfer_srv(r.wire_server_b / r.s as f64)) // server uplink
-            .max(maxlat(r.s) + xfer_bul(r.wire_server_b)); // bulletin ingest
-        let c = maxlat(1) + xfer_bul(r.wire_server_b);
-        let net_us = a + hop + b + c;
-        (net_us, m.agg_cpu_us + net_us)
-    };
 
     // RS flow: the client uplinks n coded shares (total (n/k)·C) plus its S
     // openings; the bulletin only ever sees the constant-size post. A node
@@ -1820,7 +1722,6 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
     NetPoint {
         direct_net_us,
         direct_e2e_us: m.wall_us + direct_net_us,
-        agg,
         rs,
     }
 }
@@ -2031,25 +1932,6 @@ fn print_tables(rows: &[Row]) {
     );
     println!();
 
-    println!("── [M] cpu — aggregated flow (per aggregator / leader) ──────────────────────");
-    println!(
-        "{:<4}{:>4}  {:<16}{:>11}{:>13}  recovered",
-        "id", "g", "fan-in", "agg", "leader"
-    );
-    for (i, r) in rows.iter().enumerate() {
-        let p = &r.agg;
-        println!(
-            "{:<4}{:>4}  {:<16}{:>11}{:>13}  {}",
-            cell_id(i),
-            p.group_size,
-            format!("{}→{}→1", r.n, p.n_l1),
-            fmt_us(p.agg_cpu.med),
-            fmt_us(p.leader.med),
-            if p.recovered { "yes" } else { "NO" },
-        );
-    }
-    println!();
-
     if rows.iter().any(|r| !r.rs_plans.is_empty()) {
         println!("── [M] cpu — rs-sharded ingress (client commit / lane round / verifier) ─────");
         println!(
@@ -2192,17 +2074,15 @@ fn print_tables(rows: &[Row]) {
 
     println!("── [D] per-role wire, one round (← in / → out) ──────────────────────────────");
     println!(
-        "{:<4}{:<44}{:<24}{:<24}leader ← direct / agg-1",
-        "id", "client → (comm + ctxt + S·open)", "server ← / →", "L1-agg ← / →"
+        "{:<4}{:<44}{:<24}recipient ←",
+        "id", "client → (comm + ctxt + S·open)", "server ← / →"
     );
     for (i, r) in rows.iter().enumerate() {
         let m = &models[i];
         let client_ctxt = r.wire_ctxt_b / r.n as f64;
         let client_out = r.comm_client_b as f64 + client_ctxt + m.client_open_b;
-        let l1_in = r.agg.group_size as f64 * m.post_b;
-        let leader_agg = r.wire_server_b + r.agg.n_l1 as f64 * m.post_b;
         println!(
-            "{:<4}{:<44}{:<24}{:<24}{}",
+            "{:<4}{:<44}{:<24}{}",
             cell_id(i),
             format!(
                 "{} ({} + {} + {})",
@@ -2216,25 +2096,20 @@ fn print_tables(rows: &[Row]) {
                 fmt_bytes(r.wire_opening_b / r.s as f64),
                 fmt_bytes(r.wire_server_b / r.s as f64)
             ),
-            format!("{} / {}", fmt_bytes(l1_in), fmt_bytes(m.post_b)),
-            format!(
-                "{} / {}",
-                fmt_bytes(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b),
-                fmt_bytes(leader_agg)
-            ),
+            fmt_bytes(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b),
         );
     }
     println!();
 
     println!("── [C] model: wall = fixed + payload (client → server → verifier, serial) ───");
     println!(
-        "{:<4}{:>10}{:>10}{:>10}{:>12}{:>13}{:>10}{:>12}",
-        "id", "fixed", "payload", "wall", "useful", "wire/round", "eff", "agg1-wall"
+        "{:<4}{:>10}{:>10}{:>10}{:>12}{:>13}{:>10}",
+        "id", "fixed", "payload", "wall", "useful", "wire/round", "eff"
     );
     for (i, r) in rows.iter().enumerate() {
         let m = &models[i];
         println!(
-            "{:<4}{:>10}{:>10}{:>10}{:>12}{:>13}{:>10.2e}{:>12}",
+            "{:<4}{:>10}{:>10}{:>10}{:>12}{:>13}{:>10.2e}",
             cell_id(i),
             fmt_us(m.fixed_us),
             fmt_us(m.payload_us),
@@ -2242,20 +2117,17 @@ fn print_tables(rows: &[Row]) {
             fmt_bytes(r.useful_b),
             fmt_bytes(m.wire_total_b),
             m.efficiency,
-            fmt_us(m.agg_cpu_us),
         );
     }
     println!();
 
     println!("── [P] network sim: e2e = [C] wall + synthetic net; MB/s = useful/e2e ───────");
     println!(
-        "{:<4}{:<9}{:>12}{:>13}{:>12}{:>12}{}",
+        "{:<4}{:<9}{:>12}{:>13}{}",
         "id",
         "net",
         "direct e2e",
         "direct MB/s",
-        "agg-1 e2e",
-        "agg-1 MB/s",
         if rows.iter().any(|r| !r.rs_plans.is_empty()) {
             format!("{:>12}{:>12}", "rs e2e", "rs MB/s")
         } else {
@@ -2265,7 +2137,6 @@ fn print_tables(rows: &[Row]) {
     for (i, r) in rows.iter().enumerate() {
         let nets = net_all(r, &models[i]);
         for (prof, np) in NETWORKS.iter().zip(&nets) {
-            let (_, agg_e2e) = np.agg;
             let rs = np.rs.first().map_or(String::new(), |(_, e2e)| {
                 format!(
                     "{:>12}{:>12.3}",
@@ -2274,13 +2145,11 @@ fn print_tables(rows: &[Row]) {
                 )
             });
             println!(
-                "{:<4}{:<9}{:>12}{:>13.3}{:>12}{:>12.3}{}",
+                "{:<4}{:<9}{:>12}{:>13.3}{}",
                 cell_id(i),
                 prof.label,
                 fmt_us(np.direct_e2e_us),
                 r.useful_b / (np.direct_e2e_us / 1e6) / 1e6,
-                fmt_us(agg_e2e),
-                r.useful_b / (agg_e2e / 1e6) / 1e6,
                 rs,
             );
         }
@@ -2321,7 +2190,6 @@ enum Owner {
     Client,
     Server,
     Verifier,
-    Agg,
     Rs,
 }
 
@@ -2433,18 +2301,6 @@ const PHASES: &[PhaseCol] = &[
         owner: Owner::Verifier,
         get: |r| r.verify,
         set: |r, s| r.verify = s,
-    },
-    PhaseCol {
-        name: "agg1_level",
-        owner: Owner::Agg,
-        get: |r| r.agg.agg_cpu,
-        set: |r, s| r.agg.agg_cpu = s,
-    },
-    PhaseCol {
-        name: "agg1_leader",
-        owner: Owner::Agg,
-        get: |r| r.agg.leader,
-        set: |r, s| r.agg.leader = s,
     },
     PhaseCol {
         // Stable CSV name retained for pre-RNS sweep compatibility.
@@ -2603,7 +2459,7 @@ fn write_csv(rows: &[Row]) {
     let phases = PHASES;
 
     let mut header = String::new();
-    header.push_str("id,s,threshold,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,agg1_recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
+    header.push_str("id,s,threshold,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
     for p in phases {
         write!(
             header,
@@ -2622,12 +2478,12 @@ fn write_csv(rows: &[Row]) {
          ,c_client_us,c_server_us,c_recipient_us\
          ,c_client_cpu_us,c_server_cpu_us,c_recipient_cpu_us\
          ,m_client_mem_kib,m_server_mem_kib,m_recipient_mem_kib,m_peak_rss_kib\
-         ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_agg1_wall_us,c_rs_wall_us",
+         ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_rs_wall_us",
     );
     for prof in NETWORKS {
         write!(
             header,
-            ",p_{0}_direct_net_us,p_{0}_direct_e2e_us,p_{0}_direct_mbps,p_{0}_agg1_net_us,p_{0}_agg1_e2e_us,p_{0}_agg1_mbps,p_{0}_rs_net_us,p_{0}_rs_e2e_us,p_{0}_rs_mbps",
+            ",p_{0}_direct_net_us,p_{0}_direct_e2e_us,p_{0}_direct_mbps,p_{0}_rs_net_us,p_{0}_rs_e2e_us,p_{0}_rs_mbps",
             prof.label
         )
         .unwrap();
@@ -2649,7 +2505,7 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
             r.threshold,
@@ -2667,7 +2523,6 @@ fn write_csv(rows: &[Row]) {
             r.threads,
             r.affinity,
             r.recovered_ok,
-            r.agg.recovered,
             rs0(r).map_or(0, |p| p.k),
             rs0(r).map_or(0, |p| p.n_nodes),
             rs0(r).is_some_and(|p| p.recovered),
@@ -2746,12 +2601,11 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
         write!(
             out,
-            ",{:.3},{:.3},{:.3},{:.6e},{:.3},{:.3}",
+            ",{:.3},{:.3},{:.3},{:.6e},{:.3}",
             m.fixed_us,
             m.payload_us,
             m.wall_us,
             m.efficiency,
-            m.agg_cpu_us,
             m.rs_cpu_us.first().copied().unwrap_or(0.0),
         )
         .unwrap();
@@ -2763,17 +2617,13 @@ fn write_csv(rows: &[Row]) {
             }
         };
         for np in net_all(r, &m) {
-            let (agg_net, agg_e2e) = np.agg;
             let (rs_net, rs_e2e) = np.rs.first().copied().unwrap_or((0.0, 0.0));
             write!(
                 out,
-                ",{:.3},{:.3},{:.4},{:.3},{:.3},{:.4},{:.3},{:.3},{:.4}",
+                ",{:.3},{:.3},{:.4},{:.3},{:.3},{:.4}",
                 np.direct_net_us,
                 np.direct_e2e_us,
                 mbps(np.direct_e2e_us),
-                agg_net,
-                agg_e2e,
-                mbps(agg_e2e),
                 rs_net,
                 rs_e2e,
                 mbps(rs_e2e),
@@ -2818,9 +2668,7 @@ fn write_csv(rows: &[Row]) {
 // ── reading rows back, and splicing two environments ────────────────────────
 
 /// Rebuild a `Row` from one CSV line. Only the fields the CSV carries are
-/// restored; the aggregator topology is recomputed from `ρ` via
-/// [`agg_group_size`] rather than stored, and is therefore identical to the run
-/// that wrote the line.
+/// restored.
 fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
     let cells: Vec<&str> = line.split(',').collect();
     if cells.len() != header.len() {
@@ -2866,15 +2714,6 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         "mse" => "mse",
         "prony" => "prony",
         other => return Err(format!("unknown flow {other:?}")),
-    };
-
-    let g = agg_group_size(n);
-    let agg = AggPlan {
-        group_size: g,
-        n_l1: n.div_ceil(g),
-        agg_cpu: stat("agg1_level")?,
-        leader: stat("agg1_leader")?,
-        recovered: flag("agg1_recovered")?,
     };
 
     let rs_k = idx("rs_k")?;
@@ -2960,13 +2799,12 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         wire_comm_b: num("d_wire_comm_b")?,
         wire_opening_b: num("d_wire_opening_b")?,
         wire_server_b: num("d_wire_server_b")?,
-        agg,
         rs_plans,
     };
     // Plain phases go through the same table the writer used, so the two cannot
     // drift. Plan-nested ones were already set above.
     for p in PHASES {
-        if matches!(p.owner, Owner::Agg | Owner::Rs) {
+        if matches!(p.owner, Owner::Rs) {
             continue;
         }
         // `verify_total` is newer than the other phases; sweeps written before
@@ -3203,7 +3041,6 @@ pub fn run() {
                     ("client", roles.client),
                     ("server", roles.server),
                     ("verifier", roles.verifier),
-                    ("agg", roles.agg),
                     ("rs", roles.rs),
                 ]
                 .iter()

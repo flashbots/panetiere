@@ -9,10 +9,7 @@ This file is the integration guide: architecture, roles, and the call sequence.
 
 Direct mode requires authenticated, consistent broadcast delivery: callers must
 supply the same unmodified client posts, bound to their sender and session, to
-all participants. The library does not implement that channel. Aggregated
-recovery verifies key-share openings but does not check ciphertext-sum
-correctness; callers requiring aggregate integrity must verify the sum against
-the authentic individual posts.
+all participants. The library does not implement that channel.
 
 Ring arithmetic comes from [negacyclic-rings](https://github.com/Ruteri/negacyclic-rings).
 [Chipmunk](https://github.com/Ruteri/Chipmunk) supplies the Ring-SIS hash and
@@ -73,17 +70,14 @@ bottleneck — at the reference cell below it is 2.12 GB per round (300 clients 
 7.06 MB of ciphertext) against 0.14 GB of key-share envelopes, and 6.15 GB with
 the peeling encoding in place of the sketch.
 
-**Aggregators** and **erasure-coding lanes** are two practical improvements that
-attack exactly that term. An aggregator serves a group of clients and publishes
-one summed ciphertext and commitment for the whole group; it is untrusted, since
-anyone can re-sum the group and catch it. Erasure-coding lanes go further: the
-ciphertext never goes on the bulletin at all, but leaves the client as $n$ coded
+**Erasure-coding lanes** are a practical improvement that attacks exactly that
+term: the ciphertext never goes on the bulletin at all, but leaves the client as $n$ coded
 shares, and the recipient reconstructs $\sum ct$ from any $k$ lane sums — so what a
 client posts is constant size in the message: the key-share commitment, plus a
 second commitment covering the $n$ coded shares, signed. Servers can double as
 lanes; extra lanes hold no key material.
 
-Client crypto and the server round are the same in all three, and key shares
+Client crypto and the server round are the same in both, and key shares
 stay per-server and sealed throughout, so the threshold and privacy model does
 not change.
 
@@ -93,25 +87,21 @@ flowchart TB
         direction LR
         c1["client ×ρ"] -->|ciphertext + commitment| b1[(bulletin)] -->|ρ posts| r1[recipient]
     end
-    subgraph A[Aggregated]
-        direction LR
-        c2["client ×ρ"] -->|ciphertext + commitment| a2[aggregator] -->|one sum per group| r2[recipient]
-    end
     subgraph E[Erasure-coded]
         direction LR
         c3["client ×ρ"] -->|n coded shares| l3["lane ×n"] -->|k lane sums| r3[recipient]
     end
-    D ~~~ A ~~~ E
+    D ~~~ E
 ```
 
-| | **Direct** | **Aggregated** | **Erasure-coded** |
-|---|---|---|---|
-| Setup | `ProtocolParams::setup*` | `ProtocolParams::setup*` | `setup_rs_mode` |
-| Client posts | ciphertext + commitment | same, to its aggregator | both commitments + signature — constant size in message length |
-| Ciphertext travels | on the bulletin | summed per group | as $n$ coded shares, one per lane |
-| Client fn | `run_client_round` | `run_client_round` | `run_client_round_rs` |
-| Recipient fn | `recover_unverified_direct` | `recover_unverified_aggregate` | `aggregate_and_decrypt_rs` |
-| Extra checks | — | — | signatures; each lane's sum opens the summed share commitments |
+| | **Direct** | **Erasure-coded** |
+|---|---|---|
+| Setup | `ProtocolParams::setup*` | `setup_rs_mode` |
+| Client posts | ciphertext + commitment | both commitments + signature — constant size in message length |
+| Ciphertext travels | on the bulletin | as $n$ coded shares, one per lane |
+| Client fn | `run_client_round` | `run_client_round_rs` |
+| Recipient fn | `recover_unverified_direct` | `aggregate_and_decrypt_rs` |
+| Extra checks | — | signatures; each lane's sum opens the summed share commitments |
 
 ## Integration
 
@@ -309,20 +299,12 @@ let Recovered { canonical, plaintext, culprits } =
 
 Decoding is strictly over the canonical client set: servers that shared over
 any other set do not count towards $t$. `culprits` are the servers excluded to
-reach the threshold. `recover_unverified_aggregate` is the same over `(group client set,
-summed entry)` pairs. `recover_unverified_once` is one attempt over a caller-named set with
+reach the threshold. `recover_unverified_once` is one attempt over a caller-named set with
 no exclusion.
 
-Underneath: `aggregate_and_decrypt_unverified` (+ `_timed`), `decrypt_unverified_aggregate` for a
-pre-summed ciphertext, and `aggregate_and_decrypt_rs` for RS mode (no recipient
+Underneath: `aggregate_and_decrypt_unverified` (+ `_timed`) and `aggregate_and_decrypt_rs` for RS mode (no recipient
 wrapper — call it directly). All return $\sum m_i \bmod t$ as `Vec<KahePoly>`, which
 goes straight back to the payload layer.
-
-### Aggregator
-
-`run_aggregator_round(&entries) -> AggregatedPublic` sums a group's ciphertexts
-and commitments; both are coefficient-wise, hence associative, so the recipient
-re-sums groups with the same operations and gets the direct round's value.
 
 In erasure-coded mode each lane's post is checked on its own: the opening must
 walk to the sum of the roots the clients signed, and the lane's share sum must
@@ -469,15 +451,15 @@ a third of these rates.
 
 Prony sketch:
 
-| Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Aggregated | MB/s | Erasure-coded | MB/s |
-|---|---|---|---|---|---|---|
-| 100 / 1k / 1k | 34.5 s | 0.14 | 2.7 s | 1.81 | 2.9 s | 1.70 |
-| 100 / 4k / 4k | 9.1 s | 0.54 | 1.6 s | 3.06 | 2.0 s | 2.47 |
-| 100 / 1k / 8k | 4.9 s | 1.01 | 1.8 s | 2.67 | 2.6 s | 1.86 |
-| 100 / 1k / 20k | 2.3 s | 2.12 | 1.8 s | 2.76 | 2.6 s | 1.87 |
-| 1k / 1k / 4k | 9.1 s | 0.54 | 2.0 s | 2.50 | 2.7 s | 1.83 |
-| 1k / 1k / 8k | 4.9 s | 1.01 | 1.8 s | 2.67 | 2.6 s | 1.86 |
-| 1k / 1k / 20k | 2.3 s | 2.12 | 1.8 s | 2.76 | 2.6 s | 1.87 |
+| Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Erasure-coded | MB/s |
+|---|---|---|---|---|
+| 100 / 1k / 1k | 34.5 s | 0.14 | 2.9 s | 1.70 |
+| 100 / 4k / 4k | 9.1 s | 0.54 | 2.0 s | 2.47 |
+| 100 / 1k / 8k | 4.9 s | 1.01 | 2.6 s | 1.86 |
+| 100 / 1k / 20k | 2.3 s | 2.12 | 2.6 s | 1.87 |
+| 1k / 1k / 4k | 9.1 s | 0.54 | 2.7 s | 1.83 |
+| 1k / 1k / 8k | 4.9 s | 1.01 | 2.6 s | 1.86 |
+| 1k / 1k / 20k | 2.3 s | 2.12 | 2.6 s | 1.87 |
 
 ### Bytes on each link
 
@@ -485,5 +467,5 @@ Same cell (Prony), per ingress mode.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/traffic-dark.svg">
-  <img src="docs/traffic.svg" width="760" alt="Bytes on each connection of one round in the three ingress modes, at 16 servers and 300 clients of 16 KB with the Prony sketch encoding. Direct: each client posts 7.06 MB and the recipient downloads all 2.12 GB. Aggregated: 17 aggregators each forward one summed 7.06 MB post; the recipient reads 120 MB. Erasure-coded: each client sends a 0.70 MB coded share to each server, each lane ingests 210 MB, and the recipient reads 19 MB. Key-share envelopes are 70 KB per client per server in every mode.">
+  <img src="docs/traffic.svg" width="760" alt="Bytes on each connection of one round in the two ingress modes, at 16 servers and 300 clients of 16 KB with the Prony sketch encoding. Direct: each client posts 7.06 MB and the recipient downloads all 2.12 GB. Erasure-coded: each client sends a 0.70 MB coded share to each server, each lane ingests 210 MB, and the recipient reads 19 MB. Key-share envelopes are 70 KB per client per server in every mode.">
 </picture>
