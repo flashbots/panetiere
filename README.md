@@ -26,10 +26,11 @@ Merkle tree used by the commitment layer.
   envelope is only transport. Clients run inside a TEE, but a client that breaks TEEs
   costs liveness, not privacy; the client image lives in [github.com/flashbots/flashbots-images](https://github.com/flashbots/flashbots-images).
 - **Server** — holds one Shamir share of every client's KAHE key. It publishes
-  the sum of those shares together with a summed opening that verifies against
-  the summed commitment, which is what stops it publishing a wrong sum.
-- **Recipient** — verifies the openings, interpolates $\sum sk$ from any $t$ summed
-  shares, decrypts $\sum ct$, decodes.
+  the sum of the openings of those shares. The summed opening verifies against
+  the summed commitment and opens it to the sum of the shares.
+- **Recipient** — verifies the openings, which gives it each server's summed
+  share, interpolates $\sum sk$ from any $t$ of them, decrypts $\sum ct$,
+  decodes.
 
 Any $t$ shares reconstruct $\sum sk$, so **anonymity needs enough servers to refuse
 to decrypt over any client set other than the canonical one — at least
@@ -87,7 +88,7 @@ sequenceDiagram
     B-->>S: canonical client set
     B-->>S: client commitments
     Note over S: unseal_opening, then run_server_round —<br/>verify each opening, all-or-nothing over the canonical set
-    S->>B: summed share + summed opening
+    S->>B: summed opening (opens to the summed share)
     B-->>R: all client posts + server entries
     Note over R: recover_unverified_direct — verify each opening, drop culprits,<br/>interpolate Σsk from t shares, decrypt Σct
     Note over R: channel::decode_messages — Σm mod t back to payloads
@@ -231,8 +232,8 @@ to the payload layer.
 
 ## Errors
 
-Two `VerifyError` variants are server-attributable and carry an index into
-`server_outputs`: `InvalidServerOpening(i)` and `ShareOpeningMismatch(i)`. The
+One `VerifyError` variant is server-attributable and carries an index into
+`server_outputs`: `InvalidServerOpening(i)`. The
 `recover_*` functions act on exactly those, excluding and retrying until $t$
 remain; everything else fails the round. A rejected round comes back as
 `RecipientError::Rejected(RejectReason)`, so a caller can report *why* rather
