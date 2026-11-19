@@ -47,7 +47,7 @@ impl ClientBulletinEntry {
         let mut ctxt = Vec::with_capacity(n_ctxt);
         let mut start = 2;
         for _ in 0..n_ctxt {
-            let (coeffs, next) = unpack_poly64(bytes, start, KAHE_MODULUS);
+            let (coeffs, next) = unpack_poly64(bytes, start, KAHE_MODULUS)?;
             start = next;
             ctxt.push(KahePoly::from_coeffs(coeffs));
         }
@@ -107,7 +107,7 @@ impl RsClientBulletinEntry {
         }
         let hvc_len = poly_packed_len(HVC_MODULUS);
         let comm = Commitment::from_bytes(&bytes[..hvc_len])?;
-        let (root_coeffs, start) = unpack_poly(bytes, hvc_len, HVC_MODULUS);
+        let (root_coeffs, start) = unpack_poly(bytes, hvc_len, HVC_MODULUS)?;
         let mut pubkey = [0u8; sig::PUBKEY_LEN];
         pubkey.copy_from_slice(&bytes[start..start + sig::PUBKEY_LEN]);
         let mut s = [0u8; sig::SIG_LEN];
