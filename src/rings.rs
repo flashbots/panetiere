@@ -758,3 +758,59 @@ mod ring_tests {
         assert_eq!(KaheNTTPoly::from_ntt_slots(&bad), None);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CS_MODULUS, KAHE_MODULUS};
+    use chipmunk_code::HVC_MODULUS;
+
+    #[test]
+    fn centering_matches_rem_euclid() {
+        let m = KAHE_MODULUS;
+        let h = m / 2;
+        for x in [
+            0,
+            1,
+            -1,
+            h,
+            h + 1,
+            -h,
+            -h - 1,
+            m - 1,
+            -(m - 1),
+            m,
+            -m,
+            3 * m + 5,
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let r = x.rem_euclid(m);
+            let expected = if r > h { r - m } else { r };
+            assert_eq!(center_i64(x, m), expected, "x = {x}");
+        }
+        for m in [CS_MODULUS, HVC_MODULUS] {
+            let h = m / 2;
+            for x in [
+                0,
+                1,
+                -1,
+                h,
+                h + 1,
+                -h,
+                -h - 1,
+                m - 1,
+                -(m - 1),
+                m,
+                -m,
+                3 * m + 5,
+                i32::MAX,
+                i32::MIN,
+            ] {
+                let r = x.rem_euclid(m);
+                let expected = if r > h { r - m } else { r };
+                assert_eq!(center_i32(x, m), expected, "x = {x}");
+            }
+        }
+    }
+}
