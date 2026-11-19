@@ -16,6 +16,7 @@
 //!   PROFILE_ITERS=10    iterations of the timed inner loop (default 10)
 //!   PROFILE_MU=0        KAHE width in polys (0 = the default parameter set)
 //!   PROFILE_T=0         plaintext modulus, only with PROFILE_MU (0 = default)
+//!   PROFILE_THRESHOLD=0 Shamir threshold (0 = honest majority, ⌊S/2⌋ + 1)
 //!   PROFILE_ROLE=all    which party's work the timed loop repeats:
 //!                       `all` runs the whole round per iteration;
 //!                       `client`, `server` or `recipient` builds that role's
@@ -200,6 +201,11 @@ fn main() {
         ProtocolParams::setup_with_kahe_dims(&mut rng, s, mu)
     } else {
         ProtocolParams::setup(&mut rng, s)
+    };
+    // PROFILE_THRESHOLD = 0 keeps the honest-majority ⌊S/2⌋ + 1.
+    let pp = match env_usize("PROFILE_THRESHOLD", 0) {
+        0 => pp,
+        t => pp.with_threshold(t),
     };
 
     eprintln!(
