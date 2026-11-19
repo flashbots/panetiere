@@ -2,8 +2,7 @@
 //!
 //! The bytes form a little-endian bit stream; symbol `i` is bits
 //! `[i·bits, (i+1)·bits)` of it, so every symbol is a value in `[0, 2^bits)`.
-//! Chunking is linear over byte strings with disjoint set bits (no carries),
-//! which is what lets the slot codec sum byte-granular slots exactly.
+//! Chunking is linear over byte strings with disjoint set bits (no carries).
 
 pub(crate) fn pack(bytes: &[u8], bits: usize, symbols: usize) -> Vec<u64> {
     debug_assert!((1..=56).contains(&bits));

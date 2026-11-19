@@ -48,7 +48,7 @@ which is what makes the round work. Panetière owns its ring parameters and thin
 semantic types in `src/rings.rs`; `negacyclic-rings` provides the arithmetic.
 The layers above are, bottom-up, the schemes (`kahe`, `sss`, `cs`, `rs`, `pke`,
 `sig`), the round drivers under `protocol::`, and the payload encodings a caller
-picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consume
+picks between (`channel`, `mse`, `prony`), which all produce and consume
 `Vec<KahePoly>`.
 
 | Module | |
@@ -63,7 +63,6 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `protocol::*` | the round drivers, verifier, recipient policy |
 | `channel` | recommended payload layer: sizes either encoding for up to $C$ messages of $n$ bytes |
 | `mse` / `prony` | the two multiset encodings (peeling; MDS sketch) |
-| `codec` | raw byte↔poly packing for disjoint slots |
 | `scaling_bench` | harness behind `panetiere_scaling` / `panetiere_merge` |
 
 ## Ingress modes
@@ -190,8 +189,8 @@ with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mat
 and decoding unmasks every element and returns the messages sorted. Each byte
 message carries a length header, so trailing zero bytes survive the padding. The masking is what allows the security proof to fix the corrupted clients' inputs before the honest messages are known. The honest messages themselves are hidden by the encryption. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
 $Q = 2^{64}$ oracle queries at the largest round of $\rho = 300$ clients: six
-extra 34-bit symbols per element. This guarantee covers the `channel` path only — polys built with `mse`,
-`prony` or `codec` directly, including slot mode, are not masked.
+extra 34-bit symbols per element. This guarantee covers the `channel` path only — polys built with `mse`
+or `prony` directly are not masked.
 
 `ChannelParams` covers both multiset encodings behind that one interface:
 `for_messages` / `for_symbols` build the peeling variant,
@@ -200,9 +199,7 @@ sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to m
 recovery is all-or-nothing for both. The sketch also needs a
 prime plaintext modulus, which `protocol_params` handles by selecting
 `PRONY_PRIME` for that variant. `mse` / `prony` directly when you want to choose
-$\gamma$, $\delta$, $\xi$, capacity or slack yourself. `codec` for disjoint byte slots
-— use `encode_raw`/`decode_raw` there, since `encode`/`decode`
-carry a per-coefficient length header that multiplies under summation.
+$\gamma$, $\delta$, $\xi$, capacity or slack yourself.
 
 ### Client
 
@@ -360,8 +357,7 @@ peeling table that is not an honest sum comes back as
 decoder checks, as the paper's does, that each peeled key hashes to the cell it
 was read from and stops after `capacity` elements, so a forged contribution
 costs the recipient at most `capacity` peels.
-`CodecError::CoeffOutOfRange` means a per-coefficient sum overflowed the symbol
-modulus, i.e. the slot layout let two clients collide. A `None` from
+A `None` from
 `unseal_opening` is wrong session, wrong client/server, or a tampered envelope.
 
 Nothing that arrives over the wire can panic a peer. Every remote input is
@@ -415,7 +411,7 @@ channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their semantic
 prime fields.
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
-slot mode, *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
+*t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
 invariance), `mse_e2e.rs` and `prony_e2e.rs` (each encoding carried end-to-end,
 with cover traffic), `rs_mode_e2e.rs` (lanes, constant-size posts, a lying lane
 named, a bad share named at its lane, capacity faults not blamed on clients),
