@@ -637,6 +637,17 @@ mod tests {
     }
 
     #[test]
+    fn security_targets_match_reference() {
+        use crate::reference_params::{int, reference};
+        let r = reference();
+        assert_eq!(int(&r, "/setting/eps_mse"), u64::from(EPS_MSE));
+        assert_eq!(int(&r, "/setting/secpar"), SECURITY_BITS as u64);
+        // the reference nonce is `xi_nonce` elements of `F_{t^ω}`, `ω` symbols each
+        let nonce = int(&r, "/kahe/mse/xi_nonce") * int(&r, "/kahe/mse/omega");
+        assert_eq!(nonce, nonce_symbols(BITS_PER_CHUNK) as u64);
+    }
+
+    #[test]
     fn oracle_is_deterministic_and_separates_sessions() {
         let a = random_oracle(&SID, &[1, 2, 3], 1000, 35);
         assert_eq!(a, random_oracle(&SID, &[1, 2, 3], 1000, 35));
