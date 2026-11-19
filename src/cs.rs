@@ -2599,24 +2599,36 @@ mod tests {
     // each field the sum relies on has to agree across the set on its own
     #[test]
     fn sum_openings_rejects_each_mismatched_field() {
-        let (_, _, opens_a) = committed(112, 1);
-        let (_, _, opens_b) = committed(113, 1);
-        assert!(HidingMerkleCommitment::sum_openings(&[&opens_a[0], &opens_b[0]]).is_some());
+        let mut rng = ChaCha20Rng::from_seed([112u8; 32]);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let mut open_first = || {
+            let shares = rand_shares(&mut rng, 4, 1);
+            let (_, mut opens) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+            opens.swap_remove(0)
+        };
+        let (first, second) = (open_first(), open_first());
+        assert!(HidingMerkleCommitment::sum_openings(&pp, 0, &[&first, &second]).is_ok());
 
-        let change: [fn(&mut Opening); 7] = [
-            |o| o.server_index += 1,
-            |o| o.kappa_cs -= 1,
-            |o| o.mu_cs += 1,
-            |o| o.stored_path_len += 1,
-            |o| o.path_index += 1,
-            |o| o.data = with_extra(&o.data),
-            |o| o.rs = with_extra(&o.rs),
+        let wrong_position = SumError::WrongPosition { index: 1 };
+        let wrong_shape = SumError::WrongShape { index: 1 };
+        type Change = fn(&mut Opening);
+        let change: [(Change, &SumError); 7] = [
+            (|o| o.server_index += 1, &wrong_position),
+            (|o| o.path_index += 1, &wrong_position),
+            (|o| o.kappa_cs -= 1, &wrong_shape),
+            (|o| o.mu_cs += 1, &wrong_shape),
+            (|o| o.stored_path_len += 1, &wrong_shape),
+            (|o| o.data = with_extra(&o.data), &wrong_shape),
+            (|o| o.rs = with_extra(&o.rs), &wrong_shape),
         ];
-        for (which, change) in change.iter().enumerate() {
-            let mut other = opens_b[0].clone();
+        for (which, (change, expected)) in change.iter().enumerate() {
+            let mut other = second.clone();
             change(&mut other);
-            assert!(
-                HidingMerkleCommitment::sum_openings(&[&opens_a[0], &other]).is_none(),
+            assert_eq!(
+                HidingMerkleCommitment::sum_openings(&pp, 0, &[&first, &other])
+                    .err()
+                    .as_ref(),
+                Some(*expected),
                 "field {which}"
             );
         }
@@ -2751,7 +2763,7 @@ mod tests {
                 let mut back = vec![0i32; len];
                 assert_eq!(
                     unpack_bits(&bytes, 0, &mut back, bound, bits),
-                    bytes.len(),
+                    Some(bytes.len()),
                     "bound {bound}"
                 );
                 assert_eq!(back, values, "bound {bound}");
@@ -2768,7 +2780,7 @@ mod tests {
                 let mut back = vec![0i64; len];
                 assert_eq!(
                     unpack_bits64(&bytes, 0, &mut back, bound, bits),
-                    bytes.len(),
+                    Some(bytes.len()),
                     "bound {bound}"
                 );
                 assert_eq!(back, values, "bound {bound}");
@@ -2877,7 +2889,8 @@ mod tests {
                 })
                 .collect();
             let refs: Vec<&Opening> = openings.iter().collect();
-            let agg = HidingMerkleCommitment::sum_openings(&refs).expect("same shape");
+            let agg = HidingMerkleCommitment::sum_openings(&pp, 0, &refs)
+                .expect("openings are for position 0 under the same parameters");
             let (r_bound, s_bound, tree_bound) = aggregated_opening_pack_bounds(&pp, rho);
             let wire = agg.pack(r_bound, s_bound, tree_bound).to_bytes().len()
                 + pack_cs_shares(agg.s()).len();
