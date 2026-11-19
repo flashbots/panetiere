@@ -376,44 +376,8 @@ impl KaheNTTPoly {
         }
     }
 
-    /// NTT-domain coefficients, canonical in `[0, q)`.
-    pub(crate) fn coeffs(&self) -> &[u64; N] {
-        &self.coeffs
-    }
-
-    pub fn ntt_slots(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
-        self.coeffs.iter().copied()
-    }
-
-    pub fn from_ntt_slots(slots: &[u64]) -> Option<Self> {
-        Self::from_canonical(slots.try_into().ok()?)
-    }
-
-    /// Wrap NTT-domain coefficients, rejecting any not in `[0, q)`.
-    pub(crate) fn from_canonical(coeffs: [u64; N]) -> Option<Self> {
-        coeffs
-            .iter()
-            .all(|&x| x < KAHE_MODULUS as u64)
-            .then_some(Self { coeffs })
-    }
-
     pub fn from_kahe(poly: &KahePoly) -> Self {
         Self::from(poly)
-    }
-
-    pub(crate) fn set_from_coeffs(&mut self, coeffs: &[i64; N]) {
-        for (out, &c) in self.coeffs.iter_mut().zip(coeffs) {
-            *out = lift64(c, KAHE_MODULUS) as u64;
-        }
-        ntt64::ntt(kahe_ring(), &mut self.coeffs);
-    }
-
-    pub(crate) fn add_product_assign(&mut self, lhs: &Self, rhs: &Self) {
-        let ring = kahe_ring();
-        for i in 0..N {
-            let product = ntt64::mul_mod(lhs.coeffs[i], rhs.coeffs[i], ring);
-            self.coeffs[i] = ntt64::add_mod(self.coeffs[i], product, ring.q);
-        }
     }
 
     pub fn to_centered_coeffs(&self) -> [i64; N] {
@@ -690,11 +654,6 @@ pub fn pointwise_dot_cs(a: &[CsNTTPoly], b: &[CsNTTPoly]) -> CsNTTPoly {
     cs_aux_rns().pointwise_mac(&mut result.coeffs, &a, &b);
     result
 }
-pub type RsNTTPoly = KaheNTTPoly;
-
-pub fn pointwise_dot_rs(a: &[RsNTTPoly], b: &[RsNTTPoly]) -> RsNTTPoly {
-    pointwise_dot_kahe(a, b)
-}
 
 #[cfg(test)]
 mod ring_tests {
@@ -742,20 +701,6 @@ mod ring_tests {
         let b = KahePoly::rand_poly(&mut rng);
         assert_eq!(KahePoly::from(KaheNTTPoly::from(&a)), a);
         assert_eq!(a * b, KahePoly::schoolbook(&a, &b));
-        let mut acc = KaheNTTPoly::from(&a);
-        acc.add_product_assign(&KaheNTTPoly::from(&a), &KaheNTTPoly::from(&b));
-        assert_eq!(KahePoly::from(acc), a + KahePoly::schoolbook(&a, &b));
-    }
-
-    #[test]
-    fn kahe_ntt_slots_round_trip_and_reject_noncanonical() {
-        let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
-        let p = KaheNTTPoly::rand_ntt_poly(&mut rng);
-        let slots: Vec<u64> = p.ntt_slots().collect();
-        assert_eq!(KaheNTTPoly::from_ntt_slots(&slots), Some(p));
-        let mut bad = slots;
-        bad[0] = KAHE_MODULUS as u64;
-        assert_eq!(KaheNTTPoly::from_ntt_slots(&bad), None);
     }
 }
 

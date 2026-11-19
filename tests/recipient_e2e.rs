@@ -279,7 +279,7 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
 
 #[test]
 fn protocol_capacity_cannot_be_raised_by_policy() {
-    use panetiere::protocol::verify::aggregate_and_decrypt_rs;
+    use panetiere::protocol::verify::decrypt_unverified_sum;
 
     let mut r = round(13, 4, 4);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
@@ -303,20 +303,13 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
         expected
     );
-
-    let mut rng = ChaCha20Rng::from_seed([93; 32]);
-    let pp = ProtocolParams::setup_rs_mode(
-        &mut rng,
-        4,
-        1,
-        3,
-        4,
-        panetiere::kahe::T_MODULUS_DEFAULT,
-        3,
-        [94; 32],
+    assert_eq!(
+        decrypt_unverified_sum(
+            &r.pp,
+            &r.publics[0].1.ctxt,
+            &r.publics[0].1.comm,
+            &r.outputs
+        ),
+        expected
     );
-    assert!(matches!(
-        aggregate_and_decrypt_rs(&pp, &SESSION, &r.canonical, &[], &r.outputs, &[]),
-        Err(VerifyError::TooManyClients { got: 4, max: 3 })
-    ));
 }
