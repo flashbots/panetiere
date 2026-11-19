@@ -12,7 +12,7 @@ use panetiere::protocol::recipient::{
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
 use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
-use panetiere::{CsPoly, KahePoly, N};
+use panetiere::{KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -119,12 +119,11 @@ fn recover_once_matches_aggregate_and_decrypt() {
 /// retry without it.
 #[test]
 fn recover_once_names_the_faulty_server() {
-    let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
     let mut r = round(2, 5, 4);
-    r.outputs[1].agg_share += CsPoly::rand_poly(&mut rng);
+    r.outputs[1].agg_open.r_mut().swap(0, 1);
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
-        Err(VerifyError::ShareOpeningMismatch(1))
+        Err(VerifyError::InvalidServerOpening(1))
     );
 }
 
@@ -132,11 +131,10 @@ fn recover_once_names_the_faulty_server() {
 /// t-of-n decryption does not need them.
 #[test]
 fn recover_direct_excludes_culprits() {
-    let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
     let mut r = round(3, 5, 4);
     assert_eq!(r.pp.shamir.t, 3);
     for i in [1usize, 3] {
-        r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
+        r.outputs[i].agg_open.r_mut().swap(0, 1);
     }
     let honest = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &{
         let mut v = r.outputs.clone();
@@ -156,12 +154,11 @@ fn recover_direct_excludes_culprits() {
 
 #[test]
 fn recover_direct_reports_exhausted_shares() {
-    let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
     let mut r = round(4, 4, 4);
     // t = 3 of 4, so two bad shares leave too few.
     assert_eq!(r.pp.shamir.t, 3);
     for i in [0usize, 2] {
-        r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
+        r.outputs[i].agg_open.r_mut().swap(0, 1);
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     match recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
@@ -435,13 +432,12 @@ fn from_bytes(r: &Round, posts: &[Option<Vec<u8>>]) -> Result<Recovered, Recipie
 /// parsed posts, and excludes the same culprits.
 #[test]
 fn from_bytes_matches_parsed_posts() {
-    let mut rng = ChaCha20Rng::from_seed([34u8; 32]);
     let mut r = round(34, 5, 6);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     let posts = r.post_bytes();
     for corrupt in [&[][..], &[1usize, 3][..]] {
         for &i in corrupt {
-            r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
+            r.outputs[i].agg_open.r_mut().swap(0, 1);
         }
         let want = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap();
         let got = from_bytes(&r, &posts).unwrap();

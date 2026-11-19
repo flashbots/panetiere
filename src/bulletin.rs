@@ -3,9 +3,8 @@
 use std::sync::Mutex;
 
 use crate::cs::{
-    add_unpacked_poly64, aggregated_opening_pack_bounds, pack_cs_shares, pack_poly, pack_poly64,
-    poly_packed_len, poly_packed_len64, unpack_cs_shares, unpack_poly, unpack_poly64, Commitment,
-    CsParams, Opening, PackedOpening,
+    add_unpacked_poly64, aggregated_opening_pack_bounds, pack_poly, pack_poly64, poly_packed_len,
+    poly_packed_len64, unpack_poly, unpack_poly64, Commitment, CsParams, Opening, PackedOpening,
 };
 use crate::hvc_sum::reduce_hvc_sum;
 use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
@@ -13,7 +12,7 @@ use crate::rings::{center_i32, center_i64};
 use crate::rs::Share;
 use crate::share_commitment::ShareOpening;
 use crate::sig;
-use crate::{CsPoly, KahePoly, CS_MODULUS, KAHE_MODULUS, N as POLY_N};
+use crate::{KahePoly, KAHE_MODULUS, N as POLY_N};
 use chipmunk_code::{HVCPoly, HVC_MODULUS};
 
 #[derive(Clone)]
@@ -320,28 +319,24 @@ pub struct ServerBulletinEntry {
     pub server_id: ServerId,
     pub clients: Vec<ClientId>,
     pub agg_open: Opening,
-    pub agg_share: CsPoly,
 }
 
 impl ServerBulletinEntry {
     /// Wire form: `server_id: u32 LE ‖ |clients|: u32 LE ‖ clients: u32 LE each
-    /// ‖ agg_open ‖ agg_share`. The aggregated opening is bit-packed against
-    /// the bounds for `|clients|` summed openings
-    /// ([`aggregated_opening_pack_bounds`]) and carries its own header; the
-    /// share is one packed CS polynomial, so it has a fixed length and comes
-    /// last.
+    /// ‖ agg_open`. The aggregated opening is bit-packed against the bounds for
+    /// `|clients|` summed openings ([`aggregated_opening_pack_bounds`]) and
+    /// carries its own header. The server's share is not posted: the recipient
+    /// gets it from verifying the opening.
     pub fn to_bytes(&self, cs: &CsParams) -> Vec<u8> {
-        let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(cs, self.clients.len() as u32);
-        let opening = self.agg_open.pack(r_b, s_b, t_b).to_bytes();
-        let share = pack_cs_shares(std::slice::from_ref(&self.agg_share));
-        let mut out = Vec::with_capacity(8 + 4 * self.clients.len() + opening.len() + share.len());
+        let (r_b, t_b) = aggregated_opening_pack_bounds(cs, self.clients.len() as u32);
+        let opening = self.agg_open.pack(r_b, t_b).to_bytes();
+        let mut out = Vec::with_capacity(8 + 4 * self.clients.len() + opening.len());
         out.extend_from_slice(&self.server_id.0.to_le_bytes());
         out.extend_from_slice(&(self.clients.len() as u32).to_le_bytes());
         for c in &self.clients {
             out.extend_from_slice(&c.0.to_le_bytes());
         }
         out.extend_from_slice(&opening);
-        out.extend_from_slice(&share);
         out
     }
 
@@ -361,23 +356,19 @@ impl ServerBulletinEntry {
         };
         let server_id = ServerId(word(0)?);
         let n_clients = word(1)? as usize;
-        let share_len = poly_packed_len(CS_MODULUS);
         let clients_end = 8usize.checked_add(n_clients.checked_mul(4)?)?;
-        let opening_end = bytes.len().checked_sub(share_len)?;
-        if opening_end < clients_end {
+        if bytes.len() < clients_end {
             return None;
         }
         let clients = (0..n_clients)
             .map(|i| word(2 + i).map(ClientId))
             .collect::<Option<Vec<_>>>()?;
-        let packed = PackedOpening::from_bytes(&bytes[clients_end..opening_end])?;
+        let packed = PackedOpening::from_bytes(&bytes[clients_end..])?;
         let agg_open = Opening::from_packed(&packed).ok()?;
-        let agg_share = unpack_cs_shares(&bytes[opening_end..], 1)?.pop()?;
         Some(Self {
             server_id,
             clients,
             agg_open,
-            agg_share,
         })
     }
 }

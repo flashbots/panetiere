@@ -189,10 +189,7 @@ where
         }
         match decode(&outputs) {
             Ok(plain) => return Ok((plain, culprits)),
-            Err(VerifyError::InvalidServerOpening(i))
-            | Err(VerifyError::ShareOpeningMismatch(i))
-                if i < outputs.len() =>
-            {
+            Err(VerifyError::InvalidServerOpening(i)) if i < outputs.len() => {
                 culprits.push(outputs[i].server_id);
                 outputs.remove(i);
             }

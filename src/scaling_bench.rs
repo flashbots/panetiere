@@ -75,7 +75,7 @@
 //!                  flow, message_bytes), so cells never share a stream; the
 //!                  MSE PRF key is drawn from that stream
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
-//!  asserted per cell: agg_open + agg_share == CsParams::aggregated_server_crypto_len
+//!  asserted per cell: agg_open == CsParams::aggregated_server_crypto_len
 //!
 //! Run with:
 //!   RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep
@@ -93,8 +93,8 @@ use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::channel::{self, ChannelParams};
 use crate::codec::{self, BYTES_PER_POLY};
 use crate::cs::{
-    aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
-    Cs, HidingMerkleCommitment,
+    aggregated_opening_pack_bounds, poly_packed_len, poly_packed_len64, Commitment, Cs,
+    HidingMerkleCommitment,
 };
 use crate::kahe::{Kahe, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::mse::BITS_PER_SYMBOL;
@@ -641,7 +641,6 @@ struct Row {
     kahe_key_b: usize,    // one KAHE key (κ_kahe = 1 ring element)
     plaintext_b: usize,   // KAHE plaintext, n_polys elements of R_t
     agg_open_b: usize,    // server-posted aggregate opening
-    agg_share_b: usize,   // server-posted agg_share (one CS poly)
     /// Correctness exponent the KAHE condition yields at this (ρ, n_polys):
     /// a round decodes with probability ≥ 1 − 2^−eps. `0` = no guarantee.
     eps_correct: f64,
@@ -841,7 +840,6 @@ mod csv_tests {
             kahe_key_b: 12800,
             plaintext_b: 1234560,
             agg_open_b: 106240,
-            agg_share_b: 4864,
             eps_correct: 35.9,
             useful_b: 409900.0,
             wire_ctxt_b: 5.0e8,
@@ -1046,7 +1044,7 @@ fn client_post_b(r: &Row) -> usize {
 }
 
 fn server_entry_b(r: &Row) -> usize {
-    r.agg_open_b + r.agg_share_b
+    r.agg_open_b
 }
 
 /// Per-cell RNG seed: domain-separated hash over every parameter that defines
@@ -1256,14 +1254,10 @@ fn run_cell(
     let open_env_b = sealed_inbox0[0].1.len();
     // Server-posted aggregate, at the same bounds the servers would pack with.
     let rho = canonical.len() as u32;
-    let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(&pp.cs, rho);
-    let agg_open_b = outputs[0].agg_open.pack(r_b, s_b, t_b).to_bytes().len();
-    let agg_share_b = pack_cs_shares(std::slice::from_ref(&outputs[0].agg_share)).len();
+    let (r_b, t_b) = aggregated_opening_pack_bounds(&pp.cs, rho);
+    let agg_open_b = outputs[0].agg_open.pack(r_b, t_b).to_bytes().len();
     // Pins the wire-planning formula to what packing actually emits.
-    assert_eq!(
-        agg_open_b + agg_share_b,
-        pp.cs.aggregated_server_crypto_len(rho)
-    );
+    assert_eq!(agg_open_b, pp.cs.aggregated_server_crypto_len(rho));
     let comm_client_b = poly_packed_len(HVC_MODULUS);
     let ctxt_client_b = n_polys * poly_packed_len64(KAHE_MODULUS);
 
@@ -1284,7 +1278,7 @@ fn run_cell(
     // verifier's S-way parallel pass instead, so the two are not interchangeable.
     let (v_one_open, one_open_ok) =
         measure(|| HidingMerkleCommitment::verify(&pp.cs, &comm0, &openings0[0]));
-    assert!(one_open_ok, "fresh opening must verify");
+    assert!(one_open_ok.is_some(), "fresh opening must verify");
     let (seal, _) =
         measure(|| seal_openings(&mut rng, &pp, &SESSION, client_ids[0], &openings0, &servers));
     let (unseal, _) =
@@ -1676,14 +1670,13 @@ fn run_cell(
         kahe_key_b: poly_packed_len64(KAHE_MODULUS),
         plaintext_b: n_polys * POLY_N * BITS_PER_SYMBOL / 8,
         agg_open_b,
-        agg_share_b,
         // ρ = every client's ciphertext is summed, cover included.
         eps_correct: correctness_epsilon(n, n_polys, t_modulus),
         useful_b: (delivered * payload_bits) as f64 / 8.0,
         wire_ctxt_b: n as f64 * ctxt_client_b as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
-        wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
+        wire_server_b: s as f64 * agg_open_b as f64,
         agg: AggPlan {
             agg_cpu: owned(roles.agg, agg.agg_cpu),
             leader: owned(roles.agg, agg.leader),
@@ -1992,7 +1985,7 @@ fn print_tables(rows: &[Row]) {
             fmt_eps(r.eps_correct),
         );
     }
-    println!("    (client → = comm + ctxt + S·open_env; server → = agg_open + agg_share)");
+    println!("    (client → = comm + ctxt + S·open_env; server → = agg_open)");
     println!();
 
     println!("── components: vector commitment | KAHE ([M] times, [D] sizes) ──────────────");
@@ -2260,7 +2253,7 @@ fn print_tables(rows: &[Row]) {
 
     println!("── wire components, per emitter ([M] off the wire except comm/ctxt, [D]) ────");
     println!(
-        "{:<4}{:>10}{:>15}   {:<30}srv_entry = agg_open + agg_share",
+        "{:<4}{:>10}{:>15}   {:<30}srv_entry = agg_open",
         "id", "comm/cl", "ctxt/cl", "open_env →1srv (×S /cl)"
     );
     for (i, r) in rows.iter().enumerate() {
@@ -2275,12 +2268,7 @@ fn print_tables(rows: &[Row]) {
                 r.s,
                 fmt_bytes((r.open_env_b * r.s) as f64)
             ),
-            format!(
-                "{} = {} + {}",
-                fmt_bytes((r.agg_open_b + r.agg_share_b) as f64),
-                fmt_bytes(r.agg_open_b as f64),
-                fmt_bytes(r.agg_share_b as f64)
-            ),
+            fmt_bytes(r.agg_open_b as f64),
         );
     }
     println!();
@@ -2709,7 +2697,7 @@ fn write_csv(rows: &[Row]) {
     }
     header.push_str(
         ",m_open_env_b\
-         ,d_comm_client_b,d_ctxt_client_b,d_agg_open_b,d_agg_share_b\
+         ,d_comm_client_b,d_ctxt_client_b,d_agg_open_b\
          ,d_open_body_b,d_kahe_key_b,d_plaintext_b\
          ,d_client_to_server_b,d_client_to_recipient_b,d_client_post_b,d_server_entry_b,d_epsilon\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
@@ -2780,12 +2768,11 @@ fn write_csv(rows: &[Row]) {
         }
         write!(
             out,
-            ",{},{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.0}",
+            ",{},{},{},{},{},{},{},{},{},{},{},{:.2},{:.0},{:.0},{:.0},{:.0},{:.0}",
             r.open_env_b,
             r.comm_client_b,
             r.ctxt_client_b,
             r.agg_open_b,
-            r.agg_share_b,
             r.open_env_b - pke::SEAL_OVERHEAD,
             r.kahe_key_b,
             r.plaintext_b,
@@ -3049,7 +3036,6 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         kahe_key_b: idx("d_kahe_key_b")?,
         plaintext_b: idx("d_plaintext_b")?,
         agg_open_b: idx("d_agg_open_b")?,
-        agg_share_b: idx("d_agg_share_b")?,
         eps_correct: num("d_epsilon")?,
         useful_b: num("d_useful_b")?,
         wire_ctxt_b: num("d_wire_ctxt_b")?,
