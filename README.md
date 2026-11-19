@@ -148,6 +148,12 @@ let servers: Vec<(ServerId, pke::PublicKey)> = /* ordered by ServerId */;
 let session = SessionId(/* 32 fresh bytes */);
 ```
 
+Every `setup*` uses the Shamir threshold `honest_majority_threshold(γ) = ⌊γ/2⌋ + 1`
+for γ servers (the paper's *t*<sub>s</sub>): anonymity and output delivery both
+hold as long as the honest servers are a majority. `.with_threshold(t)` sets
+another threshold on any of them; a threshold *t* gives anonymity against *t* − 1
+corrupt servers and output delivery against min(*t* − 1, γ − *t*).
+
 `ProtocolParams` is the CRS — every party must use the same instance (derive it
 from a shared seed). `ServerId(i)` is the server's index into that set;
 `NodeId(j) < n_nodes`. **`SessionId` must be unique per execution:** sealed
@@ -417,8 +423,8 @@ named, a bad share named at its lane, capacity faults not blamed on clients),
 `recipient_e2e.rs` (anchor admission, culprit exclusion, every `RejectReason`).
 
 The sweep binary takes its cells from the environment (`SWEEP_CLIENTS=300x300`,
-`SWEEP_PAYLOAD_SYMBOLS`, `SWEEP_RS`, `BENCH_BUDGET_SECS`) and writes one CSV row
-per cell to `BENCH_CSV`. `BENCH_ROLES` selects which roles a run *records* — the
+`SWEEP_PAYLOAD_SYMBOLS`, `SWEEP_RS`, `SWEEP_THRESHOLD`, `BENCH_BUDGET_SECS`) and
+writes one CSV row per cell to `BENCH_CSV`. `BENCH_ROLES` selects which roles a run *records* — the
 full round executes either way, so a client measured in a TEE and everything
 else measured on the host walk identical code:
 
@@ -440,6 +446,10 @@ Measured on a 16-core 3.9 GHz Intel Xeon Gold 6526Y with 503 GB of memory,
 Ubuntu 26.04 / kernel 7.0.0-22, TDX enabled. The client runs in an 8-vCPU,
 64 GB TDX VM under QEMU on the same host; every workload is core-pinned,
 including the VM's vCPUs, and everything uses 8 threads.
+
+These numbers predate the switch to the honest-majority threshold and were measured
+with max(⌊γ/2⌋ + 1, γ − 2), i.e. 6 of 8 and 14 of 16 servers
+(`SWEEP_THRESHOLD=S-2`).
 
 ### CPU and bytes per round
 
