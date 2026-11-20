@@ -4,14 +4,14 @@
 //! to a `μ_cs`-component share vector `s ∈ R_{q_cs}^{μ_cs}` under randomness
 //! `r ∈ B^{κ_cs}_{β_cs,q_cs}`. `a` is a length-`κ_cs` row vector, `B` is a
 //! `μ_cs × κ_cs` matrix. All BDLOP arithmetic lives on the **CS ring**
-//! `R_{q_cs}` (`CsPoly`, q_cs = 139301), decoupled from the HVC
-//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 40961).
+//! `R_{q_cs}` (`CsPoly`, q_cs = 150413), decoupled from the HVC
+//! Merkle-tree hash ring `R_{q_hvc}` (q_hvc = 557057).
 //!
 //! **CS → HVC bridge.** A BDLOP leaf is a `CsPoly` whose coefficients span
 //! `[-q_cs/2, q_cs/2]`, larger than `q_hvc`. To feed it into the HVC tree hash
-//! we base-`(2ζ+1)=69` decompose each leaf element into `HVC_WIDTH = 3`
+//! we base-`(2ζ+1)=791` decompose each leaf element into `HVC_WIDTH = 2`
 //! `HVCPoly` digits (`CsPoly::decompose_r_to_hvc`); the digits are tiny
-//! (`|·| ≤ ζ = 34 ≪ q_hvc`) so they embed losslessly. The left-inverse
+//! (`|·| ≤ ζ = 395 ≪ q_hvc`) so they embed losslessly. The left-inverse
 //! `CsPoly::project_r_from_hvc` is linear in the digits, so summed opening
 //! digits project to the summed leaf — keeping `sum_openings` correct.
 //!
@@ -35,11 +35,14 @@
 //! projections are linear, so summing stored digits pointwise keeps
 //! `sum_openings` correct.
 
+use std::borrow::Borrow;
+
 use crate::hvc_stream::StreamingHvcDot;
 use crate::hvc_sum::sum_hvc_polys;
-use crate::rings::center_i32;
-use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, N as POLY_N};
-use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH};
+use crate::rings::{center_i32, center_i64, RHO_MAX};
+use crate::{pointwise_dot_cs, CsNTTPoly, CsPoly, CS_MODULUS, KAHE_MODULUS, N as POLY_N};
+use chipmunk_code::{HVCHash, HVCPoly, Tree, HVC_MODULUS, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
+use negacyclic_rings::arithmetic;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
@@ -58,9 +61,25 @@ pub trait Cs {
     ) -> (Self::Commitment, Vec<Self::Opening>);
     fn verify(pp: &Self::Params, c: &Self::Commitment, o: &Self::Opening) -> bool;
     fn sum_commitments(cs: &[Self::Commitment]) -> Self::Commitment;
-    /// Take borrowed slices to avoid cloning openings (each can be ~100s of KB).
-    /// `None` when the set cannot be summed (empty, or mismatched shapes).
-    fn sum_openings(os: &[&Self::Opening]) -> Option<Self::Opening>;
+    /// Sum of the openings at `position`; the empty sum is the zero opening.
+    /// Takes borrowed slices to avoid cloning openings (each can be ~100s of
+    /// KB). Fails if an opening does not have the shape `pp` prescribes or is
+    /// for another position.
+    fn sum_openings(
+        pp: &Self::Params,
+        position: usize,
+        os: &[&Self::Opening],
+    ) -> Result<Self::Opening, SumError>;
+}
+
+/// Why a set of openings cannot be summed. Openings come from mutually
+/// distrusting clients, so this is a rejection, not an invariant violation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SumError {
+    /// Opening `index` does not have the shape the parameters prescribe.
+    WrongShape { index: usize },
+    /// Opening `index` is for another position.
+    WrongPosition { index: usize },
 }
 
 /// `g ∈ R_{q_hvc}^{ξ·HVC_WIDTH}`: the Ajtai hash labelling one vector-commitment
@@ -97,7 +116,7 @@ pub struct CsParams {
     pub r_bound: u32,
     /// Aggregated bound on the base-(2η+1) decomposition digits of the HVC
     /// tree opening. Each digit-coefficient ∈ [−η, η] fresh, [−ρη, ρη] after
-    /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·34 = 10200). Checked
+    /// summing ρ openings, so `β_agg_hvc = ρ_max·η` (= 300·395 = 118500). Checked
     /// in `verify` so a forged opening can't use out-of-range digits.
     pub beta_agg_hvc: u32,
     /// Labels a leaf from its `ξ·HVC_WIDTH` bridged digits.
@@ -248,6 +267,71 @@ impl HidingMerkleCommitment {
         verify_with_bounds(pp, c, o, pp.beta_cs, chipmunk_code::ZETA)
     }
 
+    /// The cheap half of [`Self::verify_fresh`]: shape and the fresh norm
+    /// bounds, no ring arithmetic. What [`Self::verify_fresh_batch`] assumes
+    /// of every opening it is handed.
+    pub fn check_fresh_shape(pp: &CsParams, o: &Opening) -> bool {
+        shape_and_norms(pp, o, pp.beta_cs, chipmunk_code::ZETA)
+    }
+
+    /// [`Self::verify_fresh`] over a whole batch at once. Every equation the
+    /// per-opening check tests is linear in the opening and its root, so a
+    /// random weighted sum of the batch is checked in place of each member:
+    /// `weights[combo][i]` scales opening `i` (and its commitment) in
+    /// combination `combo`, and the batch passes iff every combination does.
+    ///
+    /// The weights must be drawn after the openings are fixed. Then a batch
+    /// containing an opening that fails on its own passes a combination with
+    /// probability at most `2^-15` (the weight has to hit the one value that
+    /// cancels the defect, out of `2^15`), independently per combination;
+    /// nine rows give `2^-135`, past the 128-bit target. The weight range has
+    /// to fit below both moduli for that to hold, which
+    /// [`BATCH_WEIGHT_BOUND`] asserts at compile time. A pass says nothing
+    /// about which member would fail, so a failing batch is re-checked member
+    /// by member.
+    ///
+    /// Requires `openings.len() ≤ batch_capacity(pp)`, every opening to pass
+    /// [`Self::check_fresh_shape`], and all of them to sit at one position;
+    /// anything else is rejected.
+    pub fn verify_fresh_batch(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> bool {
+        openings.iter().all(|o| Self::check_fresh_shape(pp, o))
+            && Self::verify_fresh_batch_shaped(pp, comms, openings, weights)
+    }
+
+    /// [`Self::verify_fresh_batch`] for openings that have already passed
+    /// [`Self::check_fresh_shape`], as the server's per-client gate does.
+    /// The norm bounds are the part a linear combination can't check, so
+    /// skipping them on openings nobody has checked is unsound.
+    pub(crate) fn verify_fresh_batch_shaped(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> bool {
+        let Some(first) = openings.first() else {
+            return false;
+        };
+        let combos = weights.len();
+        if comms.len() != openings.len()
+            || openings.len() > batch_capacity(pp)
+            || combos == 0
+            || weights.iter().any(|row| row.len() != openings.len())
+            || weights.iter().flatten().any(|&w| w >= BATCH_WEIGHT_BOUND)
+            || openings.iter().any(|o| o.path_index != first.path_index)
+        {
+            return false;
+        }
+        let acc = BatchAcc::accumulate(pp, comms, openings, weights);
+        (0..acc.combos)
+            .into_par_iter()
+            .all(|combo| acc.verify_combo(pp, combo, first.path_index))
+    }
+
     pub fn sum_commitment_refs(cs: &[&Commitment]) -> Commitment {
         let roots: Vec<&HVCPoly> = cs.iter().map(|c| &c.root).collect();
         Commitment {
@@ -310,26 +394,7 @@ fn verify_with_bounds(
     tree_bound: u32,
 ) -> bool {
     // Step 1
-    if o.kappa_cs() != pp.kappa_cs
-        || o.mu_cs() != pp.mu_cs
-        || o.stored_path_len() != pp.stored_path_len()
-    {
-        return false;
-    }
-    // Guard backing buffers before the accessors slice into them.
-    if o.rs.len() != pp.kappa_cs + pp.mu_cs
-        || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
-    {
-        return false;
-    }
-    if !o.r().iter().all(|p| p.infinity_norm() <= r_bound) {
-        return false;
-    }
-    // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
-    // by tree_bound, so a forged opening can't substitute out-of-range digits
-    // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
-    // after aggregation), well within β_agg_hvc = ρ_max·ζ.
-    if !o.data.iter().all(|p| p.infinity_norm() <= tree_bound) {
+    if !shape_and_norms(pp, o, r_bound, tree_bound) {
         return false;
     }
 
@@ -345,22 +410,95 @@ fn verify_with_bounds(
     let leaf_label = pp.leaf_hash.hash(o.u());
 
     // Step 4: chipmunk path above the leaf label.
-    let stored_path_len = o.stored_path_len();
+    walk_path(pp, &c.root, &o.data, o.xi(), o.path_index, &leaf_label)
+}
+
+/// Shape of `o` against `pp`, `‖r‖∞ ≤ r_bound` on the CS ring and
+/// `‖digits‖∞ ≤ tree_bound` on the HVC ring.
+fn shape_and_norms(pp: &CsParams, o: &Opening, r_bound: u32, tree_bound: u32) -> bool {
+    if o.kappa_cs() != pp.kappa_cs
+        || o.mu_cs() != pp.mu_cs
+        || o.stored_path_len() != pp.stored_path_len()
+    {
+        return false;
+    }
+    // Guard backing buffers before the accessors slice into them.
+    if o.rs.len() != pp.kappa_cs + pp.mu_cs
+        || o.data.len() != opening_data_polys(pp.xi(), pp.stored_path_len())
+    {
+        return false;
+    }
+    if !o.r().iter().all(|p| norm_within(p.coeffs(), r_bound)) {
+        return false;
+    }
+    // Bound the base-(2η+1) HVC decomposition digits (leaf digits + path)
+    // by tree_bound, so a forged opening can't substitute out-of-range digits
+    // that still project/hash correctly. Honest digits are ζ-bounded (ρ·ζ
+    // after aggregation), well within β_agg_hvc = ρ_max·ζ.
+    o.data.iter().all(|p| norm_within(p.coeffs(), tree_bound))
+}
+
+/// `‖coeffs‖∞ ≤ bound`, as a full reduction rather than an early-exit scan
+/// so it compiles to vector absolute-value and max instructions.
+fn norm_within(coeffs: &[i32; POLY_N], bound: u32) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            return unsafe { infinity_norm_avx2(coeffs) } <= bound;
+        }
+    }
+    arithmetic::infinity_norm_i32(coeffs) <= bound
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn infinity_norm_avx2(coeffs: &[i32; POLY_N]) -> u32 {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let mut m = _mm256_setzero_si256();
+    let mut k = 0;
+    while k < POLY_N {
+        let x = _mm256_loadu_si256(coeffs.as_ptr().add(k) as *const __m256i);
+        m = _mm256_max_epu32(m, _mm256_abs_epi32(x));
+        k += 8;
+    }
+    let mut lanes = [0u32; 8];
+    _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, m);
+    lanes.into_iter().max().unwrap_or(0)
+}
+
+/// Walk the stored path digits in `data` (laid out as an opening's `data`,
+/// leaf digits first) from `leaf_label` up to `root`.
+fn walk_path(
+    pp: &CsParams,
+    root: &HVCPoly,
+    data: &[HVCPoly],
+    xi: usize,
+    path_index: usize,
+    leaf_label: &HVCPoly,
+) -> bool {
+    let stored_path_len = pp.stored_path_len();
+    let node = |level: usize| {
+        let base = xi * HVC_WIDTH + level * 2 * HVC_WIDTH;
+        (
+            &data[base..base + HVC_WIDTH],
+            &data[base + HVC_WIDTH..base + 2 * HVC_WIDTH],
+        )
+    };
     if stored_path_len == 0 {
-        return c.root == leaf_label;
+        return root == leaf_label;
     }
 
-    let (top_l, top_r) = o.path_node(0);
-    if pp.hasher.hash_separate_inputs(top_l, top_r) != c.root {
+    let (top_l, top_r) = node(0);
+    if pp.hasher.hash_separate_inputs(top_l, top_r) != *root {
         return false;
     }
 
-    let leaf_index = o.path_index;
-    let pos = position_list(leaf_index, stored_path_len);
+    let pos = position_list(path_index, stored_path_len);
     for i in 1..stored_path_len {
-        let (cur_l, cur_r) = o.path_node(i);
+        let (cur_l, cur_r) = node(i);
         let parent = pp.hasher.hash_separate_inputs(cur_l, cur_r);
-        let (prev_l, prev_r) = o.path_node(i - 1);
+        let (prev_l, prev_r) = node(i - 1);
         let expected = if pos[i] {
             HVCPoly::projection_r(prev_r)
         } else {
@@ -372,13 +510,251 @@ fn verify_with_bounds(
     }
 
     let last = stored_path_len - 1;
-    let (last_l, last_r) = o.path_node(last);
+    let (last_l, last_r) = node(last);
     let stored_running = if pos[stored_path_len] {
         HVCPoly::projection_r(last_r)
     } else {
         HVCPoly::projection_r(last_l)
     };
-    stored_running == leaf_label
+    stored_running == *leaf_label
+}
+
+/// Exclusive upper bound on a batch combination weight: weights are uniform
+/// in `[0, 2^15)`, the paper's `W`. A defective opening cancels out of a
+/// combination only for one weight value (zero, if it is the only defective
+/// one), and only if distinct weights stay distinct modulo both `q_cs` and
+/// `q_hvc`, so the whole range has to sit below the smaller modulus. The one
+/// value is unique because both moduli are prime, so a non-zero defect is
+/// invertible. The bound also keeps the i32 accumulation of
+/// [`batch_capacity`] exact.
+pub const BATCH_WEIGHT_BOUND: u16 = 1 << 15;
+
+/// Whether the weights in `[0, bound)` are pairwise distinct modulo both
+/// moduli: the largest weight, `bound − 1`, has to stay below the smaller
+/// one, or two weights would share a residue and the cancelling residue
+/// could be hit twice.
+const fn batch_weights_distinct(bound: u16, q_cs: i32, q_hvc: i32) -> bool {
+    let smaller = if q_cs < q_hvc { q_cs } else { q_hvc };
+    (bound as i32) - 1 < smaller
+}
+
+const _: () = assert!(
+    batch_weights_distinct(BATCH_WEIGHT_BOUND, CS_MODULUS, HVC_MODULUS),
+    "batch weights must be distinct modulo both q_cs and q_hvc"
+);
+
+const fn is_prime(n: i32) -> bool {
+    let mut d = 2;
+    while d * d <= n {
+        if n % d == 0 {
+            return false;
+        }
+        d += 1;
+    }
+    n > 1
+}
+
+const _: () = assert!(
+    is_prime(CS_MODULUS) && is_prime(HVC_MODULUS),
+    "the batch soundness argument needs prime moduli"
+);
+
+/// Largest batch the fresh check can accumulate in i32: every combination
+/// weight is below [`BATCH_WEIGHT_BOUND`] and every accumulated coefficient is
+/// bounded by `max(β_cs, ζ)`, so `ρ · (BATCH_WEIGHT_BOUND − 1) · max(β_cs, ζ)`
+/// has to stay within `i32::MAX`.
+pub fn batch_capacity(pp: &CsParams) -> usize {
+    let largest_term =
+        (BATCH_WEIGHT_BOUND as usize - 1) * pp.beta_cs.max(chipmunk_code::ZETA) as usize;
+    i32::MAX as usize / largest_term
+}
+
+/// Weights for one batched fresh check: `combos` independent rows, one
+/// weight per opening, each uniform in `[0, BATCH_WEIGHT_BOUND)`.
+pub fn batch_weights<R: Rng>(rng: &mut R, combos: usize, openings: usize) -> Vec<Vec<u16>> {
+    (0..combos)
+        .map(|_| {
+            (0..openings)
+                .map(|_| rng.gen_range(0..BATCH_WEIGHT_BOUND))
+                .collect()
+        })
+        .collect()
+}
+
+/// Weighted sums of a batch of openings, every slot holding one accumulator
+/// per combination (slot-major). `r`, the digits and the roots stay in i32 or
+/// i64 unreduced; the capacity bound keeps them exact.
+struct BatchAcc {
+    combos: usize,
+    r: Vec<[i32; POLY_N]>,
+    s: Vec<[i64; POLY_N]>,
+    data: Vec<[i32; POLY_N]>,
+    root: Vec<[i64; POLY_N]>,
+}
+
+impl BatchAcc {
+    /// Each slot is accumulated on its own, over every opening and every
+    /// combination at once, so an opening's poly is read from memory once
+    /// and there is nothing to merge afterwards.
+    fn accumulate(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> Self {
+        let combos = weights.len();
+        let kappa = pp.kappa_cs;
+        let mu = pp.mu_cs;
+        let data_polys = opening_data_polys(pp.xi(), pp.stored_path_len());
+        let r: Vec<[i32; POLY_N]> = (0..kappa)
+            .into_par_iter()
+            .flat_map_iter(|p| {
+                let polys = openings.iter().map(move |o| o.r()[p].coeffs());
+                slot_i32(polys, weights)
+            })
+            .collect();
+        let data: Vec<[i32; POLY_N]> = (0..data_polys)
+            .into_par_iter()
+            .flat_map_iter(|p| {
+                let polys = openings.iter().map(move |o| o.data[p].coeffs());
+                slot_i32(polys, weights)
+            })
+            .collect();
+        let s: Vec<[i64; POLY_N]> = (0..mu)
+            .into_par_iter()
+            .flat_map_iter(|p| {
+                let polys = openings.iter().map(move |o| o.s()[p].coeffs());
+                slot_i64(polys, weights)
+            })
+            .collect();
+        let root = slot_i64(comms.iter().map(|c| c.root.coeffs()), weights);
+        Self {
+            combos,
+            r,
+            s,
+            data,
+            root,
+        }
+    }
+
+    /// Run the fresh check's algebra on combination `combo`: the weighted
+    /// digit sums must project to the weighted leaf block over the integers
+    /// and, reduced mod `q_hvc`, hash and walk to the weighted root.
+    fn verify_combo(&self, pp: &CsParams, combo: usize, path_index: usize) -> bool {
+        let c = self.combos;
+        let xi = pp.xi();
+        let r: Vec<CsPoly> = (0..pp.kappa_cs)
+            .map(|p| CsPoly::from_coeffs(self.r[p * c + combo].map(|x| center_i32(x, CS_MODULUS))))
+            .collect();
+        let s: Vec<CsPoly> = (0..pp.mu_cs)
+            .map(|p| {
+                CsPoly::from_coeffs(
+                    self.s[p * c + combo].map(|x| center_i64(x, CS_MODULUS as i64) as i32),
+                )
+            })
+            .collect();
+        let raw = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, &s);
+        let data_polys = opening_data_polys(xi, pp.stored_path_len());
+        let digit = |p: usize| &self.data[p * c + combo];
+        // the projection is linear over the integers, so it is taken on the
+        // unreduced sums; the hash and the path live mod q_hvc
+        for (k, expected) in raw.iter().enumerate() {
+            let mut projected = [0i32; POLY_N];
+            for (j, out) in projected.iter_mut().enumerate() {
+                let mut acc = 0i64;
+                for w in (0..HVC_WIDTH).rev() {
+                    acc = acc * TWO_ZETA_PLUS_ONE as i64 + digit(k * HVC_WIDTH + w)[j] as i64;
+                }
+                *out = center_i64(acc, CS_MODULUS as i64) as i32;
+            }
+            if CsPoly::from_coeffs(projected) != *expected {
+                return false;
+            }
+        }
+        let reduced: Vec<HVCPoly> = (0..data_polys)
+            .map(|p| HVCPoly::from_coeffs(digit(p).map(|x| center_i32(x, HVC_MODULUS))))
+            .collect();
+        let root = HVCPoly::from_coeffs(
+            self.root[combo].map(|x| center_i64(x, HVC_MODULUS as i64) as i32),
+        );
+        let leaf_label = pp.leaf_hash.hash(&reduced[..xi * HVC_WIDTH]);
+        walk_path(pp, &root, &reduced, xi, path_index, &leaf_label)
+    }
+}
+
+/// One slot's accumulators, one per combination, over that slot's poly in
+/// every opening (or commitment), in batch order.
+fn slot_i32<'a>(
+    polys: impl Iterator<Item = &'a [i32; POLY_N]>,
+    weights: &[Vec<u16>],
+) -> Vec<[i32; POLY_N]> {
+    let mut accs = vec![[0i32; POLY_N]; weights.len()];
+    for (i, coeffs) in polys.enumerate() {
+        for (acc, row) in accs.iter_mut().zip(weights) {
+            mac_i32(acc, coeffs, row[i] as i32);
+        }
+    }
+    accs
+}
+
+/// [`slot_i32`] with i64 accumulators, for the full-range `s` and roots.
+fn slot_i64<'a>(
+    polys: impl Iterator<Item = &'a [i32; POLY_N]>,
+    weights: &[Vec<u16>],
+) -> Vec<[i64; POLY_N]> {
+    let mut accs = vec![[0i64; POLY_N]; weights.len()];
+    for (i, coeffs) in polys.enumerate() {
+        for (acc, row) in accs.iter_mut().zip(weights) {
+            mac_i64(acc, coeffs, row[i] as i64);
+        }
+    }
+    accs
+}
+
+/// `acc[i] += v[i] · weight`; the caller's bounds keep it in range. AVX2 when
+/// available, as the auto-vectoriser only reaches SSE2 on the baseline target.
+#[inline(always)]
+fn mac_i32(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // checking per call is cheap: each call covers all `POLY_N`
+        // coefficients, so the check and the call into the non-inlinable
+        // avx2 kernel are noise. measurements and disassembly:
+        // https://gist.github.com/come-maiz/276e95df72c33c8ff47466e808998b1b
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe { mac_i32_avx2(acc, v, weight) };
+            return;
+        }
+    }
+    mac_i32_scalar(acc, v, weight);
+}
+
+fn mac_i32_scalar(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    for (a, &x) in acc.iter_mut().zip(v) {
+        *a += x * weight;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mac_i32_avx2(acc: &mut [i32; POLY_N], v: &[i32; POLY_N], weight: i32) {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(POLY_N % 8, 0);
+    let w = _mm256_set1_epi32(weight);
+    let mut k = 0;
+    while k < POLY_N {
+        let a_ptr = acc.as_mut_ptr().add(k) as *mut __m256i;
+        let av = _mm256_loadu_si256(a_ptr as *const __m256i);
+        let xv = _mm256_loadu_si256(v.as_ptr().add(k) as *const __m256i);
+        _mm256_storeu_si256(a_ptr, _mm256_add_epi32(av, _mm256_mullo_epi32(xv, w)));
+        k += 8;
+    }
+}
+
+fn mac_i64(acc: &mut [i64; POLY_N], v: &[i32; POLY_N], weight: i64) {
+    for (a, &x) in acc.iter_mut().zip(v) {
+        *a += x as i64 * weight;
+    }
 }
 
 impl Cs for HidingMerkleCommitment {
@@ -390,7 +766,7 @@ impl Cs for HidingMerkleCommitment {
     type Opening = Opening;
 
     fn setup<R: Rng>(rng: &mut R, num_servers: usize) -> CsParams {
-        Self::setup_with_dims(rng, num_servers, 1, 5)
+        Self::setup_with_dims(rng, num_servers, MU_CS, KAPPA_CS)
     }
 
     /// Commit per-server share vectors and emit one opening per server.
@@ -488,28 +864,23 @@ impl Cs for HidingMerkleCommitment {
         Self::sum_commitment_refs(&refs)
     }
 
-    /// `None` if the set is empty or the openings disagree on shape or
-    /// position — each is a separate client's untrusted post, so a mismatch is
-    /// a rejection, not an invariant violation.
-    fn sum_openings(os: &[&Opening]) -> Option<Opening> {
-        let first = os.first()?;
-        let idx = first.server_index;
-        let kappa_cs = first.kappa_cs();
-        let mu_cs = first.mu_cs();
-        let stored_path_len = first.stored_path_len();
-        let path_index = first.path_index;
-        let total = first.data.len();
-        let rs_len = first.rs.len();
-        for o in os {
-            if o.server_index != idx
-                || o.kappa_cs() != kappa_cs
+    fn sum_openings(pp: &CsParams, position: usize, os: &[&Opening]) -> Result<Opening, SumError> {
+        // the shape every opening must have, from the parameters
+        let (kappa_cs, mu_cs) = (pp.kappa_cs, pp.mu_cs);
+        let stored_path_len = pp.stored_path_len();
+        let rs_len = kappa_cs + mu_cs;
+        let total = opening_data_polys(pp.xi(), stored_path_len);
+        for (index, o) in os.iter().enumerate() {
+            if o.server_index != position || o.path_index != position {
+                return Err(SumError::WrongPosition { index });
+            }
+            if o.kappa_cs() != kappa_cs
                 || o.mu_cs() != mu_cs
                 || o.stored_path_len() != stored_path_len
-                || o.path_index != path_index
                 || o.data.len() != total
                 || o.rs.len() != rs_len
             {
-                return None;
+                return Err(SumError::WrongShape { index });
             }
         }
 
@@ -577,9 +948,9 @@ impl Cs for HidingMerkleCommitment {
             }
         }
 
-        Some(Opening {
-            server_index: idx,
-            path_index,
+        Ok(Opening {
+            server_index: position,
+            path_index: position,
             kappa_cs,
             mu_cs,
             stored_path_len,
@@ -635,8 +1006,8 @@ unsafe fn wrapping_add_avx2_impl(acc: &mut [i32; POLY_N], v: &[i32; POLY_N]) {
 //
 // Tight pack uses just enough bits per coefficient for each region's bound:
 //   r:    ⌈log₂(2·r_bound + 1)⌉ bits
-//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 139301)
-//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(69)⌉ = 7 bits
+//   s:    ⌈log₂(q_cs)⌉ bits (18 at q_cs = 150413)
+//   tree: ⌈log₂(2·ZETA + 1)⌉ = ⌈log₂(791)⌉ = 10 bits
 
 /// Number of bits to encode signed values in [-bound, bound].
 #[inline]
@@ -647,13 +1018,20 @@ pub(crate) fn bits_for_signed(bound: u32) -> u32 {
 
 /// Pack signed values in [-bound, bound] into `out` at `bits` bits each
 /// (LSB-first within each byte), offset by `bound` to become unsigned.
-fn pack_bits(out: &mut Vec<u8>, values: &[i32], bound: u32, bits: u32) {
-    debug_assert!(bits <= 32);
+/// Takes a slice or any iterator, so callers can transform values on the fly.
+fn pack_bits<V: Borrow<i32>>(
+    out: &mut Vec<u8>,
+    values: impl IntoIterator<Item = V>,
+    bound: u32,
+    bits: u32,
+) {
+    assert!(bits <= 32, "u64 accumulator supports up to 32-bit values");
     let offset = bound as i64;
     let max_u: u64 = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
     let mut acc_bits: u32 = 0;
-    for &v in values {
+    for v in values {
+        let v = *v.borrow();
         debug_assert!(
             v >= -(bound as i32) && v <= bound as i32,
             "pack_bits: value {} outside [{}, {}]",
@@ -677,57 +1055,151 @@ fn pack_bits(out: &mut Vec<u8>, values: &[i32], bound: u32, bits: u32) {
 }
 
 /// Inverse of `pack_bits`. Reads `values.len()` signed integers each `bits`
-/// wide from `input` starting at `start_byte`; returns the next byte index.
+/// wide from `input` starting at `start_byte`; returns the next byte index,
+/// or `None` if a value lies outside `[-bound, bound]`, which `pack_bits`
+/// never writes. Either way, `values` holds every decoded value. Panics if
+/// `input` ends before the last value.
 fn unpack_bits(
     input: &[u8],
     start_byte: usize,
     values: &mut [i32],
     bound: u32,
     bits: u32,
-) -> usize {
+) -> Option<usize> {
+    assert!(
+        (1..=32).contains(&bits),
+        "unpack_bits: width {bits} outside 1..=32"
+    );
     let offset = bound as i64;
-    let mask: u64 = (1u64 << bits) - 1;
-    let mut acc: u64 = 0;
-    let mut acc_bits: u32 = 0;
-    let mut byte_idx = start_byte;
-    for v in values.iter_mut() {
-        while acc_bits < bits {
-            acc |= (input[byte_idx] as u64) << acc_bits;
-            byte_idx += 1;
-            acc_bits += 8;
-        }
-        let u = (acc & mask) as i64;
-        *v = (u - offset) as i32;
-        acc >>= bits;
-        acc_bits -= bits;
+    unpack_fields(input, start_byte, values, bound as u64, bits, |u| {
+        (u as i64 - offset) as i32
+    })
+}
+
+/// Shared body of [`unpack_bits`] and [`unpack_bits64`]: decodes each field
+/// `u` of up to 56 bits, checks `u <= 2 * bound` and stores `convert(u)`.
+///
+/// Every field is read with one unaligned 8-byte little-endian load at its
+/// byte, shifted down by its bit offset and masked; a field of up to 56 bits
+/// starting at bit `bit % 8 < 8` always fits in that word. The window may
+/// extend past `end` into whatever follows in `input`; those bits are masked
+/// off. Only fields whose window would run past the end of `input` itself
+/// read from a zero-padded copy of its last bytes.
+#[inline(always)]
+fn unpack_fields<T>(
+    input: &[u8],
+    start_byte: usize,
+    values: &mut [T],
+    bound: u64,
+    bits: u32,
+    convert: impl Fn(u64) -> T,
+) -> Option<usize> {
+    let end = start_byte + (values.len() * bits as usize).div_ceil(8);
+    assert!(end <= input.len(), "input ends before the last value");
+    let bytes = &input[start_byte..];
+    // Fields whose whole window lies inside `bytes`: field i starts at byte
+    // ⌊i·bits/8⌋, which must be at most `bytes.len() - 8`.
+    let direct = bytes.len().checked_sub(8).map_or(0, |room| {
+        ((room * 8 + 7) / bits as usize + 1).min(values.len())
+    });
+    let (head, tail) = values.split_at_mut(direct);
+    let mut in_range = decode_fields(bytes, 0, head, bound, bits, &convert);
+    if !tail.is_empty() {
+        let first = direct * bits as usize;
+        // The rest of `input` from the first such field: at most 7 bytes, and
+        // every window then starts within the first 8 bytes of `padded`.
+        let rest = &bytes[first / 8..];
+        let mut padded = [0u8; 16];
+        padded[..rest.len()].copy_from_slice(rest);
+        in_range &= decode_fields(&padded, first % 8, tail, bound, bits, &convert);
     }
-    byte_idx
+    in_range.then_some(end)
 }
 
-/// Bytes one polynomial occupies when bit-packed against `modulus` — each of
-/// the `N` coefficients in `⌈log₂(2·modulus+1)⌉` bits.
+/// Decode `values.len()` fields of `bits` bits from `bytes`, the first at bit
+/// `bit0`, into `convert(u)`. Each field's 8-byte window must lie inside
+/// `bytes`. Returns whether every field is at most `2 * bound`.
+#[inline(always)]
+fn decode_fields<T>(
+    bytes: &[u8],
+    bit0: usize,
+    values: &mut [T],
+    bound: u64,
+    bits: u32,
+    convert: &impl Fn(u64) -> T,
+) -> bool {
+    let mask = (1u64 << bits) - 1;
+    let max_u = 2 * bound;
+    let mut in_range = true;
+    for (i, v) in values.iter_mut().enumerate() {
+        let bit = bit0 + i * bits as usize;
+        let window: [u8; 8] = bytes[bit / 8..bit / 8 + 8].try_into().expect("8 bytes");
+        let u = (u64::from_le_bytes(window) >> (bit % 8)) & mask;
+        in_range &= u <= max_u;
+        *v = convert(u);
+    }
+    in_range
+}
+
+// Centered packing (`pack_poly`, `pack_poly64`, `poly_packed_len*`) is exact
+// only for an odd modulus: then every residue has exactly one centered
+// representative in `[-(m-1)/2, (m-1)/2]`. Every caller passes one of these.
+const _: () = assert!(
+    CS_MODULUS % 2 == 1 && HVC_MODULUS % 2 == 1 && KAHE_MODULUS % 2 == 1,
+    "centered packing needs odd moduli"
+);
+
+/// Bytes one polynomial occupies when bit-packed against an odd `modulus` —
+/// each of the `N` coefficients as its centered representative in
+/// `[-(modulus-1)/2, (modulus-1)/2]`, i.e. in `⌈log₂ modulus⌉` bits.
 pub fn poly_packed_len(modulus: i32) -> usize {
-    (POLY_N * bits_for_signed(modulus as u32) as usize).div_ceil(8)
+    (POLY_N * bits_for_signed((modulus / 2) as u32) as usize).div_ceil(8)
 }
 
-/// 64-bit variants for the KAHE ring (q ≈ 2^49.3 → 51 bits per coefficient).
+/// 64-bit variants for the KAHE ring.
 #[inline]
-fn bits_for_signed64(bound: u64) -> u32 {
+const fn bits_for_signed64(bound: u64) -> u32 {
     let n = 2u128 * bound as u128 + 1;
-    (128 - n.leading_zeros()).max(1)
+    let bits = 128 - n.leading_zeros();
+    if bits == 0 {
+        1
+    } else {
+        bits
+    }
 }
+
+/// Widest value the 64-bit packers support: `pack_bits64` keeps up to 7
+/// leftover bits in a `u64` next to the incoming value.
+const MAX_BITS64: u32 = 56;
+
+/// KAHE coefficients are packed as centered representatives, with bound
+/// `(q-1)/2`, so they must fit the 64-bit packers: `q < 2^56`.
+const _: () = assert!(
+    bits_for_signed64((KAHE_MODULUS / 2) as u64) <= MAX_BITS64,
+    "KAHE_MODULUS is too large to pack: coefficients would need more than 56 bits"
+);
 
 pub fn poly_packed_len64(modulus: i64) -> usize {
-    (POLY_N * bits_for_signed64(modulus as u64) as usize).div_ceil(8)
+    (POLY_N * bits_for_signed64((modulus / 2) as u64) as usize).div_ceil(8)
 }
 
-fn pack_bits64(out: &mut Vec<u8>, values: &[i64], bound: u64, bits: u32) {
-    debug_assert!(bits <= 56, "u64 accumulator supports up to 56-bit symbols");
+/// [`pack_bits`] for `i64` values.
+fn pack_bits64<V: Borrow<i64>>(
+    out: &mut Vec<u8>,
+    values: impl IntoIterator<Item = V>,
+    bound: u64,
+    bits: u32,
+) {
+    assert!(
+        bits <= MAX_BITS64,
+        "u64 accumulator supports up to 56-bit values"
+    );
     let offset = bound as i64;
     let max_u: u64 = (1u64 << bits) - 1;
     let mut acc: u64 = 0;
     let mut acc_bits: u32 = 0;
-    for &v in values {
+    for v in values {
+        let v = *v.borrow();
         debug_assert!(
             v >= -(bound as i64) && v <= bound as i64,
             "pack_bits64: value {v} outside [-{bound}, {bound}]"
@@ -747,64 +1219,68 @@ fn pack_bits64(out: &mut Vec<u8>, values: &[i64], bound: u64, bits: u32) {
     }
 }
 
+/// [`unpack_bits`] for `i64` values of up to 56 bits.
 fn unpack_bits64(
     input: &[u8],
     start_byte: usize,
     values: &mut [i64],
     bound: u64,
     bits: u32,
-) -> usize {
+) -> Option<usize> {
+    assert!(
+        (1..=MAX_BITS64).contains(&bits),
+        "unpack_bits64: width {bits} outside 1..=56"
+    );
     let offset = bound as i64;
-    let mask: u128 = (1u128 << bits) - 1;
-    // u128: acc_bits can reach bits-1+8 = 58 before draining, so byte shifts
-    // exceed the u64 range.
-    let mut acc: u128 = 0;
-    let mut acc_bits: u32 = 0;
-    let mut byte_idx = start_byte;
-    for v in values.iter_mut() {
-        while acc_bits < bits {
-            acc |= (input[byte_idx] as u128) << acc_bits;
-            byte_idx += 1;
-            acc_bits += 8;
-        }
-        *v = (acc & mask) as i64 - offset;
-        acc >>= bits;
-        acc_bits -= bits;
-    }
-    byte_idx
+    unpack_fields(input, start_byte, values, bound, bits, |u| {
+        u as i64 - offset
+    })
 }
 
 /// [`pack_poly`] for i64 coefficient arrays (KAHE ring).
 pub(crate) fn pack_poly64(coeffs: &[i64], modulus: i64, out: &mut Vec<u8>) {
-    let bound = modulus as u64;
-    pack_bits64(out, coeffs, bound, bits_for_signed64(bound));
+    let bound = (modulus / 2) as u64;
+    let centered = coeffs.iter().map(|&x| center_i64(x, modulus));
+    pack_bits64(out, centered, bound, bits_for_signed64(bound));
 }
 
 /// [`unpack_poly`] for i64 coefficient arrays (KAHE ring).
-pub(crate) fn unpack_poly64(input: &[u8], start: usize, modulus: i64) -> ([i64; POLY_N], usize) {
-    let bound = modulus as u64;
+pub(crate) fn unpack_poly64(
+    input: &[u8],
+    start: usize,
+    modulus: i64,
+) -> Option<([i64; POLY_N], usize)> {
+    let bound = (modulus / 2) as u64;
     let mut coeffs = [0i64; POLY_N];
-    let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound));
-    (coeffs, next)
+    let next = unpack_bits64(input, start, &mut coeffs, bound, bits_for_signed64(bound))?;
+    Some((coeffs, next))
 }
 
-/// Append one polynomial's coefficients to `out`, packed against `modulus`.
-/// Like the opening's `s`-region packing, values are offset by the full modulus
-/// rather than centered, so any representative in `[-modulus, modulus]` round-
-/// trips to the identical `i32` — commitment/equality checks that depend on the
-/// exact representative are unaffected.
+/// Append one polynomial's coefficients to `out`, packed against an odd
+/// `modulus`. Each coefficient is first reduced to its centered representative
+/// in `[-(modulus-1)/2, (modulus-1)/2]`, so it takes `⌈log₂ modulus⌉` bits and
+/// any input representative is accepted. The wire bytes therefore depend only
+/// on the residues, and unpacking returns the centered representatives, which
+/// compare equal (mod `modulus`) to the packed polynomial.
 pub(crate) fn pack_poly(coeffs: &[i32], modulus: i32, out: &mut Vec<u8>) {
-    let bound = modulus as u32;
-    pack_bits(out, coeffs, bound, bits_for_signed(bound));
+    let bound = (modulus / 2) as u32;
+    let centered = coeffs.iter().map(|&x| center_i32(x, modulus));
+    pack_bits(out, centered, bound, bits_for_signed(bound));
 }
 
 /// Inverse of [`pack_poly`]: read one polynomial's `N` coefficients starting at
-/// `start`, returning them and the next byte index.
-pub(crate) fn unpack_poly(input: &[u8], start: usize, modulus: i32) -> ([i32; POLY_N], usize) {
-    let bound = modulus as u32;
+/// `start`, returning them (centered) and the next byte index. `None` if a
+/// field holds a value above `modulus - 1`, i.e. a second encoding of a
+/// residue, so every polynomial has exactly one encoding.
+pub(crate) fn unpack_poly(
+    input: &[u8],
+    start: usize,
+    modulus: i32,
+) -> Option<([i32; POLY_N], usize)> {
+    let bound = (modulus / 2) as u32;
     let mut coeffs = [0i32; POLY_N];
-    let next = unpack_bits(input, start, &mut coeffs, bound, bits_for_signed(bound));
-    (coeffs, next)
+    let next = unpack_bits(input, start, &mut coeffs, bound, bits_for_signed(bound))?;
+    Some((coeffs, next))
 }
 
 /// Wire size of a digit vector: `bits_for_signed(bound)` bits per coefficient,
@@ -833,16 +1309,14 @@ pub(crate) fn unpack_digits(bytes: &[u8], n_polys: usize, bound: u32) -> Option<
         return None;
     }
     let mut flat = vec![0i32; n_polys * POLY_N];
-    unpack_bits(bytes, 0, &mut flat, bound, bits_for_signed(bound));
-    flat.as_chunks::<POLY_N>()
-        .0
-        .iter()
-        .map(|chunk| {
-            let p = HVCPoly::from_coeffs(*chunk);
-            // Offset decoding spans [−bound, −bound + 2^bits − 1].
-            (p.infinity_norm() <= bound).then_some(p)
-        })
-        .collect()
+    unpack_bits(bytes, 0, &mut flat, bound, bits_for_signed(bound))?;
+    Some(
+        flat.as_chunks::<POLY_N>()
+            .0
+            .iter()
+            .map(|chunk| HVCPoly::from_coeffs(*chunk))
+            .collect(),
+    )
 }
 
 impl Commitment {
@@ -859,7 +1333,7 @@ impl Commitment {
         if bytes.len() != poly_packed_len(HVC_MODULUS) {
             return None;
         }
-        let (coeffs, _) = unpack_poly(bytes, 0, HVC_MODULUS);
+        let (coeffs, _) = unpack_poly(bytes, 0, HVC_MODULUS)?;
         Some(Commitment {
             root: HVCPoly::from_coeffs(coeffs),
         })
@@ -885,7 +1359,7 @@ pub fn unpack_cs_shares(bytes: &[u8], count: usize) -> Option<Vec<CsPoly>> {
     let mut out = Vec::with_capacity(count);
     let mut start = 0;
     for _ in 0..count {
-        let (coeffs, next) = unpack_poly(bytes, start, CS_MODULUS);
+        let (coeffs, next) = unpack_poly(bytes, start, CS_MODULUS)?;
         start = next;
         out.push(CsPoly::from_coeffs(coeffs));
     }
@@ -966,6 +1440,10 @@ pub enum OpeningDecodeError {
     BadHeader,
     /// `bytes` is shorter than the declared regions require.
     Truncated,
+    /// `bytes` is longer than the declared regions require.
+    TrailingBytes,
+    /// A coefficient lies outside its region's bound, which `pack` never writes.
+    OutOfRange,
 }
 
 /// Upper bound on any single opening dimension; rejects adversarial headers
@@ -1019,11 +1497,17 @@ impl Opening {
         let mu_cs = p.mu_cs as usize;
         let stored_path_len = p.stored_path_len as usize;
 
+        // The bounds come from the sender too. Values decode into `i32`, so a
+        // bound must fit one; larger ones would ask the decoder for more than
+        // 32 bits per value.
         if kappa_cs == 0
             || mu_cs == 0
             || kappa_cs > MAX_OPENING_DIM
             || mu_cs > MAX_OPENING_DIM
             || stored_path_len > MAX_OPENING_DIM
+            || [p.r_bound, p.s_bound, p.tree_bound]
+                .iter()
+                .any(|&b| b > i32::MAX as u32)
         {
             return Err(OpeningDecodeError::BadHeader);
         }
@@ -1036,8 +1520,12 @@ impl Opening {
         let total_bits = (kappa_cs * POLY_N) * r_bits as usize
             + (mu_cs * POLY_N) * s_bits as usize
             + (data_polys * POLY_N) * tree_bits as usize;
-        if p.bytes.len() < total_bits.div_ceil(8) {
+        let body_len = total_bits.div_ceil(8);
+        if p.bytes.len() < body_len {
             return Err(OpeningDecodeError::Truncated);
+        }
+        if p.bytes.len() > body_len {
+            return Err(OpeningDecodeError::TrailingBytes);
         }
 
         let mut rs: Vec<CsPoly> = vec![CsPoly::default(); kappa_cs + mu_cs];
@@ -1046,12 +1534,14 @@ impl Opening {
         let mut tmp = [0i32; POLY_N];
         // Unpack r (CS)
         for poly in rs[..kappa_cs].iter_mut() {
-            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.r_bound, r_bits);
+            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.r_bound, r_bits)
+                .ok_or(OpeningDecodeError::OutOfRange)?;
             *poly = CsPoly::from_coeffs(tmp);
         }
         // Unpack s (CS)
         for poly in rs[kappa_cs..kappa_cs + mu_cs].iter_mut() {
-            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.s_bound, s_bits);
+            byte_idx = unpack_bits(&p.bytes, byte_idx, &mut tmp, p.s_bound, s_bits)
+                .ok_or(OpeningDecodeError::OutOfRange)?;
             *poly = CsPoly::from_coeffs(tmp);
         }
         // Unpack leaf digits + path (HVC)
@@ -1062,7 +1552,8 @@ impl Opening {
                 poly.coeffs_mut(),
                 p.tree_bound,
                 tree_bits,
-            );
+            )
+            .ok_or(OpeningDecodeError::OutOfRange)?;
         }
         Ok(Opening {
             server_index: p.server_index as usize,
@@ -1099,13 +1590,17 @@ fn aggregated_opening_pack_bounds_raw(
     (r, CS_MODULUS as u32, tree)
 }
 
+/// One committed value per server: the Shamir share of the single KAHE key
+pub(crate) const MU_CS: usize = 1;
+/// BDLOP randomness width
+pub(crate) const KAPPA_CS: usize = 5;
 /// Fresh per-opening randomness radius.
-pub const BETA_CS: u32 = 116;
+pub const BETA_CS: u32 = 120;
 /// Aggregate verify bound: `ρ_max·β_cs` at `ρ_max = 300`.
-pub const R_BOUND: u32 = 34_800;
+pub const R_BOUND: u32 = RHO_MAX * BETA_CS;
 /// Aggregated HVC digit bound: `ρ_max·ζ`.
 pub fn beta_agg_hvc() -> u32 {
-    300 * chipmunk_code::ZETA
+    RHO_MAX * chipmunk_code::ZETA
 }
 
 /// [`CsParams::aggregated_server_crypto_len`] from dimensions alone, so a caller
@@ -1140,6 +1635,81 @@ mod tests {
         (0..n).map(|_| rand_share_vec(rng, mu)).collect()
     }
 
+    /// The byte-at-a-time decoder `unpack_bits` and `unpack_bits64` used to
+    /// be, kept as the reference they must agree with.
+    fn unpack_reference(
+        input: &[u8],
+        start: usize,
+        n: usize,
+        bound: u64,
+        bits: u32,
+    ) -> (Vec<i64>, usize) {
+        let mut out = Vec::with_capacity(n);
+        let (mut acc, mut acc_bits, mut idx) = (0u128, 0u32, start);
+        for _ in 0..n {
+            while acc_bits < bits {
+                acc |= (input[idx] as u128) << acc_bits;
+                idx += 1;
+                acc_bits += 8;
+            }
+            out.push((acc & ((1u128 << bits) - 1)) as i64 - bound as i64);
+            acc >>= bits;
+            acc_bits -= bits;
+        }
+        (out, idx)
+    }
+
+    /// The word-at-a-time decoders agree with the byte-at-a-time reference at
+    /// every width, start offset and length: when the region ends exactly at
+    /// the end of the input, so its last values go through the zero-padded
+    /// copy, and when other bytes follow it, which the 8-byte windows read
+    /// into but must not affect the result.
+    #[test]
+    fn unpack_matches_the_bytewise_reference() {
+        let mut rng = ChaCha20Rng::from_seed([105u8; 32]);
+        for bits in [1u32, 7, 8, 9, 17, 31, 32, 33, 46, 47, 55, 56] {
+            for start in [0usize, 1, 3] {
+                for n in [0usize, 1, 7, 8, 9, 2048] {
+                    let len = start + (n * bits as usize).div_ceil(8);
+                    let input: Vec<u8> = (0..len).map(|_| rng.gen()).collect();
+                    let bound = (1u64 << (bits - 1)) - 1;
+                    let (expected, end) = unpack_reference(&input, start, n, bound, bits);
+                    // The decoders reject any value outside [-bound, bound].
+                    let expected_end = expected.iter().all(|&v| v <= bound as i64).then_some(end);
+
+                    for trailing in [0usize, 1, 7, 8, 20] {
+                        let mut buf = input.clone();
+                        buf.extend((0..trailing).map(|_| rng.gen::<u8>()));
+                        let case = format!("bits={bits} start={start} n={n} trailing={trailing}");
+
+                        let mut got64 = vec![0i64; n];
+                        let end = unpack_bits64(&buf, start, &mut got64, bound, bits);
+                        assert_eq!((got64, end), (expected.clone(), expected_end), "64: {case}");
+
+                        if bits <= 32 {
+                            let mut got32 = vec![0i32; n];
+                            let end = unpack_bits(&buf, start, &mut got32, bound as u32, bits);
+                            let got32: Vec<i64> = got32.into_iter().map(i64::from).collect();
+                            assert_eq!(
+                                (got32, end),
+                                (expected.clone(), expected_end),
+                                "32: {case}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Input that ends before the last value panics before decoding.
+    #[test]
+    #[should_panic(expected = "input ends before the last value")]
+    fn unpack_panics_on_short_input() {
+        let mut values = [0i64; 4];
+        unpack_bits64(&[0u8; 22], 0, &mut values, 1 << 44, 46);
+    }
+
     #[test]
     fn pack_cs_shares_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
@@ -1168,6 +1738,134 @@ mod tests {
         assert!(bytes.len() < POLY_N * 4);
         assert_eq!(Commitment::from_bytes(&bytes).unwrap().root, comm.root);
         assert!(Commitment::from_bytes(&[0u8; 3]).is_none());
+    }
+
+    /// A batch of honest openings at one position passes with any weights;
+    /// a single tampered member — share, randomness, leaf digit, path digit
+    /// or root — fails it.
+    /// The top weight may be one below the smaller modulus, never equal to it.
+    #[test]
+    fn batch_weight_bound_stays_below_both_moduli() {
+        assert!(batch_weights_distinct(
+            BATCH_WEIGHT_BOUND,
+            CS_MODULUS,
+            HVC_MODULUS
+        ));
+        assert!(batch_weights_distinct(8, 8, 100));
+        assert!(!batch_weights_distinct(9, 8, 100));
+        assert!(batch_weights_distinct(8, 100, 8));
+        assert!(!batch_weights_distinct(9, 100, 8));
+        assert!(is_prime(2) && is_prime(40961) && is_prime(139301));
+        assert!(!is_prime(1) && !is_prime(4) && !is_prime(40962));
+    }
+
+    #[test]
+    fn batched_fresh_check_accepts_honest_and_catches_one_bad_member() {
+        let mut rng = ChaCha20Rng::from_seed([77u8; 32]);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let position = 2;
+        let rounds: Vec<(Commitment, Opening)> = (0..12)
+            .map(|_| {
+                let shares = rand_shares(&mut rng, 4, 1);
+                let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+                (c, os.swap_remove(position))
+            })
+            .collect();
+        let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
+        let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
+        let weights = batch_weights(&mut rng, 3, rounds.len());
+        assert!(HidingMerkleCommitment::verify_fresh_batch(
+            &pp, &comms, &opens, &weights
+        ));
+
+        fn unit(i: usize) -> CsPoly {
+            let mut c = [0i32; POLY_N];
+            c[i] = 1;
+            CsPoly::from_coeffs(c)
+        }
+        let tamper: [fn(&mut Commitment, &mut Opening); 5] = [
+            |_, o| o.s_mut()[0] += CsPoly::from_coeffs([1; POLY_N]),
+            |_, o| o.r_mut()[1] += unit(5),
+            |_, o| o.data[0].coeffs_mut()[0] += 1,
+            |_, o| o.data[o.data.len() - 1].coeffs_mut()[7] -= 1,
+            |c, _| c.root.coeffs_mut()[3] += 1,
+        ];
+        for (which, t) in tamper.iter().enumerate() {
+            let mut bad = rounds.clone();
+            let (c, o) = &mut bad[5];
+            t(c, o);
+            assert!(
+                !HidingMerkleCommitment::verify_fresh(&pp, c, o),
+                "tamper {which}"
+            );
+            let comms: Vec<&Commitment> = bad.iter().map(|(c, _)| c).collect();
+            let opens: Vec<&Opening> = bad.iter().map(|(_, o)| o).collect();
+            assert!(
+                !HidingMerkleCommitment::verify_fresh_batch(&pp, &comms, &opens, &weights),
+                "tamper {which} slipped through the batch"
+            );
+        }
+
+        let one_too_many = batch_capacity(&pp) + 1;
+        let comms: Vec<&Commitment> = std::iter::repeat_n(&rounds[0].0, one_too_many).collect();
+        let opens: Vec<&Opening> = std::iter::repeat_n(&rounds[0].1, one_too_many).collect();
+        let weights = batch_weights(&mut rng, 1, one_too_many);
+        assert!(!HidingMerkleCommitment::verify_fresh_batch(
+            &pp, &comms, &opens, &weights
+        ));
+    }
+
+    #[test]
+    fn simd_kernels_match_scalar() {
+        #[cfg(target_arch = "x86_64")]
+        let avx2 = std::is_x86_feature_detected!("avx2");
+        let mut rng = ChaCha20Rng::from_seed([78u8; 32]);
+        let random = |rng: &mut ChaCha20Rng, bound: u32| {
+            let mut coeffs = [0i32; POLY_N];
+            for c in coeffs.iter_mut() {
+                *c = rng.gen_range(-(bound as i64)..=bound as i64) as i32;
+            }
+            coeffs
+        };
+
+        // the norm gate sees any i32, forged openings included
+        let extreme = [i32::MIN; POLY_N];
+        for coeffs in [1u32, 34, 116, 20_480, 1 << 30]
+            .map(|bound| random(&mut rng, bound))
+            .into_iter()
+            .chain([extreme])
+        {
+            let norm = arithmetic::infinity_norm_i32(&coeffs);
+            assert!(norm_within(&coeffs, norm));
+            assert_eq!(norm_within(&coeffs, norm.saturating_sub(1)), norm == 0);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                assert_eq!(unsafe { infinity_norm_avx2(&coeffs) }, norm);
+            }
+        }
+
+        // the accumulation only ever sees inputs the batch bounds keep exact
+        // in i32, so neither kernel may overflow here
+        for bound in [1u32, 34, 116, 20_480] {
+            let coeffs = random(&mut rng, bound);
+            let mut expected = [0i32; POLY_N];
+            let mut dispatched = [0i32; POLY_N];
+            #[cfg(target_arch = "x86_64")]
+            let mut vectorised = [0i32; POLY_N];
+            for weight in [0i32, 1, 7, BATCH_WEIGHT_BOUND as i32 - 1] {
+                mac_i32_scalar(&mut expected, &coeffs, weight);
+                mac_i32(&mut dispatched, &coeffs, weight);
+                #[cfg(target_arch = "x86_64")]
+                if avx2 {
+                    unsafe { mac_i32_avx2(&mut vectorised, &coeffs, weight) };
+                }
+            }
+            assert_eq!(dispatched, expected);
+            #[cfg(target_arch = "x86_64")]
+            if avx2 {
+                assert_eq!(vectorised, expected);
+            }
+        }
     }
 
     #[test]
@@ -1222,7 +1920,7 @@ mod tests {
         let pp = HidingMerkleCommitment::setup(&mut rng, 4);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 69650 ≫ r_bound = 34800.
+        // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 75206 ≫ r_bound = 36000.
         openings[1].r_mut()[0] = CsPoly::rand_poly(&mut rng);
         assert!(!HidingMerkleCommitment::verify(&pp, &comm, &openings[1]));
     }
@@ -1283,6 +1981,22 @@ mod tests {
         };
         assert!(HidingMerkleCommitment::verify(&pp, &comm, &opening));
         assert!(!HidingMerkleCommitment::verify_fresh(&pp, &comm, &opening));
+
+        // the batch algebra can't see the norm either: only the shape gate
+        // keeps this opening out of a batch
+        let weights = batch_weights(&mut rng, 1, 1);
+        assert!(HidingMerkleCommitment::verify_fresh_batch_shaped(
+            &pp,
+            &[&comm],
+            &[&opening],
+            &weights
+        ));
+        assert!(!HidingMerkleCommitment::verify_fresh_batch(
+            &pp,
+            &[&comm],
+            &[&opening],
+            &weights
+        ));
     }
 
     #[test]
@@ -1307,14 +2021,16 @@ mod tests {
         let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
         let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
         for i in 0..n_servers {
-            let summed = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+            let summed =
+                HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
             assert_eq!(summed.s()[0], shares_a[i][0] + shares_b[i][0]);
             assert!(HidingMerkleCommitment::verify(&pp, &comm_sum, &summed));
         }
     }
 
     /// Openings arrive from mutually distrusting clients, so a set that cannot
-    /// be summed is rejected rather than panicking the server.
+    /// be summed is rejected rather than panicking the server, and the error
+    /// names the first opening that does not fit.
     #[test]
     fn sum_openings_rejects_a_mismatched_set() {
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
@@ -1324,19 +2040,106 @@ mod tests {
         let shares_b = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let (_, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
         let (_, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
-        assert!(HidingMerkleCommitment::sum_openings(&[]).is_none());
-        assert!(
-            HidingMerkleCommitment::sum_openings(&[&opens_a[0], &opens_b[1]]).is_none(),
-            "openings for different server positions must not sum"
+        let sum = |os: &[&Opening]| HidingMerkleCommitment::sum_openings(&pp, 0, os).err();
+        assert_eq!(
+            sum(&[&opens_a[0], &opens_b[0]]),
+            None,
+            "matching openings sum"
         );
 
-        let wide = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, pp.mu_cs + 1, 5);
-        let shares_wide = rand_shares(&mut rng, n_servers, wide.mu_cs);
-        let (_, opens_wide) = HidingMerkleCommitment::commit(&mut rng, &wide, &shares_wide);
-        assert!(
-            HidingMerkleCommitment::sum_openings(&[&opens_a[0], &opens_wide[0]]).is_none(),
-            "openings of different μ_cs must not sum"
+        // position: an opening for another server, or with only one of its
+        // two indices wrong, first or second in the set
+        assert_eq!(
+            sum(&[&opens_a[0], &opens_b[1]]),
+            Some(SumError::WrongPosition { index: 1 })
         );
+        assert_eq!(
+            sum(&[&opens_b[1], &opens_a[0]]),
+            Some(SumError::WrongPosition { index: 0 })
+        );
+        let mut wrong_server = opens_b[0].clone();
+        wrong_server.server_index = 1;
+        assert_eq!(
+            sum(&[&opens_a[0], &wrong_server]),
+            Some(SumError::WrongPosition { index: 1 })
+        );
+        let mut wrong_path = opens_b[0].clone();
+        wrong_path.path_index = 1;
+        assert_eq!(
+            sum(&[&opens_a[0], &wrong_path]),
+            Some(SumError::WrongPosition { index: 1 })
+        );
+
+        // shape, one field at a time: an opening whose declared dimensions or
+        // buffer lengths do not match the parameters, e.g. a forged one
+        type Tamper = fn(&mut Opening);
+        let tampered: [(&str, Tamper); 5] = [
+            ("κ_cs", |o| o.kappa_cs += 1),
+            ("μ_cs", |o| o.mu_cs += 1),
+            ("path length", |o| o.stored_path_len += 1),
+            ("r ‖ s length", |o| {
+                let mut rs = o.rs.to_vec();
+                rs.pop();
+                o.rs = rs.into_boxed_slice();
+            }),
+            ("data length", |o| {
+                let mut data = o.data.to_vec();
+                data.pop();
+                o.data = data.into_boxed_slice();
+            }),
+        ];
+        for (what, tamper) in tampered {
+            let mut bad = opens_b[0].clone();
+            tamper(&mut bad);
+            assert_eq!(
+                sum(&[&opens_a[0], &bad]),
+                Some(SumError::WrongShape { index: 1 }),
+                "{what}"
+            );
+        }
+
+        // shape: openings made with other parameters (another μ_cs, another
+        // κ_cs, another tree depth)
+        for (mu_cs, kappa_cs, servers) in [
+            (pp.mu_cs + 1, pp.kappa_cs, n_servers),
+            (pp.mu_cs, pp.kappa_cs + 1, n_servers),
+            (pp.mu_cs, pp.kappa_cs, 2 * n_servers),
+        ] {
+            let other = HidingMerkleCommitment::setup_with_dims(&mut rng, servers, mu_cs, kappa_cs);
+            let shares = rand_shares(&mut rng, servers, other.mu_cs);
+            let (_, opens) = HidingMerkleCommitment::commit(&mut rng, &other, &shares);
+            assert_eq!(
+                sum(&[&opens_a[0], &opens[0]]),
+                Some(SumError::WrongShape { index: 1 }),
+                "μ_cs = {mu_cs}, κ_cs = {kappa_cs}, {servers} servers"
+            );
+            assert_eq!(
+                sum(&[&opens[0], &opens_a[0]]),
+                Some(SumError::WrongShape { index: 0 }),
+                "μ_cs = {mu_cs}, κ_cs = {kappa_cs}, {servers} servers"
+            );
+        }
+    }
+
+    /// The empty sum is the zero opening, which opens the empty sum of
+    /// commitments (the zero commitment) to the zero share.
+    #[test]
+    fn empty_sum_is_the_zero_opening() {
+        let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
+        let n_servers = 4;
+        let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+        for position in 0..n_servers {
+            let zero = HidingMerkleCommitment::sum_openings(&pp, position, &[]).unwrap();
+            assert_eq!(zero.server_index, position);
+            assert!(zero.s().iter().all(|p| *p == CsPoly::default()));
+            let empty = HidingMerkleCommitment::sum_commitment_refs(&[]);
+            assert!(HidingMerkleCommitment::verify(&pp, &empty, &zero));
+        }
+        // but it does not open an actual commitment
+        let shares = rand_shares(&mut rng, n_servers, pp.mu_cs);
+        let (comm, _) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let zero = HidingMerkleCommitment::sum_openings(&pp, 0, &[]).unwrap();
+        assert!(!HidingMerkleCommitment::verify(&pp, &comm, &zero));
     }
 
     #[test]
@@ -1350,11 +2153,85 @@ mod tests {
         let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
         let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
         for i in 0..n_servers {
-            let summed = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+            let summed =
+                HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
             for k in 0..pp.mu_cs {
                 assert_eq!(summed.s()[k], shares_a[i][k] + shares_b[i][k]);
             }
             assert!(HidingMerkleCommitment::verify(&pp, &comm_sum, &summed));
+        }
+    }
+
+    /// Polynomials are packed as centered representatives: any input
+    /// representative in (-m, m) round-trips to an equal residue, in
+    /// ⌈log₂ m⌉ bits per coefficient.
+    #[test]
+    fn poly_packing_is_centered_and_tight() {
+        // edge cases of the centering, and inputs outside (-m, m)
+        for m in [CS_MODULUS, HVC_MODULUS] {
+            let h = m / 2;
+            for extra in [0, 3 * m + 5, i32::MIN + 1] {
+                let mut coeffs = [0i32; POLY_N];
+                for (c, x) in coeffs
+                    .iter_mut()
+                    .zip([h, h + 1, -h, -h - 1, m - 1, -(m - 1), extra])
+                {
+                    *c = x;
+                }
+                let mut out = Vec::new();
+                pack_poly(&coeffs, m, &mut out);
+                let (back, _) = unpack_poly(&out, 0, m).unwrap();
+                for (&a, &b) in coeffs.iter().zip(&back) {
+                    assert_eq!(a.rem_euclid(m), b.rem_euclid(m));
+                    assert!(2 * b.abs() < m);
+                }
+            }
+        }
+        let (m, h) = (KAHE_MODULUS, KAHE_MODULUS / 2);
+        for extra in [0, 3 * m + 5, i64::MIN + 1] {
+            let mut coeffs = [0i64; POLY_N];
+            for (c, x) in coeffs
+                .iter_mut()
+                .zip([h, h + 1, -h, -h - 1, m - 1, -(m - 1), extra])
+            {
+                *c = x;
+            }
+            let mut out = Vec::new();
+            pack_poly64(&coeffs, m, &mut out);
+            let (back, _) = unpack_poly64(&out, 0, m).unwrap();
+            for (&a, &b) in coeffs.iter().zip(&back) {
+                assert_eq!(a.rem_euclid(m), b.rem_euclid(m));
+                assert!(2 * b.abs() < m);
+            }
+        }
+        let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
+        for modulus in [CS_MODULUS, HVC_MODULUS] {
+            let coeffs: [i32; POLY_N] =
+                std::array::from_fn(|_| rng.gen_range(-(modulus - 1)..modulus));
+            let mut out = Vec::new();
+            pack_poly(&coeffs, modulus, &mut out);
+            let bits = 32 - ((modulus - 1) as u32).leading_zeros();
+            assert_eq!(out.len(), (POLY_N * bits as usize).div_ceil(8));
+            assert_eq!(out.len(), poly_packed_len(modulus));
+            let (back, next) = unpack_poly(&out, 0, modulus).unwrap();
+            assert_eq!(next, out.len());
+            for (&a, &b) in coeffs.iter().zip(&back) {
+                assert_eq!(a.rem_euclid(modulus), b.rem_euclid(modulus));
+                assert!(2 * b.abs() < modulus);
+            }
+        }
+        let coeffs: [i64; POLY_N] =
+            std::array::from_fn(|_| rng.gen_range(-(KAHE_MODULUS - 1)..KAHE_MODULUS));
+        let mut out = Vec::new();
+        pack_poly64(&coeffs, KAHE_MODULUS, &mut out);
+        let bits = 64 - ((KAHE_MODULUS - 1) as u64).leading_zeros();
+        assert_eq!(out.len(), (POLY_N * bits as usize).div_ceil(8));
+        assert_eq!(out.len(), poly_packed_len64(KAHE_MODULUS));
+        let (back, next) = unpack_poly64(&out, 0, KAHE_MODULUS).unwrap();
+        assert_eq!(next, out.len());
+        for (&a, &b) in coeffs.iter().zip(&back) {
+            assert_eq!(a.rem_euclid(KAHE_MODULUS), b.rem_euclid(KAHE_MODULUS));
+            assert!(2 * b.abs() < KAHE_MODULUS);
         }
     }
 
@@ -1384,6 +2261,161 @@ mod tests {
         }
     }
 
+    /// A packed opening decodes only from exactly the body `pack` wrote: one
+    /// byte fewer or one byte more is rejected.
+    #[test]
+    fn unpack_requires_the_exact_body_length() {
+        let mut rng = ChaCha20Rng::from_seed([104u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_b, s_b, t_b);
+        assert!(Opening::from_packed(&packed).is_ok());
+
+        let mut short = packed.clone();
+        short.bytes.pop();
+        assert_eq!(
+            Opening::from_packed(&short).err(),
+            Some(OpeningDecodeError::Truncated)
+        );
+        let mut long = packed;
+        long.bytes.push(0);
+        assert_eq!(
+            Opening::from_packed(&long).err(),
+            Some(OpeningDecodeError::TrailingBytes)
+        );
+    }
+
+    /// The bounds in a packed opening's header come from the sender. A bound
+    /// that does not fit an `i32` is a bad header, not a panic in the decoder.
+    #[test]
+    fn unpack_rejects_bounds_wider_than_32_bits() {
+        let mut rng = ChaCha20Rng::from_seed([106u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_b, s_b, t_b);
+        for forge in [
+            |p: &mut PackedOpening| p.r_bound = u32::MAX,
+            |p: &mut PackedOpening| p.s_bound = i32::MAX as u32 + 1,
+            |p: &mut PackedOpening| p.tree_bound = u32::MAX,
+        ] {
+            let mut bad = packed.clone();
+            forge(&mut bad);
+            // Give the body the length the forged widths ask for, so the
+            // length check passes and only the bounds check stands between
+            // the header and the decoder.
+            let body_bits = (bad.kappa_cs as usize * POLY_N)
+                * bits_for_signed(bad.r_bound) as usize
+                + (bad.mu_cs as usize * POLY_N) * bits_for_signed(bad.s_bound) as usize
+                + (opening_data_polys(1 + bad.mu_cs as usize, bad.stored_path_len as usize)
+                    * POLY_N)
+                    * bits_for_signed(bad.tree_bound) as usize;
+            bad.bytes.resize(body_bits.div_ceil(8), 0);
+            assert_eq!(
+                Opening::from_packed(&bad).err(),
+                Some(OpeningDecodeError::BadHeader)
+            );
+        }
+    }
+
+    /// Overwrite the `bits`-wide field at bit offset `at` of `bytes` with `u`.
+    fn set_field(bytes: &mut [u8], at: usize, bits: u32, u: u64) {
+        for k in 0..bits as usize {
+            let (byte, bit) = ((at + k) / 8, (at + k) % 8);
+            bytes[byte] = (bytes[byte] & !(1 << bit)) | ((((u >> k) & 1) as u8) << bit);
+        }
+    }
+
+    /// A field holding `u + m` instead of `u` decodes to the same residue, so
+    /// without a range check a polynomial would have several encodings. The
+    /// decoders accept the largest canonical value `m - 1` and reject `m`.
+    #[test]
+    fn unpack_poly_rejects_non_canonical_encodings() {
+        let mut rng = ChaCha20Rng::from_seed([107u8; 32]);
+        for m in [CS_MODULUS, HVC_MODULUS] {
+            let h = m / 2;
+            let bits = bits_for_signed(h as u32);
+            let mut coeffs: [i32; POLY_N] = std::array::from_fn(|_| rng.gen_range(-h..=h));
+            coeffs[5] = -h; // field value u = 0, whose second encoding is m
+            let mut good = Vec::new();
+            pack_poly(&coeffs, m, &mut good);
+            assert!(unpack_poly(&good, 0, m).is_some());
+
+            let mut largest = good.clone();
+            set_field(&mut largest, 5 * bits as usize, bits, (m - 1) as u64);
+            let (back, _) = unpack_poly(&largest, 0, m).expect("m - 1 is canonical");
+            assert_eq!(back[5], h);
+
+            let mut second = good.clone();
+            set_field(&mut second, 5 * bits as usize, bits, m as u64);
+            assert!(unpack_poly(&second, 0, m).is_none(), "m = {m}");
+        }
+        let (m, h) = (KAHE_MODULUS, KAHE_MODULUS / 2);
+        let bits = bits_for_signed64(h as u64);
+        let mut coeffs: [i64; POLY_N] = std::array::from_fn(|_| rng.gen_range(-h..=h));
+        coeffs[5] = -h;
+        let mut good = Vec::new();
+        pack_poly64(&coeffs, m, &mut good);
+        assert!(unpack_poly64(&good, 0, m).is_some());
+        let mut largest = good.clone();
+        set_field(&mut largest, 5 * bits as usize, bits, (m - 1) as u64);
+        assert_eq!(
+            unpack_poly64(&largest, 0, m).expect("m - 1 is canonical").0[5],
+            h
+        );
+        let mut second = good;
+        set_field(&mut second, 5 * bits as usize, bits, m as u64);
+        assert!(unpack_poly64(&second, 0, m).is_none());
+
+        // The public decoders pass the rejection on.
+        let comm = Commitment {
+            root: HVCPoly::from_coeffs(std::array::from_fn(|i| {
+                if i == 0 {
+                    -(HVC_MODULUS / 2)
+                } else {
+                    0
+                }
+            })),
+        };
+        let mut bytes = comm.to_bytes();
+        assert!(Commitment::from_bytes(&bytes).is_some());
+        set_field(
+            &mut bytes,
+            0,
+            bits_for_signed((HVC_MODULUS / 2) as u32),
+            HVC_MODULUS as u64,
+        );
+        assert!(Commitment::from_bytes(&bytes).is_none());
+    }
+
+    /// An opening's coefficients lie within the bounds in its header; a field
+    /// above `2 · bound` is rejected instead of decoded.
+    #[test]
+    fn unpack_rejects_opening_values_outside_the_header_bounds() {
+        let mut rng = ChaCha20Rng::from_seed([108u8; 32]);
+        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let shares = rand_shares(&mut rng, 4, pp.mu_cs);
+        let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+        let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_b, s_b, t_b);
+        assert!(Opening::from_packed(&packed).is_ok());
+        let r_bits = bits_for_signed(r_b);
+        let all_ones = (1u64 << r_bits) - 1;
+        assert!(
+            all_ones > 2 * r_b as u64,
+            "the field has room above 2 · r_bound"
+        );
+        let mut bad = packed;
+        set_field(&mut bad.bytes, 0, r_bits, all_ones);
+        assert_eq!(
+            Opening::from_packed(&bad).err(),
+            Some(OpeningDecodeError::OutOfRange)
+        );
+    }
+
     #[test]
     fn pack_round_trip_aggregated_opening() {
         let mut rng = ChaCha20Rng::from_seed([101u8; 32]);
@@ -1394,7 +2426,8 @@ mod tests {
         let (_, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
         let (_, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
         for i in 0..n_servers {
-            let agg = HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+            let agg =
+                HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
             // ρ = 2; tree nodes bounded by ρ·ZETA, r by 2·β_cs.
             let packed = agg.pack(
                 2 * pp.beta_cs,
@@ -1426,7 +2459,10 @@ mod tests {
     #[test]
     fn opening_size_unchanged_at_mu_1() {
         for path in 0usize..5 {
-            assert_eq!(opening_data_polys(2, path), 6 + 6 * path);
+            assert_eq!(
+                opening_data_polys(2, path),
+                2 * HVC_WIDTH + 2 * HVC_WIDTH * path
+            );
         }
     }
 
@@ -1453,7 +2489,8 @@ mod tests {
             let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
             for i in 0..n_servers {
                 let summed =
-                    HidingMerkleCommitment::sum_openings(&[&opens_a[i], &opens_b[i]]).unwrap();
+                    HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]])
+                        .unwrap();
                 for k in 0..mu_cs {
                     assert_eq!(summed.s()[k], shares_a[i][k] + shares_b[i][k]);
                 }
@@ -1467,7 +2504,7 @@ mod tests {
 
     /// `N = 2048` is a multiple of 8, so no region pads and the body is exactly
     /// its bit budget — a tighter pin than a ratio, which moves with the region
-    /// mix (`s` packs 18/32, digits 7/32).
+    /// mix (`s` packs 18/32, digits 10/32).
     #[test]
     fn pack_size_reduction() {
         let mut rng = ChaCha20Rng::from_seed([102u8; 32]);
@@ -1489,8 +2526,8 @@ mod tests {
                 / 8;
             assert_eq!(packed_bytes, expected, "μ_cs={mu_cs}");
             assert!(
-                packed_bytes * 3 <= in_mem_bytes,
-                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 3"
+                packed_bytes * 2 <= in_mem_bytes,
+                "μ_cs={mu_cs}: packed {packed_bytes} not ≤ in_mem {in_mem_bytes} / 2"
             );
         }
     }

@@ -75,13 +75,21 @@ impl ShamirSharing {
         (0..n)
             .map(|i| {
                 let x = (i + 1) as i32;
-                let mut x_pow = x;
-                let mut acc = *secret;
-                for c in &coeffs {
-                    acc += scalar_mul(c, x_pow);
-                    x_pow = mul_q(x_pow, x);
+                // powers of the point reduced once each; the terms then
+                // accumulate unreduced in i64 and reduce once per coefficient
+                let powers: Vec<i64> = std::iter::successors(Some(x), |&p| Some(mul_q(p, x)))
+                    .take(t - 1)
+                    .map(i64::from)
+                    .collect();
+                let mut out = [0i32; N];
+                for (k, value) in out.iter_mut().enumerate() {
+                    let mut acc = secret.coeffs()[k] as i64;
+                    for (c, &p) in coeffs.iter().zip(&powers) {
+                        acc += c.coeffs()[k] as i64 * p;
+                    }
+                    *value = reduce(acc);
                 }
-                acc
+                CsPoly::from_coeffs(out)
             })
             .collect()
     }
@@ -126,11 +134,14 @@ impl ShamirSharing {
                 mul_q(num, inv_q(den))
             })
             .collect();
-        let mut acc = CsPoly::default();
+        let mut acc = [0i64; N];
         for (slot, (_, share)) in samples.iter().take(t).enumerate() {
-            acc += scalar_mul(share, lagrange[slot]);
+            let weight = lagrange[slot] as i64;
+            for (a, &c) in acc.iter_mut().zip(share.coeffs()) {
+                *a += c as i64 * weight;
+            }
         }
-        Ok(acc)
+        Ok(CsPoly::from_coeffs(acc.map(reduce)))
     }
 }
 
@@ -170,15 +181,6 @@ fn pow_q(base: i32, mut exp: i32) -> i32 {
 fn inv_q(x: i32) -> i32 {
     debug_assert!(reduce(x as i64) != 0, "inv of zero");
     pow_q(x, CS_MODULUS - 2)
-}
-
-fn scalar_mul(p: &CsPoly, c: i32) -> CsPoly {
-    let mut out = [0i32; N];
-    let src = p.coeffs();
-    for i in 0..N {
-        out[i] = mul_q(src[i], c);
-    }
-    CsPoly::from_coeffs(out)
 }
 
 #[cfg(test)]

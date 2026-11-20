@@ -4,17 +4,20 @@
 
 pub mod bulletin;
 pub mod channel;
-pub mod codec;
+mod chunking;
 pub mod cs;
 #[doc(hidden)]
 pub mod hvc_stream;
 #[doc(hidden)]
 pub mod hvc_sum;
+mod iblt_shape;
 pub mod kahe;
 pub mod mse;
 pub mod pke;
 pub mod prony;
 pub mod protocol;
+#[cfg(test)]
+mod reference_params;
 pub mod rings;
 pub mod rs;
 pub mod scaling_bench;

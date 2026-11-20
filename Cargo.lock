@@ -125,7 +125,7 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 [[package]]
 name = "chipmunk_code"
 version = "0.1.0"
-source = "git+https://github.com/Ruteri/Chipmunk?rev=dd5e8287c9072547368bc1140e04e978d9984c7a#dd5e8287c9072547368bc1140e04e978d9984c7a"
+source = "git+https://github.com/noot/Chipmunk?rev=93b8cea86880b7ce9e7f46aaf85d13b0e1de25bf#93b8cea86880b7ce9e7f46aaf85d13b0e1de25bf"
 dependencies = [
  "ark-std",
  "env_logger",
@@ -393,6 +393,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
 ]
 
@@ -740,9 +741,11 @@ dependencies = [
 name = "panetiere"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "chipmunk_code",
  "criterion",
+ "libc",
  "ml-kem",
  "negacyclic-rings",
  "p256",
@@ -750,7 +753,9 @@ dependencies = [
  "rand_chacha",
  "rand_distr",
  "rayon",
+ "serde_json",
  "sha2",
+ "sha3",
 ]
 
 [[package]]
