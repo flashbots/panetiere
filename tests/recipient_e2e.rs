@@ -6,8 +6,7 @@ use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
-    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_once,
-    RecipientError, RejectReason, SetPolicy,
+    recover_unverified_direct, recover_unverified_once, RecipientError, RejectReason, SetPolicy,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
@@ -251,11 +250,6 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
     let r = round(12, 4, 4);
     assert_eq!(r.pp.shamir.t, 3);
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
-    let groups: Vec<_> = r
-        .publics
-        .iter()
-        .map(|(cid, entry)| (vec![*cid], entry.clone()))
-        .collect();
     let mut anchor = r.canonical.clone();
     anchor.reverse();
     let policy = SetPolicy::anchored(&anchor, 0, NO_CAP);
@@ -265,11 +259,8 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
         outputs[bad].clients.push(r.canonical[0]);
         outputs[(bad + 1) % r.outputs.len()].clients.reverse();
         let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap();
-        let aggregate = recover_unverified_aggregate(&r.pp, &policy, &groups, &outputs).unwrap();
         assert_eq!(direct.plaintext, want);
-        assert_eq!(aggregate.plaintext, want);
         assert_eq!(direct.canonical, r.canonical);
-        assert_eq!(aggregate.canonical, r.canonical);
     }
 
     let mut outputs = r.outputs.clone();
@@ -284,33 +275,18 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
         expected
     );
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &outputs).unwrap_err(),
-        expected
-    );
 }
 
 #[test]
 fn protocol_capacity_cannot_be_raised_by_policy() {
-    use panetiere::protocol::verify::{aggregate_and_decrypt_rs, decrypt_unverified_aggregate};
+    use panetiere::protocol::verify::aggregate_and_decrypt_rs;
 
     let mut r = round(13, 4, 4);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    let groups: Vec<_> = r
-        .publics
-        .iter()
-        .map(|(cid, entry)| (vec![*cid], entry.clone()))
-        .collect();
     r.pp.max_clients = 4;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     assert_eq!(
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs)
-            .unwrap()
-            .plaintext,
-        want
-    );
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs)
             .unwrap()
             .plaintext,
         want
@@ -322,22 +298,9 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
         expected
     );
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs).unwrap_err(),
-        expected
-    );
     let expected = Err(VerifyError::TooManyClients { got: 4, max: 3 });
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
-        expected
-    );
-    assert_eq!(
-        decrypt_unverified_aggregate(
-            &r.pp,
-            &r.publics[0].1.ctxt,
-            &r.publics[0].1.comm,
-            &r.outputs
-        ),
         expected
     );
 

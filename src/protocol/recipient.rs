@@ -2,7 +2,7 @@
 //!
 //! - [`recover_unverified_once`] is a single attempt over a set the caller names. A faulty
 //!   share fails the round and names the server; nothing is retried.
-//! - [`recover_unverified_direct`] and [`recover_unverified_aggregate`] admit the set per
+//! - [`recover_unverified_direct`] admits the set per
 //!   [`SetPolicy`], then drop servers whose shares fail their opening until `t`
 //!   honest ones remain. Threshold decryption tolerates that; the excluded
 //!   servers come back in [`Recovered::culprits`] for the caller to attribute.
@@ -10,10 +10,8 @@
 use crate::KahePoly;
 
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use crate::cs::{Commitment, HidingMerkleCommitment};
-use crate::kahe::Kahe;
 
-use super::verify::{aggregate_and_decrypt_unverified, decrypt_unverified_aggregate, VerifyError};
+use super::verify::{aggregate_and_decrypt_unverified, VerifyError};
 use super::{ClientId, ProtocolParams, ServerId};
 
 /// The canonical-set rule: decode strictly over the anchor the caller names.
@@ -74,13 +72,6 @@ pub enum RejectReason {
     MissingClientPublics {
         have: usize,
         need: usize,
-    },
-    GroupAggregateMissing {
-        group_of: ClientId,
-    },
-    GroupMembershipMismatch {
-        got: usize,
-        expected: usize,
     },
     ExhaustedShares {
         remaining: usize,
@@ -225,59 +216,6 @@ where
     }
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
         aggregate_and_decrypt_unverified(pp, &canonical, &entries, outs)
-    })
-    .map_err(RecipientError::Rejected)?;
-    Ok(Recovered {
-        canonical,
-        plaintext,
-        culprits,
-    })
-}
-
-/// Aggregated flow: aggregators already summed each group's public parts, so the
-/// recipient re-sums the groups instead of the individual posts.
-/// Ciphertext-sum correctness is unchecked, even when recovery succeeds.
-/// Callers requiring integrity must verify the sum against authentic client posts.
-pub fn recover_unverified_aggregate(
-    pp: &ProtocolParams,
-    policy: &SetPolicy,
-    groups: &[(Vec<ClientId>, ClientBulletinEntry)],
-    server_outputs: &[ServerBulletinEntry],
-) -> Result<Recovered, RecipientError> {
-    if server_outputs.len() < pp.shamir.t {
-        return Err(RecipientError::BelowShareThreshold {
-            have: server_outputs.len(),
-            need: pp.shamir.t,
-        });
-    }
-    let (canonical, agreeing) = anchored_set(policy, server_outputs);
-    admit(pp, policy, &canonical, agreeing.len()).map_err(RecipientError::Rejected)?;
-
-    // Every canonical client must appear in exactly one supplied group, and
-    // the groups must contribute nothing outside the set.
-    let covered: Vec<ClientId> = sorted_dedup(
-        &groups
-            .iter()
-            .flat_map(|(cs, _)| cs.iter().copied())
-            .collect::<Vec<_>>(),
-    );
-    if covered != canonical {
-        let missing = canonical.iter().find(|c| !covered.contains(c));
-        return Err(RecipientError::Rejected(match missing {
-            Some(c) => RejectReason::GroupAggregateMissing { group_of: *c },
-            None => RejectReason::GroupMembershipMismatch {
-                got: covered.len(),
-                expected: canonical.len(),
-            },
-        }));
-    }
-
-    let ctxts: Vec<&[KahePoly]> = groups.iter().map(|(_, e)| e.ctxt.as_slice()).collect();
-    let comms: Vec<&Commitment> = groups.iter().map(|(_, e)| &e.comm).collect();
-    let total_ctxt = Kahe::agg_ctxt_refs(&ctxts);
-    let total_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
-    let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
-        decrypt_unverified_aggregate(pp, &total_ctxt, &total_comm, outs)
     })
     .map_err(RecipientError::Rejected)?;
     Ok(Recovered {

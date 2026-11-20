@@ -391,9 +391,9 @@ pub fn aggregate_and_decrypt_rs(
     Ok((plain, tt))
 }
 
-/// Aggregated-flow verifier: ciphertext and commitment are already summed over
-/// the whole client set, so there is no per-client `canonical` to cross-check.
-pub fn decrypt_unverified_aggregate(
+/// Decrypt from client posts that are already summed over the whole client
+/// set, so there is no per-client `canonical` to cross-check.
+pub fn decrypt_unverified_sum(
     pp: &ProtocolParams,
     summed_ctxt: &[KahePoly],
     summed_comm: &Commitment,

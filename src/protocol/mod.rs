@@ -1,4 +1,3 @@
-pub mod aggregator;
 pub mod client;
 pub mod recipient;
 pub mod server;
