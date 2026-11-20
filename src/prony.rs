@@ -423,12 +423,91 @@ fn poly_gcd(a: &[F2], b: &[F2], ext: Ext) -> Vec<F2> {
     trim(x.iter().map(|&c| ext.mul(c, inv)).collect())
 }
 
-/// `(X + c)^e mod m`, `deg m ≥ 1`. Each multiplication by the linear factor is
-/// `X·g + c·g` followed by a single division step, not a full product.
+/// Moduli of at least this degree are reduced with [`Reducer`] and squared in
+/// parallel; below it, the serial schoolbook is faster. Splitting already runs
+/// the small factors in parallel with each other.
+const PAR_DEGREE: usize = 128;
+
+/// Coefficients `[0, len)` of `a·b`, each a sum computed in parallel and
+/// reduced once.
+fn poly_mul_low_par(a: &[F2], b: &[F2], len: usize, ext: Ext) -> Vec<F2> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let len = len.min(a.len() + b.len() - 1);
+    (0..len)
+        .into_par_iter()
+        .with_min_len(16)
+        .map(|k| {
+            let lo = k.saturating_sub(b.len() - 1);
+            let hi = k.min(a.len() - 1);
+            let acc = (lo..=hi).fold(WideF2::default(), |acc, i| ext.mul_acc(acc, a[i], b[k - i]));
+            ext.reduce_acc(acc)
+        })
+        .collect()
+}
+
+/// Remainders modulo a fixed monic `m` of degree `n` by multiplication instead
+/// of long division (Barrett reduction for polynomials), so that both steps
+/// run in parallel. With `inv = rev(m)^{−1} mod X^n`, the quotient of an
+/// `a` of degree `n + d < 2n` is `rev(rev(a)·inv mod X^{d+1})`, and the
+/// remainder the low `n` coefficients of `a − q·m`.
+struct Reducer {
+    m: Vec<F2>,
+    inv: Vec<F2>,
+}
+
+impl Reducer {
+    fn new(m: &[F2], ext: Ext) -> Self {
+        debug_assert!(m.last() == Some(&F2::ONE), "m must be monic");
+        let n = m.len() - 1;
+        // The power series inverse of rev(m), whose constant term is 1:
+        // inv_k = −Σ_{j=1..k} rev(m)_j · inv_{k−j}.
+        let mut inv = Vec::with_capacity(n);
+        inv.push(F2::ONE);
+        for k in 1..n {
+            let acc = (1..=k).fold(WideF2::default(), |acc, j| {
+                ext.mul_acc(acc, m[n - j], inv[k - j])
+            });
+            inv.push(ext.neg(ext.reduce_acc(acc)));
+        }
+        Reducer { m: m.to_vec(), inv }
+    }
+
+    /// `a mod m` for `deg a < 2·deg m`.
+    fn rem(&self, a: &[F2], ext: Ext) -> Vec<F2> {
+        let n = self.m.len() - 1;
+        if a.len() <= n {
+            return a.to_vec();
+        }
+        debug_assert!(a.len() <= 2 * n);
+        let d = a.len() - 1 - n;
+        let ra: Vec<F2> = a.iter().rev().take(d + 1).copied().collect();
+        let mut q = poly_mul_low_par(&ra, &self.inv, d + 1, ext);
+        q.resize(d + 1, F2::ZERO);
+        q.reverse();
+        let qm = poly_mul_low_par(&q, &self.m, n, ext);
+        trim(
+            a[..n]
+                .iter()
+                .zip(qm.iter().chain(std::iter::repeat(&F2::ZERO)))
+                .map(|(&x, &y)| ext.sub(x, y))
+                .collect(),
+        )
+    }
+}
+
+/// `(X + c)^e mod m`, `deg m ≥ 1`, `m` monic. Each multiplication by the
+/// linear factor is `X·g + c·g` followed by a single division step, not a
+/// full product.
 fn powmod_linear(c: F2, e: u128, m: &[F2], ext: Ext) -> Vec<F2> {
+    let par = (m.len() > PAR_DEGREE).then(|| Reducer::new(m, ext));
     let mut r = vec![F2::ONE];
     for bit in (0..u128::BITS - e.leading_zeros()).rev() {
-        r = poly_rem(&poly_mul(&r, &r, ext), m, ext);
+        r = match &par {
+            Some(red) => red.rem(&poly_mul_low_par(&r, &r, usize::MAX, ext), ext),
+            None => poly_rem(&poly_mul(&r, &r, ext), m, ext),
+        };
         if (e >> bit) & 1 == 1 {
             let mut h = vec![F2::ZERO; r.len() + 1];
             for (i, &g) in r.iter().enumerate() {
@@ -1172,6 +1251,36 @@ mod tests {
                 assert_eq!(f.reduce_wide(x), (x % p as u128) as u64);
                 assert_eq!(f.reduce_acc(Wide(x)), (x % p as u128) as u64);
             }
+        }
+    }
+
+    /// The parallel product and the Barrett remainder agree with the serial
+    /// schoolbook and long division, at every degree the remainder accepts.
+    #[test]
+    fn parallel_reduction_matches_division() {
+        let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
+        let ext = Ext::new(PRONY_PRIME);
+        let rand_poly = |rng: &mut ChaCha20Rng, len: usize| -> Vec<F2> {
+            (0..len).map(|_| ext.random(rng)).collect()
+        };
+        for n in [1usize, 2, 3, 70, 131] {
+            let mut m = rand_poly(&mut rng, n);
+            m.push(F2::ONE);
+            let red = Reducer::new(&m, ext);
+            for len in [0, 1, n, n + 1, 2 * n - 1, 2 * n] {
+                let a = trim(rand_poly(&mut rng, len));
+                assert_eq!(
+                    red.rem(&a, ext),
+                    poly_rem(&a, &m, ext),
+                    "n = {n}, len = {len}"
+                );
+            }
+            let a = rand_poly(&mut rng, n);
+            let b = rand_poly(&mut rng, n + 3);
+            assert_eq!(
+                trim(poly_mul_low_par(&a, &b, usize::MAX, ext)),
+                poly_mul(&a, &b, ext)
+            );
         }
     }
 
