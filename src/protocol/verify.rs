@@ -7,7 +7,8 @@ use rayon::prelude::*;
 use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
-use crate::sss::{ShamirSharing, SssError};
+use crate::sss::ShamirSharing;
+pub use crate::sss::SssError;
 
 use super::ProtocolParams;
 use super::{ClientId, ServerId};
@@ -28,7 +29,7 @@ pub enum VerifyError {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
-pub struct VerifyTimings {
+pub(crate) struct VerifyTimings {
     pub agg_ctxt_us: f64,
     pub sum_comm_us: f64,
     pub opening_verify_us: f64,
@@ -100,7 +101,7 @@ pub(super) fn check_client_count(
     Ok(())
 }
 
-pub fn aggregate_and_decrypt_unverified(
+pub(crate) fn aggregate_and_decrypt_unverified(
     pp: &ProtocolParams,
     canonical: &[ClientId],
     client_entries: &[(ClientId, ClientBulletinEntry)],
@@ -110,7 +111,7 @@ pub fn aggregate_and_decrypt_unverified(
         .map(|(m, _)| m)
 }
 
-pub fn aggregate_and_decrypt_unverified_timed(
+pub(crate) fn aggregate_and_decrypt_unverified_timed(
     pp: &ProtocolParams,
     canonical: &[ClientId],
     client_entries: &[(ClientId, ClientBulletinEntry)],

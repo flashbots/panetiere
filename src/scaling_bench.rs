@@ -1036,7 +1036,7 @@ fn run_cell(
         .collect();
     let outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).unwrap())
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).unwrap())
         .collect();
 
     // Wire ledger. Ciphertext + commitment (root) are uniform-mod-q → tight at
@@ -1076,7 +1076,7 @@ fn run_cell(
     let (unseal, _) =
         measure(|| unseal_openings(&server_keys[0], &SESSION, servers[0].0, &sealed_inbox0));
     let (server, _) =
-        measure(|| run_server_round(&pp.cs, &inboxes[0], &canonical, &commitments).unwrap());
+        measure(|| run_server_round(&pp, &inboxes[0], &canonical, &commitments).unwrap());
 
     // Verify: REPS full runs, field-wise medians over the returned timings.
     // Recovery is ATTEMPTED, not asserted: a decode to garbage still yields

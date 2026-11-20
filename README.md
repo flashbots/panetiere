@@ -47,7 +47,8 @@ semantic types in `src/rings.rs`; `negacyclic-rings` provides the arithmetic.
 The layers above are, bottom-up, the schemes (`kahe`, `sss`, `cs`, `pke`), the round
 drivers under `protocol::`, and the payload encodings a caller picks between
 (`channel`, `mse`, `prony`), which all produce and consume
-`Vec<KahePoly>`.
+`Vec<KahePoly>`. Only `protocol`, `bulletin`, `channel` and `pke` are public;
+the schemes underneath are internal.
 
 | Module | |
 |---|---|
@@ -95,11 +96,10 @@ sequenceDiagram
 ### Setup
 
 ```rust
-let pp = ProtocolParams::setup(&mut rng, n_servers);              // or setup_with_threshold,
-                                                                   // setup_with_kahe_dims[_full]
+let pp = ProtocolParams::setup(&mut rng, n_servers);              // or setup_with_kahe_dims
 let server_key = pke::PrivateKey::generate(&mut rng);              // one per server
 let servers: Vec<(ServerId, pke::PublicKey)> = /* ordered by ServerId */;
-let session = SessionId(/* 32 fresh bytes */);
+let session = SessionId::new(/* 32 fresh bytes */);
 ```
 
 Every `setup*` uses the Shamir threshold `honest_majority_threshold(γ) = ⌊γ/2⌋ + 1`
@@ -109,15 +109,15 @@ another threshold on any of them; a threshold *t* gives anonymity against *t* �
 corrupt servers and output delivery against min(*t* − 1, γ − *t*).
 
 `ProtocolParams` is the CRS — every party must use the same instance (derive it
-from a shared seed). `ServerId(i)` is the server's index into that set.
+from a shared seed). `ServerId::new(i)` is the server's index into that set.
 **`SessionId` must be unique per execution:** sealed
 openings are bound to `(sid, client_id, server_id)` as AEAD associated data, so
 reuse lets an envelope be replayed from one round into another.
 
 ### Payload layer
 
-This fixes $\mu_\mathrm{kahe}$. Every client contributes exactly `message_polys(pp)`
-polys, real or cover — `zero_message(pp)` is the trivial cover.
+This fixes $\mu_\mathrm{kahe}$. Every client contributes exactly `pp.message_polys()`
+polys, real or cover — `channel::cover(&ch)` builds a cover contribution.
 
 `channel` is the default: it sizes an encoding from "at most $C$ senders, $n$
 bytes each", does the byte↔symbol packing, and derives matching
@@ -141,8 +141,7 @@ with $\mathrm{RO}(s) = \mathrm{SHAKE256}(\texttt{"panetiere/ro-mask/v1"} \| \mat
 and decoding unmasks every element and returns the messages sorted. Each byte
 message carries a length header, so trailing zero bytes survive the padding. The masking is what allows the security proof to fix the corrupted clients' inputs before the honest messages are known. The honest messages themselves are hidden by the encryption. The nonce is sized so that $\rho(Q + \rho)/|N| \le 2^{-128}$ with
 $Q = 2^{64}$ oracle queries at the largest round of $\rho = 300$ clients: six
-extra 34-bit symbols per element. This guarantee covers the `channel` path only — polys built with `mse`
-or `prony` directly are not masked.
+extra 34-bit symbols per element.
 
 `ChannelParams` covers both multiset encodings behind that one interface:
 `for_messages` / `for_symbols` build the peeling variant,
@@ -150,8 +149,7 @@ or `prony` directly are not masked.
 sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to move;
 recovery is all-or-nothing for both. The sketch also needs a
 prime plaintext modulus, which `protocol_params` handles by selecting
-`PRONY_PRIME` for that variant. `mse` / `prony` directly when you want to choose
-$\gamma$, $\delta$, $\xi$, capacity or slack yourself.
+`PRONY_PRIME` for that variant.
 
 ### Client
 
@@ -159,7 +157,7 @@ $\gamma$, $\delta$, $\xi$, capacity or slack yourself.
 pub fn run_client_round<R: CryptoRng + Rng>(
     rng: &mut R, pp: &ProtocolParams, sid: &SessionId, client_id: ClientId,
     message: Vec<KahePoly>, servers: &[(ServerId, pke::PublicKey)],
-) -> ClientRoundOutput;               // { client_id, encrypted_message, sealed_openings }
+) -> ClientRoundOutput;               // client_id(), post(), sealed_openings(), into_parts()
 
 ClientRound::new(...).finalize(&message) -> ClientRoundOutput;
 ```
@@ -175,27 +173,25 @@ let output = round.finalize(&message);
 This moves key generation, zero encryption, Shamir sharing, the key-share
 commitment, and sealed openings out of the message-critical path. `ClientRound`
 exposes no publishable fields; `finalize` consumes it and must run at the
-same scheduled point for real messages and `zero_message(pp)` covers.
+same scheduled point for real messages and covers.
 
-Publish `encrypted_message`; send `sealed_openings[i]` to server
+Publish `post()`; send `sealed_openings()[i]` to server
 `i` over any channel (already CCA2-sealed and context-bound). Each envelope holds a commitment
 `Opening` whose committed value is that server's Shamir share of the KAHE key —
 that share is the secret, the envelope only carries it. `servers` must be
 ordered by `ServerId`, and
-`sealed_openings` comes back in that order. The key is fresh per round — a hard
-requirement of the scheme. The phases are also public individually
-(`kahe_keygen`, `kahe_encrypt`, `shamir_share`, `cs_commit`, `seal_openings`)
-for callers that need to split or interleave them.
+`sealed_openings()` comes back in that order. The key is fresh per round — a hard
+requirement of the scheme.
 
 ### Server
 
 ```rust
 let op = unseal_opening(&server_key, &session, client_id, server_id, sealed)?;  // Option
 let entry = run_server_round(
-    &pp.cs,
-    &ServerInbox { server_id, items },
+    &pp,
+    &ServerInbox::new(server_id, items),
     canonical,
-    commitments,                          // each client's commitment, off the bulletin
+    commitments,                          // each client's post.commitment(), off the bulletin
 )?;
 ```
 
@@ -215,13 +211,14 @@ subset of what arrived. `unseal_openings` is the batch form.
 
 ### Recipient
 
-Prefer `protocol::recipient` over calling `verify` directly: it owns the
-canonical-set rule and drops faulty servers instead of failing the round.
+`protocol::recipient` owns the canonical-set rule and drops faulty servers
+instead of failing the round.
 
 ```rust
-let policy = SetPolicy::anchored(&announced, min_clients, max_clients);
-let Recovered { canonical, plaintext, culprits } =
+let policy = SetPolicy::anchored(&announced, min_clients, pp.max_clients());
+let recovered =
     recover_unverified_direct(&pp, &policy, |cid| bulletin.get(cid), &server_outputs)?;
+// recovered.canonical(), recovered.plaintext(), recovered.culprits()
 ```
 
 Decoding is strictly over the canonical client set: servers that shared over
@@ -229,9 +226,8 @@ any other set do not count towards $t$. `culprits` are the servers excluded to
 reach the threshold. `recover_unverified_once` is one attempt over a caller-named set with
 no exclusion.
 
-Underneath: `aggregate_and_decrypt_unverified` (+ `_timed`) and `decrypt_unverified_sum` for a
-pre-summed ciphertext. Both return $\sum m_i \bmod t$ as `Vec<KahePoly>`, which
-goes straight back to the payload layer.
+The plaintext is $\sum m_i \bmod t$ as `KahePoly`s, which goes straight back
+to the payload layer.
 
 ## Errors
 
@@ -272,13 +268,13 @@ so they only run in the debug test profile.
 The crate serialises the crypto objects and nothing else — framing, transport,
 retries and authenticated delivery are the caller's.
 
-- `ClientBulletinEntry::{to_bytes, from_bytes, packed_len}`.
-- `Commitment::{to_bytes, from_bytes}`, `pack_cs_shares` / `unpack_cs_shares`.
-- Openings are bit-packed per region at the tightest width, so the bounds
-  matter: `Opening::pack(r_bound, s_bound, tree_bound)` with
-  `fresh_opening_pack_bounds(&pp.cs)` for a client opening and
-  `aggregated_opening_pack_bounds(&pp.cs, rho)` for a server's, then
-  `PackedOpening::{to_bytes, from_bytes}` and `Opening::from_packed`.
+- `ClientBulletinEntry::{to_bytes, try_from_bytes}`.
+- `ServerBulletinEntry::{to_bytes, try_from_bytes}`; encoding takes the
+  `ProtocolParams`, since the aggregated opening is bit-packed against the
+  bounds for its client count.
+- `pke::{PublicKey, PrivateKey}::{to_bytes, try_from_bytes}`.
+- Sealed openings are already bytes (`ClientRoundOutput::sealed_openings`), opened
+  with `unseal_opening`.
 - `round_wire_sizes(n_servers, ctxt_polys, rho)` budgets a round without
   sampling a CRS.
 
@@ -297,7 +293,7 @@ domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
 channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their semantic
 prime fields.
 
-The integration tests are the executable spec: `end_to_end.rs` (canonical round,
+The end-to-end tests in `src/e2e/` are the executable spec: `end_to_end.rs` (canonical round,
 *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
 invariance), `mse_e2e.rs` and `prony_e2e.rs` (each encoding carried end-to-end,
 with cover traffic), `recipient_e2e.rs` (anchor admission, culprit exclusion, every `RejectReason`).

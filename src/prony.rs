@@ -561,8 +561,6 @@ pub enum PronyError {
     NotSplit,
     /// A `slack` column disagrees with the recovered solution.
     CheckFailed,
-    /// `params` of two sketches disagree under `add_assign`.
-    ParamsMismatch,
     /// `payload` slice length disagrees with `params.payload_symbols`.
     PayloadArity,
 }
@@ -621,24 +619,6 @@ impl PronySketch {
                     *slot = center(f.add(canon(*slot, p), f.mul(xc, pw)), p);
                 }
             });
-    }
-
-    /// Pointwise add another sketch into self. Both must share `params`.
-    pub fn add_assign(&mut self, other: &Self) -> Result<(), PronyError> {
-        if self.params != other.params {
-            return Err(PronyError::ParamsMismatch);
-        }
-        let p = self.params.p;
-        let f = Fp::new(p);
-        for (a, &b) in self.s.iter_mut().zip(other.s.iter()) {
-            *a = center(f.add(canon(*a, p), canon(b, p)), p);
-        }
-        for (sa, sb) in self.w.iter_mut().zip(other.w.iter()) {
-            for (a, &b) in sa.iter_mut().zip(sb.iter()) {
-                *a = center(f.add(canon(*a, p), canon(b, p)), p);
-            }
-        }
-        Ok(())
     }
 
     /// Recover `(z_i, payload_i)` for every contributor, sorted by `z_i`.
@@ -1007,39 +987,6 @@ mod tests {
         msgs.sort();
         got.sort();
         assert_eq!(got, msgs);
-    }
-
-    #[test]
-    fn union_via_pointwise_add() {
-        let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
-        let pp = PronyParams::new(8, 1);
-        let mut a = PronySketch::new(pp.clone());
-        let mut b = PronySketch::new(pp);
-        for x in [1, 5, 9, 17] {
-            a.insert(&mut rng, &[x]);
-        }
-        for x in [2, 6, 11, 23] {
-            b.insert(&mut rng, &[x]);
-        }
-        a.add_assign(&b).unwrap();
-        let mut got: Vec<i64> = a.decode().unwrap().into_iter().map(|t| t[0]).collect();
-        got.sort();
-        assert_eq!(got, vec![1, 2, 5, 6, 9, 11, 17, 23]);
-    }
-
-    #[test]
-    fn cover_adds_nothing() {
-        let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
-        let pp = PronyParams::new(8, 2);
-        let mut a = PronySketch::new(pp.clone());
-        a.insert(&mut rng, &[5, 6]);
-        let cover = PronySketch::unpack(&pp, &PronySketch::cover(&pp));
-        a.add_assign(&cover).unwrap();
-        assert_eq!(a.decode().unwrap(), vec![vec![5, 6]]);
-        assert_eq!(
-            PronySketch::new(pp).decode().unwrap(),
-            Vec::<Vec<i64>>::new()
-        );
     }
 
     #[test]

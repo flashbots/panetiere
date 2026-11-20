@@ -5,7 +5,6 @@ use negacyclic_rings::ntt64::{self, Ring64};
 use negacyclic_rings::params::{find_psi32, find_psi64, generate_ring32, generate_ring64};
 use negacyclic_rings::{Residues, Rns};
 use rand::Rng;
-use sha2::{Digest, Sha256};
 use std::sync::OnceLock;
 
 pub const N: usize = chipmunk_code::N;
@@ -209,22 +208,23 @@ impl std::ops::Mul for KahePoly {
 }
 
 impl KahePoly {
-    pub fn from_coeffs(coeffs: [i64; N]) -> Self {
+    pub(crate) fn from_coeffs(coeffs: [i64; N]) -> Self {
         Self { coeffs }
     }
 
-    pub fn from_signed_coeffs(coeffs: &[i64; N]) -> Self {
+    pub(crate) fn from_signed_coeffs(coeffs: &[i64; N]) -> Self {
         debug_assert!(coeffs
             .iter()
             .all(|&c| (-KAHE_MODULUS_OVER_TWO..=KAHE_MODULUS_OVER_TWO).contains(&c)));
         Self { coeffs: *coeffs }
     }
 
-    pub fn coeffs(&self) -> &[i64; N] {
+    pub(crate) fn coeffs(&self) -> &[i64; N] {
         &self.coeffs
     }
 
-    pub fn rand_poly<R: Rng>(rng: &mut R) -> Self {
+    #[cfg(test)]
+    pub(crate) fn rand_poly<R: Rng>(rng: &mut R) -> Self {
         let q = KAHE_MODULUS as u64;
         let threshold = (((1u128 << 64) / q as u128) * q as u128) as u64;
         let coeffs = core::array::from_fn(|_| {
@@ -237,7 +237,8 @@ impl KahePoly {
         Self { coeffs }
     }
 
-    pub fn schoolbook(a: &Self, b: &Self) -> Self {
+    #[cfg(test)]
+    pub(crate) fn schoolbook(a: &Self, b: &Self) -> Self {
         let q = KAHE_MODULUS as i128;
         let mut buf = vec![0i128; N * 2];
         for i in 0..N {
@@ -250,15 +251,7 @@ impl KahePoly {
         }
     }
 
-    pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        for &coefficient in &self.coeffs {
-            hasher.update(lift64(coefficient, KAHE_MODULUS).to_le_bytes());
-        }
-        hasher.finalize().into()
-    }
-
-    pub fn normalize(&mut self) {
+    pub(crate) fn normalize(&mut self) {
         for coefficient in &mut self.coeffs {
             *coefficient = normalize64(*coefficient, KAHE_MODULUS);
         }
@@ -430,19 +423,8 @@ impl CsPoly {
         Self { coeffs }
     }
 
-    pub fn from_signed_coeffs(coeffs: &[i32; N]) -> Self {
-        debug_assert!(coeffs
-            .iter()
-            .all(|&c| (-CS_MODULUS_OVER_TWO..=CS_MODULUS_OVER_TWO).contains(&c)));
-        Self { coeffs: *coeffs }
-    }
-
     pub fn coeffs(&self) -> &[i32; N] {
         &self.coeffs
-    }
-
-    pub fn schoolbook(a: &Self, b: &Self) -> Self {
-        Self::from_coeffs(arithmetic::schoolbook_i32(&a.coeffs, &b.coeffs, CS_MODULUS))
     }
 
     pub fn rand_poly<R: Rng>(rng: &mut R) -> Self {
@@ -457,10 +439,6 @@ impl CsPoly {
 
     pub fn rand_mod_p<R: Rng>(rng: &mut R, p: u32) -> Self {
         Self::from_coeffs(arithmetic::rand_mod_p_i32(rng, p))
-    }
-
-    pub fn digest(&self) -> [u8; 32] {
-        arithmetic::digest_i32(&self.coeffs)
     }
 
     pub fn normalize(&mut self) {

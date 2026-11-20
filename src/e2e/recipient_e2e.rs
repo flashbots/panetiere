@@ -1,17 +1,17 @@
 //! The recipient over a real round: anchor admission, culprit exclusion and the
 //! rejection reasons it reports.
 
-use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use panetiere::cs::Commitment;
-use panetiere::pke;
-use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::recipient::{
+use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
+use crate::cs::Commitment;
+use crate::pke;
+use crate::protocol::client::run_client_round;
+use crate::protocol::recipient::{
     recover_unverified_direct, recover_unverified_once, RecipientError, RejectReason, SetPolicy,
 };
-use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
-use panetiere::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
-use panetiere::{CsPoly, KahePoly, N};
+use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
+use crate::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
+use crate::protocol::{ClientId, ProtocolParams, ServerId, SessionId};
+use crate::{CsPoly, KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -86,7 +86,7 @@ fn round(seed: u8, n_servers: usize, n_clients: usize) -> Round {
         .collect();
     let outputs = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("server round"))
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("server round"))
         .collect();
     Round {
         pp,
@@ -279,7 +279,7 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
 
 #[test]
 fn protocol_capacity_cannot_be_raised_by_policy() {
-    use panetiere::protocol::verify::decrypt_unverified_sum;
+    use crate::protocol::verify::decrypt_unverified_sum;
 
     let mut r = round(13, 4, 4);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);

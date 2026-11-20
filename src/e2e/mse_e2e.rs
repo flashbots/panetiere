@@ -6,16 +6,16 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use panetiere::channel::ChannelParams;
-use panetiere::cs::Commitment;
-use panetiere::mse::{MseEncoding, MseParams};
-use panetiere::pke;
-use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
-use panetiere::protocol::ProtocolParams;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
-use panetiere::KahePoly;
+use crate::channel::ChannelParams;
+use crate::cs::Commitment;
+use crate::mse::{MseEncoding, MseParams};
+use crate::pke;
+use crate::protocol::client::run_client_round;
+use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
+use crate::protocol::verify::aggregate_and_decrypt_unverified;
+use crate::protocol::ProtocolParams;
+use crate::protocol::{ClientId, ServerId, SessionId};
+use crate::KahePoly;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -94,7 +94,7 @@ fn mse_recovers_through_panetiere() {
         let outputs: Vec<_> = inboxes
             .iter()
             .map(|inb| {
-                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+                run_server_round(&pp, inb, &canonical, &commitments).expect("missing client")
             })
             .collect();
         let recovered =
@@ -189,7 +189,7 @@ fn cover_clients_do_not_inflate_iblt() {
         let outputs: Vec<_> = inboxes
             .iter()
             .map(|inb| {
-                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+                run_server_round(&pp, inb, &canonical, &commitments).expect("missing client")
             })
             .collect();
         let recovered =
@@ -290,7 +290,7 @@ fn multi_symbol_cover_through_panetiere() {
         let outputs: Vec<_> = inboxes
             .iter()
             .map(|inb| {
-                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+                run_server_round(&pp, inb, &canonical, &commitments).expect("missing client")
             })
             .collect();
         let recovered =
