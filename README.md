@@ -200,7 +200,7 @@ sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to m
 recovery is all-or-nothing for both. The sketch also needs a
 prime plaintext modulus, which `protocol_params` handles by selecting
 `PRONY_PRIME` for that variant. `mse` / `prony` directly when you want to choose
-$\gamma$, $\delta$, $\xi$, capacity or slack yourself. `codec` for non-multiset layouts (disjoint
+$\gamma$, $\delta$, $\xi$ or capacity yourself. `codec` for non-multiset layouts (disjoint
 slots, or a reservation schedule via `beacon` / `allocate` / `encode_at` /
 `decode_ranges`) — use `encode_raw`/`decode_raw` there, since `encode`/`decode`
 carry a per-coefficient length header that multiplies under summation.
@@ -354,8 +354,8 @@ than "no output". `RecipientError::BelowShareThreshold` is expected early in a
 round and is worth demoting to trace level.
 
 On the payload side, an over-subscribed structure surfaces as
-`ChannelError::PeelStalled` or `ChannelError::SketchFailed(PronyError::{CapacityExceeded,
-NotSplit, CheckFailed})` — never as a successfully decoded empty round. A
+`ChannelError::PeelStalled` or `ChannelError::SketchFailed(PronyError::{NotSplit,
+CheckFailed})` — never as a successfully decoded empty round. A
 peeling table that is not an honest sum comes back as
 `ChannelError::MalformedEncoding(MseError::{OverCapacity, KeyMismatch})`: the
 decoder checks, as the paper's does, that each peeled key hashes to the cell it
@@ -375,7 +375,7 @@ distinctness, and the verifier rejects an out-of-range or duplicated
 `ServerId`/`NodeId` before using it. The `assert!`s that remain are on locally
 supplied arguments — parameter constructors (`setup_rs_mode`, `ShamirParams::new`,
 `MseParams::new`, `PronyParams::new`, `RsParams::new`) and payload arity in
-`MseEncoding::insert` / `PronyEncoding::insert_with_z` — where a violation is a
+`MseEncoding::insert` / `PronySketch::insert` — where a violation is a
 caller bug, not an attack. Range checks on the ring bridges are `debug_assert!`,
 so they only run in the debug test profile.
 

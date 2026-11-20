@@ -4,28 +4,31 @@
 //! sketch over the KAHE plaintext modulus, packed into `KahePoly` slots, whose
 //! coefficient-wise sum decodes to the multiset union. Different mechanism:
 //! instead of hashing each element into `γ` of `δ` buckets and peeling, each
-//! contributor picks a random evaluation point `z ∈ F_p^*` and writes a
-//! Vandermonde row.
+//! contributor picks a random key `r ∈ F_p^*` and writes a Vandermonde row.
 //!
 //! ```text
-//!   z ← F_p^*                              (per-element evaluation point)
-//!   S[j]    += z^j                         (j ∈ [0, cols])
-//!   W[s][j] += x_s · z^j                   (s ∈ [ξ], j ∈ [0, cols))
+//!   r ← F_p^*                              (per-element key)
+//!   K[j]    += r^j                         (j ∈ [1, C])
+//!   V[ℓ][j] += x_ℓ · r^j                   (ℓ ∈ [ξ], j ∈ [0, C))
 //! ```
 //!
-//! Summed over the round, `S[j] = Σ_i z_i^j` are the power sums of the
-//! contributors' points and `W[s][j] = Σ_i x_{i,s} z_i^j`. Decoding:
+//! That is `C(1 + ξ)` scalars for capacity `C`. Summed over the round,
+//! `K[j] = Σ_i r_i^j` are the power sums of the contributors' keys and
+//! `V[ℓ][j] = Σ_i x_{i,ℓ} r_i^j`. Decoding:
 //!
-//! 1. `k := S[0]` is the number of contributors (a zero sketch — cover
-//!    traffic — adds nothing, exactly as `MseEncoding::cover`).
-//! 2. Newton's identities turn `S[1..=k]` into the elementary symmetric
-//!    polynomials, i.e. the coefficients of `Λ(X) = Π_i (X − z_i)`.
-//! 3. The `z_i` are the roots of `Λ` (Cantor–Zassenhaus over `F_p`).
-//! 4. With the points known, each payload symbol is one transposed-Vandermonde
-//!    solve: `x_{i,s} = (Σ_m b_{i,m} W[s][m]) / Λ'(z_i)` where
-//!    `Λ(X)/(X − z_i) = Σ_m b_{i,m} X^m`.
+//! 1. Newton's identities turn `K[1..=C]` into the elementary symmetric
+//!    polynomials `e_1, …, e_C` of the keys. The number of contributors `ρ̂`
+//!    is the largest `m` with `e_m ≠ 0`; a zero sketch (cover traffic) has
+//!    `ρ̂ = 0` and decodes to nothing.
+//! 2. The `r_i` are the roots of `Λ(X) = Π_i (X − r_i)`, whose coefficients
+//!    are `e_0, …, e_ρ̂` (Cantor–Zassenhaus over `F_p`). Decoding fails unless
+//!    `Λ` has `ρ̂` distinct nonzero roots.
+//! 3. With the keys known, each payload symbol is one transposed-Vandermonde
+//!    solve: `x_{i,ℓ} = (Σ_m b_{i,m} V[ℓ][m]) / Λ'(r_i)` where
+//!    `Λ(X)/(X − r_i) = Σ_m b_{i,m} X^m`. For `ρ̂ < C`, the payload columns
+//!    `ρ̂..C` must agree with the solution.
 //!
-//! Newton's identities divide by `1..k`, so the field must be prime. The KAHE
+//! Newton's identities divide by `1..C`, so the field must be prime. The KAHE
 //! plaintext modulus [`T_MODULUS_DEFAULT`] is, and the sketch uses it directly.
 
 use crate::kahe::T_MODULUS_DEFAULT;
@@ -306,8 +309,8 @@ fn roots_of_split(lam: &[u64], f: Fp) -> Option<Vec<u64>> {
 // Payload solve kernel
 // ---------------------------------------------------------------
 //
-// The solve is one GEMM, `X = D·Wᵀ`, with `D` the k×k Lagrange-dual matrix and
-// `W` the ξ×k payload block. Two structural points make it cheap:
+// The solve is one GEMM, `X = D·Vᵀ`, with `D` the k×k Lagrange-dual matrix and
+// `V` the ξ×k payload block. Two structural points make it cheap:
 //
 //   * Reduction is deferred to one per output. A dot product of `k ≤ 2^20`
 //     terms below `p² < 2^72` stays under `2^92`, so nothing needs reducing
@@ -495,25 +498,17 @@ fn solve_symbol(d: &DualLimbs, w: &[i64], p: u64, f: Fp) -> Vec<u64> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PronyParams {
     /// Maximum number of contributors the sketch can resolve.
-    pub capacity: usize,
+    pub(crate) capacity: usize,
     /// Symbols per element; total payload is `payload_symbols · log₂ p` bits.
-    pub payload_symbols: usize,
-    /// Extra Vandermonde columns beyond `capacity`, checked against the
-    /// recovered solution. Turns malformed contributions and capacity
-    /// overflow into `CheckFailed` instead of silent garbage.
-    pub slack: usize,
-    pub p: u64,
+    pub(crate) payload_symbols: usize,
+    pub(crate) p: u64,
 }
 
 impl PronyParams {
     pub fn new(capacity: usize, payload_symbols: usize) -> Self {
-        Self::with_slack(capacity, payload_symbols, 1, PRONY_PRIME)
-    }
-
-    pub fn with_slack(capacity: usize, payload_symbols: usize, slack: usize, p: u64) -> Self {
+        let p = PRONY_PRIME;
         assert!(capacity >= 1, "capacity must be ≥ 1");
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
-        assert!(p > 2, "p must be an odd prime");
         assert!(
             (capacity as u64) < p,
             "Newton's identities divide by 1..capacity",
@@ -521,98 +516,86 @@ impl PronyParams {
         Self {
             capacity,
             payload_symbols,
-            slack,
             p,
         }
     }
 
     /// Bits of payload per symbol: every `⌊log₂ p⌋`-bit pattern is a distinct
     /// residue. Equal to `mse::BITS_PER_SYMBOL`, since both encodings use `t`.
-    pub fn bits_per_symbol(&self) -> usize {
+    pub(crate) fn bits_per_symbol(&self) -> usize {
         self.p.ilog2() as usize
     }
 
-    /// Vandermonde columns: `capacity + slack`.
-    pub fn cols(&self) -> usize {
-        self.capacity + self.slack
-    }
-
-    /// `(cols + 1)` point syndromes plus `payload_symbols · cols` payload cells.
-    pub fn total_scalars(&self) -> usize {
-        (self.cols() + 1) + self.payload_symbols * self.cols()
+    /// `capacity` power sums plus `payload_symbols · capacity` payload cells.
+    fn total_scalars(&self) -> usize {
+        self.capacity * (1 + self.payload_symbols)
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PronySketch {
-    pub params: PronyParams,
-    /// `s[j] = Σ_i z_i^j`, `j ∈ [0, cols]`. `s[0]` is the contributor count.
-    pub s: Vec<i64>,
-    /// `w[sym][j] = Σ_i x_{i,sym} · z_i^j`, `j ∈ [0, cols)`.
-    pub w: Vec<Vec<i64>>,
+    params: PronyParams,
+    /// `k[j − 1] = Σ_i r_i^j`, `j ∈ [1, capacity]`.
+    k: Vec<i64>,
+    /// `v[ℓ][j] = Σ_i x_{i,ℓ} · r_i^j`, `j ∈ [0, capacity)`.
+    v: Vec<Vec<i64>>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum PronyError {
-    /// `s[0]` exceeds `capacity` — more contributors than the sketch resolves.
-    CapacityExceeded { count: usize, capacity: usize },
-    /// `Λ` does not split into distinct linear factors: two contributors drew
-    /// the same `z`, or a contribution was malformed.
+    /// `Λ` does not split into distinct nonzero linear factors: two
+    /// contributors drew the same key, there were more contributors than the
+    /// capacity, or a contribution was malformed.
     NotSplit,
-    /// A `slack` column disagrees with the recovered solution.
+    /// A payload column the solve did not use disagrees with the recovered
+    /// solution.
     CheckFailed,
-    /// `params` of two sketches disagree under `add_assign`.
-    ParamsMismatch,
-    /// `payload` slice length disagrees with `params.payload_symbols`.
-    PayloadArity,
 }
 
 impl PronySketch {
     pub fn new(params: PronyParams) -> Self {
-        let cols = params.cols();
-        let w = (0..params.payload_symbols)
-            .map(|_| vec![0i64; cols])
-            .collect();
+        let c = params.capacity;
+        let v = (0..params.payload_symbols).map(|_| vec![0i64; c]).collect();
         Self {
-            s: vec![0i64; cols + 1],
-            w,
+            k: vec![0i64; c],
+            v,
             params,
         }
     }
 
-    /// Insert one element under a fresh random evaluation point.
+    /// Insert one element under a fresh random key.
     /// May be called repeatedly; one item per client is enforced by client code,
     /// not by this multiset encoding.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i64]) {
         let p = self.params.p;
-        let z = rng.gen_range(1..p);
-        self.insert_with_z(payload, z);
+        let r = rng.gen_range(1..p);
+        self.insert_with_key(payload, r);
     }
 
-    /// Insert with a caller-supplied point — useful for deterministic tests.
-    /// `z` must be a nonzero residue.
-    pub fn insert_with_z(&mut self, payload: &[i64], z: u64) {
+    /// Insert under a given key `r`, a nonzero residue.
+    fn insert_with_key(&mut self, payload: &[i64], r: u64) {
         assert_eq!(
             payload.len(),
             self.params.payload_symbols,
             "payload arity must match params.payload_symbols",
         );
         let p = self.params.p;
-        assert!(z > 0 && z < p, "z must be a nonzero residue in [1, p)");
+        assert!(r > 0 && r < p, "r must be a nonzero residue in [1, p)");
         let f = Fp::new(p);
-        let cols = self.params.cols();
+        let c = self.params.capacity;
 
-        let mut pows = Vec::with_capacity(cols + 1);
+        // r^0, …, r^C: the power sums take r^1..r^C, the payload r^0..r^{C−1}.
+        let mut pows = Vec::with_capacity(c + 1);
         let mut cur = 1u64;
-        for _ in 0..=cols {
+        for _ in 0..=c {
             pows.push(cur);
-            cur = f.mul(cur, z);
+            cur = f.mul(cur, r);
         }
 
-        for (slot, &pw) in self.s.iter_mut().zip(pows.iter()) {
+        for (slot, &pw) in self.k.iter_mut().zip(pows[1..].iter()) {
             *slot = center(f.add(canon(*slot, p), pw), p);
         }
-        self.w
+        self.v
             .par_iter_mut()
             .zip(payload.par_iter())
             .for_each(|(sym, &x)| {
@@ -623,57 +606,22 @@ impl PronySketch {
             });
     }
 
-    /// Pointwise add another sketch into self. Both must share `params`.
-    pub fn add_assign(&mut self, other: &Self) -> Result<(), PronyError> {
-        if self.params != other.params {
-            return Err(PronyError::ParamsMismatch);
-        }
+    /// Recover `(r_i, payload_i)` for every contributor, sorted by `r_i`.
+    fn decode_with_keys(&self) -> Result<Vec<(u64, Vec<i64>)>, PronyError> {
         let p = self.params.p;
         let f = Fp::new(p);
-        for (a, &b) in self.s.iter_mut().zip(other.s.iter()) {
-            *a = center(f.add(canon(*a, p), canon(b, p)), p);
-        }
-        for (sa, sb) in self.w.iter_mut().zip(other.w.iter()) {
-            for (a, &b) in sa.iter_mut().zip(sb.iter()) {
-                *a = center(f.add(canon(*a, p), canon(b, p)), p);
-            }
-        }
-        Ok(())
-    }
+        let c = self.params.capacity;
 
-    /// Recover `(z_i, payload_i)` for every contributor, sorted by `z_i`.
-    pub fn decode_with_points(&self) -> Result<Vec<(u64, Vec<i64>)>, PronyError> {
-        let p = self.params.p;
-        let f = Fp::new(p);
-        let cols = self.params.cols();
-        let count = canon(self.s[0], p);
-        if count > self.params.capacity as u64 {
-            return Err(PronyError::CapacityExceeded {
-                count: count as usize,
-                capacity: self.params.capacity,
-            });
-        }
-        let k = count as usize;
-        if k == 0 {
-            let clean = self.s.iter().all(|&x| x == 0)
-                && self.w.iter().all(|sym| sym.iter().all(|&x| x == 0));
-            return if clean {
-                Ok(Vec::new())
-            } else {
-                Err(PronyError::CheckFailed)
-            };
-        }
-
-        // Newton's identities: e_m = (1/m) Σ_{i=1..m} (−1)^{i−1} e_{m−i} P_i.
+        // Newton's identities: e_m = (1/m) Σ_{i=1..m} (−1)^{i−1} e_{m−i} K[i].
         // The alternating sum is split into two deferred accumulators so the
         // inner loop reduces nothing.
-        let mut e = vec![0u64; k + 1];
+        let sums: Vec<u64> = self.k.iter().map(|&x| canon(x, p)).collect();
+        let mut e = vec![0u64; c + 1];
         e[0] = 1;
-        let syn: Vec<u64> = (0..=cols).map(|i| canon(self.s[i], p)).collect();
-        for m in 1..=k {
+        for m in 1..=c {
             let (mut pos, mut neg) = (0u128, 0u128);
             for i in 1..=m {
-                let term = e[m - i] as u128 * syn[i] as u128;
+                let term = e[m - i] as u128 * sums[i - 1] as u128;
                 if i % 2 == 1 {
                     pos += term;
                 } else {
@@ -683,42 +631,41 @@ impl PronySketch {
             let acc = f.sub(f.reduce_wide(pos), f.reduce_wide(neg));
             e[m] = f.mul(acc, f.inv(m as u64 % p));
         }
-        // Λ(X) = Σ_m (−1)^m e_m X^{k−m}, monic of degree k.
-        let mut lam = vec![0u64; k + 1];
-        for m in 0..=k {
-            lam[k - m] = if m % 2 == 0 { e[m] } else { f.sub(0, e[m]) };
+        // The number of contributors. Since `e_m = 0` for every `m > ρ̂`, the
+        // power sums are exactly those of the roots of `Λ` once it splits, so
+        // they need no separate check.
+        let rho_hat = (0..=c).rev().find(|&m| e[m] != 0).unwrap_or(0);
+        if rho_hat == 0 {
+            return if self.v.iter().all(|sym| sym.iter().all(|&x| x == 0)) {
+                Ok(Vec::new())
+            } else {
+                Err(PronyError::CheckFailed)
+            };
+        }
+        // Λ(X) = Σ_m (−1)^m e_m X^{ρ̂−m}, monic of degree ρ̂.
+        let mut lam = vec![0u64; rho_hat + 1];
+        for m in 0..=rho_hat {
+            lam[rho_hat - m] = if m % 2 == 0 { e[m] } else { f.sub(0, e[m]) };
         }
 
-        let z = roots_of_split(&lam, f).ok_or(PronyError::NotSplit)?;
-        if z.len() != k || z.contains(&0) {
+        let r = roots_of_split(&lam, f).ok_or(PronyError::NotSplit)?;
+        if r.len() != rho_hat || r.contains(&0) {
             return Err(PronyError::NotSplit);
         }
 
-        // Unused point syndromes must match the recovered points.
-        let mut zp: Vec<u64> = z.iter().map(|&zi| f.pow(zi, k as u64 + 1)).collect();
-        for j in (k + 1)..=cols {
-            let got = zp.iter().fold(0u64, |a, &v| f.add(a, v));
-            if got != syn[j] {
-                return Err(PronyError::CheckFailed);
-            }
-            for (v, &zi) in zp.iter_mut().zip(z.iter()) {
-                *v = f.mul(*v, zi);
-            }
-        }
-
-        // Lagrange duals: b_i = Λ/(X − z_i) by synthetic division, scaled by
-        // 1/Λ'(z_i) = 1/b_i(z_i). Then x_{i,s} = Σ_m b_{i,m}·W[s][m].
-        let dual: Vec<Vec<u64>> = z
+        // Lagrange duals: b_i = Λ/(X − r_i) by synthetic division, scaled by
+        // 1/Λ'(r_i) = 1/b_i(r_i). Then x_{i,ℓ} = Σ_m b_{i,m}·V[ℓ][m].
+        let dual: Vec<Vec<u64>> = r
             .iter()
-            .map(|&zi| {
-                let mut b = vec![0u64; k];
-                b[k - 1] = 1;
-                for m in (1..k).rev() {
-                    b[m - 1] = f.add(lam[m], f.mul(zi, b[m]));
+            .map(|&ri| {
+                let mut b = vec![0u64; rho_hat];
+                b[rho_hat - 1] = 1;
+                for m in (1..rho_hat).rev() {
+                    b[m - 1] = f.add(lam[m], f.mul(ri, b[m]));
                 }
                 let mut den = 0u64;
                 for &c in b.iter().rev() {
-                    den = f.add(f.mul(den, zi), c);
+                    den = f.add(f.mul(den, ri), c);
                 }
                 let inv = f.inv(den);
                 b.iter().map(|&c| f.mul(c, inv)).collect()
@@ -727,44 +674,44 @@ impl PronySketch {
         let dual_limbs = DualLimbs::new(&dual);
 
         let xs: Vec<Vec<u64>> = self
-            .w
+            .v
             .par_iter()
-            .map(|sym| solve_symbol(&dual_limbs, &sym[..k], p, f))
+            .map(|sym| solve_symbol(&dual_limbs, &sym[..rho_hat], p, f))
             .collect();
 
         // Unused payload columns must match the recovered payloads. The power
-        // ladder depends only on the points, so it is built once here rather
+        // ladder depends only on the keys, so it is built once here rather
         // than per symbol.
-        let zpow: Vec<Vec<u64>> = (k..cols)
+        let rpow: Vec<Vec<u64>> = (rho_hat..c)
             .scan(
-                z.iter()
-                    .map(|&zi| f.pow(zi, k as u64))
+                r.iter()
+                    .map(|&ri| f.pow(ri, rho_hat as u64))
                     .collect::<Vec<u64>>(),
                 |cur, _| {
                     let this = cur.clone();
-                    for (v, &zi) in cur.iter_mut().zip(z.iter()) {
-                        *v = f.mul(*v, zi);
+                    for (pw, &ri) in cur.iter_mut().zip(r.iter()) {
+                        *pw = f.mul(*pw, ri);
                     }
                     Some(this)
                 },
             )
             .collect();
-        let bad = self.w.par_iter().zip(xs.par_iter()).any(|(sym, xrow)| {
-            zpow.iter().enumerate().any(|(idx, zj)| {
+        let bad = self.v.par_iter().zip(xs.par_iter()).any(|(sym, xrow)| {
+            rpow.iter().enumerate().any(|(idx, rj)| {
                 let acc = xrow
                     .iter()
-                    .zip(zj.iter())
-                    .fold(0u128, |a, (&x, &v)| a + x as u128 * v as u128);
-                f.reduce_wide(acc) != canon(sym[k + idx], p)
+                    .zip(rj.iter())
+                    .fold(0u128, |a, (&x, &pw)| a + x as u128 * pw as u128);
+                f.reduce_wide(acc) != canon(sym[rho_hat + idx], p)
             })
         });
         if bad {
             return Err(PronyError::CheckFailed);
         }
 
-        Ok(z.iter()
+        Ok(r.iter()
             .enumerate()
-            .map(|(i, &zi)| (zi, xs.iter().map(|row| row[i] as i64).collect()))
+            .map(|(i, &ri)| (ri, xs.iter().map(|row| row[i] as i64).collect()))
             .collect())
     }
 
@@ -772,7 +719,7 @@ impl PronySketch {
     /// signature-compatible with `MseEncoding::decode`.
     pub fn decode(&self) -> Result<Vec<Vec<i64>>, PronyError> {
         let mut out: Vec<Vec<i64>> = self
-            .decode_with_points()?
+            .decode_with_keys()?
             .into_iter()
             .map(|(_, x)| x)
             .collect();
@@ -791,7 +738,7 @@ impl PronySketch {
         Self::new(params.clone()).pack()
     }
 
-    /// Flatten `S` then `W_0 … W_{ξ−1}` into `KahePoly` coefficient slots.
+    /// Flatten `K` then `V[0] … V[ξ−1]` into `KahePoly` coefficient slots.
     pub fn pack(&self) -> Vec<KahePoly> {
         let total = self.params.total_scalars();
         let n_polys = total.div_ceil(N);
@@ -806,10 +753,10 @@ impl PronySketch {
                 buf = [0i64; N];
             }
         };
-        for &x in &self.s {
+        for &x in &self.k {
             feed(x, &mut polys);
         }
-        for sym in &self.w {
+        for sym in &self.v {
             for &x in sym {
                 feed(x, &mut polys);
             }
@@ -830,16 +777,15 @@ impl PronySketch {
             q.normalize();
             flat.extend_from_slice(q.coeffs());
         }
-        let cols = params.cols();
-        let s = flat[..cols + 1].to_vec();
-        let base = cols + 1;
-        let w = (0..params.payload_symbols)
-            .map(|i| flat[base + i * cols..base + (i + 1) * cols].to_vec())
+        let c = params.capacity;
+        let k = flat[..c].to_vec();
+        let v = (0..params.payload_symbols)
+            .map(|i| flat[c + i * c..c + (i + 1) * c].to_vec())
             .collect();
         Self {
             params: params.clone(),
-            s,
-            w,
+            k,
+            v,
         }
     }
 }
@@ -1009,8 +955,22 @@ mod tests {
         assert_eq!(got, msgs);
     }
 
+    /// The sum of packed sketches, as KAHE computes it.
+    fn sum_packed(sketches: &[PronySketch]) -> PronySketch {
+        let packed: Vec<Vec<KahePoly>> = sketches.iter().map(PronySketch::pack).collect();
+        let summed: Vec<KahePoly> = (0..packed[0].len())
+            .map(|i| {
+                packed
+                    .iter()
+                    .map(|p| p[i])
+                    .fold(KahePoly::default(), |a, b| a + b)
+            })
+            .collect();
+        PronySketch::unpack(&sketches[0].params, &summed)
+    }
+
     #[test]
-    fn union_via_pointwise_add() {
+    fn union_via_packed_sum() {
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
         let pp = PronyParams::new(8, 1);
         let mut a = PronySketch::new(pp.clone());
@@ -1021,8 +981,8 @@ mod tests {
         for x in [2, 6, 11, 23] {
             b.insert(&mut rng, &[x]);
         }
-        a.add_assign(&b).unwrap();
-        let mut got: Vec<i64> = a.decode().unwrap().into_iter().map(|t| t[0]).collect();
+        let sum = sum_packed(&[a, b]);
+        let mut got: Vec<i64> = sum.decode().unwrap().into_iter().map(|t| t[0]).collect();
         got.sort();
         assert_eq!(got, vec![1, 2, 5, 6, 9, 11, 17, 23]);
     }
@@ -1034,8 +994,8 @@ mod tests {
         let mut a = PronySketch::new(pp.clone());
         a.insert(&mut rng, &[5, 6]);
         let cover = PronySketch::unpack(&pp, &PronySketch::cover(&pp));
-        a.add_assign(&cover).unwrap();
-        assert_eq!(a.decode().unwrap(), vec![vec![5, 6]]);
+        let sum = sum_packed(&[a, cover]);
+        assert_eq!(sum.decode().unwrap(), vec![vec![5, 6]]);
         assert_eq!(
             PronySketch::new(pp).decode().unwrap(),
             Vec::<Vec<i64>>::new()
@@ -1090,45 +1050,70 @@ mod tests {
         }
     }
 
+    /// More contributors than the capacity: `Λ` is then essentially a random
+    /// polynomial of degree `C`, which splits into distinct linear factors
+    /// with probability about `1/C!`.
     #[test]
     fn overflowing_capacity_is_detected() {
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        let pp = PronyParams::new(4, 1);
+        let pp = PronyParams::new(16, 1);
         let mut sk = PronySketch::new(pp);
-        for i in 0..6 {
+        for i in 0..20 {
             sk.insert(&mut rng, &[i]);
         }
-        assert_eq!(
-            sk.decode(),
-            Err(PronyError::CapacityExceeded {
-                count: 6,
-                capacity: 4
-            })
-        );
-    }
-
-    /// Two contributors on the same point: `Λ` is not squarefree. Detected,
-    /// not returned as garbage.
-    #[test]
-    fn duplicate_point_is_detected() {
-        let pp = PronyParams::new(8, 1);
-        let mut sk = PronySketch::new(pp);
-        sk.insert_with_z(&[11], 12345);
-        sk.insert_with_z(&[22], 12345);
-        sk.insert_with_z(&[33], 999);
         assert_eq!(sk.decode(), Err(PronyError::NotSplit));
     }
 
-    /// A contribution that is not a Vandermonde row fails the slack check.
+    /// The number of contributors comes from the power sums alone, for every
+    /// count from an empty sketch to full capacity.
+    #[test]
+    fn contributor_count_from_power_sums() {
+        let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
+        let cap = 12;
+        for k in [0usize, 1, 2, cap - 1, cap] {
+            let mut sk = PronySketch::new(PronyParams::new(cap, 2));
+            let mut want: Vec<Vec<i64>> = (0..k as i64).map(|i| vec![i, 1000 - i]).collect();
+            for m in &want {
+                sk.insert(&mut rng, m);
+            }
+            let mut got = sk.decode().unwrap();
+            want.sort();
+            got.sort();
+            assert_eq!(got, want, "k = {k}");
+        }
+    }
+
+    /// Without contributors, every payload cell must be zero.
+    #[test]
+    fn payload_without_contributors_is_detected() {
+        let mut sk = PronySketch::new(PronyParams::new(8, 2));
+        sk.v[1][3] = 5;
+        assert_eq!(sk.decode(), Err(PronyError::CheckFailed));
+    }
+
+    /// Two contributors with the same key: `Λ` is not squarefree. Detected,
+    /// not returned as garbage.
+    #[test]
+    fn duplicate_key_is_detected() {
+        let pp = PronyParams::new(8, 1);
+        let mut sk = PronySketch::new(pp);
+        sk.insert_with_key(&[11], 12345);
+        sk.insert_with_key(&[22], 12345);
+        sk.insert_with_key(&[33], 999);
+        assert_eq!(sk.decode(), Err(PronyError::NotSplit));
+    }
+
+    /// Below capacity, a contribution that is not a Vandermonde row disagrees
+    /// with the payload columns the solve does not use.
     #[test]
     fn malformed_contribution_is_detected() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-        let pp = PronyParams::with_slack(8, 1, 1, PRONY_PRIME);
+        let pp = PronyParams::new(8, 1);
         let mut sk = PronySketch::new(pp);
         for x in [3i64, 4, 5] {
             sk.insert(&mut rng, &[x]);
         }
-        sk.w[0][2] += 7;
+        sk.v[0][2] += 7;
         assert_eq!(sk.decode(), Err(PronyError::CheckFailed));
     }
 

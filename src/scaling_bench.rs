@@ -1109,7 +1109,7 @@ fn run_cell(
         Some(p) => (p.total_cells(), p.delta),
         None => {
             let p = ch.prony().expect("a channel without peeling is a sketch");
-            (p.cols(), p.cols())
+            (p.capacity, p.capacity)
         }
     };
     // Slots are byte-granular: chunks straddle bytes, but disjoint slots have
