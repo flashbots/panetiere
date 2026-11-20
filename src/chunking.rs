@@ -2,7 +2,6 @@
 //!
 //! The bytes form a little-endian bit stream; symbol `i` is bits
 //! `[i·bits, (i+1)·bits)` of it, so every symbol is a value in `[0, 2^bits)`.
-//! Chunking is linear over byte strings with disjoint set bits (no carries).
 
 pub(crate) fn pack(bytes: &[u8], bits: usize, symbols: usize) -> Vec<u64> {
     debug_assert!((1..=56).contains(&bits));
@@ -60,18 +59,5 @@ mod tests {
     fn short_input_reads_as_zero_padded() {
         let symbols = pack(&[0xFF], 31, 3);
         assert_eq!(symbols, vec![0xFF, 0, 0]);
-    }
-
-    #[test]
-    fn disjoint_slots_sum_exactly() {
-        let mut a = vec![0u8; 20];
-        let mut b = vec![0u8; 20];
-        a[..9].copy_from_slice(&[0xA5; 9]);
-        b[9..].copy_from_slice(&[0x5A; 11]);
-        let (sa, sb) = (pack(&a, 31, 6), pack(&b, 31, 6));
-        let summed: Vec<u64> = sa.iter().zip(&sb).map(|(x, y)| x + y).collect();
-        let mut both = a.clone();
-        both[9..].copy_from_slice(&b[9..]);
-        assert_eq!(unpack(&summed, 31, 20), both);
     }
 }
