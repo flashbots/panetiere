@@ -206,7 +206,7 @@ fn mse_round_trip_through_rs_lanes() {
 #[test]
 fn prony_round_trip_through_rs_lanes() {
     let rho = 20;
-    let xi = 1400;
+    let xi = 1500;
     let mut rng = ChaCha20Rng::from_seed([0x32; 32]);
     let params = PronyParams::new(rho, xi);
     let payload_polys = PronySketch::n_polys(&params);
