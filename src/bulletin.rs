@@ -63,7 +63,7 @@ impl ClientBulletinEntry {
 
 /// Why a post cannot be added to a [`PostSum`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PostError {
+pub(crate) enum PostError {
     /// The post does not parse.
     Malformed,
     /// The post's ciphertext does not have exactly `μ` ring elements.
@@ -81,7 +81,7 @@ const MAX_POSTS: usize = (i64::MAX / (4 * KAHE_MODULUS + 2)) as usize;
 /// cannot be added leaves the sum unchanged. Sums over disjoint sets of posts
 /// combine with [`PostSum::merge`], in any order.
 #[derive(Clone)]
-pub struct PostSum {
+pub(crate) struct PostSum {
     mu: usize,
     /// Empty until the first post, so an unused sum costs nothing.
     ctxt: Vec<[i64; POLY_N]>,
@@ -98,11 +98,6 @@ impl PostSum {
             comm: Vec::new(),
             posts: 0,
         }
-    }
-
-    /// How many posts the sum holds.
-    pub fn posts(&self) -> usize {
-        self.posts
     }
 
     /// Add a post given as wire bytes ([`ClientBulletinEntry::to_bytes`]). The
@@ -430,7 +425,7 @@ mod tests {
         with_empty.merge(PostSum::new(3));
 
         for sum in [bytes, parsed, merged_ab, merged_ba, with_empty] {
-            assert_eq!(sum.posts(), 5);
+            assert_eq!(sum.posts, 5);
             let (ctxt, comm) = sum.finish();
             assert_eq!(ctxt, want_ctxt);
             assert_eq!(comm.root, want_comm.root);
@@ -480,7 +475,7 @@ mod tests {
             Err(PostError::WrongCiphertextLength)
         );
 
-        assert_eq!(sum.posts(), 1);
+        assert_eq!(sum.posts, 1);
         let (ctxt, comm) = sum.finish();
         assert_eq!(ctxt, want_ctxt);
         assert_eq!(comm.root, want_comm.root);
