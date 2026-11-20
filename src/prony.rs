@@ -84,8 +84,9 @@ impl Fp {
         }
     }
 
-    /// `x mod p` for `x < p²` (HAC 14.42 — the estimate leaves a residue
-    /// below `3p`, hence at most two corrections).
+    /// `x mod p` for `x < 2^{2k}`, which covers sums of up to three products
+    /// below `p²` (HAC 14.42 — the estimate leaves a residue below `3p`, hence
+    /// at most two corrections).
     #[inline]
     fn reduce(self, x: u128) -> u64 {
         let q = ((x >> (self.k - 1)) * self.mu) >> (self.k + 1);
@@ -215,10 +216,7 @@ impl Ext {
                 f.reduce(x.a as u128 * y.a as u128),
                 f.reduce(NONRESIDUE as u128 * bb as u128),
             ),
-            b: f.add(
-                f.reduce(x.a as u128 * y.b as u128),
-                f.reduce(x.b as u128 * y.a as u128),
-            ),
+            b: f.reduce(x.a as u128 * y.b as u128 + x.b as u128 * y.a as u128),
         }
     }
 
@@ -318,24 +316,48 @@ fn poly_mul(a: &[F2], b: &[F2], ext: Ext) -> Vec<F2> {
 }
 
 /// `(quotient, remainder)` of `a / b`. `b` must be nonzero.
+///
+/// Long division with deferred reduction: each coefficient of `a` keeps the
+/// three coordinate products subtracted from it unreduced in `u128`, and is
+/// only reduced when it becomes the leading coefficient or part of the
+/// remainder. Subtracting `c·b` is adding `(−c)·b`, so the accumulators only
+/// grow; each gets at most `deg a` terms below `2p² < 2^73`.
 fn poly_divmod(a: &[F2], b: &[F2], ext: Ext) -> (Vec<F2>, Vec<F2>) {
     debug_assert!(!b.is_empty());
     if a.len() < b.len() {
         return (Vec::new(), a.to_vec());
     }
+    let f = ext.f;
+    let reduce = |aa: u128, bb: u128, ab: u128| F2 {
+        a: f.add(
+            f.reduce_wide(aa),
+            f.reduce(NONRESIDUE as u128 * f.reduce_wide(bb) as u128),
+        ),
+        b: f.reduce_wide(ab),
+    };
+    let mut aa: Vec<u128> = a.iter().map(|x| x.a as u128).collect();
+    let mut bb = vec![0u128; a.len()];
+    let mut ab: Vec<u128> = a.iter().map(|x| x.b as u128).collect();
     let inv_lead = ext.inv(*b.last().unwrap());
-    let mut rem = a.to_vec();
-    let mut q = vec![F2::ZERO; a.len() - b.len() + 1];
+    let top = b.len() - 1;
+    let mut q = vec![F2::ZERO; a.len() - top];
     for shift in (0..q.len()).rev() {
-        let c = ext.mul(rem[shift + b.len() - 1], inv_lead);
+        let lead = reduce(aa[shift + top], bb[shift + top], ab[shift + top]);
+        let c = ext.mul(lead, inv_lead);
         if c.is_zero() {
             continue;
         }
         q[shift] = c;
-        for (i, &bi) in b.iter().enumerate() {
-            rem[shift + i] = ext.sub(rem[shift + i], ext.mul(bi, c));
+        let nc = ext.neg(c);
+        let (ca, cb) = (nc.a as u128, nc.b as u128);
+        for (i, y) in b[..top].iter().enumerate() {
+            let k = shift + i;
+            aa[k] += y.a as u128 * ca;
+            bb[k] += y.b as u128 * cb;
+            ab[k] += y.a as u128 * cb + y.b as u128 * ca;
         }
     }
+    let rem = (0..top).map(|k| reduce(aa[k], bb[k], ab[k])).collect();
     (trim(q), trim(rem))
 }
 
@@ -392,46 +414,46 @@ fn split_seed(lam: &[F2]) -> [u8; 32] {
 /// All roots of a monic `lam` of degree ≥ 1, or `None` unless `lam` splits
 /// into distinct linear factors over `F` (which is exactly `lam | X^q − X`
 /// for `q = |F|`).
-///
-/// Equal-degree splitting with `d = 1` (Cantor–Zassenhaus): for a random
-/// `c ∈ F`, `gcd((X + c)^{(q−1)/2} − 1, f)` collects the roots `x` with
-/// `x + c` a square, splitting `f` with probability about 1/2 per try. The
-/// shifts come from a ChaCha20 stream seeded with a hash of `lam`, so the
-/// result is a function of `lam` alone; the shifts only affect how long the
-/// splitting takes, never which roots it returns.
 fn roots_of_split(lam: &[F2], ext: Ext) -> Option<Vec<F2>> {
     let q = ext.order();
     let x = vec![F2::ZERO, F2::ONE];
     if powmod_linear(F2::ZERO, q, lam, ext) != poly_rem(&x, lam, ext) {
         return None;
     }
-    let mut rng = ChaCha20Rng::from_seed(split_seed(lam));
-    let mut out = Vec::with_capacity(lam.len() - 1);
-    let mut stack = vec![lam.to_vec()];
-    while let Some(fac) = stack.pop() {
-        match fac.len() {
-            0 | 1 => continue,
-            2 => {
-                // monic X + c
-                out.push(ext.neg(fac[0]));
-                continue;
-            }
-            _ => {}
-        }
-        loop {
-            let c = ext.random(&mut rng);
-            let h = poly_sub(&powmod_linear(c, (q - 1) / 2, &fac, ext), &[F2::ONE], ext);
-            let g = poly_gcd(&h, &fac, ext);
-            if g.len() > 1 && g.len() < fac.len() {
-                let (cof, _) = poly_divmod(&fac, &g, ext);
-                stack.push(g);
-                stack.push(cof);
-                break;
-            }
-        }
-    }
+    let mut out = split_roots(lam.to_vec(), ext);
     out.sort_unstable();
     Some(out)
+}
+
+/// The roots of a monic `fac` that splits into distinct linear factors.
+///
+/// Equal-degree splitting with `d = 1` (Cantor–Zassenhaus): for a random
+/// `c ∈ F`, `gcd((X + c)^{(q−1)/2} − 1, fac)` collects the roots `x` with
+/// `x + c` a square, splitting `fac` with probability about 1/2 per try. The
+/// two factors are split in parallel. Each factor's shifts come from a
+/// ChaCha20 stream seeded with a hash of that factor, so the result is a
+/// function of `fac` alone, however the work is scheduled; the shifts only
+/// affect how long the splitting takes, never which roots it returns.
+fn split_roots(fac: Vec<F2>, ext: Ext) -> Vec<F2> {
+    match fac.len() {
+        0 | 1 => return Vec::new(),
+        // monic X + c
+        2 => return vec![ext.neg(fac[0])],
+        _ => {}
+    }
+    let half = (ext.order() - 1) / 2;
+    let mut rng = ChaCha20Rng::from_seed(split_seed(&fac));
+    loop {
+        let c = ext.random(&mut rng);
+        let h = poly_sub(&powmod_linear(c, half, &fac, ext), &[F2::ONE], ext);
+        let g = poly_gcd(&h, &fac, ext);
+        if g.len() > 1 && g.len() < fac.len() {
+            let (cof, _) = poly_divmod(&fac, &g, ext);
+            let (mut a, b) = rayon::join(|| split_roots(g, ext), || split_roots(cof, ext));
+            a.extend(b);
+            return a;
+        }
+    }
 }
 
 // ---------------------------------------------------------------
@@ -746,12 +768,22 @@ impl PronySketch {
                 b: s.get(1).map_or(0, |&y| canon(y, p)),
             })
             .collect();
+        // x·r^j with x fixed per row: both coordinates are sums of two
+        // products below p², one reduction each.
+        let f = ext.f;
         self.v
             .par_iter_mut()
             .zip(xs.par_iter())
             .for_each(|(row, &x)| {
+                let (xa, xb) = (x.a as u128, x.b as u128);
+                let xb3 = f.mul(NONRESIDUE, x.b) as u128;
                 for (slot, &pw) in row.iter_mut().zip(pows.iter()) {
-                    *slot = ext.add(*slot, ext.mul(x, pw));
+                    let (pa, pb) = (pw.a as u128, pw.b as u128);
+                    let prod = F2 {
+                        a: f.reduce(xa * pa + xb3 * pb),
+                        b: f.reduce(xa * pb + xb * pa),
+                    };
+                    *slot = ext.add(*slot, prod);
                 }
             });
     }
@@ -803,7 +835,7 @@ impl PronySketch {
         // Lagrange duals: b_i = Λ/(X − r_i) by synthetic division, scaled by
         // 1/Λ'(r_i) = 1/b_i(r_i). Then x_{i,ℓ} = Σ_m b_{i,m}·V[ℓ][m].
         let dual: Vec<Vec<F2>> = r
-            .iter()
+            .par_iter()
             .map(|&ri| {
                 let mut b = vec![F2::ZERO; rho_hat];
                 b[rho_hat - 1] = F2::ONE;
@@ -818,9 +850,11 @@ impl PronySketch {
                 b.iter().map(|&c| ext.mul(c, inv)).collect()
             })
             .collect();
-        // The solve runs on the coordinates: with D = D_a + D_b Z and
-        // V = V_a + V_b Z, D·V = (D_a V_a + 3 D_b V_b) + (D_a V_b + D_b V_a) Z.
-        let plane = |coord: fn(&F2) -> u64| {
+        // The solve runs on the coordinates, Karatsuba-style: with
+        // D = D_a + D_b Z and V = V_a + V_b Z,
+        // D·V = (D_a V_a + 3 D_b V_b) + ((D_a + D_b)(V_a + V_b) − D_a V_a − D_b V_b) Z,
+        // three products over F_t.
+        let plane = |coord: &(dyn Fn(&F2) -> u64 + Sync)| {
             DualLimbs::new(
                 &dual
                     .iter()
@@ -828,21 +862,24 @@ impl PronySketch {
                     .collect::<Vec<Vec<u64>>>(),
             )
         };
-        let (d_a, d_b) = (plane(|x| x.a), plane(|x| x.b));
+        let d_a = plane(&|x| x.a);
+        let d_b = plane(&|x| x.b);
+        let d_s = plane(&|x| f.add(x.a, x.b));
         let xs: Vec<Vec<F2>> = self
             .v
             .par_iter()
             .map(|row| {
-                let w_a: Vec<u64> = row[..rho_hat].iter().map(|x| x.a).collect();
-                let w_b: Vec<u64> = row[..rho_hat].iter().map(|x| x.b).collect();
+                let w = &row[..rho_hat];
+                let w_a: Vec<u64> = w.iter().map(|x| x.a).collect();
+                let w_b: Vec<u64> = w.iter().map(|x| x.b).collect();
+                let w_s: Vec<u64> = w.iter().map(|x| f.add(x.a, x.b)).collect();
                 let aa = solve_symbol(&d_a, &w_a, f);
                 let bb = solve_symbol(&d_b, &w_b, f);
-                let ab = solve_symbol(&d_a, &w_b, f);
-                let ba = solve_symbol(&d_b, &w_a, f);
+                let ss = solve_symbol(&d_s, &w_s, f);
                 (0..rho_hat)
                     .map(|i| F2 {
                         a: f.add(aa[i], f.mul(NONRESIDUE, bb[i])),
-                        b: f.add(ab[i], ba[i]),
+                        b: f.sub(ss[i], f.add(aa[i], bb[i])),
                     })
                     .collect()
             })
@@ -1082,6 +1119,8 @@ mod tests {
             for _ in 0..20_000 {
                 let x = rng.gen::<u128>() % pp;
                 assert_eq!(f.reduce(x), (x % p as u128) as u64);
+                let y = rng.gen::<u128>() % (3 * pp);
+                assert_eq!(f.reduce(y), (y % p as u128) as u64, "reduce {y} mod {p}");
                 assert_eq!(f.mul(x as u64 % p, (x >> 64) as u64 % p), {
                     let a = (x as u64 % p) as u128;
                     let b = ((x >> 64) as u64 % p) as u128;
