@@ -1,4 +1,4 @@
-use chipmunk_code::{HVCPoly, ALPHA_H, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
+use chipmunk_code::{HVCPoly, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use negacyclic_rings::arithmetic;
 use negacyclic_rings::decomposition;
 use negacyclic_rings::ntt64::{self, Ring64};
@@ -258,24 +258,6 @@ impl KahePoly {
         hasher.finalize().into()
     }
 
-    pub fn infinity_norm(&self) -> u64 {
-        self.coeffs
-            .iter()
-            .map(|x| x.unsigned_abs())
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub fn lift(&mut self) {
-        for coefficient in &mut self.coeffs {
-            *coefficient = lift64(*coefficient, KAHE_MODULUS);
-        }
-    }
-
-    pub fn lift_inplace(&mut self) {
-        self.lift();
-    }
-
     pub fn normalize(&mut self) {
         for coefficient in &mut self.coeffs {
             *coefficient = normalize64(*coefficient, KAHE_MODULUS);
@@ -358,12 +340,6 @@ impl std::ops::Mul for KaheNTTPoly {
 }
 
 impl KaheNTTPoly {
-    pub fn rand_ntt_poly<R: Rng>(rng: &mut R) -> Self {
-        let mut result = Self::default();
-        result.fill_random(rng);
-        result
-    }
-
     pub(crate) fn fill_random<R: Rng>(&mut self, rng: &mut R) {
         let q = KAHE_MODULUS as u64;
         let threshold = (((1u128 << 64) / q as u128) * q as u128) as u64;
@@ -374,14 +350,6 @@ impl KaheNTTPoly {
             }
             *coefficient = value % q;
         }
-    }
-
-    pub fn from_kahe(poly: &KahePoly) -> Self {
-        Self::from(poly)
-    }
-
-    pub fn to_centered_coeffs(&self) -> [i64; N] {
-        KahePoly::from(self).coeffs
     }
 }
 
@@ -487,44 +455,12 @@ impl CsPoly {
         ))
     }
 
-    pub fn rand_balanced_ternary<R: Rng>(rng: &mut R, half_weight: usize) -> Self {
-        Self::from_coeffs(arithmetic::rand_balanced_ternary_i32(rng, half_weight))
-    }
-
-    pub fn rand_binary<R: Rng>(rng: &mut R) -> Self {
-        Self::from_coeffs(arithmetic::rand_binary_i32(rng))
-    }
-
-    pub fn rand_ternary<R: Rng>(rng: &mut R, weight: usize) -> Self {
-        Self::from_coeffs(arithmetic::rand_ternary_i32(rng, weight))
-    }
-
     pub fn rand_mod_p<R: Rng>(rng: &mut R, p: u32) -> Self {
         Self::from_coeffs(arithmetic::rand_mod_p_i32(rng, p))
     }
 
-    pub fn from_hash_message(msg: &[u8]) -> Self {
-        Self::from_coeffs(arithmetic::from_hash_message_i32(msg, ALPHA_H))
-    }
-
     pub fn digest(&self) -> [u8; 32] {
         arithmetic::digest_i32(&self.coeffs)
-    }
-
-    pub fn is_ternary(&self) -> bool {
-        arithmetic::is_ternary_i32(&self.coeffs)
-    }
-
-    pub fn infinity_norm(&self) -> u32 {
-        arithmetic::infinity_norm_i32(&self.coeffs)
-    }
-
-    pub fn lift(&mut self) {
-        arithmetic::lift_assign_i32(&mut self.coeffs, CS_MODULUS);
-    }
-
-    pub fn lift_inplace(&mut self) {
-        self.lift();
     }
 
     pub fn normalize(&mut self) {

@@ -3,39 +3,6 @@
 use crate::{CsPoly, CS_MODULUS, CS_MODULUS_OVER_TWO, N};
 use rand::Rng;
 
-pub trait Sss {
-    type Secret: Clone;
-    type Share: Clone;
-
-    fn share<R: Rng>(rng: &mut R, secret: &Self::Secret, n: usize) -> Vec<Self::Share>;
-    fn recover(shares: &[Self::Share]) -> Self::Secret;
-}
-
-/// Additive n-of-n sharing over `CsPoly`. `s_1..s_{n-1}` random; `s_n = secret − Σ s_i`.
-pub struct AdditiveSharing;
-
-impl Sss for AdditiveSharing {
-    type Secret = CsPoly;
-    type Share = CsPoly;
-
-    fn share<R: Rng>(rng: &mut R, secret: &Self::Secret, n: usize) -> Vec<Self::Share> {
-        assert!(n >= 1);
-        let mut shares = Vec::with_capacity(n);
-        let mut acc = CsPoly::default();
-        for _ in 0..n - 1 {
-            let s = CsPoly::rand_poly(rng);
-            acc += s;
-            shares.push(s);
-        }
-        shares.push(*secret - acc);
-        shares
-    }
-
-    fn recover(shares: &[Self::Share]) -> Self::Secret {
-        shares.iter().copied().fold(CsPoly::default(), |a, x| a + x)
-    }
-}
-
 /// Shamir t-of-n secret sharing over `R_q`.
 ///
 /// Evaluation points are `Z_q*` scalars `1..=n` (their pairwise differences are
@@ -188,17 +155,6 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
-
-    #[test]
-    fn round_trip() {
-        let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
-        for n in [1usize, 2, 4, 7] {
-            let secret = CsPoly::rand_poly(&mut rng);
-            let shares = AdditiveSharing::share(&mut rng, &secret, n);
-            assert_eq!(shares.len(), n);
-            assert_eq!(AdditiveSharing::recover(&shares), secret);
-        }
-    }
 
     #[test]
     fn shamir_round_trip() {
