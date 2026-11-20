@@ -199,7 +199,10 @@ extra 34-bit symbols per element. This guarantee covers the `channel` path only 
 sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to move;
 recovery is all-or-nothing for both. The sketch also needs a
 prime plaintext modulus, which `protocol_params` handles by selecting
-`PRONY_PRIME` for that variant. `mse` / `prony` directly when you want to choose
+`PRONY_PRIME` for that variant. Its keys and payload are elements of
+$F_{t^2} = F_t[Z]/(Z^2 - 3)$, two plaintext slots each, so two of $C$ keys
+collide with probability at most $C^2/t^2$ (about $2^{-51.5}$ at $C = 300$).
+`mse` / `prony` directly when you want to choose
 $\gamma$, $\delta$, $\xi$ or capacity yourself. `codec` for non-multiset layouts (disjoint
 slots, or a reservation schedule via `beacon` / `allocate` / `encode_at` /
 `decode_ranges`) — use `encode_raw`/`decode_raw` there, since `encode`/`decode`
@@ -418,8 +421,8 @@ RAYON_NUM_THREADS=8 cargo bench -j 8 --bench protocol_sweep   # (S, ρ) × encod
 
 KAHE runs on a single 64-bit NTT over its prime modulus; the CS auxiliary
 domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
-channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their semantic
-prime fields.
+channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their own
+field arithmetic.
 
 The integration tests are the executable spec: `end_to_end.rs` (canonical round,
 slot mode, *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
