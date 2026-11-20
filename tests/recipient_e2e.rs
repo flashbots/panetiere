@@ -6,8 +6,8 @@ use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
-    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_once,
-    RecipientError, RejectReason, SetPolicy,
+    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_direct_from_bytes,
+    recover_unverified_once, RecipientError, Recovered, RejectReason, SetPolicy,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
@@ -38,6 +38,15 @@ struct Round {
 }
 
 impl Round {
+    /// Every client's post as wire bytes, indexed by client id.
+    fn post_bytes(&self) -> Vec<Option<Vec<u8>>> {
+        let mut out = vec![None; self.canonical.len()];
+        for (cid, e) in &self.publics {
+            out[cid.0 as usize] = Some(e.to_bytes());
+        }
+        out
+    }
+
     fn lookup(&self) -> impl Fn(ClientId) -> Option<ClientBulletinEntry> + '_ {
         |cid| {
             self.publics
@@ -193,7 +202,7 @@ fn missing_client_public_is_rejected() {
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
-        RecipientError::Rejected(RejectReason::MissingClientPublics { have: 4, need: 5 })
+        RecipientError::Rejected(RejectReason::MissingClientPost(ClientId(2)))
     );
 }
 
@@ -356,4 +365,138 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         aggregate_and_decrypt_rs(&pp, &SESSION, &r.canonical, &[], &r.outputs, &[]),
         Err(VerifyError::TooManyClients { got: 4, max: 3 })
     ));
+}
+
+/// Each client ciphertext has exactly `μ` ring elements. With several
+/// misbehaving clients, the first in the set's order is named, whatever the
+/// kind of fault.
+#[test]
+fn the_first_misbehaving_client_is_named() {
+    let r = round(33, 4, 5);
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    let longer = |cid: u32| {
+        let (_, e) = &r.publics[cid as usize];
+        ClientBulletinEntry {
+            ctxt: [e.ctxt.clone(), e.ctxt.clone()].concat(),
+            comm: e.comm.clone(),
+        }
+    };
+    let direct = |missing: &[u32], long: &[u32]| {
+        let lookup = |cid: ClientId| {
+            if missing.contains(&cid.0) {
+                None
+            } else if long.contains(&cid.0) {
+                Some(longer(cid.0))
+            } else {
+                r.lookup()(cid)
+            }
+        };
+        match recover_unverified_direct(&r.pp, &policy, lookup, &r.outputs) {
+            Err(RecipientError::Rejected(reason)) => reason,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        direct(&[3, 1], &[]),
+        RejectReason::MissingClientPost(ClientId(1))
+    );
+    assert_eq!(
+        direct(&[], &[4, 2]),
+        RejectReason::WrongCiphertextLength(ClientId(2))
+    );
+    assert_eq!(
+        direct(&[3], &[1]),
+        RejectReason::WrongCiphertextLength(ClientId(1))
+    );
+    assert_eq!(
+        direct(&[1], &[3]),
+        RejectReason::MissingClientPost(ClientId(1))
+    );
+
+    let mut publics = r.publics.clone();
+    publics[2].1 = longer(2);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &publics, &r.outputs),
+        Err(VerifyError::WrongCiphertextLength(ClientId(2)))
+    );
+}
+
+fn from_bytes(r: &Round, posts: &[Option<Vec<u8>>]) -> Result<Recovered, RecipientError> {
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    recover_unverified_direct_from_bytes(
+        &r.pp,
+        &policy,
+        |cid: ClientId| posts.get(cid.0 as usize)?.as_deref(),
+        &r.outputs,
+    )
+}
+
+/// From the posts' bytes, the recipient recovers what it recovers from the
+/// parsed posts, and excludes the same culprits.
+#[test]
+fn from_bytes_matches_parsed_posts() {
+    let mut rng = ChaCha20Rng::from_seed([34u8; 32]);
+    let mut r = round(34, 5, 6);
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    let posts = r.post_bytes();
+    for corrupt in [&[][..], &[1usize, 3][..]] {
+        for &i in corrupt {
+            r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
+        }
+        let want = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap();
+        let got = from_bytes(&r, &posts).unwrap();
+        assert_eq!(got.culprits.len(), corrupt.len());
+        assert_eq!(
+            (got.plaintext, got.culprits),
+            (want.plaintext, want.culprits)
+        );
+    }
+}
+
+/// From the posts' bytes, too, the first misbehaving client in the set's
+/// order is named, whatever the kind of fault.
+#[test]
+fn from_bytes_names_the_first_misbehaving_client() {
+    let r = round(35, 4, 6);
+    let reject = |posts: &[Option<Vec<u8>>]| match from_bytes(&r, posts) {
+        Err(RecipientError::Rejected(reason)) => reason,
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+    let (_, e) = &r.publics[0];
+    let longer = ClientBulletinEntry {
+        ctxt: [e.ctxt.clone(), e.ctxt.clone()].concat(),
+        comm: e.comm.clone(),
+    }
+    .to_bytes();
+    let with = |faults: &[(usize, &str)]| {
+        let mut posts = r.post_bytes();
+        for &(i, kind) in faults {
+            match kind {
+                "missing" => posts[i] = None,
+                "malformed" => {
+                    posts[i].as_mut().unwrap().pop();
+                }
+                _ => posts[i] = Some(longer.clone()),
+            }
+        }
+        reject(&posts)
+    };
+    use RejectReason::*;
+    assert_eq!(
+        with(&[(4, "missing"), (2, "missing")]),
+        MissingClientPost(ClientId(2))
+    );
+    assert_eq!(
+        with(&[(5, "malformed"), (1, "malformed")]),
+        MalformedClientPost(ClientId(1))
+    );
+    assert_eq!(with(&[(3, "long")]), WrongCiphertextLength(ClientId(3)));
+    assert_eq!(
+        with(&[(4, "missing"), (2, "malformed"), (3, "long")]),
+        MalformedClientPost(ClientId(2))
+    );
+    assert_eq!(
+        with(&[(1, "long"), (0, "missing"), (5, "malformed")]),
+        MissingClientPost(ClientId(0))
+    );
 }

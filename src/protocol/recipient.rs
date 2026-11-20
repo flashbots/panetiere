@@ -6,10 +6,19 @@
 //!   [`SetPolicy`], then drop servers whose shares fail their opening until `t`
 //!   honest ones remain. Threshold decryption tolerates that; the excluded
 //!   servers come back in [`Recovered::culprits`] for the caller to attribute.
+//! - [`recover_unverified_direct_from_bytes`] is the direct flow over the posts'
+//!   wire bytes: it parses and sums them in parallel without building their
+//!   polynomials.
+//!
+//! Both direct entry points sum the posts once, with a `PostSum`, and only
+//! repeat verification and decryption while excluding culprits. They check
+//! the posts alike and name the first misbehaving client in the set's order.
+
+use rayon::prelude::*;
 
 use crate::KahePoly;
 
-use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
+use crate::bulletin::{ClientBulletinEntry, PostError, PostSum, ServerBulletinEntry};
 use crate::cs::{Commitment, HidingMerkleCommitment};
 use crate::kahe::Kahe;
 
@@ -71,10 +80,12 @@ pub enum RejectReason {
         agreeing: usize,
         need: usize,
     },
-    MissingClientPublics {
-        have: usize,
-        need: usize,
-    },
+    /// No post from this client.
+    MissingClientPost(ClientId),
+    /// This client's post does not parse.
+    MalformedClientPost(ClientId),
+    /// This client's ciphertext does not have exactly `μ` ring elements.
+    WrongCiphertextLength(ClientId),
     GroupAggregateMissing {
         group_of: ClientId,
     },
@@ -211,20 +222,37 @@ where
     let (canonical, agreeing) = anchored_set(policy, server_outputs);
     admit(pp, policy, &canonical, agreeing.len()).map_err(RecipientError::Rejected)?;
 
-    let entries: Vec<(ClientId, ClientBulletinEntry)> = canonical
-        .iter()
-        .filter_map(|cid| publics(*cid).map(|p| (*cid, p)))
-        .collect();
-    if entries.len() != canonical.len() {
-        return Err(RecipientError::Rejected(
-            RejectReason::MissingClientPublics {
-                have: entries.len(),
-                need: canonical.len(),
-            },
-        ));
+    // Summed once, in the set's order, so the first misbehaving client is the
+    // one named.
+    let mut sum = PostSum::new(pp.kahe.mu_kahe);
+    for &cid in &canonical {
+        let post = publics(cid)
+            .ok_or(RejectReason::MissingClientPost(cid))
+            .map_err(RecipientError::Rejected)?;
+        sum.add_entry(&post)
+            .map_err(|e| RecipientError::Rejected(post_fault(e, cid)))?;
     }
+    decode_over_sum(pp, canonical, agreeing, sum.finish())
+}
+
+/// The reason a client's post cannot be summed.
+fn post_fault(e: PostError, cid: ClientId) -> RejectReason {
+    match e {
+        PostError::Malformed => RejectReason::MalformedClientPost(cid),
+        PostError::WrongCiphertextLength => RejectReason::WrongCiphertextLength(cid),
+    }
+}
+
+/// Exclude culprits and decrypt over the summed posts, which do not depend on
+/// which servers are excluded.
+fn decode_over_sum(
+    pp: &ProtocolParams,
+    canonical: Vec<ClientId>,
+    agreeing: Vec<ServerBulletinEntry>,
+    (ctxt, comm): (Vec<KahePoly>, Commitment),
+) -> Result<Recovered, RecipientError> {
     let (plaintext, culprits) = exclude_and_decode(pp.shamir.t, agreeing, |outs| {
-        aggregate_and_decrypt_unverified(pp, &canonical, &entries, outs)
+        decrypt_unverified_aggregate(pp, &ctxt, &comm, outs)
     })
     .map_err(RecipientError::Rejected)?;
     Ok(Recovered {
@@ -232,6 +260,86 @@ where
         plaintext,
         culprits,
     })
+}
+
+/// Sum the posts of the clients in `canonical`, given as wire bytes
+/// ([`ClientBulletinEntry::to_bytes`]) by `posts`, which is called once per
+/// client, from several threads. The posts are parsed in parallel and their
+/// ciphertexts unpacked straight into a [`PostSum`], so no post's polynomials
+/// are ever built. The first client in `canonical`'s order whose post is
+/// missing, does not parse or has the wrong length is named. An empty set
+/// sums to zero.
+fn sum_client_posts<L, B>(
+    pp: &ProtocolParams,
+    canonical: &[ClientId],
+    posts: L,
+) -> Result<(Vec<KahePoly>, Commitment), RejectReason>
+where
+    L: Fn(ClientId) -> Option<B> + Sync,
+    B: AsRef<[u8]>,
+{
+    type Fault = Option<(usize, RejectReason)>;
+    let first = |a: Fault, b: Fault| match (a, b) {
+        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
+        (a, b) => a.or(b),
+    };
+    let mu = pp.kahe.mu_kahe;
+    let (sum, fault) = canonical
+        .par_iter()
+        .enumerate()
+        .fold(
+            || (PostSum::new(mu), None),
+            |(mut sum, fault): (PostSum, Fault), (i, &cid)| {
+                // A fold sees its clients in order: past a fault, the rest
+                // cannot be named first.
+                if fault.is_some() {
+                    return (sum, fault);
+                }
+                let here = match posts(cid) {
+                    None => Some(RejectReason::MissingClientPost(cid)),
+                    Some(post) => sum.add(post.as_ref()).err().map(|e| post_fault(e, cid)),
+                };
+                (sum, here.map(|why| (i, why)))
+            },
+        )
+        .reduce(
+            || (PostSum::new(mu), None),
+            |(mut a, fa), (b, fb)| {
+                a.merge(b);
+                (a, first(fa, fb))
+            },
+        );
+    match fault {
+        Some((_, why)) => Err(why),
+        None => Ok(sum.finish()),
+    }
+}
+
+/// Direct flow over the posts' wire bytes: as [`recover_unverified_direct`],
+/// but the posts are parsed and summed in parallel, without keeping them
+/// parsed.
+/// Requires authentic, session-bound posts consistent with the servers' view;
+/// recovery does not authenticate the supplied ciphertexts.
+pub fn recover_unverified_direct_from_bytes<L, B>(
+    pp: &ProtocolParams,
+    policy: &SetPolicy,
+    posts: L,
+    server_outputs: &[ServerBulletinEntry],
+) -> Result<Recovered, RecipientError>
+where
+    L: Fn(ClientId) -> Option<B> + Sync,
+    B: AsRef<[u8]>,
+{
+    if server_outputs.len() < pp.shamir.t {
+        return Err(RecipientError::BelowShareThreshold {
+            have: server_outputs.len(),
+            need: pp.shamir.t,
+        });
+    }
+    let (canonical, agreeing) = anchored_set(policy, server_outputs);
+    admit(pp, policy, &canonical, agreeing.len()).map_err(RecipientError::Rejected)?;
+    let sum = sum_client_posts(pp, &canonical, posts).map_err(RecipientError::Rejected)?;
+    decode_over_sum(pp, canonical, agreeing, sum)
 }
 
 /// Aggregated flow: aggregators already summed each group's public parts, so the
