@@ -1283,42 +1283,6 @@ pub(crate) fn unpack_poly(
     Some((coeffs, next))
 }
 
-/// Wire size of a digit vector: `bits_for_signed(bound)` bits per coefficient,
-/// continuous across polys.
-pub(crate) fn digits_packed_len(n_polys: usize, bound: u32) -> usize {
-    (n_polys * POLY_N * bits_for_signed(bound) as usize).div_ceil(8)
-}
-
-/// Pack a digit vector at its norm bound, so the wire form doubles as the norm
-/// gate — a vector that does not fit could not have verified either.
-pub(crate) fn pack_digits(polys: &[HVCPoly], bound: u32) -> Option<Vec<u8>> {
-    if !polys.iter().all(|p| p.infinity_norm() <= bound) {
-        return None;
-    }
-    let mut flat = Vec::with_capacity(polys.len() * POLY_N);
-    for p in polys {
-        flat.extend_from_slice(p.coeffs());
-    }
-    let mut out = Vec::with_capacity(digits_packed_len(polys.len(), bound));
-    pack_bits(&mut out, &flat, bound, bits_for_signed(bound));
-    Some(out)
-}
-
-pub(crate) fn unpack_digits(bytes: &[u8], n_polys: usize, bound: u32) -> Option<Vec<HVCPoly>> {
-    if bytes.len() != digits_packed_len(n_polys, bound) {
-        return None;
-    }
-    let mut flat = vec![0i32; n_polys * POLY_N];
-    unpack_bits(bytes, 0, &mut flat, bound, bits_for_signed(bound))?;
-    Some(
-        flat.as_chunks::<POLY_N>()
-            .0
-            .iter()
-            .map(|chunk| HVCPoly::from_coeffs(*chunk))
-            .collect(),
-    )
-}
-
 impl Commitment {
     /// Bit-packed wire form: the single HVC root packed against `HVC_MODULUS`.
     pub fn to_bytes(&self) -> Vec<u8> {

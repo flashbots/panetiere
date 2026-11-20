@@ -3,16 +3,13 @@
 use std::sync::Mutex;
 
 use crate::cs::{
-    aggregated_opening_pack_bounds, pack_cs_shares, pack_poly, pack_poly64, poly_packed_len,
-    poly_packed_len64, unpack_cs_shares, unpack_poly, unpack_poly64, Commitment, CsParams, Opening,
+    aggregated_opening_pack_bounds, pack_cs_shares, pack_poly64, poly_packed_len,
+    poly_packed_len64, unpack_cs_shares, unpack_poly64, Commitment, CsParams, Opening,
     PackedOpening,
 };
-use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
-use crate::rs::Share;
-use crate::share_commitment::ShareOpening;
-use crate::sig;
-use crate::{CsPoly, KahePoly, CS_MODULUS, KAHE_MODULUS, N as POLY_N};
-use chipmunk_code::{HVCPoly, HVC_MODULUS};
+use crate::protocol::{ClientId, ServerId};
+use crate::{CsPoly, KahePoly, CS_MODULUS, KAHE_MODULUS};
+use chipmunk_code::HVC_MODULUS;
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
@@ -54,82 +51,6 @@ impl ClientBulletinEntry {
         let comm = Commitment::from_bytes(&bytes[start..])?;
         Some(ClientBulletinEntry { ctxt, comm })
     }
-}
-
-#[derive(Clone)]
-pub struct RsClientBulletinEntry {
-    pub comm: Commitment,
-    /// HVC root over the client's `n` coded shares, one leaf per lane.
-    pub share_root: HVCPoly,
-    pub pubkey: [u8; sig::PUBKEY_LEN],
-    pub sig: [u8; sig::SIG_LEN],
-}
-
-/// One canonical NTT-domain coefficient (`q < 2^48`) in six bytes.
-pub fn rs_poly_packed_len() -> usize {
-    POLY_N * crate::rs::RS_COEFF_BYTES
-}
-
-impl RsClientBulletinEntry {
-    pub fn signing_bytes(
-        sid: &SessionId,
-        client_id: ClientId,
-        comm: &Commitment,
-        share_root: &HVCPoly,
-    ) -> Vec<u8> {
-        const DOMAIN: &[u8] = b"panetiere/rs-bulletin/v4";
-        let mut out = Vec::with_capacity(DOMAIN.len() + 36 + 2 * poly_packed_len(HVC_MODULUS));
-        out.extend_from_slice(DOMAIN);
-        out.extend_from_slice(&sid.0);
-        out.extend_from_slice(&client_id.0.to_le_bytes());
-        out.extend_from_slice(&comm.to_bytes());
-        pack_poly(share_root.coeffs(), HVC_MODULUS, &mut out);
-        out
-    }
-
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(Self::packed_len());
-        out.extend_from_slice(&self.comm.to_bytes());
-        pack_poly(self.share_root.coeffs(), HVC_MODULUS, &mut out);
-        out.extend_from_slice(&self.pubkey);
-        out.extend_from_slice(&self.sig);
-        out
-    }
-
-    /// Independent of the message length — that is the point of the mode.
-    pub fn packed_len() -> usize {
-        2 * poly_packed_len(HVC_MODULUS) + sig::PUBKEY_LEN + sig::SIG_LEN
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != Self::packed_len() {
-            return None;
-        }
-        let hvc_len = poly_packed_len(HVC_MODULUS);
-        let comm = Commitment::from_bytes(&bytes[..hvc_len])?;
-        let (root_coeffs, start) = unpack_poly(bytes, hvc_len, HVC_MODULUS)?;
-        let mut pubkey = [0u8; sig::PUBKEY_LEN];
-        pubkey.copy_from_slice(&bytes[start..start + sig::PUBKEY_LEN]);
-        let mut s = [0u8; sig::SIG_LEN];
-        s.copy_from_slice(&bytes[start + sig::PUBKEY_LEN..]);
-        Some(RsClientBulletinEntry {
-            comm,
-            share_root: HVCPoly::from_coeffs(root_coeffs),
-            pubkey,
-            sig: s,
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct RsNodeBulletinEntry {
-    pub node_id: NodeId,
-    pub clients: Vec<ClientId>,
-    /// Positional sum of this lane's shares — what reconstruction consumes.
-    pub share_sum: Share,
-    /// Digit-domain sum of the label openings, with the summed path: proves
-    /// `A·share_sum` opens the sum of signed roots at this lane's position.
-    pub agg_open: ShareOpening,
 }
 
 #[derive(Clone)]

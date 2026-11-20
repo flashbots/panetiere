@@ -10,8 +10,6 @@ use crate::cs::{Cs, HidingMerkleCommitment, KAPPA_CS, MU_CS};
 use crate::kahe::{
     Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT,
 };
-use crate::rs::RsParams;
-use crate::share_commitment::ShareCommitmentParams;
 use crate::sss::ShamirParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
@@ -19,10 +17,6 @@ pub struct ClientId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
 pub struct ServerId(pub u32);
-
-/// Erasure coding lane node id
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
-pub struct NodeId(pub u32);
 
 /// Client's unique per-round session id to prevent replays
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -70,9 +64,6 @@ pub struct ProtocolParams {
     pub min_clients: usize,
     /// Aggregate capacity derived at setup from commitment and KAHE bounds.
     pub max_clients: usize,
-    /// Set only in the RS-sharded ingress mode; `None` is the broadcast flow.
-    pub rs: Option<RsParams>,
-    pub share_comm: Option<ShareCommitmentParams>,
 }
 
 impl ProtocolParams {
@@ -92,8 +83,6 @@ impl ProtocolParams {
             cs,
             shamir,
             min_clients: 1,
-            rs: None,
-            share_comm: None,
         }
     }
 
@@ -126,8 +115,6 @@ impl ProtocolParams {
             cs,
             shamir,
             min_clients: 1,
-            rs: None,
-            share_comm: None,
         }
     }
 }
@@ -138,46 +125,6 @@ impl ProtocolParams {
     pub fn with_threshold(mut self, t: usize) -> Self {
         self.shamir = ShamirParams::new(t, self.shamir.n);
         self
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn setup_rs_mode<R: Rng>(
-        rng: &mut R,
-        n_servers: usize,
-        payload_polys: usize,
-        k: usize,
-        n_nodes: usize,
-        t_modulus: u64,
-        rho_max: usize,
-        crs_seed: [u8; 32],
-    ) -> Self {
-        assert!(payload_polys >= 1, "payload must be ≥ 1 poly");
-        assert!(
-            n_nodes >= n_servers,
-            "every threshold server is also a lane; n_nodes ≥ n_servers"
-        );
-        let t = honest_majority_threshold(n_servers);
-        let kahe = Kahe::setup_with_dims(
-            rng,
-            payload_polys,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            t_modulus,
-        );
-        let rs = RsParams::new(k, n_nodes);
-        let block_len = rs.block_len(payload_polys);
-        let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
-        Self {
-            max_clients: aggregate_capacity(&kahe, &cs).min(rho_max),
-            kahe,
-            cs,
-            shamir: ShamirParams::new(t, n_servers),
-            min_clients: 1,
-            rs: Some(rs),
-            share_comm: Some(ShareCommitmentParams::from_seed(
-                crs_seed, block_len, n_nodes, rho_max,
-            )),
-        }
     }
 }
 
@@ -245,17 +192,6 @@ mod tests {
                 T_MODULUS_DEFAULT,
             );
             assert_eq!(pp.shamir.t, t);
-            let pp = ProtocolParams::setup_rs_mode(
-                &mut rng,
-                gamma,
-                1,
-                gamma - 2,
-                gamma,
-                T_MODULUS_DEFAULT,
-                300,
-                [94; 32],
-            );
-            assert_eq!(pp.shamir.t, t);
             let pp = pp.with_threshold(gamma - 1);
             assert_eq!((pp.shamir.t, pp.shamir.n), (gamma - 1, gamma));
         }
@@ -290,19 +226,5 @@ mod tests {
         let half_q = crate::rings::KAHE_MODULUS as f64 / 2.0;
         assert!(budget(pp.max_clients) < half_q);
         assert!(budget(pp.max_clients + 1) >= half_q);
-
-        for rho_max in [3, 400] {
-            let pp = ProtocolParams::setup_rs_mode(
-                &mut rng,
-                4,
-                1,
-                3,
-                4,
-                T_MODULUS_DEFAULT,
-                rho_max,
-                [92; 32],
-            );
-            assert_eq!(pp.max_clients, rho_max.min(300));
-        }
     }
 }

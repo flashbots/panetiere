@@ -83,38 +83,23 @@ use std::fmt::Write as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rayon::prelude::*;
-
-use crate::bulletin::rs_poly_packed_len;
-use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::channel::{self, ChannelParams};
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
 };
-use crate::kahe::{Kahe, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::mse::BITS_PER_SYMBOL;
 use crate::pke;
 use crate::protocol::client::{
-    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, run_client_round_rs, seal_openings,
-    shamir_share,
+    cs_commit, kahe_encrypt, kahe_keygen, run_client_round, seal_openings, shamir_share,
 };
-use crate::protocol::server::{
-    run_rs_node_round, run_server_round, unseal_opening, unseal_openings, RsNodeInbox, ServerInbox,
-};
-use crate::protocol::verify::{
-    aggregate_and_decrypt_rs, aggregate_and_decrypt_unverified_timed, RsVerifyTimings, VerifyError,
-    VerifyTimings,
-};
+use crate::protocol::server::{run_server_round, unseal_opening, unseal_openings, ServerInbox};
+use crate::protocol::verify::{aggregate_and_decrypt_unverified_timed, VerifyTimings};
 use crate::protocol::{honest_majority_threshold, ProtocolParams};
-use crate::protocol::{ClientId, NodeId, ServerId, SessionId};
-use crate::rs::Rs;
-use crate::share_commitment::{
-    commit_shares, fresh_path_packed_len, ingest_share, lane_post_packed_len, open_share,
-};
-use crate::sig::SigningKey;
+use crate::protocol::{ClientId, ServerId, SessionId};
 use crate::{KahePoly, KAHE_MODULUS, N as POLY_N};
-use chipmunk_code::{HVCPoly, HVC_MODULUS, HVC_WIDTH};
+use chipmunk_code::HVC_MODULUS;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
@@ -134,19 +119,6 @@ const REPS: usize = 5;
 
 /// One cell is one protocol execution.
 const SESSION: SessionId = SessionId([0x5C; 32]);
-
-// RS-sharded ingress: (k, n) pairs run live, one extra round per pair per cell
-// (so the default is a single point). The pair fixes the redundancy `n−k`; `n`
-// and `k` both rise together when a cell has more threshold servers. The
-// k-sweep in the `[D] rs sizing` table is exact arithmetic and costs nothing,
-// so only measure what measurement actually settles.
-const RS_PLANS: &[(usize, usize)] = &[(14, 16)];
-
-/// k values priced (not measured) in the sizing table, at n = k+2.
-const RS_SIZING_K: &[usize] = &[4, 8, 14, 32, 64];
-
-/// Aggregation ceiling for the RNS share commitment.
-const RS_RHO_MAX: usize = 300;
 
 // Per-client element size = ξ symbols · 34 bits: 964 ⇒ 4 KiB, 3856 ⇒ 16 KiB.
 const DEFAULT_PAYLOAD_SYMBOLS: &[usize] = &[964, 3856];
@@ -528,41 +500,6 @@ fn cell_id(i: usize) -> String {
     }
 }
 
-/// One live RS-sharded round. `reconstruct` is the identity-set path (nodes
-/// `0..k` hold the blocks, so it is a concatenation); `reconstruct_lagrange` is
-/// the same with the sample set shifted by one, i.e. what a lane outage costs.
-struct RsPlan {
-    k: usize,
-    n_nodes: usize,
-    share_b: usize,
-    /// One lane's Merkle path, sent alongside its share.
-    path_b: usize,
-    /// A lane's digit-domain post: the summed opening plus its path.
-    lane_post_b: usize,
-    bulletin_b: usize,
-    rns_encrypt: Stat,
-    share_commit: Stat,
-    rs_enc: Stat,
-    client_sign: Stat,
-    /// Full lane round: ρ opens, the digit-wise sum, one aggregate proof.
-    node_sum: Stat,
-    /// Breakdown of `node_sum` — per-client decompose + bound checks.
-    lane_ingest: Stat,
-    /// Off the happy path: ρ per-client verifications to name a culprit.
-    lane_attribute: Stat,
-    v_sig: Stat,
-    v_open: Stat,
-    v_interp: Stat,
-    v_lane_open: Stat,
-    v_crosscheck: Stat,
-    v_reconstruct: Stat,
-    v_reconstruct_lagrange: Stat,
-    v_kahe_dec: Stat,
-    recovered: bool,
-    /// Which mechanism rejected a tampered lane post.
-    lane_lie_caught: &'static str,
-}
-
 struct Row {
     s: usize,
     /// Shamir threshold.
@@ -587,7 +524,7 @@ struct Row {
     recovered_ok: bool,
     /// [M] highest resident set the process reached while running this cell,
     /// KiB. The bench holds every party's state at once (all ρ clients' posts,
-    /// every lane's shares, the aggregation tree), so this is the harness's
+    /// the aggregation tree), so this is the harness's
     /// footprint, an upper bound on any one role's.
     peak_rss_kib: f64,
     // [M] CPU, per-round totals for one party.
@@ -630,7 +567,6 @@ struct Row {
     wire_comm_b: f64,
     wire_opening_b: f64,
     wire_server_b: f64,
-    rs_plans: Vec<RsPlan>,
 }
 
 /// Which phases a run's timings are authoritative for. Setup and the live round
@@ -641,11 +577,10 @@ struct Roles {
     client: bool,
     server: bool,
     verifier: bool,
-    rs: bool,
 }
 
 impl Roles {
-    /// `BENCH_ROLES=client`, `=server,verifier,rs`, or absent for everything.
+    /// `BENCH_ROLES=client`, `=server,verifier`, or absent for everything.
     fn from_env() -> Self {
         match std::env::var("BENCH_ROLES") {
             Err(_) => Self::all(),
@@ -661,17 +596,15 @@ impl Roles {
             client: false,
             server: false,
             verifier: false,
-            rs: false,
         };
         for name in raw.split(',').map(str::trim) {
             match name {
                 "client" => roles.client = true,
                 "server" => roles.server = true,
                 "verifier" => roles.verifier = true,
-                "rs" => roles.rs = true,
                 other => panic!(
                     "bad BENCH_ROLES entry {other:?} \
-                     (want client|server|verifier|rs|all)"
+                     (want client|server|verifier|all)"
                 ),
             }
         }
@@ -683,7 +616,6 @@ impl Roles {
             client: true,
             server: true,
             verifier: true,
-            rs: true,
         }
     }
 }
@@ -816,31 +748,6 @@ mod csv_tests {
             wire_comm_b: 1.3e6,
             wire_opening_b: 1.4e8,
             wire_server_b: 8.9e5,
-            rs_plans: vec![RsPlan {
-                k: 14,
-                n_nodes: 16,
-                share_b: 1884160,
-                path_b: 86016,
-                lane_post_b: 4423680,
-                bulletin_b: 4194,
-                rns_encrypt: Stat::default(),
-                share_commit: Stat::default(),
-                rs_enc: Stat::default(),
-                client_sign: Stat::default(),
-                node_sum: Stat::default(),
-                lane_ingest: Stat::default(),
-                lane_attribute: Stat::default(),
-                v_sig: Stat::default(),
-                v_open: Stat::default(),
-                v_interp: Stat::default(),
-                v_lane_open: Stat::default(),
-                v_crosscheck: Stat::default(),
-                v_reconstruct: Stat::default(),
-                v_reconstruct_lagrange: Stat::default(),
-                v_kahe_dec: Stat::default(),
-                recovered: true,
-                lane_lie_caught: "lane-proof",
-            }],
         };
         for (i, p) in PHASES.iter().enumerate() {
             let base = (i as f64 + 1.0) * 100.0;
@@ -887,10 +794,6 @@ mod csv_tests {
         assert_eq!(b.agg_open_b, row.agg_open_b);
         assert_eq!(b.plaintext_b, row.plaintext_b);
         assert!((b.eps_correct - row.eps_correct).abs() < 0.01);
-        assert_eq!(b.rs_plans[0].k, 14);
-        assert_eq!(b.rs_plans[0].lane_lie_caught, "lane-proof");
-        assert_eq!(b.rs_plans[0].path_b, row.rs_plans[0].path_b);
-        assert_eq!(b.rs_plans[0].lane_post_b, row.rs_plans[0].lane_post_b);
 
         for p in PHASES {
             let (want, got) = ((p.get)(&row), (p.get)(b));
@@ -917,7 +820,6 @@ mod csv_tests {
                 Owner::Client => all.client,
                 Owner::Server => all.server,
                 Owner::Verifier => all.verifier,
-                Owner::Rs => all.rs,
             };
             assert!(owned_by_all, "{} unreachable", p.name);
         }
@@ -1234,243 +1136,6 @@ fn run_cell(
         }
     };
 
-    // RS-sharded ingress, measured live: its own `pp` (μ = n_polys + 1, the
-    // extra slot holding Enc(H(m))), its own client rounds, one node round per
-    // lane, and the full verify. The ciphertext never reaches the bulletin, so
-    // the comparison against the direct/aggregated flows is per-role wire, not
-    // just CPU.
-    let rs_specs = rs_specs();
-    if !rs_specs.is_empty() {
-        assert!(
-            n <= RS_RHO_MAX,
-            "RS lane posts and digest params are budgeted for rho <= {RS_RHO_MAX}, got {n}"
-        );
-    }
-    let rs_plans: Vec<RsPlan> = rs_specs
-        .iter()
-        .map(|&(spec_k, spec_n)| {
-            // Every threshold server is also a lane, so n ≥ S; the pair fixes
-            // n−k, not k.
-            let n_nodes = spec_n.max(s);
-            let k = n_nodes - (spec_n - spec_k);
-            let mut rrng = ChaCha20Rng::from_seed(rs_seed(&seed, k, n_nodes));
-            let pp_rs = ProtocolParams::setup_rs_mode(
-                &mut rrng, s, n_polys, k, n_nodes, t_modulus, RS_RHO_MAX, [0x42; 32],
-            )
-            .with_threshold(threshold);
-            let rs_keys: Vec<pke::PrivateKey> = (0..s)
-                .map(|_| pke::PrivateKey::generate(&mut rrng))
-                .collect();
-            let rs_servers: Vec<(ServerId, pke::PublicKey)> = server_ids
-                .iter()
-                .map(|&sid| (sid, rs_keys[sid.0 as usize].public()))
-                .collect();
-
-            let rounds: Vec<_> = client_ids
-                .iter()
-                .enumerate()
-                .map(|(i, &cid)| {
-                    let sk = SigningKey::generate(&mut rrng);
-                    run_client_round_rs(
-                        &mut rrng,
-                        &pp_rs,
-                        &SESSION,
-                        cid,
-                        client_polys[i].clone(),
-                        &rs_servers,
-                        &sk,
-                    )
-                })
-                .collect();
-            let entries: Vec<(ClientId, RsClientBulletinEntry)> = rounds
-                .iter()
-                .map(|r| (r.client_id, r.bulletin.clone()))
-                .collect();
-            // Pin the [D] RS wire formulas to the real objects.
-            assert_eq!(
-                entries[0].1.to_bytes().len(),
-                RsClientBulletinEntry::packed_len()
-            );
-
-            let sign_key = SigningKey::generate(&mut rrng);
-            let (client_sign, _) = measure(|| {
-                sign_key.sign(&RsClientBulletinEntry::signing_bytes(
-                    &SESSION,
-                    client_ids[0],
-                    &entries[0].1.comm,
-                    &entries[0].1.share_root,
-                ))
-            });
-
-            let rs_commitments: Vec<(ClientId, Commitment)> = entries
-                .iter()
-                .map(|(cid, e)| (*cid, e.comm.clone()))
-                .collect();
-            let rs_outputs: Vec<_> = (0..s)
-                .map(|j| {
-                    let items = rounds
-                        .iter()
-                        .map(|r| {
-                            let (sid, sealed) = &r.sealed_openings[j];
-                            let op =
-                                unseal_opening(&rs_keys[j], &SESSION, r.client_id, *sid, sealed)
-                                    .unwrap();
-                            (r.client_id, op)
-                        })
-                        .collect();
-                    run_server_round(
-                        &pp_rs.cs,
-                        &ServerInbox {
-                            server_id: server_ids[j],
-                            items,
-                        },
-                        &canonical,
-                        &rs_commitments,
-                    )
-                    .unwrap()
-                })
-                .collect();
-
-            let scp = pp_rs.share_comm.as_ref().unwrap();
-            let roots: Vec<(ClientId, HVCPoly)> = entries
-                .iter()
-                .map(|(cid, e)| (*cid, e.share_root))
-                .collect();
-            let node_inboxes: Vec<RsNodeInbox> = (0..n_nodes)
-                .map(|j| RsNodeInbox {
-                    node_id: NodeId(j as u32),
-                    items: rounds
-                        .iter()
-                        .map(|r| {
-                            (
-                                r.client_id,
-                                r.rs_shares[j].clone(),
-                                r.share_paths[j].clone(),
-                            )
-                        })
-                        .collect(),
-                })
-                .collect();
-            let (node_sum, _) =
-                measure(|| run_rs_node_round(scp, &node_inboxes[0], &canonical, &roots).unwrap());
-            // The per-client half of the lane round: decompose + bound-check,
-            // no hashing. Same rayon shape, so it is a breakdown of `node_sum`.
-            let (lane_ingest, _) = measure(|| {
-                node_inboxes[0]
-                    .items
-                    .par_iter()
-                    .filter(|(_, share, path)| open_share(scp, 0, share, path).is_none())
-                    .count()
-            });
-            // What naming a culprit costs, charged only when the aggregate fails.
-            let (lane_attribute, _) = measure(|| {
-                node_inboxes[0]
-                    .items
-                    .par_iter()
-                    .filter(|(cid, share, path)| {
-                        let root = roots.iter().find(|(c, _)| c == cid).unwrap().1;
-                        ingest_share(scp, &root, 0, share, path).is_none()
-                    })
-                    .count()
-            });
-            let node_outputs: Vec<RsNodeBulletinEntry> = node_inboxes
-                .iter()
-                .map(|inb| run_rs_node_round(scp, inb, &canonical, &roots).unwrap())
-                .collect();
-            assert_eq!(node_outputs[0].share_sum.len(), scp.block_len);
-            assert_eq!(
-                rounds[0].share_paths[0].nodes.len(),
-                scp.path_len() * 2 * HVC_WIDTH
-            );
-
-            // Full encryption directly into persistent NTT channels. Encoding
-            // is (n−k)·n_polys·N modmuls.
-            let key0 = kahe_keygen(&mut rrng, &pp_rs);
-            let (rns_encrypt, embedded0) =
-                measure(|| Kahe::enc_ntt(&mut rrng, &pp_rs.kahe, &key0, &client_polys[0]));
-            let rs_params = pp_rs.rs.as_ref().unwrap();
-            let (rs_enc, shares0) = measure(|| Rs::encode(rs_params, &embedded0));
-            let (share_commit, _) = measure(|| commit_shares(scp, &shares0));
-            let share_b = shares0[0].len() * rs_poly_packed_len();
-
-            let run_verify = |nodes: &[RsNodeBulletinEntry]| {
-                aggregate_and_decrypt_rs(&pp_rs, &SESSION, &canonical, &entries, &rs_outputs, nodes)
-            };
-            let mut rvts: Vec<RsVerifyTimings> = Vec::with_capacity(REPS);
-            let mut rs_recovered: Option<Vec<KahePoly>> = None;
-            for _ in 0..REPS {
-                if let Ok((rec, vt)) = run_verify(&node_outputs) {
-                    rvts.push(vt);
-                    rs_recovered = Some(rec);
-                }
-            }
-            if rvts.is_empty() {
-                eprintln!(
-                    "  rs verify (k={k}/n={n_nodes}) errored on all {REPS} reps; \
-                     verifier phases recorded as zero"
-                );
-            }
-            let rstat = |f: fn(&RsVerifyTimings) -> f64| {
-                if rvts.is_empty() {
-                    Stat::default()
-                } else {
-                    stat(rvts.iter().map(f).collect())
-                }
-            };
-
-            // Lane outage: shift the sample set off the identity so the
-            // reconstruction actually interpolates.
-            let shifted: Vec<RsNodeBulletinEntry> = node_outputs[1..].to_vec();
-            let mut lag: Vec<f64> = Vec::with_capacity(REPS);
-            for _ in 0..REPS {
-                if let Ok((_, vt)) = run_verify(&shifted) {
-                    lag.push(vt.reconstruct_us);
-                }
-            }
-
-            // A tampered lane post must be attributed, not just detected: a
-            // wrong share_sum no longer hashes to the labels its opening
-            // projects to, so the Ajtai check names the lane.
-            let mut lying = node_outputs.clone();
-            lying[0].share_sum[0] = lying[0].share_sum[0] + lying[0].share_sum[0];
-            let lane_lie_caught = match run_verify(&lying) {
-                Err(VerifyError::LaneOpeningFailed(ref v)) if v == &[NodeId(0)] => "lane-proof",
-                Err(_) => "other",
-                Ok(_) => "MISSED",
-            };
-
-            RsPlan {
-                k,
-                n_nodes,
-                share_b,
-                path_b: fresh_path_packed_len(n_nodes),
-                lane_post_b: lane_post_packed_len(scp.block_len, n_nodes, RS_RHO_MAX),
-                bulletin_b: RsClientBulletinEntry::packed_len(),
-                rns_encrypt,
-                share_commit,
-                rs_enc,
-                client_sign,
-                node_sum,
-                lane_ingest,
-                lane_attribute,
-                v_sig: rstat(|v| v.sig_verify_us),
-                v_open: rstat(|v| v.opening_verify_us),
-                v_interp: rstat(|v| v.interpolation_us),
-                v_lane_open: rstat(|v| v.lane_open_us),
-                v_crosscheck: rstat(|v| v.crosscheck_us),
-                v_reconstruct: rstat(|v| v.reconstruct_us),
-                v_reconstruct_lagrange: if lag.is_empty() {
-                    Stat::default()
-                } else {
-                    stat(lag)
-                },
-                v_kahe_dec: rstat(|v| v.kahe_dec_us),
-                recovered: rs_recovered.as_deref().map(check_decode).unwrap_or(false),
-                lane_lie_caught,
-            }
-        })
-        .collect();
-
     Row {
         s,
         threshold,
@@ -1521,62 +1186,7 @@ fn run_cell(
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
         wire_server_b: s as f64 * (agg_open_b + agg_share_b) as f64,
-        rs_plans: rs_plans
-            .into_iter()
-            .map(|mut p| {
-                for st in [
-                    &mut p.rns_encrypt,
-                    &mut p.share_commit,
-                    &mut p.rs_enc,
-                    &mut p.client_sign,
-                    &mut p.node_sum,
-                    &mut p.lane_ingest,
-                    &mut p.lane_attribute,
-                    &mut p.v_sig,
-                    &mut p.v_open,
-                    &mut p.v_interp,
-                    &mut p.v_lane_open,
-                    &mut p.v_crosscheck,
-                    &mut p.v_reconstruct,
-                    &mut p.v_reconstruct_lagrange,
-                    &mut p.v_kahe_dec,
-                ] {
-                    *st = owned(roles.rs, *st);
-                }
-                p
-            })
-            .collect(),
     }
-}
-
-/// `SWEEP_RS="14x16,32x34"`; empty string skips the RS section entirely.
-fn rs_specs() -> Vec<(usize, usize)> {
-    match std::env::var("SWEEP_RS") {
-        Err(_) => RS_PLANS.to_vec(),
-        Ok(raw) if raw.trim().is_empty() => vec![],
-        Ok(raw) => raw
-            .split(',')
-            .map(|c| {
-                let (k, n) = c
-                    .trim()
-                    .split_once('x')
-                    .unwrap_or_else(|| panic!("bad SWEEP_RS pair {c:?} (want KxN)"));
-                (
-                    k.parse().unwrap_or_else(|_| panic!("bad k in {c:?}")),
-                    n.parse().unwrap_or_else(|_| panic!("bad n in {c:?}")),
-                )
-            })
-            .collect(),
-    }
-}
-
-fn rs_seed(cell: &[u8; 32], k: usize, n_nodes: usize) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(b"panetiere/bench/rs");
-    h.update(cell);
-    h.update((k as u64).to_le_bytes());
-    h.update((n_nodes as u64).to_le_bytes());
-    h.finalize().into()
 }
 
 // ── [C] cost model over [M] medians ─────────────────────────────────────────
@@ -1588,9 +1198,8 @@ struct Model {
     wall_us: f64,
     wire_total_b: f64,
     efficiency: f64,
-    post_b: f64,         // one client bulletin post = comm + ctxt
-    client_open_b: f64,  // one client's S sealed openings
-    rs_cpu_us: Vec<f64>, // per RsPlan
+    post_b: f64,        // one client bulletin post = comm + ctxt
+    client_open_b: f64, // one client's S sealed openings
 }
 
 fn model(r: &Row) -> Model {
@@ -1608,36 +1217,6 @@ fn model(r: &Row) -> Model {
         r.enc_app.med + r.kahe_enc.med + r.v_agg_ctxt.med + r.v_kahe_dec.med + r.dec_app.med;
     let wall_us = fixed_us + payload_us;
     let wire_total_b = r.wire_ctxt_b + r.wire_comm_b + r.wire_opening_b + r.wire_server_b;
-    // RS flow: client pays app-encode + encrypt + RS-encode + key work; one
-    // node sums its lane; the verifier no longer sums ciphertexts at all.
-    let rs_cpu_us = r
-        .rs_plans
-        .iter()
-        .map(|p| {
-            let encryption_us = p.rns_encrypt.med;
-            r.enc_app.med
-                + r.kahe_keygen.med
-                + encryption_us
-                + p.rs_enc.med
-                + p.share_commit.med
-                + p.client_sign.med
-                + r.share.med
-                + r.cs.med
-                + r.seal.med
-                + r.unseal.med
-                + r.server.med
-                + p.node_sum.med
-                + p.v_sig.med
-                + r.v_sum_comm.med
-                + p.v_open.med
-                + p.v_interp.med
-                + p.v_lane_open.med
-                + p.v_crosscheck.med
-                + p.v_reconstruct.med
-                + p.v_kahe_dec.med
-                + r.dec_app.med
-        })
-        .collect();
     Model {
         fixed_us,
         payload_us,
@@ -1646,7 +1225,6 @@ fn model(r: &Row) -> Model {
         efficiency: r.useful_b / wire_total_b,
         post_b: (r.wire_comm_b + r.wire_ctxt_b) / r.n as f64,
         client_open_b: r.wire_opening_b / r.n as f64,
-        rs_cpu_us,
     }
 }
 
@@ -1665,7 +1243,6 @@ fn model(r: &Row) -> Model {
 struct NetPoint {
     direct_net_us: f64,
     direct_e2e_us: f64,
-    rs: Vec<(f64, f64)>, // (net_us, e2e_us) per RsPlan
 }
 
 fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> NetPoint {
@@ -1688,41 +1265,9 @@ fn net_sim(r: &Row, m: &Model, prof: &NetProfile, nrng: &mut ChaCha20Rng) -> Net
     let c = maxlat(1) + xfer_bul(r.wire_comm_b + r.wire_server_b + r.wire_ctxt_b);
     let direct_net_us = a + b + c;
 
-    // RS flow: the client uplinks n coded shares (total (n/k)·C) plus its S
-    // openings; the bulletin only ever sees the constant-size post. A node
-    // ingests ρ shares of C/k. The verifier reads every lane post (k
-    // reconstruct, all carry a proof), the server entries and every client's
-    // bulletin post (it must check the signatures and sum the digests).
-    let rs = r
-        .rs_plans
-        .iter()
-        .zip(&m.rs_cpu_us)
-        .map(|(p, &rs_cpu_us)| {
-            // Each share travels with its Merkle path, so the lane can verify
-            // it against the client's signed root before summing.
-            let lane_item_b = (p.share_b + p.path_b) as f64;
-            let client_shares_b = p.n_nodes as f64 * lane_item_b;
-            let node_in_b = r.n as f64 * lane_item_b;
-            let client_out_b = client_shares_b + p.bulletin_b as f64 + m.client_open_b;
-            let a = (maxlat(r.n) + xfer_cl(client_out_b)) // client uplink
-                .max(maxlat(r.n) + xfer_srv(r.wire_opening_b / r.s as f64)) // server downlink
-                .max(maxlat(r.n) + xfer_srv(node_in_b)) // one lane's ingest
-                .max(maxlat(r.n) + xfer_bul(r.n as f64 * p.bulletin_b as f64)); // bulletin ingest
-            let lane_posts_b = p.n_nodes as f64 * p.lane_post_b as f64;
-            let b = (maxlat(r.s) + xfer_srv(r.wire_server_b / r.s as f64)) // server uplink
-                .max(maxlat(p.n_nodes) + xfer_srv(p.lane_post_b as f64)) // lane uplink
-                .max(maxlat(p.n_nodes) + xfer_bul(lane_posts_b + r.wire_server_b)); // bulletin ingest
-            let c = maxlat(1)
-                + xfer_bul(lane_posts_b + r.wire_server_b + r.n as f64 * p.bulletin_b as f64);
-            let net_us = a + b + c;
-            (net_us, rs_cpu_us + net_us)
-        })
-        .collect();
-
     NetPoint {
         direct_net_us,
         direct_e2e_us: m.wall_us + direct_net_us,
-        rs,
     }
 }
 
@@ -1932,146 +1477,6 @@ fn print_tables(rows: &[Row]) {
     );
     println!();
 
-    if rows.iter().any(|r| !r.rs_plans.is_empty()) {
-        println!("── [M] cpu — rs-sharded ingress (client commit / lane round / verifier) ─────");
-        println!(
-            "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>10}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}lane lie",
-            "id", "k/n", "embed", "rs_enc", "commit", "sign", "node_sum", "open+fold", "attribute",
-            "sig", "open", "lane_open", "crosscheck", "reconstruct", "kahe_dec", "recovered"
-        );
-        for (i, r) in rows.iter().enumerate() {
-            for p in &r.rs_plans {
-                println!(
-                    "{:<4}{:>8}  {:>10}{:>10}{:>11}{:>10}{:>12}{:>11}{:>12} {:>10}{:>10}{:>11}{:>12}{:>12}{:>10}  {:<10}{}",
-                    cell_id(i),
-                    format!("{}/{}", p.k, p.n_nodes),
-                    fmt_us(p.rns_encrypt.med),
-                    fmt_us(p.rs_enc.med),
-                    fmt_us(p.share_commit.med),
-                    fmt_us(p.client_sign.med),
-                    fmt_us(p.node_sum.med),
-                    fmt_us(p.lane_ingest.med),
-                    fmt_us(p.lane_attribute.med),
-                    fmt_us(p.v_sig.med),
-                    fmt_us(p.v_open.med),
-                    fmt_us(p.v_lane_open.med),
-                    fmt_us(p.v_crosscheck.med),
-                    fmt_us(p.v_reconstruct.med),
-                    fmt_us(p.v_kahe_dec.med),
-                    if p.recovered { "yes" } else { "NO" },
-                    p.lane_lie_caught,
-                );
-            }
-        }
-        println!(
-            "    (reconstruct is the identity sample set — a concatenation. With one lane down it\n     interpolates instead: {})",
-            rows.iter()
-                .flat_map(|r| r.rs_plans.iter())
-                .map(|p| fmt_us(p.v_reconstruct_lagrange.med))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        println!();
-
-        println!("── [D] rs sizing — measured at the run k/n, priced across k at n − k = 2 ────");
-        println!("    (k clamped to ≥ S−2: every threshold server is a lane, so n ≥ S)");
-        println!(
-            "{:<4}{:>5}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  gate",
-            "id",
-            "k",
-            "n",
-            "share = C/k",
-            "path",
-            "lane post",
-            "bulletin",
-            "client egress",
-            "node ingress",
-            "verifier in"
-        );
-        for (i, r) in rows.iter().enumerate() {
-            if r.rs_plans.is_empty() {
-                continue;
-            }
-            let bulletin_b = r.rs_plans[0].bulletin_b as f64;
-            let open_b = (r.open_env_b * r.s) as f64;
-            let ctxt_b = r.ctxt_client_b as f64;
-            let mut priced: Vec<usize> = Vec::new();
-            for &k_req in RS_SIZING_K {
-                let n_nodes = (k_req + 2).max(r.s);
-                let k = n_nodes - 2;
-                if priced.contains(&k) {
-                    continue;
-                }
-                let block_len = r.n_polys.div_ceil(k);
-                let share_b = (block_len * rs_poly_packed_len()) as f64;
-                // The path rides with the share; the lane's post is its proof.
-                let path_b = fresh_path_packed_len(n_nodes) as f64;
-                let lane_post_b = lane_post_packed_len(block_len, n_nodes, RS_RHO_MAX) as f64;
-                let egress = n_nodes as f64 * (share_b + path_b) + open_b + bulletin_b;
-                let node_in = r.n as f64 * (share_b + path_b);
-                let verifier_in =
-                    n_nodes as f64 * lane_post_b + r.n as f64 * bulletin_b + r.wire_server_b;
-                let gate = if egress / NETWORKS[0].client_mbps > node_in / NETWORKS[0].server_mbps {
-                    "client NIC"
-                } else {
-                    "node ingest"
-                };
-                println!(
-                    "{:<4}{:>5}{:>5}{:>14}{:>10}{:>12}{:>12}{:>16}{:>15}{:>14}  {}",
-                    if priced.is_empty() {
-                        cell_id(i)
-                    } else {
-                        String::new()
-                    },
-                    k,
-                    n_nodes,
-                    fmt_bytes(share_b),
-                    fmt_bytes(path_b),
-                    fmt_bytes(lane_post_b),
-                    fmt_bytes(bulletin_b),
-                    fmt_bytes(egress),
-                    fmt_bytes(node_in),
-                    fmt_bytes(verifier_in),
-                    gate,
-                );
-                priced.push(k);
-            }
-            println!(
-                "    (broadcast baseline: client egress {}, per-node ingress {})",
-                fmt_bytes(ctxt_b + open_b + r.comm_client_b as f64),
-                fmt_bytes(r.n as f64 * ctxt_b),
-            );
-        }
-        println!();
-    }
-
-    println!("── wire components, per emitter ([M] off the wire except comm/ctxt, [D]) ────");
-    println!(
-        "{:<4}{:>10}{:>15}   {:<30}srv_entry = agg_open + agg_share",
-        "id", "comm/cl", "ctxt/cl", "open_env →1srv (×S /cl)"
-    );
-    for (i, r) in rows.iter().enumerate() {
-        println!(
-            "{:<4}{:>10}{:>15}   {:<30}{}",
-            cell_id(i),
-            fmt_bytes(r.comm_client_b as f64),
-            fmt_bytes(r.ctxt_client_b as f64),
-            format!(
-                "{} (×{} = {})",
-                fmt_bytes(r.open_env_b as f64),
-                r.s,
-                fmt_bytes((r.open_env_b * r.s) as f64)
-            ),
-            format!(
-                "{} = {} + {}",
-                fmt_bytes((r.agg_open_b + r.agg_share_b) as f64),
-                fmt_bytes(r.agg_open_b as f64),
-                fmt_bytes(r.agg_share_b as f64)
-            ),
-        );
-    }
-    println!();
-
     println!("── [D] per-role wire, one round (← in / → out) ──────────────────────────────");
     println!(
         "{:<4}{:<44}{:<24}recipient ←",
@@ -2123,34 +1528,18 @@ fn print_tables(rows: &[Row]) {
 
     println!("── [P] network sim: e2e = [C] wall + synthetic net; MB/s = useful/e2e ───────");
     println!(
-        "{:<4}{:<9}{:>12}{:>13}{}",
-        "id",
-        "net",
-        "direct e2e",
-        "direct MB/s",
-        if rows.iter().any(|r| !r.rs_plans.is_empty()) {
-            format!("{:>12}{:>12}", "rs e2e", "rs MB/s")
-        } else {
-            String::new()
-        },
+        "{:<4}{:<9}{:>12}{:>13}",
+        "id", "net", "direct e2e", "direct MB/s",
     );
     for (i, r) in rows.iter().enumerate() {
         let nets = net_all(r, &models[i]);
         for (prof, np) in NETWORKS.iter().zip(&nets) {
-            let rs = np.rs.first().map_or(String::new(), |(_, e2e)| {
-                format!(
-                    "{:>12}{:>12.3}",
-                    fmt_us(*e2e),
-                    r.useful_b / (e2e / 1e6) / 1e6
-                )
-            });
             println!(
-                "{:<4}{:<9}{:>12}{:>13.3}{}",
+                "{:<4}{:<9}{:>12}{:>13.3}",
                 cell_id(i),
                 prof.label,
                 fmt_us(np.direct_e2e_us),
                 r.useful_b / (np.direct_e2e_us / 1e6) / 1e6,
-                rs,
             );
         }
     }
@@ -2179,10 +1568,6 @@ fn csv_path() -> String {
     std::env::var("BENCH_CSV").unwrap_or_else(|_| CSV_PATH_DEFAULT.to_string())
 }
 
-fn rs0(r: &Row) -> Option<&RsPlan> {
-    r.rs_plans.first()
-}
-
 /// Which role owns a phase — the same grouping `client_us`/`server_us`/
 /// `recipient_us` use, so gating and composing cannot disagree.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -2190,7 +1575,6 @@ enum Owner {
     Client,
     Server,
     Verifier,
-    Rs,
 }
 
 /// One timing column: its name, its owning role, and how to read and write it on
@@ -2302,164 +1686,13 @@ const PHASES: &[PhaseCol] = &[
         get: |r| r.verify,
         set: |r, s| r.verify = s,
     },
-    PhaseCol {
-        // Stable CSV name retained for pre-RNS sweep compatibility.
-        name: "rs_dgt_embed",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.rns_encrypt),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.rns_encrypt = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_enc",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.rs_enc),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.rs_enc = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_client_sign",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.client_sign),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.client_sign = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_share_commit",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.share_commit),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.share_commit = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_node_sum",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.node_sum),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.node_sum = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_lane_ingest",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.lane_ingest),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.lane_ingest = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_lane_attribute",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.lane_attribute),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.lane_attribute = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_verify_sig",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_sig),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_sig = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_verify_open",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_open),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_open = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_verify_interp",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_interp),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_interp = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_reconstruct",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_reconstruct = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_reconstruct_lagrange",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_reconstruct_lagrange),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_reconstruct_lagrange = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_verify_kahe_dec",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_kahe_dec),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_kahe_dec = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_verify_lane_open",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_lane_open),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_lane_open = s
-            }
-        },
-    },
-    PhaseCol {
-        name: "rs_verify_crosscheck",
-        owner: Owner::Rs,
-        get: |r| rs0(r).map_or(Stat::default(), |p| p.v_crosscheck),
-        set: |r, s| {
-            if let Some(p) = r.rs_plans.first_mut() {
-                p.v_crosscheck = s
-            }
-        },
-    },
 ];
 
 fn write_csv(rows: &[Row]) {
     let phases = PHASES;
 
     let mut header = String::new();
-    header.push_str("id,s,threshold,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered,rs_k,rs_n,rs_recovered,rs_lane_lie");
+    header.push_str("id,s,threshold,rho,active,cover,flow,payload_client_b,delta,xi,n_polys,mu_kahe,iblt_cells,env,m_threads,m_affinity,recovered");
     for p in phases {
         write!(
             header,
@@ -2474,16 +1707,15 @@ fn write_csv(rows: &[Row]) {
          ,d_open_body_b,d_kahe_key_b,d_plaintext_b\
          ,d_client_to_server_b,d_client_to_recipient_b,d_client_post_b,d_server_entry_b,d_epsilon\
          ,d_wire_ctxt_b,d_wire_comm_b,d_wire_opening_b,d_wire_server_b,d_useful_b\
-         ,d_rs_share_b,d_rs_path_b,d_rs_lane_post_b,d_rs_bulletin_b,d_rs_client_egress_b,d_rs_node_ingress_b\
          ,c_client_us,c_server_us,c_recipient_us\
          ,c_client_cpu_us,c_server_cpu_us,c_recipient_cpu_us\
          ,m_client_mem_kib,m_server_mem_kib,m_recipient_mem_kib,m_peak_rss_kib\
-         ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency,c_rs_wall_us",
+         ,c_fixed_us,c_payload_us,c_wall_us,c_efficiency",
     );
     for prof in NETWORKS {
         write!(
             header,
-            ",p_{0}_direct_net_us,p_{0}_direct_e2e_us,p_{0}_direct_mbps,p_{0}_rs_net_us,p_{0}_rs_e2e_us,p_{0}_rs_mbps",
+            ",p_{0}_direct_net_us,p_{0}_direct_e2e_us,p_{0}_direct_mbps",
             prof.label
         )
         .unwrap();
@@ -2505,7 +1737,7 @@ fn write_csv(rows: &[Row]) {
         let m = model(r);
         write!(
             out,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             cell_id(i),
             r.s,
             r.threshold,
@@ -2523,10 +1755,6 @@ fn write_csv(rows: &[Row]) {
             r.threads,
             r.affinity,
             r.recovered_ok,
-            rs0(r).map_or(0, |p| p.k),
-            rs0(r).map_or(0, |p| p.n_nodes),
-            rs0(r).is_some_and(|p| p.recovered),
-            rs0(r).map_or("-", |p| p.lane_lie_caught),
         )
         .unwrap();
         for p in phases {
@@ -2561,29 +1789,6 @@ fn write_csv(rows: &[Row]) {
             r.useful_b,
         )
         .unwrap();
-        let (rs_share_b, rs_path_b, rs_lane_post_b, rs_bulletin_b, rs_egress_b, rs_node_in_b) =
-            match rs0(r) {
-                None => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
-                Some(p) => {
-                    let item_b = (p.share_b + p.path_b) as f64;
-                    (
-                        p.share_b as f64,
-                        p.path_b as f64,
-                        p.lane_post_b as f64,
-                        p.bulletin_b as f64,
-                        p.n_nodes as f64 * item_b
-                            + (r.open_env_b * r.s) as f64
-                            + p.bulletin_b as f64,
-                        r.n as f64 * item_b,
-                    )
-                }
-            };
-        write!(
-            out,
-            ",{:.0},{:.0},{:.0},{:.0},{:.0},{:.0}",
-            rs_share_b, rs_path_b, rs_lane_post_b, rs_bulletin_b, rs_egress_b, rs_node_in_b
-        )
-        .unwrap();
         write!(
             out,
             ",{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.0},{:.0},{:.0},{:.0}",
@@ -2601,12 +1806,8 @@ fn write_csv(rows: &[Row]) {
         .unwrap();
         write!(
             out,
-            ",{:.3},{:.3},{:.3},{:.6e},{:.3}",
-            m.fixed_us,
-            m.payload_us,
-            m.wall_us,
-            m.efficiency,
-            m.rs_cpu_us.first().copied().unwrap_or(0.0),
+            ",{:.3},{:.3},{:.3},{:.6e}",
+            m.fixed_us, m.payload_us, m.wall_us, m.efficiency,
         )
         .unwrap();
         let mbps = |e2e_us: f64| {
@@ -2617,16 +1818,12 @@ fn write_csv(rows: &[Row]) {
             }
         };
         for np in net_all(r, &m) {
-            let (rs_net, rs_e2e) = np.rs.first().copied().unwrap_or((0.0, 0.0));
             write!(
                 out,
-                ",{:.3},{:.3},{:.4},{:.3},{:.3},{:.4}",
+                ",{:.3},{:.3},{:.4}",
                 np.direct_net_us,
                 np.direct_e2e_us,
                 mbps(np.direct_e2e_us),
-                rs_net,
-                rs_e2e,
-                mbps(rs_e2e),
             )
             .unwrap();
         }
@@ -2708,48 +1905,12 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
     };
 
     let n = idx("rho")?;
-    // `flow` and `lane_lie_caught` are `&'static str` in `Row`; map the parsed
+    // `flow` is `&'static str` in `Row`; map the parsed
     // text back onto the fixed set rather than leaking a string.
     let flow = match at("flow")? {
         "mse" => "mse",
         "prony" => "prony",
         other => return Err(format!("unknown flow {other:?}")),
-    };
-
-    let rs_k = idx("rs_k")?;
-    let rs_plans = if rs_k == 0 {
-        vec![]
-    } else {
-        vec![RsPlan {
-            k: rs_k,
-            n_nodes: idx("rs_n")?,
-            share_b: num("d_rs_share_b")? as usize,
-            path_b: num("d_rs_path_b")? as usize,
-            lane_post_b: num("d_rs_lane_post_b")? as usize,
-            bulletin_b: num("d_rs_bulletin_b")? as usize,
-            rns_encrypt: stat("rs_dgt_embed")?,
-            share_commit: stat("rs_share_commit")?,
-            rs_enc: stat("rs_enc")?,
-            client_sign: stat("rs_client_sign")?,
-            node_sum: stat("rs_node_sum")?,
-            lane_ingest: stat("rs_lane_ingest")?,
-            lane_attribute: stat("rs_lane_attribute")?,
-            v_sig: stat("rs_verify_sig")?,
-            v_open: stat("rs_verify_open")?,
-            v_interp: stat("rs_verify_interp")?,
-            v_lane_open: stat("rs_verify_lane_open")?,
-            v_crosscheck: stat("rs_verify_crosscheck")?,
-            v_reconstruct: stat("rs_reconstruct")?,
-            v_reconstruct_lagrange: stat("rs_reconstruct_lagrange")?,
-            v_kahe_dec: stat("rs_verify_kahe_dec")?,
-            recovered: flag("rs_recovered")?,
-            lane_lie_caught: match at("rs_lane_lie")? {
-                "lane-proof" => "lane-proof",
-                "other" => "other",
-                "MISSED" => "MISSED",
-                _ => "-",
-            },
-        }]
     };
 
     let mut row = Row {
@@ -2799,14 +1960,10 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
         wire_comm_b: num("d_wire_comm_b")?,
         wire_opening_b: num("d_wire_opening_b")?,
         wire_server_b: num("d_wire_server_b")?,
-        rs_plans,
     };
     // Plain phases go through the same table the writer used, so the two cannot
-    // drift. Plan-nested ones were already set above.
+    // drift.
     for p in PHASES {
-        if matches!(p.owner, Owner::Rs) {
-            continue;
-        }
         // `verify_total` is newer than the other phases; sweeps written before
         // it have no such columns and read as zero, like the resource columns
         let legacy = p.name == "verify_total" && at(&format!("m_{}_us_med", p.name)).is_err();
@@ -3041,7 +2198,6 @@ pub fn run() {
                     ("client", roles.client),
                     ("server", roles.server),
                     ("verifier", roles.verifier),
-                    ("rs", roles.rs),
                 ]
                 .iter()
                 .filter(|(_, on)| *on)
