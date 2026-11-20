@@ -428,4 +428,52 @@ mod tests {
             Some(ServerRoundError::BadOpening(ClientId(4)))
         );
     }
+
+    // an opening filed under another server, or at another tree position,
+    // is turned away by name, whichever of the two is off
+    #[test]
+    fn opening_for_another_position_names_the_client() {
+        let mut rng = ChaCha20Rng::from_seed([84u8; 32]);
+        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let (canonical, commitments, inbox) = round(&mut rng, &cs, 5);
+
+        let mut wrong_server = ServerInbox {
+            server_id: inbox.server_id,
+            items: inbox.items.clone(),
+        };
+        wrong_server.items[1].1.server_index += 1;
+        assert_eq!(
+            run_server_round(&cs, &wrong_server, &canonical, &commitments).err(),
+            Some(ServerRoundError::BadOpening(ClientId(1)))
+        );
+
+        let mut wrong_position = ServerInbox {
+            server_id: inbox.server_id,
+            items: inbox.items,
+        };
+        wrong_position.items[3].1.path_index += 1;
+        assert_eq!(
+            run_server_round(&cs, &wrong_position, &canonical, &commitments).err(),
+            Some(ServerRoundError::BadOpening(ClientId(3)))
+        );
+    }
+
+    // a client missing from the inbox or from the commitments is named
+    #[test]
+    fn missing_client_is_named() {
+        let mut rng = ChaCha20Rng::from_seed([85u8; 32]);
+        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let (canonical, mut commitments, mut inbox) = round(&mut rng, &cs, 4);
+        let (cid, comm) = commitments.remove(2);
+        assert_eq!(
+            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            Some(ServerRoundError::MissingClient(cid))
+        );
+        commitments.push((cid, comm));
+        inbox.items.remove(0);
+        assert_eq!(
+            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            Some(ServerRoundError::MissingClient(ClientId(0)))
+        );
+    }
 }

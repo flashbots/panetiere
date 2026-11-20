@@ -240,4 +240,24 @@ mod tests {
             SEAL_OVERHEAD
         );
     }
+
+    // an envelope may carry nothing at all; anything shorter is not an
+    // envelope, and distinct keys do not compare equal
+    #[test]
+    fn empty_plaintext_and_key_equality() {
+        let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
+        let sk = PrivateKey::generate(&mut rng);
+        let pk = sk.public();
+        let sealed = encrypt(&mut rng, &pk, b"", b"ctx");
+        assert_eq!(sealed.len(), SEAL_OVERHEAD);
+        assert_eq!(decrypt(&sk, &sealed, b"ctx").unwrap(), b"");
+        assert_eq!(
+            decrypt(&sk, &sealed[..SEAL_OVERHEAD - 1], b"ctx"),
+            Err(PkeError::TooShort)
+        );
+
+        let other = PrivateKey::generate(&mut rng).public();
+        assert!(pk != other);
+        assert!(pk == sk.public());
+    }
 }

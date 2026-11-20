@@ -557,3 +557,75 @@ fn ingest_rejects_a_bad_share_naming_the_client() {
         Some(ServerRoundError::BadShare(ClientId(culprit as u32)))
     );
 }
+
+// exactly the threshold of servers decodes; one fewer is refused
+#[test]
+fn exactly_the_threshold_of_servers_is_enough() {
+    let (r, _, _) = mse_round(16, 8);
+    let (servers, nodes) = r.outputs(&r.canonical);
+    let t = r.pp.shamir.t;
+    assert!(t < S);
+    let (full, _) =
+        aggregate_and_decrypt_rs(&r.pp, &SESSION, &r.canonical, &r.entries, &servers, &nodes)
+            .expect("rs verify");
+    let (at_threshold, _) = aggregate_and_decrypt_rs(
+        &r.pp,
+        &SESSION,
+        &r.canonical,
+        &r.entries,
+        &servers[..t],
+        &nodes,
+    )
+    .expect("rs verify at the threshold");
+    assert_eq!(at_threshold, full);
+    assert_eq!(
+        aggregate_and_decrypt_rs(
+            &r.pp,
+            &SESSION,
+            &r.canonical,
+            &r.entries,
+            &servers[..t - 1],
+            &nodes,
+        )
+        .err(),
+        Some(VerifyError::BadServerCoverage)
+    );
+}
+
+// a server or a lane that reports twice, or under an id outside its
+// roster, voids the attempt
+#[test]
+fn duplicate_or_unknown_servers_and_lanes_are_rejected() {
+    let (r, _, _) = mse_round(16, 8);
+    let (servers, nodes) = r.outputs(&r.canonical);
+    let attempt = |servers: &[ServerBulletinEntry], nodes: &[RsNodeBulletinEntry]| {
+        aggregate_and_decrypt_rs(&r.pp, &SESSION, &r.canonical, &r.entries, servers, nodes).err()
+    };
+    assert_eq!(attempt(&servers, &nodes), None);
+
+    let mut twice = servers.clone();
+    twice[1] = twice[0].clone();
+    assert_eq!(
+        attempt(&twice, &nodes),
+        Some(VerifyError::BadServerCoverage)
+    );
+    let mut unknown = servers.clone();
+    unknown[1].server_id = ServerId(S as u32);
+    assert_eq!(
+        attempt(&unknown, &nodes),
+        Some(VerifyError::BadServerCoverage)
+    );
+
+    let mut twice = nodes.clone();
+    twice[1] = twice[0].clone();
+    assert_eq!(
+        attempt(&servers, &twice),
+        Some(VerifyError::BadNodeCoverage)
+    );
+    let mut unknown = nodes.clone();
+    unknown[1].node_id = NodeId(N_NODES as u32);
+    assert_eq!(
+        attempt(&servers, &unknown),
+        Some(VerifyError::BadNodeCoverage)
+    );
+}

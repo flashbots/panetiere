@@ -306,4 +306,21 @@ mod tests {
             assert_eq!(pp.max_clients, rho_max.min(300));
         }
     }
+
+    // with noise to spare, the commitment bounds alone cap the set
+    #[test]
+    fn commitment_bounds_cap_the_set_when_noise_does_not() {
+        let mut rng = ChaCha20Rng::from_seed([97; 32]);
+        let pp = ProtocolParams::setup_with_kahe_dims_full(
+            &mut rng,
+            4,
+            1,
+            SIGMA_S_DEFAULT,
+            SIGMA_E_DEFAULT,
+            2,
+        );
+        assert_eq!(pp.cs.r_bound / pp.cs.beta_cs, 300);
+        assert_eq!(pp.cs.beta_agg_hvc / chipmunk_code::ZETA, 300);
+        assert_eq!(pp.max_clients, 300);
+    }
 }
