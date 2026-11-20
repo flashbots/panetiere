@@ -1,5 +1,7 @@
 # Panetière
 
+[![codecov](https://codecov.io/gh/flashbots/panetiere/branch/main/graph/badge.svg)](https://codecov.io/gh/flashbots/panetiere)
+
 This repository is a reference implementation of **Panetière: Efficient Anonymous Broadcast**, an efficient anonymous broadcast
 protocol. Clients each publish one message; a threshold of servers cooperates to
 reveal the *sum* of the clients' encrypted vectors and nothing else, and an application-side
