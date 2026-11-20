@@ -16,8 +16,8 @@ RAYON_NUM_THREADS=8 cargo test -j 8
 
 KAHE runs on a single 64-bit NTT over its prime modulus; the CS auxiliary
 domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
-channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their semantic
-prime fields.
+channels dispatch to scalar, AVX2, or NEON. CS and Prony retain their own
+field arithmetic.
 
 The end-to-end tests in `src/e2e/` are the executable spec: `end_to_end.rs` (canonical round,
 *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread

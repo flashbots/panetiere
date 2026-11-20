@@ -4,15 +4,21 @@
 //! sketch over the KAHE plaintext modulus, packed into `KahePoly` slots, whose
 //! coefficient-wise sum decodes to the multiset union. Different mechanism:
 //! instead of hashing each element into `γ` of `δ` buckets and peeling, each
-//! contributor picks a random key `r ∈ F_p^*` and writes a Vandermonde row.
+//! contributor picks a random key `r ∈ F^*` and writes a Vandermonde row.
+//!
+//! The field is `F = F_{t²} = F_t[Z]/(Z² − 3)`, with `t` the KAHE plaintext
+//! modulus. As an additive group `F ≅ Z_t²`, so an element of `F` takes two
+//! KAHE plaintext slots and sketches add coordinate-wise. A payload of `ξ`
+//! symbols of `Z_t` becomes `ξ_F = ⌈ξ/2⌉` elements of `F`, the symbols in
+//! pairs, the last one padded with zero.
 //!
 //! ```text
-//!   r ← F_p^*                              (per-element key)
+//!   r ← F^*                                (per-element key)
 //!   K[j]    += r^j                         (j ∈ [1, C])
-//!   V[ℓ][j] += x_ℓ · r^j                   (ℓ ∈ [ξ], j ∈ [0, C))
+//!   V[ℓ][j] += x_ℓ · r^j                   (ℓ ∈ [ξ_F], j ∈ [0, C))
 //! ```
 //!
-//! That is `C(1 + ξ)` scalars for capacity `C`. Summed over the round,
+//! That is `2C(1 + ξ_F)` scalars for capacity `C`. Summed over the round,
 //! `K[j] = Σ_i r_i^j` are the power sums of the contributors' keys and
 //! `V[ℓ][j] = Σ_i x_{i,ℓ} r_i^j`. Decoding:
 //!
@@ -21,31 +27,36 @@
 //!    is the largest `m` with `e_m ≠ 0`; a zero sketch (cover traffic) has
 //!    `ρ̂ = 0` and decodes to nothing.
 //! 2. The `r_i` are the roots of `Λ(X) = Π_i (X − r_i)`, whose coefficients
-//!    are `e_0, …, e_ρ̂` (Cantor–Zassenhaus over `F_p`). Decoding fails unless
-//!    `Λ` has `ρ̂` distinct nonzero roots.
-//! 3. With the keys known, each payload symbol is one transposed-Vandermonde
+//!    are `e_0, …, e_ρ̂` (Cantor–Zassenhaus over `F`). Decoding fails unless
+//!    `Λ` has `ρ̂` distinct nonzero roots in `F`.
+//! 3. With the keys known, each payload element is one transposed-Vandermonde
 //!    solve: `x_{i,ℓ} = (Σ_m b_{i,m} V[ℓ][m]) / Λ'(r_i)` where
 //!    `Λ(X)/(X − r_i) = Σ_m b_{i,m} X^m`. For `ρ̂ < C`, the payload columns
 //!    `ρ̂..C` must agree with the solution.
 //!
-//! Newton's identities divide by `1..C`, so the field must be prime. The KAHE
-//! plaintext modulus [`T_MODULUS_DEFAULT`] is, and the sketch uses it directly.
+//! Newton's identities divide by `1..C`, so the characteristic `t` must exceed
+//! the capacity.
 
 use crate::kahe::T_MODULUS_DEFAULT;
 use crate::rings::center_canonical_half_open_i64;
 use crate::{KahePoly, N};
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
+use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
+use sha3::Shake256;
 
-/// The sketch's field: the shared prime plaintext modulus.
-///
-/// Keys are single elements of `F_p`, so two of `ρ` clients collide (and the
-/// round fails to decode) with probability about `ρ²/p`: roughly `2^-17.5` at
-/// `ρ = 300`, far above the `2^-40` the IBLT shape is sized for. The paper
-/// instead draws keys from an extension field `F_{t^ω}`, which keeps `t` and
-/// makes the error negligible; that is tracked as issue #27 and not yet
-/// implemented here.
+/// The prime `t` underneath the sketch's field: the KAHE plaintext modulus.
 pub const PRONY_PRIME: u64 = T_MODULUS_DEFAULT;
+
+/// The extension degree `ω` of the sketch's field `F = F_{t^ω}`. Two of `C`
+/// contributors draw the same key, and the round fails to decode, with
+/// probability at most `C²/t^ω`: about `2^-51.5` at `C = 300`.
+pub const PRONY_OMEGA: usize = 2;
+
+/// `F_{t²} = F_t[Z]/(Z² − NONRESIDUE)`; `Z² − 3` is irreducible since 3 is
+/// not a square mod `t`.
+const NONRESIDUE: u64 = 3;
 
 // ---------------------------------------------------------------
 // F_p scalars
@@ -135,23 +146,107 @@ impl Fp {
         }
         self.pow(a, self.p - 2)
     }
+}
 
-    /// Shoup companion `⌊w·2^64/p⌋` for a multiplier reused across a loop.
-    #[inline]
-    fn shoup(self, w: u64) -> u64 {
-        (((w as u128) << 64) / self.p as u128) as u64
+// ---------------------------------------------------------------
+// F = F_{t²}
+// ---------------------------------------------------------------
+
+/// `a + b·Z`, both coordinates canonical in `[0, p)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct F2 {
+    a: u64,
+    b: u64,
+}
+
+impl F2 {
+    const ZERO: F2 = F2 { a: 0, b: 0 };
+    const ONE: F2 = F2 { a: 1, b: 0 };
+
+    fn is_zero(self) -> bool {
+        self == Self::ZERO
+    }
+}
+
+/// Arithmetic in `F_{t²}`, on top of the Barrett context of `F_t`.
+#[derive(Clone, Copy, Debug)]
+struct Ext {
+    f: Fp,
+}
+
+impl Ext {
+    fn new(p: u64) -> Self {
+        Ext { f: Fp::new(p) }
     }
 
-    /// `a·w mod p` given `w`'s precomputed companion. Two multiplies and a
-    /// correction, against Barrett's three.
+    /// `|F| = p²`.
+    fn order(self) -> u128 {
+        self.f.p as u128 * self.f.p as u128
+    }
+
     #[inline]
-    fn mul_shoup(self, a: u64, w: u64, w_shoup: u64) -> u64 {
-        let q = ((a as u128 * w_shoup as u128) >> 64) as u64;
-        let r = a.wrapping_mul(w).wrapping_sub(q.wrapping_mul(self.p));
-        if r >= self.p {
-            r - self.p
-        } else {
-            r
+    fn add(self, x: F2, y: F2) -> F2 {
+        F2 {
+            a: self.f.add(x.a, y.a),
+            b: self.f.add(x.b, y.b),
+        }
+    }
+
+    #[inline]
+    fn sub(self, x: F2, y: F2) -> F2 {
+        F2 {
+            a: self.f.sub(x.a, y.a),
+            b: self.f.sub(x.b, y.b),
+        }
+    }
+
+    #[inline]
+    fn neg(self, x: F2) -> F2 {
+        self.sub(F2::ZERO, x)
+    }
+
+    /// `(x_a + x_b Z)(y_a + y_b Z) = x_a y_a + 3 x_b y_b + (x_a y_b + x_b y_a) Z`.
+    #[inline]
+    fn mul(self, x: F2, y: F2) -> F2 {
+        let f = self.f;
+        let bb = f.reduce(x.b as u128 * y.b as u128);
+        F2 {
+            a: f.add(
+                f.reduce(x.a as u128 * y.a as u128),
+                f.reduce(NONRESIDUE as u128 * bb as u128),
+            ),
+            b: f.add(
+                f.reduce(x.a as u128 * y.b as u128),
+                f.reduce(x.b as u128 * y.a as u128),
+            ),
+        }
+    }
+
+    /// `x · c` for `c ∈ F_t`.
+    #[inline]
+    fn scale(self, x: F2, c: u64) -> F2 {
+        F2 {
+            a: self.f.mul(x.a, c),
+            b: self.f.mul(x.b, c),
+        }
+    }
+
+    /// `(a + bZ)⁻¹ = (a − bZ)/(a² − 3b²)`; the norm `a² − 3b²` is nonzero for
+    /// `x ≠ 0` because `Z² − 3` is irreducible.
+    fn inv(self, x: F2) -> F2 {
+        let f = self.f;
+        let norm = f.sub(f.mul(x.a, x.a), f.mul(NONRESIDUE, f.mul(x.b, x.b)));
+        let n = f.inv(norm);
+        F2 {
+            a: f.mul(x.a, n),
+            b: f.mul(f.sub(0, x.b), n),
+        }
+    }
+
+    fn random<R: Rng>(self, rng: &mut R) -> F2 {
+        F2 {
+            a: rng.gen_range(0..self.f.p),
+            b: rng.gen_range(0..self.f.p),
         }
     }
 }
@@ -169,132 +264,166 @@ fn canon(x: i64, p: u64) -> u64 {
 }
 
 // ---------------------------------------------------------------
-// F_p[X], coefficients little-endian by degree, trailing zeros trimmed
+// F[X], coefficients little-endian by degree, trailing zeros trimmed
 // ---------------------------------------------------------------
 
-fn trim(mut v: Vec<u64>) -> Vec<u64> {
-    while v.last() == Some(&0) {
+fn trim(mut v: Vec<F2>) -> Vec<F2> {
+    while v.last().is_some_and(|c| c.is_zero()) {
         v.pop();
     }
     v
 }
 
-fn poly_sub(a: &[u64], b: &[u64], f: Fp) -> Vec<u64> {
-    let mut out = vec![0u64; a.len().max(b.len())];
+fn poly_sub(a: &[F2], b: &[F2], ext: Ext) -> Vec<F2> {
+    let mut out = vec![F2::ZERO; a.len().max(b.len())];
     out[..a.len()].copy_from_slice(a);
     for (o, &x) in out.iter_mut().zip(b.iter()) {
-        *o = f.sub(*o, x);
+        *o = ext.sub(*o, x);
     }
     trim(out)
 }
 
-/// Schoolbook, accumulating raw products and reducing once per output
-/// coefficient. Each accumulator sums at most `min(|a|,|b|)` terms below
-/// `p² < 2^72`, so `u128` has room for degrees far past any capacity here.
-fn poly_mul(a: &[u64], b: &[u64], f: Fp) -> Vec<u64> {
+/// Schoolbook, accumulating the three coordinate products of each output
+/// coefficient unreduced and reducing once at the end. Each term is below
+/// `2p² < 2^73`, so `u128` has room for degrees far past any capacity here.
+fn poly_mul(a: &[F2], b: &[F2], ext: Ext) -> Vec<F2> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
-    let mut acc = vec![0u128; a.len() + b.len() - 1];
+    let n = a.len() + b.len() - 1;
+    let (mut aa, mut bb, mut ab) = (vec![0u128; n], vec![0u128; n], vec![0u128; n]);
     for (i, &x) in a.iter().enumerate() {
-        if x == 0 {
+        if x.is_zero() {
             continue;
         }
-        let xw = x as u128;
+        let (xa, xb) = (x.a as u128, x.b as u128);
         for (j, &y) in b.iter().enumerate() {
-            acc[i + j] += xw * y as u128;
+            aa[i + j] += xa * y.a as u128;
+            bb[i + j] += xb * y.b as u128;
+            ab[i + j] += xa * y.b as u128 + xb * y.a as u128;
         }
     }
-    trim(acc.into_iter().map(|v| f.reduce_wide(v)).collect())
+    let f = ext.f;
+    trim(
+        (0..n)
+            .map(|k| F2 {
+                a: f.add(
+                    f.reduce_wide(aa[k]),
+                    f.reduce(NONRESIDUE as u128 * f.reduce_wide(bb[k]) as u128),
+                ),
+                b: f.reduce_wide(ab[k]),
+            })
+            .collect(),
+    )
 }
 
 /// `(quotient, remainder)` of `a / b`. `b` must be nonzero.
-fn poly_divmod(a: &[u64], b: &[u64], f: Fp) -> (Vec<u64>, Vec<u64>) {
+fn poly_divmod(a: &[F2], b: &[F2], ext: Ext) -> (Vec<F2>, Vec<F2>) {
     debug_assert!(!b.is_empty());
     if a.len() < b.len() {
         return (Vec::new(), a.to_vec());
     }
-    let inv_lead = f.inv(*b.last().unwrap());
+    let inv_lead = ext.inv(*b.last().unwrap());
     let mut rem = a.to_vec();
-    let mut q = vec![0u64; a.len() - b.len() + 1];
+    let mut q = vec![F2::ZERO; a.len() - b.len() + 1];
     for shift in (0..q.len()).rev() {
-        let c = f.mul(rem[shift + b.len() - 1], inv_lead);
-        if c == 0 {
+        let c = ext.mul(rem[shift + b.len() - 1], inv_lead);
+        if c.is_zero() {
             continue;
         }
         q[shift] = c;
-        // `c` is fixed across the row, so it earns a Shoup companion.
-        let cs = f.shoup(c);
         for (i, &bi) in b.iter().enumerate() {
-            rem[shift + i] = f.sub(rem[shift + i], f.mul_shoup(bi, c, cs));
+            rem[shift + i] = ext.sub(rem[shift + i], ext.mul(bi, c));
         }
     }
     (trim(q), trim(rem))
 }
 
-fn poly_rem(a: &[u64], b: &[u64], f: Fp) -> Vec<u64> {
-    poly_divmod(a, b, f).1
+fn poly_rem(a: &[F2], b: &[F2], ext: Ext) -> Vec<F2> {
+    poly_divmod(a, b, ext).1
 }
 
 /// Monic gcd, or the zero polynomial if both inputs are zero.
-fn poly_gcd(a: &[u64], b: &[u64], f: Fp) -> Vec<u64> {
+fn poly_gcd(a: &[F2], b: &[F2], ext: Ext) -> Vec<F2> {
     let (mut x, mut y) = (a.to_vec(), b.to_vec());
     while !y.is_empty() {
-        let r = poly_rem(&x, &y, f);
+        let r = poly_rem(&x, &y, ext);
         x = y;
         y = r;
     }
     if x.is_empty() {
         return x;
     }
-    let inv = f.inv(*x.last().unwrap());
-    trim(x.iter().map(|&c| f.mul(c, inv)).collect())
+    let inv = ext.inv(*x.last().unwrap());
+    trim(x.iter().map(|&c| ext.mul(c, inv)).collect())
 }
 
-fn poly_powmod(base: &[u64], mut e: u64, m: &[u64], f: Fp) -> Vec<u64> {
-    let mut r = vec![1u64];
-    let mut b = poly_rem(base, m, f);
-    while e > 0 {
-        if e & 1 == 1 {
-            r = poly_rem(&poly_mul(&r, &b, f), m, f);
+/// `(X + c)^e mod m`, `deg m ≥ 1`. Each multiplication by the linear factor is
+/// `X·g + c·g` followed by a single division step, not a full product.
+fn powmod_linear(c: F2, e: u128, m: &[F2], ext: Ext) -> Vec<F2> {
+    let mut r = vec![F2::ONE];
+    for bit in (0..u128::BITS - e.leading_zeros()).rev() {
+        r = poly_rem(&poly_mul(&r, &r, ext), m, ext);
+        if (e >> bit) & 1 == 1 {
+            let mut h = vec![F2::ZERO; r.len() + 1];
+            for (i, &g) in r.iter().enumerate() {
+                h[i + 1] = ext.add(h[i + 1], g);
+                h[i] = ext.add(h[i], ext.mul(c, g));
+            }
+            r = poly_rem(&trim(h), m, ext);
         }
-        b = poly_rem(&poly_mul(&b, &b, f), m, f);
-        e >>= 1;
     }
     trim(r)
 }
 
-/// All roots of a monic `lam`, or `None` unless `lam` splits into *distinct*
-/// linear factors over `F_p` (which is exactly `lam | X^p − X`).
+/// The seed of the root finder's shifts: a hash of the polynomial.
+fn split_seed(lam: &[F2]) -> [u8; 32] {
+    let mut hasher = Shake256::default();
+    hasher.update(b"panetiere/prony-roots/v1");
+    for c in lam {
+        hasher.update(&c.a.to_le_bytes());
+        hasher.update(&c.b.to_le_bytes());
+    }
+    let mut seed = [0u8; 32];
+    hasher.finalize_xof().read(&mut seed);
+    seed
+}
+
+/// All roots of a monic `lam` of degree ≥ 1, or `None` unless `lam` splits
+/// into distinct linear factors over `F` (which is exactly `lam | X^q − X`
+/// for `q = |F|`).
 ///
-/// Equal-degree splitting with `d = 1`: for random `a`, `gcd((X+a)^{(p−1)/2} −
-/// 1, f)` collects the roots `z` with `z + a` a quadratic residue, splitting
-/// `f` with probability ≈ 1/2 per try. `a` walks a fixed sequence so decoding
-/// stays deterministic.
-fn roots_of_split(lam: &[u64], f: Fp) -> Option<Vec<u64>> {
-    let x = vec![0u64, 1u64];
-    if poly_powmod(&x, f.p, lam, f) != poly_rem(&x, lam, f) {
+/// Equal-degree splitting with `d = 1` (Cantor–Zassenhaus): for a random
+/// `c ∈ F`, `gcd((X + c)^{(q−1)/2} − 1, f)` collects the roots `x` with
+/// `x + c` a square, splitting `f` with probability about 1/2 per try. The
+/// shifts come from a ChaCha20 stream seeded with a hash of `lam`, so the
+/// result is a function of `lam` alone; the shifts only affect how long the
+/// splitting takes, never which roots it returns.
+fn roots_of_split(lam: &[F2], ext: Ext) -> Option<Vec<F2>> {
+    let q = ext.order();
+    let x = vec![F2::ZERO, F2::ONE];
+    if powmod_linear(F2::ZERO, q, lam, ext) != poly_rem(&x, lam, ext) {
         return None;
     }
+    let mut rng = ChaCha20Rng::from_seed(split_seed(lam));
     let mut out = Vec::with_capacity(lam.len() - 1);
     let mut stack = vec![lam.to_vec()];
-    let mut a: u64 = 0;
     while let Some(fac) = stack.pop() {
         match fac.len() {
             0 | 1 => continue,
             2 => {
                 // monic X + c
-                out.push(f.sub(0, fac[0]));
+                out.push(ext.neg(fac[0]));
                 continue;
             }
             _ => {}
         }
         loop {
-            a = (a + 1) % f.p;
-            let h = poly_sub(&poly_powmod(&[a, 1], (f.p - 1) / 2, &fac, f), &[1], f);
-            let g = poly_gcd(&h, &fac, f);
+            let c = ext.random(&mut rng);
+            let h = poly_sub(&powmod_linear(c, (q - 1) / 2, &fac, ext), &[F2::ONE], ext);
+            let g = poly_gcd(&h, &fac, ext);
             if g.len() > 1 && g.len() < fac.len() {
-                let (cof, _) = poly_divmod(&fac, &g, f);
+                let (cof, _) = poly_divmod(&fac, &g, ext);
                 stack.push(g);
                 stack.push(cof);
                 break;
@@ -474,13 +603,10 @@ fn recombine(a00: u64, a01: u64, a11: u64, f: Fp) -> u64 {
     f.reduce_wide(a00 as u128 + ((a01 as u128) << LIMB_BITS) + ((a11 as u128) << (2 * LIMB_BITS)))
 }
 
-fn solve_symbol(d: &DualLimbs, w: &[i64], p: u64, f: Fp) -> Vec<u64> {
+fn solve_symbol(d: &DualLimbs, w: &[u64], f: Fp) -> Vec<u64> {
     let (w_lo, w_hi): (Vec<u32>, Vec<u32>) = w
         .iter()
-        .map(|&c| {
-            let c = canon(c, p);
-            ((c & LIMB_MASK) as u32, (c >> LIMB_BITS) as u32)
-        })
+        .map(|&c| ((c & LIMB_MASK) as u32, (c >> LIMB_BITS) as u32))
         .unzip();
     (0..d.k)
         .map(|i| {
@@ -499,7 +625,8 @@ fn solve_symbol(d: &DualLimbs, w: &[i64], p: u64, f: Fp) -> Vec<u64> {
 pub struct PronyParams {
     /// Maximum number of contributors the sketch can resolve.
     pub(crate) capacity: usize,
-    /// Symbols per element; total payload is `payload_symbols · log₂ p` bits.
+    /// Symbols of `Z_t` per element; total payload is `payload_symbols · log₂ p`
+    /// bits.
     pub(crate) payload_symbols: usize,
     pub(crate) p: u64,
 }
@@ -526,9 +653,15 @@ impl PronyParams {
         self.p.ilog2() as usize
     }
 
-    /// `capacity` power sums plus `payload_symbols · capacity` payload cells.
+    /// `ξ_F`: elements of `F` per payload, `ω` symbols each.
+    fn payload_elements(&self) -> usize {
+        self.payload_symbols.div_ceil(PRONY_OMEGA)
+    }
+
+    /// `capacity` power sums plus `ξ_F · capacity` payload cells, `ω` scalars
+    /// each.
     fn total_scalars(&self) -> usize {
-        self.capacity * (1 + self.payload_symbols)
+        PRONY_OMEGA * self.capacity * (1 + self.payload_elements())
     }
 }
 
@@ -536,9 +669,9 @@ impl PronyParams {
 pub struct PronySketch {
     params: PronyParams,
     /// `k[j − 1] = Σ_i r_i^j`, `j ∈ [1, capacity]`.
-    k: Vec<i64>,
+    k: Vec<F2>,
     /// `v[ℓ][j] = Σ_i x_{i,ℓ} · r_i^j`, `j ∈ [0, capacity)`.
-    v: Vec<Vec<i64>>,
+    v: Vec<Vec<F2>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -555,9 +688,11 @@ pub enum PronyError {
 impl PronySketch {
     pub fn new(params: PronyParams) -> Self {
         let c = params.capacity;
-        let v = (0..params.payload_symbols).map(|_| vec![0i64; c]).collect();
+        let v = (0..params.payload_elements())
+            .map(|_| vec![F2::ZERO; c])
+            .collect();
         Self {
-            k: vec![0i64; c],
+            k: vec![F2::ZERO; c],
             v,
             params,
         }
@@ -567,151 +702,202 @@ impl PronySketch {
     /// May be called repeatedly; one item per client is enforced by client code,
     /// not by this multiset encoding.
     pub fn insert<R: Rng>(&mut self, rng: &mut R, payload: &[i64]) {
-        let p = self.params.p;
-        let r = rng.gen_range(1..p);
+        let ext = Ext::new(self.params.p);
+        let r = loop {
+            let r = ext.random(rng);
+            if !r.is_zero() {
+                break r;
+            }
+        };
         self.insert_with_key(payload, r);
     }
 
-    /// Insert under a given key `r`, a nonzero residue.
-    fn insert_with_key(&mut self, payload: &[i64], r: u64) {
+    /// Insert under a given key `r`, a nonzero element of `F`.
+    fn insert_with_key(&mut self, payload: &[i64], r: F2) {
         assert_eq!(
             payload.len(),
             self.params.payload_symbols,
             "payload arity must match params.payload_symbols",
         );
         let p = self.params.p;
-        assert!(r > 0 && r < p, "r must be a nonzero residue in [1, p)");
-        let f = Fp::new(p);
+        assert!(
+            !r.is_zero() && r.a < p && r.b < p,
+            "r must be a nonzero element of F"
+        );
+        let ext = Ext::new(p);
         let c = self.params.capacity;
 
         // r^0, …, r^C: the power sums take r^1..r^C, the payload r^0..r^{C−1}.
         let mut pows = Vec::with_capacity(c + 1);
-        let mut cur = 1u64;
+        let mut cur = F2::ONE;
         for _ in 0..=c {
             pows.push(cur);
-            cur = f.mul(cur, r);
+            cur = ext.mul(cur, r);
         }
 
         for (slot, &pw) in self.k.iter_mut().zip(pows[1..].iter()) {
-            *slot = center(f.add(canon(*slot, p), pw), p);
+            *slot = ext.add(*slot, pw);
         }
+        // The payload's symbols in pairs, the last one padded with zero.
+        let xs: Vec<F2> = payload
+            .chunks(PRONY_OMEGA)
+            .map(|s| F2 {
+                a: canon(s[0], p),
+                b: s.get(1).map_or(0, |&y| canon(y, p)),
+            })
+            .collect();
         self.v
             .par_iter_mut()
-            .zip(payload.par_iter())
-            .for_each(|(sym, &x)| {
-                let xc = canon(x, p);
-                for (slot, &pw) in sym.iter_mut().zip(pows.iter()) {
-                    *slot = center(f.add(canon(*slot, p), f.mul(xc, pw)), p);
+            .zip(xs.par_iter())
+            .for_each(|(row, &x)| {
+                for (slot, &pw) in row.iter_mut().zip(pows.iter()) {
+                    *slot = ext.add(*slot, ext.mul(x, pw));
                 }
             });
     }
 
     /// Recover `(r_i, payload_i)` for every contributor, sorted by `r_i`.
-    fn decode_with_keys(&self) -> Result<Vec<(u64, Vec<i64>)>, PronyError> {
+    fn decode_with_keys(&self) -> Result<Vec<(F2, Vec<i64>)>, PronyError> {
         let p = self.params.p;
-        let f = Fp::new(p);
+        let ext = Ext::new(p);
+        let f = ext.f;
         let c = self.params.capacity;
 
         // Newton's identities: e_m = (1/m) Σ_{i=1..m} (−1)^{i−1} e_{m−i} K[i].
-        // The alternating sum is split into two deferred accumulators so the
-        // inner loop reduces nothing.
-        let sums: Vec<u64> = self.k.iter().map(|&x| canon(x, p)).collect();
-        let mut e = vec![0u64; c + 1];
-        e[0] = 1;
+        let mut e = vec![F2::ZERO; c + 1];
+        e[0] = F2::ONE;
         for m in 1..=c {
-            let (mut pos, mut neg) = (0u128, 0u128);
+            let mut acc = F2::ZERO;
             for i in 1..=m {
-                let term = e[m - i] as u128 * sums[i - 1] as u128;
-                if i % 2 == 1 {
-                    pos += term;
+                let term = ext.mul(e[m - i], self.k[i - 1]);
+                acc = if i % 2 == 1 {
+                    ext.add(acc, term)
                 } else {
-                    neg += term;
-                }
+                    ext.sub(acc, term)
+                };
             }
-            let acc = f.sub(f.reduce_wide(pos), f.reduce_wide(neg));
-            e[m] = f.mul(acc, f.inv(m as u64 % p));
+            e[m] = ext.scale(acc, f.inv(m as u64 % p));
         }
         // The number of contributors. Since `e_m = 0` for every `m > ρ̂`, the
         // power sums are exactly those of the roots of `Λ` once it splits, so
         // they need no separate check.
-        let rho_hat = (0..=c).rev().find(|&m| e[m] != 0).unwrap_or(0);
+        let rho_hat = (0..=c).rev().find(|&m| !e[m].is_zero()).unwrap_or(0);
         if rho_hat == 0 {
-            return if self.v.iter().all(|sym| sym.iter().all(|&x| x == 0)) {
+            return if self.v.iter().all(|row| row.iter().all(|x| x.is_zero())) {
                 Ok(Vec::new())
             } else {
                 Err(PronyError::CheckFailed)
             };
         }
         // Λ(X) = Σ_m (−1)^m e_m X^{ρ̂−m}, monic of degree ρ̂.
-        let mut lam = vec![0u64; rho_hat + 1];
+        let mut lam = vec![F2::ZERO; rho_hat + 1];
         for m in 0..=rho_hat {
-            lam[rho_hat - m] = if m % 2 == 0 { e[m] } else { f.sub(0, e[m]) };
+            lam[rho_hat - m] = if m % 2 == 0 { e[m] } else { ext.neg(e[m]) };
         }
 
-        let r = roots_of_split(&lam, f).ok_or(PronyError::NotSplit)?;
-        if r.len() != rho_hat || r.contains(&0) {
+        let r = roots_of_split(&lam, ext).ok_or(PronyError::NotSplit)?;
+        if r.len() != rho_hat || r.iter().any(|x| x.is_zero()) {
             return Err(PronyError::NotSplit);
         }
 
         // Lagrange duals: b_i = Λ/(X − r_i) by synthetic division, scaled by
         // 1/Λ'(r_i) = 1/b_i(r_i). Then x_{i,ℓ} = Σ_m b_{i,m}·V[ℓ][m].
-        let dual: Vec<Vec<u64>> = r
+        let dual: Vec<Vec<F2>> = r
             .iter()
             .map(|&ri| {
-                let mut b = vec![0u64; rho_hat];
-                b[rho_hat - 1] = 1;
+                let mut b = vec![F2::ZERO; rho_hat];
+                b[rho_hat - 1] = F2::ONE;
                 for m in (1..rho_hat).rev() {
-                    b[m - 1] = f.add(lam[m], f.mul(ri, b[m]));
+                    b[m - 1] = ext.add(lam[m], ext.mul(ri, b[m]));
                 }
-                let mut den = 0u64;
+                let mut den = F2::ZERO;
                 for &c in b.iter().rev() {
-                    den = f.add(f.mul(den, ri), c);
+                    den = ext.add(ext.mul(den, ri), c);
                 }
-                let inv = f.inv(den);
-                b.iter().map(|&c| f.mul(c, inv)).collect()
+                let inv = ext.inv(den);
+                b.iter().map(|&c| ext.mul(c, inv)).collect()
             })
             .collect();
-        let dual_limbs = DualLimbs::new(&dual);
-
-        let xs: Vec<Vec<u64>> = self
+        // The solve runs on the coordinates: with D = D_a + D_b Z and
+        // V = V_a + V_b Z, D·V = (D_a V_a + 3 D_b V_b) + (D_a V_b + D_b V_a) Z.
+        let plane = |coord: fn(&F2) -> u64| {
+            DualLimbs::new(
+                &dual
+                    .iter()
+                    .map(|row| row.iter().map(coord).collect())
+                    .collect::<Vec<Vec<u64>>>(),
+            )
+        };
+        let (d_a, d_b) = (plane(|x| x.a), plane(|x| x.b));
+        let xs: Vec<Vec<F2>> = self
             .v
             .par_iter()
-            .map(|sym| solve_symbol(&dual_limbs, &sym[..rho_hat], p, f))
+            .map(|row| {
+                let w_a: Vec<u64> = row[..rho_hat].iter().map(|x| x.a).collect();
+                let w_b: Vec<u64> = row[..rho_hat].iter().map(|x| x.b).collect();
+                let aa = solve_symbol(&d_a, &w_a, f);
+                let bb = solve_symbol(&d_b, &w_b, f);
+                let ab = solve_symbol(&d_a, &w_b, f);
+                let ba = solve_symbol(&d_b, &w_a, f);
+                (0..rho_hat)
+                    .map(|i| F2 {
+                        a: f.add(aa[i], f.mul(NONRESIDUE, bb[i])),
+                        b: f.add(ab[i], ba[i]),
+                    })
+                    .collect()
+            })
             .collect();
 
         // Unused payload columns must match the recovered payloads. The power
         // ladder depends only on the keys, so it is built once here rather
-        // than per symbol.
-        let rpow: Vec<Vec<u64>> = (rho_hat..c)
+        // than per element.
+        let rpow: Vec<Vec<F2>> = (rho_hat..c)
             .scan(
                 r.iter()
-                    .map(|&ri| f.pow(ri, rho_hat as u64))
-                    .collect::<Vec<u64>>(),
+                    .map(|&ri| (0..rho_hat).fold(F2::ONE, |acc, _| ext.mul(acc, ri)))
+                    .collect::<Vec<F2>>(),
                 |cur, _| {
                     let this = cur.clone();
                     for (pw, &ri) in cur.iter_mut().zip(r.iter()) {
-                        *pw = f.mul(*pw, ri);
+                        *pw = ext.mul(*pw, ri);
                     }
                     Some(this)
                 },
             )
             .collect();
-        let bad = self.v.par_iter().zip(xs.par_iter()).any(|(sym, xrow)| {
+        let bad = self.v.par_iter().zip(xs.par_iter()).any(|(row, xrow)| {
             rpow.iter().enumerate().any(|(idx, rj)| {
-                let acc = xrow
-                    .iter()
-                    .zip(rj.iter())
-                    .fold(0u128, |a, (&x, &pw)| a + x as u128 * pw as u128);
-                f.reduce_wide(acc) != canon(sym[rho_hat + idx], p)
+                let (mut aa, mut bb, mut ab) = (0u128, 0u128, 0u128);
+                for (x, pw) in xrow.iter().zip(rj.iter()) {
+                    aa += x.a as u128 * pw.a as u128;
+                    bb += x.b as u128 * pw.b as u128;
+                    ab += x.a as u128 * pw.b as u128 + x.b as u128 * pw.a as u128;
+                }
+                let got = F2 {
+                    a: f.add(
+                        f.reduce_wide(aa),
+                        f.reduce(NONRESIDUE as u128 * f.reduce_wide(bb) as u128),
+                    ),
+                    b: f.reduce_wide(ab),
+                };
+                got != row[rho_hat + idx]
             })
         });
         if bad {
             return Err(PronyError::CheckFailed);
         }
 
+        let symbols = self.params.payload_symbols;
         Ok(r.iter()
             .enumerate()
-            .map(|(i, &ri)| (ri, xs.iter().map(|row| row[i] as i64).collect()))
+            .map(|(i, &ri)| {
+                let mut payload: Vec<i64> = xs
+                    .iter()
+                    .flat_map(|row| [row[i].a as i64, row[i].b as i64])
+                    .collect();
+                payload.truncate(symbols);
+                (ri, payload)
+            })
             .collect())
     }
 
@@ -738,28 +924,26 @@ impl PronySketch {
         Self::new(params.clone()).pack()
     }
 
-    /// Flatten `K` then `V[0] … V[ξ−1]` into `KahePoly` coefficient slots.
+    /// Flatten `K` then `V[0] … V[ξ_F−1]` into `KahePoly` coefficient slots,
+    /// each element of `F` as its two coordinates.
     pub fn pack(&self) -> Vec<KahePoly> {
+        let p = self.params.p;
         let total = self.params.total_scalars();
         let n_polys = total.div_ceil(N);
         let mut polys = Vec::with_capacity(n_polys);
         let mut buf = [0i64; N];
         let mut written = 0usize;
-        let mut feed = |val: i64, polys: &mut Vec<KahePoly>| {
-            buf[written % N] = val;
+        let mut feed = |val: u64, polys: &mut Vec<KahePoly>| {
+            buf[written % N] = center(val, p);
             written += 1;
             if written.is_multiple_of(N) {
                 polys.push(KahePoly::from_coeffs(buf));
                 buf = [0i64; N];
             }
         };
-        for &x in &self.k {
-            feed(x, &mut polys);
-        }
-        for sym in &self.v {
-            for &x in sym {
-                feed(x, &mut polys);
-            }
+        for x in self.k.iter().chain(self.v.iter().flatten()) {
+            feed(x.a, &mut polys);
+            feed(x.b, &mut polys);
         }
         if !written.is_multiple_of(N) {
             polys.push(KahePoly::from_coeffs(buf));
@@ -771,16 +955,21 @@ impl PronySketch {
     /// Inverse of `pack`. `polys.len()` must equal `n_polys(params)`.
     pub fn unpack(params: &PronyParams, polys: &[KahePoly]) -> Self {
         assert_eq!(polys.len(), params.total_scalars().div_ceil(N));
-        let mut flat: Vec<i64> = Vec::with_capacity(polys.len() * N);
-        for p in polys {
-            let mut q = *p;
+        let p = params.p;
+        let mut flat: Vec<u64> = Vec::with_capacity(polys.len() * N);
+        for poly in polys {
+            let mut q = *poly;
             q.normalize();
-            flat.extend_from_slice(q.coeffs());
+            flat.extend(q.coeffs().iter().map(|&x| canon(x, p)));
         }
+        let el = |i: usize| F2 {
+            a: flat[2 * i],
+            b: flat[2 * i + 1],
+        };
         let c = params.capacity;
-        let k = flat[..c].to_vec();
-        let v = (0..params.payload_symbols)
-            .map(|i| flat[c + i * c..c + (i + 1) * c].to_vec())
+        let k = (0..c).map(el).collect();
+        let v = (0..params.payload_elements())
+            .map(|l| (0..c).map(|j| el(c + l * c + j)).collect())
             .collect();
         Self {
             params: params.clone(),
@@ -798,21 +987,84 @@ mod tests {
 
     const SMALL_P: u64 = 1_048_583; // smallest prime > 2^20
 
+    fn rand_f2(rng: &mut ChaCha20Rng) -> F2 {
+        Ext::new(PRONY_PRIME).random(rng)
+    }
+
+    /// 3 is not a square mod `t`, so `Z² − 3` is irreducible and `F_t[Z]/(Z² − 3)`
+    /// is a field.
     #[test]
-    fn field_and_poly_sanity() {
-        let f = Fp::new(SMALL_P);
-        assert_eq!(f.mul(f.inv(12345), 12345), 1);
-        // (X−2)(X−3)(X−5) = X³ − 10X² + 31X − 30
-        let poly = poly_mul(
-            &poly_mul(&[f.sub(0, 2), 1], &[f.sub(0, 3), 1], f),
-            &[f.sub(0, 5), 1],
-            f,
+    fn nonresidue_is_not_a_square() {
+        let f = Fp::new(PRONY_PRIME);
+        assert_eq!(f.pow(NONRESIDUE, (PRONY_PRIME - 1) / 2), PRONY_PRIME - 1);
+    }
+
+    #[test]
+    fn extension_field_arithmetic() {
+        let mut rng = ChaCha20Rng::from_seed([40u8; 32]);
+        let ext = Ext::new(PRONY_PRIME);
+        let f = ext.f;
+        let z = F2 { a: 0, b: 1 };
+        assert_eq!(
+            ext.mul(z, z),
+            F2 {
+                a: NONRESIDUE,
+                b: 0
+            }
         );
-        assert_eq!(poly, vec![f.sub(0, 30), 31, f.sub(0, 10), 1]);
-        assert_eq!(roots_of_split(&poly, f), Some(vec![2, 3, 5]));
-        // A repeated root does not divide X^p − X.
-        let g = poly_mul(&[f.sub(0, 2), 1], &poly, f);
-        assert_eq!(roots_of_split(&g, f), None);
+        for _ in 0..1000 {
+            let (x, y, w) = (rand_f2(&mut rng), rand_f2(&mut rng), rand_f2(&mut rng));
+            assert_eq!(ext.mul(x, y), ext.mul(y, x));
+            assert_eq!(ext.mul(ext.mul(x, y), w), ext.mul(x, ext.mul(y, w)));
+            assert_eq!(
+                ext.mul(x, ext.add(y, w)),
+                ext.add(ext.mul(x, y), ext.mul(x, w))
+            );
+            assert_eq!(ext.scale(x, w.a), ext.mul(x, F2 { a: w.a, b: 0 }));
+            if !x.is_zero() {
+                assert_eq!(ext.mul(x, ext.inv(x)), F2::ONE);
+            }
+        }
+        // Frobenius: x^t = x_a − x_b Z, since Z^t = Z · 3^{(t−1)/2} = −Z.
+        let x = rand_f2(&mut rng);
+        let mut xt = F2::ONE;
+        let mut base = x;
+        let mut e = PRONY_PRIME;
+        while e > 0 {
+            if e & 1 == 1 {
+                xt = ext.mul(xt, base);
+            }
+            base = ext.mul(base, base);
+            e >>= 1;
+        }
+        assert_eq!(
+            xt,
+            F2 {
+                a: x.a,
+                b: f.sub(0, x.b)
+            }
+        );
+    }
+
+    #[test]
+    fn roots_in_the_extension_field() {
+        let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
+        let ext = Ext::new(PRONY_PRIME);
+        let mut want: Vec<F2> = (0..12).map(|_| rand_f2(&mut rng)).collect();
+        let lam = want.iter().fold(vec![F2::ONE], |acc, &r| {
+            poly_mul(&acc, &[ext.neg(r), F2::ONE], ext)
+        });
+        want.sort_unstable();
+        assert_eq!(roots_of_split(&lam, ext), Some(want.clone()));
+        // A repeated root does not divide X^q − X.
+        let g = poly_mul(&lam, &[ext.neg(want[3]), F2::ONE], ext);
+        assert_eq!(roots_of_split(&g, ext), None);
+        // Neither does a factor without roots in F: X² − Z is irreducible
+        // unless Z is a square, and Z's norm −3 decides that.
+        let z = F2 { a: 0, b: 1 };
+        let quad = poly_mul(&lam, &[ext.neg(z), F2::ZERO, F2::ONE], ext);
+        let norm_is_square = ext.f.pow(PRONY_PRIME - NONRESIDUE, (PRONY_PRIME - 1) / 2) == 1;
+        assert_eq!(roots_of_split(&quad, ext).is_some(), norm_is_square);
     }
 
     /// Barrett must agree with the reference remainder everywhere it is used:
@@ -830,12 +1082,6 @@ mod tests {
             for _ in 0..20_000 {
                 let x = rng.gen::<u128>() % pp;
                 assert_eq!(f.reduce(x), (x % p as u128) as u64);
-                let (a, w) = (x as u64 % p, (x >> 64) as u64 % p);
-                assert_eq!(
-                    f.mul_shoup(a, w, f.shoup(w)),
-                    ((a as u128 * w as u128) % p as u128) as u64,
-                    "shoup {a}·{w} mod {p}",
-                );
                 assert_eq!(f.mul(x as u64 % p, (x >> 64) as u64 % p), {
                     let a = (x as u64 % p) as u128;
                     let b = ((x >> 64) as u64 % p) as u128;
@@ -1087,7 +1333,7 @@ mod tests {
     #[test]
     fn payload_without_contributors_is_detected() {
         let mut sk = PronySketch::new(PronyParams::new(8, 2));
-        sk.v[1][3] = 5;
+        sk.v[0][3] = F2 { a: 5, b: 0 };
         assert_eq!(sk.decode(), Err(PronyError::CheckFailed));
     }
 
@@ -1097,9 +1343,10 @@ mod tests {
     fn duplicate_key_is_detected() {
         let pp = PronyParams::new(8, 1);
         let mut sk = PronySketch::new(pp);
-        sk.insert_with_key(&[11], 12345);
-        sk.insert_with_key(&[22], 12345);
-        sk.insert_with_key(&[33], 999);
+        let r = F2 { a: 12345, b: 678 };
+        sk.insert_with_key(&[11], r);
+        sk.insert_with_key(&[22], r);
+        sk.insert_with_key(&[33], F2 { a: 999, b: 1 });
         assert_eq!(sk.decode(), Err(PronyError::NotSplit));
     }
 
@@ -1113,7 +1360,7 @@ mod tests {
         for x in [3i64, 4, 5] {
             sk.insert(&mut rng, &[x]);
         }
-        sk.v[0][2] += 7;
+        sk.v[0][2] = Ext::new(PRONY_PRIME).add(sk.v[0][2], F2 { a: 7, b: 0 });
         assert_eq!(sk.decode(), Err(PronyError::CheckFailed));
     }
 
