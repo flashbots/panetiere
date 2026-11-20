@@ -8,8 +8,10 @@ use sha3::Shake256;
 use crate::chunking;
 use crate::iblt_shape::iblt_shape;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
-use crate::mse::{self, MseEncoding, MseError, MseParams};
-use crate::prony::{PronyError, PronyParams, PronySketch, PRONY_PRIME};
+pub use crate::mse::MseError;
+use crate::mse::{self, MseEncoding, MseParams};
+pub use crate::prony::PronyError;
+use crate::prony::{PronyParams, PronySketch, PRONY_PRIME};
 use crate::protocol::{ProtocolParams, SessionId};
 use crate::rings::RHO_MAX;
 
@@ -172,7 +174,7 @@ impl ChannelParams {
     }
 
     /// The peeling parameters underneath, nonce symbols included.
-    pub fn mse(&self) -> Option<&MseParams> {
+    pub(crate) fn mse(&self) -> Option<&MseParams> {
         match &self.encoding {
             Encoding::Mse(p) => Some(p),
             Encoding::Prony(_) => None,
@@ -180,7 +182,7 @@ impl ChannelParams {
     }
 
     /// The sketch parameters underneath, nonce symbols included.
-    pub fn prony(&self) -> Option<&PronyParams> {
+    pub(crate) fn prony(&self) -> Option<&PronyParams> {
         match &self.encoding {
             Encoding::Prony(p) => Some(p),
             Encoding::Mse(_) => None,
@@ -581,7 +583,7 @@ mod tests {
         for p in variants(16, 128) {
             let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
             let pp = p.protocol_params(&mut rng, 4);
-            assert_eq!(crate::protocol::message_polys(&pp), p.n_polys(), "{p:?}");
+            assert_eq!(pp.message_polys(), p.n_polys(), "{p:?}");
         }
     }
 

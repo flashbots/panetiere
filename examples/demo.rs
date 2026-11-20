@@ -10,12 +10,11 @@ use std::collections::HashMap;
 
 use panetiere::bulletin::{ClientBulletinEntry, InMemoryBulletin};
 use panetiere::channel::{self, ChannelParams};
-use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{recover_unverified_direct, SetPolicy};
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::protocol::{ClientId, Commitment, ServerId, SessionId};
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -42,8 +41,9 @@ fn main() {
     // many messages of this many bytes", and that fixes the KAHE width every
     // client must contribute.
     let ch = ChannelParams::for_messages(&mut rng, messages.len() as u32, MESSAGE_BYTES);
-    let mut pp = ch.protocol_params(&mut rng, N_SERVERS);
-    pp.min_clients = MIN_CLIENTS;
+    let pp = ch
+        .protocol_params(&mut rng, N_SERVERS)
+        .with_min_clients(MIN_CLIENTS);
 
     println!(
         "Panetière demo: {} clients ({} messages + {} cover), {} servers, t = {}",
@@ -51,7 +51,7 @@ fn main() {
         messages.len(),
         N_COVER,
         N_SERVERS,
-        pp.shamir.t,
+        pp.threshold(),
     );
     println!(
         "  payload width {} KahePoly, up to {} bytes per message",
@@ -66,21 +66,15 @@ fn main() {
     let servers: Vec<(ServerId, pke::PublicKey)> = server_keys
         .iter()
         .enumerate()
-        .map(|(i, k)| (ServerId(i as u32), k.public()))
+        .map(|(i, k)| (ServerId::new(i as u32), k.public()))
         .collect();
-    let session = SessionId([0xD1; 32]);
+    let session = SessionId::new([0xD1; 32]);
 
     let bulletin = InMemoryBulletin::new();
-    let mut inboxes: Vec<ServerInbox> = servers
-        .iter()
-        .map(|(sid, _)| ServerInbox {
-            server_id: *sid,
-            items: vec![],
-        })
-        .collect();
+    let mut inbox_items: Vec<Vec<_>> = servers.iter().map(|_| Vec::new()).collect();
 
     for i in 0..n_clients {
-        let cid = ClientId(i as u32);
+        let cid = ClientId::new(i as u32);
         let contribution = match messages.get(i) {
             Some(m) => channel::encode_message(&mut rng, &ch, &session, m).expect("payload fits"),
             None => channel::cover(&ch),
@@ -89,21 +83,21 @@ fn main() {
 
         // The public half goes on the bulletin as bytes — a transport carries
         // the wire form, not the in-memory type.
-        let wire = round.encrypted_message.to_bytes();
-        let post = ClientBulletinEntry::from_bytes(&wire).expect("wire round-trip");
+        let wire = round.post().to_bytes();
+        let post = ClientBulletinEntry::try_from_bytes(&wire).expect("wire round-trip");
         bulletin.publish_client(cid, post);
 
         // The private half is one sealed envelope per server, each holding that
         // server's Shamir share of this client's KAHE key.
-        for (idx, (sid, sealed)) in round.sealed_openings.iter().enumerate() {
+        for (idx, (sid, sealed)) in round.sealed_openings().iter().enumerate() {
             let share =
                 unseal_opening(&server_keys[idx], &session, cid, *sid, sealed).expect("unseal");
-            inboxes[idx].items.push((cid, share));
+            inbox_items[idx].push((cid, share));
         }
     }
 
     // Whoever fixes the canonical set announces it; here everyone took part.
-    let canonical: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
+    let canonical: Vec<ClientId> = (0..n_clients as u32).map(ClientId::new).collect();
     bulletin.publish_canonical(canonical.clone());
 
     // each server checks every opening against the client's commitment on the
@@ -111,10 +105,11 @@ fn main() {
     let commitments: Vec<(ClientId, Commitment)> = bulletin
         .clients()
         .into_iter()
-        .map(|(cid, post)| (cid, post.comm))
+        .map(|(cid, post)| (cid, post.commitment().clone()))
         .collect();
-    for inbox in &inboxes {
-        let entry = run_server_round(&pp.cs, inbox, &canonical, &commitments)
+    for ((sid, _), items) in servers.iter().zip(inbox_items) {
+        let inbox = ServerInbox::new(*sid, items);
+        let entry = run_server_round(&pp, &inbox, &canonical, &commitments)
             .expect("canonical client missing");
         bulletin.publish_server(entry);
     }
@@ -132,13 +127,13 @@ fn main() {
     .expect("recover");
 
     let payloads =
-        channel::decode_messages(&ch, &session, &recovered.plaintext, Some(messages.len()))
+        channel::decode_messages(&ch, &session, recovered.plaintext(), Some(messages.len()))
             .expect("peel");
 
     println!(
         "\nanonymity set {}, servers excluded {:?}",
-        recovered.canonical.len(),
-        recovered.culprits,
+        recovered.canonical().len(),
+        recovered.culprits(),
     );
     println!(
         "recovered {} messages, sorted — the order says nothing about who sent what:",
