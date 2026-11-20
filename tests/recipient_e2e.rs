@@ -7,7 +7,7 @@ use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
     recover_unverified_aggregate, recover_unverified_direct, recover_unverified_direct_from_bytes,
-    recover_unverified_once, sum_client_posts, RecipientError, Recovered, RejectReason, SetPolicy,
+    recover_unverified_once, RecipientError, Recovered, RejectReason, SetPolicy,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
@@ -499,13 +499,4 @@ fn from_bytes_names_the_first_misbehaving_client() {
         with(&[(1, "long"), (0, "missing"), (5, "malformed")]),
         MissingClientPost(ClientId(0))
     );
-}
-
-/// An empty set of posts sums to zero.
-#[test]
-fn empty_set_of_posts_sums_to_zero() {
-    let r = round(36, 4, 1);
-    let (ctxt, comm) = sum_client_posts(&r.pp, &[], |_| None::<Vec<u8>>).unwrap();
-    assert_eq!(ctxt, vec![KahePoly::default(); r.pp.kahe.mu_kahe]);
-    assert!(comm.root.coeffs().iter().all(|&c| c == 0));
 }

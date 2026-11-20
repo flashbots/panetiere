@@ -7,10 +7,10 @@
 //!   honest ones remain. Threshold decryption tolerates that; the excluded
 //!   servers come back in [`Recovered::culprits`] for the caller to attribute.
 //! - [`recover_unverified_direct_from_bytes`] is the direct flow over the posts'
-//!   wire bytes: [`sum_client_posts`] parses and sums them in parallel without
-//!   building their polynomials.
+//!   wire bytes: it parses and sums them in parallel without building their
+//!   polynomials.
 //!
-//! Both direct entry points sum the posts once, with a [`PostSum`], and only
+//! Both direct entry points sum the posts once, with a `PostSum`, and only
 //! repeat verification and decryption while excluding culprits. They check
 //! the posts alike and name the first misbehaving client in the set's order.
 
@@ -269,7 +269,7 @@ fn decode_over_sum(
 /// are ever built. The first client in `canonical`'s order whose post is
 /// missing, does not parse or has the wrong length is named. An empty set
 /// sums to zero.
-pub fn sum_client_posts<L, B>(
+fn sum_client_posts<L, B>(
     pp: &ProtocolParams,
     canonical: &[ClientId],
     posts: L,
@@ -316,8 +316,8 @@ where
 }
 
 /// Direct flow over the posts' wire bytes: as [`recover_unverified_direct`],
-/// but the posts are summed with [`sum_client_posts`], in parallel and without
-/// keeping them parsed.
+/// but the posts are parsed and summed in parallel, without keeping them
+/// parsed.
 /// Requires authentic, session-bound posts consistent with the servers' view;
 /// recovery does not authenticate the supplied ciphertexts.
 pub fn recover_unverified_direct_from_bytes<L, B>(
