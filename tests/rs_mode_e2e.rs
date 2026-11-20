@@ -217,9 +217,7 @@ fn prony_round_trip_through_rs_lanes() {
     let payloads: Vec<Vec<KahePoly>> = elements
         .iter()
         .map(|e| {
-            let mut sk = PronySketch::new(params.clone());
-            sk.insert(&mut rng, e);
-            let mut p = sk.pack();
+            let mut p = PronySketch::encode(&params, &mut rng, e);
             p.resize(payload_polys, KahePoly::default());
             p
         })
