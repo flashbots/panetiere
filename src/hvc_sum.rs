@@ -9,19 +9,19 @@ pub fn sum_hvc_polys(polys: &[&HVCPoly]) -> HVCPoly {
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("avx2") {
         unsafe { accumulate_avx2(&mut acc, polys) };
-        return finish(acc);
+        return reduce_hvc_sum(acc);
     }
 
     #[cfg(target_arch = "aarch64")]
     unsafe {
         accumulate_neon(&mut acc, polys);
-        return finish(acc);
+        return reduce_hvc_sum(acc);
     }
 
     #[allow(unreachable_code)]
     {
         accumulate_scalar(&mut acc, polys);
-        finish(acc)
+        reduce_hvc_sum(acc)
     }
 }
 
@@ -76,7 +76,9 @@ unsafe fn accumulate_neon(acc: &mut [i64; N], polys: &[&HVCPoly]) {
     }
 }
 
-fn finish(acc: [i64; N]) -> HVCPoly {
+/// Reduce an unreduced coefficient-wise sum of HVC polynomials to centered
+/// representatives.
+pub(crate) fn reduce_hvc_sum(acc: [i64; N]) -> HVCPoly {
     let q = HVC_MODULUS as i64;
     HVCPoly::from_coeffs(acc.map(|sum| center_i64(sum, q) as i32))
 }

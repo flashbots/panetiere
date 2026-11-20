@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{CsPoly, RsNTTPoly};
+use crate::RsNTTPoly;
 use chipmunk_code::HVCPoly;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -266,19 +266,18 @@ pub fn run_server_round(
     // each server starts from d_i = 0 and posts it if I is empty.
     let agg_open = HidingMerkleCommitment::sum_openings(cs, position, &opening_refs)
         .expect("every opening passed the shape and position checks");
-    let agg_share: CsPoly = agg_open.s()[0];
 
     Ok(ServerBulletinEntry {
         server_id: inbox.server_id,
         clients: canonical.to_vec(),
         agg_open,
-        agg_share,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CsPoly;
 
     const SERVERS: usize = 4;
     const POSITION: u32 = 1;
@@ -329,15 +328,15 @@ mod tests {
             let parsed = ServerBulletinEntry::from_bytes(&bytes).expect("entry parses");
             assert_eq!(parsed.server_id, entry.server_id);
             assert_eq!(parsed.clients, entry.clients);
-            assert_eq!(parsed.agg_share.coeffs(), entry.agg_share.coeffs());
             assert_eq!(parsed.to_bytes(&cs), bytes);
             let refs: Vec<&Commitment> = commitments.iter().map(|(_, c)| c).collect();
             let summed = HidingMerkleCommitment::sum_commitment_refs(&refs);
-            assert!(HidingMerkleCommitment::verify(
-                &cs,
-                &summed,
-                &parsed.agg_open
-            ));
+            let share = HidingMerkleCommitment::verify(&cs, &summed, &entry.agg_open);
+            assert!(share.is_some());
+            assert_eq!(
+                HidingMerkleCommitment::verify(&cs, &summed, &parsed.agg_open),
+                share
+            );
 
             assert!(ServerBulletinEntry::from_bytes(&bytes[..bytes.len() - 1]).is_none());
             let mut longer = bytes.clone();
@@ -356,7 +355,8 @@ mod tests {
         let (canonical, commitments, mut inbox) = round(&mut rng, &cs, 5);
         assert!(run_server_round(&cs, &inbox, &canonical, &commitments).is_ok());
 
-        inbox.items[3].1.s_mut()[0] += CsPoly::from_coeffs([1; crate::N]);
+        // still within the fresh bounds, but not an opening of its leaf
+        inbox.items[3].1.r_mut().swap(0, 1);
         assert_eq!(
             run_server_round(&cs, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(3)))
@@ -396,17 +396,15 @@ mod tests {
         };
         let entry = run_server_round(&cs, &inbox, &[], &[]).expect("an empty round is valid");
         assert!(entry.clients.is_empty());
-        assert_eq!(entry.agg_share, CsPoly::default());
         assert_eq!(entry.agg_open.server_index, POSITION as usize);
         let empty_sum = HidingMerkleCommitment::sum_commitment_refs(&[]);
-        assert!(HidingMerkleCommitment::verify(
-            &cs,
-            &empty_sum,
-            &entry.agg_open
-        ));
+        assert_eq!(
+            HidingMerkleCommitment::verify(&cs, &empty_sum, &entry.agg_open),
+            Some(vec![CsPoly::default()])
+        );
         // but not against an actual commitment
         let (comm, _) = commit_one(&mut rng, &cs);
-        assert!(!HidingMerkleCommitment::verify(&cs, &comm, &entry.agg_open));
+        assert!(HidingMerkleCommitment::verify(&cs, &comm, &entry.agg_open).is_none());
     }
 
     /// More clients than one batch holds still verify, and a bad one is
@@ -422,7 +420,8 @@ mod tests {
         assert_eq!(batch_capacity(&cs), 2);
         assert!(run_server_round(&cs, &inbox, &canonical, &commitments).is_ok());
 
-        inbox.items[4].1.s_mut()[0] += CsPoly::from_coeffs([1; crate::N]);
+        // still within the fresh bounds, but not an opening of its leaf
+        inbox.items[4].1.r_mut().swap(0, 1);
         assert_eq!(
             run_server_round(&cs, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(4)))

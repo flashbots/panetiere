@@ -597,7 +597,7 @@ fn session_binding_rejects_replay() {
 }
 
 #[test]
-fn tampered_agg_share_rejected() {
+fn tampered_server_opening_rejected() {
     let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
     let n_servers = 4;
     let n_clients = 4;
@@ -641,13 +641,15 @@ fn tampered_agg_share_rejected() {
         .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
         .collect();
 
-    server_outputs[0].agg_share += CsPoly::rand_poly(&mut rng);
+    // swapping two polynomials of r keeps the opening within its bounds, but it
+    // doesn't open the summed commitment, so server 0's share can't be recovered
+    server_outputs[0].agg_open.r_mut().swap(0, 1);
     let result =
         aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
-    assert!(matches!(
+    assert_eq!(
         result,
-        Err(panetiere::protocol::verify::VerifyError::ShareOpeningMismatch(_))
-    ));
+        Err(panetiere::protocol::verify::VerifyError::InvalidServerOpening(0))
+    );
 }
 
 #[test]
