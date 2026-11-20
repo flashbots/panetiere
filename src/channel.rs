@@ -371,7 +371,7 @@ pub fn decode_messages(
 
 /// `expect` optionally checks the total decoded item count, not items per client.
 /// Leave it `None` when the active-sender count is unknown (e.g. with cover traffic).
-/// MSE residual and Prony slack checks test decoding consistency, not per-client
+/// MSE residual and Prony column checks test decoding consistency, not per-client
 /// input validity or payload authenticity. Each element's nonce is stripped,
 /// its mask removed, and the unmasked payloads come back sorted.
 pub fn decode_symbols(
@@ -606,6 +606,15 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "{p:?}");
         }
+    }
+
+    /// The sketch of the reference setting fits the width `q` is chosen for:
+    /// a 1 MiB message at the largest capacity.
+    #[test]
+    fn reference_message_fits_the_reference_width() {
+        let p = ChannelParams::prony_for_messages(crate::rings::RHO_MAX, 1 << 20);
+        assert!(p.n_polys() <= crate::rings::MU_MAX, "{}", p.n_polys());
+        assert!(p.max_payload_bytes() >= 1 << 20);
     }
 
     /// 300 clients need about 201 bits of nonce, which is six 34-bit symbols:

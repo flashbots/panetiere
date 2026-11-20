@@ -240,8 +240,8 @@ than "no output". `RecipientError::BelowShareThreshold` is expected early in a
 round and is worth demoting to trace level.
 
 On the payload side, an over-subscribed structure surfaces as
-`ChannelError::PeelStalled` or `ChannelError::SketchFailed(PronyError::{CapacityExceeded,
-NotSplit, CheckFailed})` — never as a successfully decoded empty round. A
+`ChannelError::PeelStalled` or `ChannelError::SketchFailed(PronyError::{NotSplit,
+CheckFailed})` — never as a successfully decoded empty round. A
 peeling table that is not an honest sum comes back as
 `ChannelError::MalformedEncoding(MseError::{OverCapacity, KeyMismatch})`: the
 decoder checks, as the paper's does, that each peeled key hashes to the cell it
@@ -259,7 +259,7 @@ distinctness, and the verifier rejects an out-of-range or duplicated
 `ServerId` before using it. The `assert!`s that remain are on locally
 supplied arguments — parameter constructors (`ShamirParams::new`,
 `MseParams::new`, `PronyParams::new`) and payload arity in
-`MseEncoding::insert` / `PronyEncoding::insert_with_z` — where a violation is a
+`MseEncoding::insert` / `PronySketch::insert` — where a violation is a
 caller bug, not an attack. Range checks on the ring bridges are `debug_assert!`,
 so they only run in the debug test profile.
 
