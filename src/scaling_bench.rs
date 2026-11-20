@@ -33,14 +33,11 @@
 //!  CLIENTS: (clients_total, clients_active) clients_total−active send cover;
 //!                                           IBLT is sized to active, not total.
 //!  CONFIGS: ξ             payload symbols/client (useful bits = ξ·log₂ t)
-//!  SCHED_MESSAGE_BYTES:   message-vector sizes for the scheduled flow
 //!  NETWORKS: per-profile one-way latency + uniform jitter, and Mbit/s for each
 //!            of the three link classes (client, server, bulletin/recipient)
 //!  env:     SWEEP_SERVERS          "8,16,64"          overrides SERVERS
 //!           SWEEP_CLIENTS          "100x100,300x300"  overrides CLIENTS
 //!           SWEEP_PAYLOAD_SYMBOLS  "2048,10240"       overrides CONFIGS ξ
-//!           SWEEP_SCHED_BYTES      "409600,2097152"   overrides SCHED_MESSAGE_BYTES
-//!                                  ("" = skip the scheduled section)
 //!           SWEEP_THRESHOLD        "majority" (default) = ⌊S/2⌋ + 1, or "S-K" =
 //!                                  max(⌊S/2⌋ + 1, S − K) ("S-2" was the
 //!                                  default before #21)
@@ -72,7 +69,7 @@
 //!                log(nμ), so it is a per-cell number, not a global ρ ceiling.
 //!  src/mse.rs:   BITS_PER_SYMBOL = 34, K_LIMBS = 2
 //!  bench-internal: per-cell ChaCha20 seed = SHA-256 over (S, ρ, active, ξ,
-//!                  flow, message_bytes), so cells never share a stream; the
+//!                  flow), so cells never share a stream; the
 //!                  MSE PRF key is drawn from that stream
 //!  protocol coupling (asserted at runtime): μ_cs = κ_kahe
 //!  asserted per cell: agg_open + agg_share == CsParams::aggregated_server_crypto_len
@@ -91,7 +88,6 @@ use rayon::prelude::*;
 use crate::bulletin::rs_poly_packed_len;
 use crate::bulletin::{RsClientBulletinEntry, RsNodeBulletinEntry};
 use crate::channel::{self, ChannelParams};
-use crate::codec::{self, BYTES_PER_POLY};
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, poly_packed_len, poly_packed_len64, Commitment,
     Cs, HidingMerkleCommitment,
@@ -139,13 +135,6 @@ const REPS: usize = 5;
 
 /// One cell is one protocol execution.
 const SESSION: SessionId = SessionId([0x5C; 32]);
-
-/// Scheduling token = (rand u16, size u16) → 2 MSE symbols.
-const SCHED_TOKEN_SYMBOLS: usize = 2;
-/// Messaging payload sizes swept in the scheduled (two-round) section.
-/// The scheduled codec ignores ξ (token IBLT is fixed at 2 symbols), so the
-/// scheduled sweep runs once per message size, reusing CONFIGS[0].
-const SCHED_MESSAGE_BYTES: &[usize] = &[409600, 2097152];
 
 // RS-sharded ingress: (k, n) pairs run live, one extra round per pair per cell
 // (so the default is a single point). The pair fixes the redundancy `n−k`; `n`
@@ -592,8 +581,8 @@ struct Row {
     active: usize,
     cover: usize,
     iblt_cells: usize,
-    flow: &'static str,      // "mse" | "prony" | "sched"
-    payload_client_b: usize, // per-client useful bytes (element / msg slot)
+    flow: &'static str,      // "mse" | "prony"
+    payload_client_b: usize, // per-client useful bytes (element)
     mu_kahe: usize,
     delta: usize,
     xi: usize,
@@ -1052,23 +1041,10 @@ fn server_entry_b(r: &Row) -> usize {
 /// Per-cell RNG seed: domain-separated hash over every parameter that defines
 /// the cell, including the flow. Hashing (not byte-packing) keeps distinct
 /// cells on distinct streams regardless of magnitude.
-fn cell_seed(
-    s: usize,
-    n: usize,
-    active: usize,
-    xi: usize,
-    flow: &str,
-    message_bytes: usize,
-) -> [u8; 32] {
+fn cell_seed(s: usize, n: usize, active: usize, xi: usize, flow: &str) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"panetiere-scaling-cell");
-    for v in [
-        s as u64,
-        n as u64,
-        active as u64,
-        xi as u64,
-        message_bytes as u64,
-    ] {
+    for v in [s as u64, n as u64, active as u64, xi as u64] {
         h.update(v.to_le_bytes());
     }
     h.update(flow.as_bytes());
@@ -1081,28 +1057,24 @@ fn run_cell(
     active: usize,
     cfg: &Config,
     flow: &'static str,
-    message_bytes: usize,
     roles: Roles,
 ) -> Row {
     let cover = n - active;
     reset_peak_rss();
-    let seed = cell_seed(s, n, active, cfg.payload_symbols, flow, message_bytes);
+    let seed = cell_seed(s, n, active, cfg.payload_symbols, flow);
     let mut rng = ChaCha20Rng::from_seed(seed);
-    let sched = flow == "sched";
 
     // Channel sized to active (cover adds nothing). `mse` inserts the ξ-element;
     // `prony` re-derives ξ from the same payload bits, which both encodings
-    // carry at 34 bits per symbol; `sched` inserts a (rand,size) reservation
-    // token and appends a message vector to the same plaintext.
+    // carry at 34 bits per symbol.
     let ch = match flow {
         "mse" => ChannelParams::for_symbols(&mut rng, active as u32, cfg.payload_symbols),
         "prony" => {
             ChannelParams::prony_for_bits(active as u32, cfg.payload_symbols * BITS_PER_SYMBOL)
         }
-        "sched" => ChannelParams::for_symbols(&mut rng, active as u32, SCHED_TOKEN_SYMBOLS),
         other => panic!("unknown flow {other:?}"),
     };
-    let ch_polys = ch.n_polys();
+    let n_polys = ch.n_polys();
     // For `prony` the structural width is the Vandermonde column count, reported
     // in place of the IBLT's cell count.
     let (iblt_cells, delta) = match ch.mse() {
@@ -1112,16 +1084,6 @@ fn run_cell(
             (p.cols(), p.cols())
         }
     };
-    // Slots are byte-granular: chunks straddle bytes, but disjoint slots have
-    // disjoint bits, so the summed vector still decodes exactly.
-    let slot_bytes = if sched {
-        (message_bytes / active.max(1)).max(1)
-    } else {
-        0
-    };
-    let msg_vector_bytes = active * slot_bytes;
-    let msg_polys = msg_vector_bytes.div_ceil(BYTES_PER_POLY);
-    let n_polys = ch_polys + msg_polys;
     // One key covers the whole joint plaintext.
     let mu_kahe = n_polys;
     let t_modulus = ch.plaintext_modulus();
@@ -1146,54 +1108,16 @@ fn run_cell(
         .collect();
     let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
 
-    // Active clients carry a distinct payload; cover clients contribute zero.
-    // Mse/Prony: a ξ-symbol element. Scheduled: the (rand, size) reservation
-    // token each client posts, then the slot the allocator gives it.
-    let reservations: Vec<(u16, usize)> = if sched {
-        (0..active)
-            .map(|_| (rng.gen::<u16>(), slot_bytes))
-            .collect()
-    } else {
-        vec![]
-    };
-    let symbol_payloads: Vec<Vec<i64>> = if sched {
-        reservations
-            .iter()
-            .map(|&(rand, size)| vec![rand as i64, size as i64])
-            .collect()
-    } else {
-        (0..active)
-            .map(|i| {
-                (0..ch.payload_symbols())
-                    .map(|j| i as i64 + j as i64 + 1)
-                    .collect()
-            })
-            .collect()
-    };
-    // The allocation the recipient actually performs: peel the tokens, derive
-    // the beacon from their rands, assign offsets. Two clients that drew the
-    // same rand both lose their slot, so what a round delivers is `allocated`,
-    // not `active`.
-    let rands: Vec<u16> = reservations.iter().map(|&(r, _)| r).collect();
-    let offsets = codec::allocate(&reservations, codec::beacon(&rands), msg_vector_bytes);
-    let allocated: Vec<(usize, usize)> = offsets
-        .iter()
-        .enumerate()
-        .filter_map(|(i, off)| off.map(|o| (i, o)))
+    // Active clients carry a distinct ξ-symbol element; cover clients
+    // contribute zero.
+    let symbol_payloads: Vec<Vec<i64>> = (0..active)
+        .map(|i| {
+            (0..ch.payload_symbols())
+                .map(|j| i as i64 + j as i64 + 1)
+                .collect()
+        })
         .collect();
-    let byte_payloads: Vec<Vec<u8>> = (0..active)
-        .map(|i| vec![(i as u8).wrapping_add(1); slot_bytes])
-        .collect();
-    let ranges: Vec<(usize, usize)> = allocated.iter().map(|&(_, o)| (o, slot_bytes)).collect();
-    let range_payloads: Vec<Vec<u8>> = allocated
-        .iter()
-        .map(|&(i, _)| byte_payloads[i].clone())
-        .collect();
-    let (payload_bits, delivered) = if sched {
-        (slot_bytes * 8, allocated.len())
-    } else {
-        (ch.payload_symbols() * ch.bits_per_symbol(), active)
-    };
+    let payload_bits = ch.payload_symbols() * ch.bits_per_symbol();
     let client_polys: Vec<Vec<KahePoly>> = (0..n)
         .map(|i| {
             let mut polys = if i < active {
@@ -1202,10 +1126,6 @@ fn run_cell(
             } else {
                 channel::cover(&ch)
             };
-            polys.resize(ch_polys, KahePoly::default());
-            if let Some(off) = offsets.get(i).copied().flatten() {
-                polys.extend(codec::encode_at(off, msg_vector_bytes, &byte_payloads[i]));
-            }
             polys.resize(n_polys, KahePoly::default());
             polys
         })
@@ -1269,12 +1189,8 @@ fn run_cell(
 
     // [M] per-phase CPU, median of REPS one-party runs each.
     let (enc_app, _) = measure(|| {
-        let mut p = channel::encode_symbols(&mut rng, &ch, &SESSION, &symbol_payloads[0])
-            .expect("bench payload symbols are small and fit the symbol width");
-        if let Some(&(_, off)) = allocated.first() {
-            p.extend(codec::encode_at(off, msg_vector_bytes, &byte_payloads[0]));
-        }
-        p
+        channel::encode_symbols(&mut rng, &ch, &SESSION, &symbol_payloads[0])
+            .expect("bench payload symbols are small and fit the symbol width")
     });
     let (kahe_keygen_t, key0) = measure(|| kahe_keygen(&mut rng, &pp));
     let (kahe_enc, _ctxt0) = measure(|| kahe_encrypt(&mut rng, &pp, &key0, &client_polys[0]));
@@ -1333,17 +1249,9 @@ fn run_cell(
         p
     };
     let check_decode = |rec: &[KahePoly]| -> bool {
-        let elements_ok = channel::decode_symbols(&ch, &SESSION, &rec[..ch_polys], None)
+        channel::decode_symbols(&ch, &SESSION, rec, None)
             .map(|d| d == expected_payloads)
-            .unwrap_or(false);
-        if sched {
-            elements_ok
-                && codec::decode_ranges(&rec[ch_polys..n_polys], &ranges)
-                    .map(|d| d == range_payloads)
-                    .unwrap_or(false)
-        } else {
-            elements_ok
-        }
+            .unwrap_or(false)
     };
     let recovered_ok = recovered.as_deref().map(check_decode).unwrap_or(false);
 
@@ -1352,10 +1260,7 @@ fn run_cell(
         // May Err (PeelStalled) on unrecoverable params — we time the attempt.
         Some(rec) => {
             measure(|| {
-                let _ = channel::decode_symbols(&ch, &SESSION, &rec[..ch_polys], None);
-                if sched {
-                    let _ = codec::decode_ranges(&rec[ch_polys..n_polys], &ranges);
-                }
+                let _ = channel::decode_symbols(&ch, &SESSION, rec, None);
             })
             .0
         }
@@ -1679,7 +1584,7 @@ fn run_cell(
         agg_share_b,
         // ρ = every client's ciphertext is summed, cover included.
         eps_correct: correctness_epsilon(n, n_polys, t_modulus),
-        useful_b: (delivered * payload_bits) as f64 / 8.0,
+        useful_b: (active * payload_bits) as f64 / 8.0,
         wire_ctxt_b: n as f64 * ctxt_client_b as f64,
         wire_comm_b: n as f64 * poly_packed_len(HVC_MODULUS) as f64,
         wire_opening_b: (n * s) as f64 * open_env_b as f64,
@@ -2960,7 +2865,6 @@ fn row_from_csv(header: &[&str], line: &str) -> Result<Row, String> {
     let flow = match at("flow")? {
         "mse" => "mse",
         "prony" => "prony",
-        "sched" => "sched",
         other => return Err(format!("unknown flow {other:?}")),
     };
 
@@ -3321,41 +3225,23 @@ pub fn run() {
         "shamir threshold: {} (SWEEP_THRESHOLD)",
         ThresholdRule::from_env().describe()
     );
-    println!("useful = delivered · ξ · log₂(t) bits/round (cover clients carry no payload, and");
-    println!("         nor does a scheduled client whose reservation lost a rand collision)");
+    println!("useful = active · ξ · log₂(t) bits/round (cover clients carry no payload)");
     println!();
 
     let servers = env_list::<usize>("SWEEP_SERVERS").unwrap_or_else(|| SERVERS.to_vec());
     let clients = sweep_clients();
     let configs = sweep_configs();
-    let sched_bytes =
-        env_list::<usize>("SWEEP_SCHED_BYTES").unwrap_or_else(|| SCHED_MESSAGE_BYTES.to_vec());
 
-    // The protocol sweep, flattened once. Scheduled ignores ξ (its token IBLT
-    // is fixed at 2 symbols), so it varies over sched_bytes with configs[0].
-    let mut variants: Vec<(&Config, &'static str, usize, String)> = configs
+    // The protocol sweep, flattened once.
+    let variants: Vec<(&Config, &'static str, String)> = configs
         .iter()
         .flat_map(|cfg| {
             [
-                (cfg, "mse", 0, format!("mse {}", cfg.label)),
-                (cfg, "prony", 0, format!("prony {}", cfg.label)),
+                (cfg, "mse", format!("mse {}", cfg.label)),
+                (cfg, "prony", format!("prony {}", cfg.label)),
             ]
         })
         .collect();
-    match configs.first() {
-        Some(cfg0) => variants.extend(sched_bytes.iter().map(|&mb| {
-            (
-                cfg0,
-                "sched",
-                mb,
-                format!("sched msg={}", fmt_bytes(mb as f64)),
-            )
-        })),
-        None if !sched_bytes.is_empty() => {
-            eprintln!("(no payload configs; scheduled section skipped)")
-        }
-        None => {}
-    }
 
     let mut rows: Vec<Row> = Vec::new();
     let mut skipped = false;
@@ -3365,7 +3251,7 @@ pub fn run() {
     // point it reached rather than one protocol across all of them.
     'sweep: for &(clients_total, clients_active) in &clients {
         for &s in &servers {
-            for (cfg, flow, message_bytes, desc) in &variants {
+            for (cfg, flow, desc) in &variants {
                 if start.elapsed() >= budget {
                     skipped = true;
                     break 'sweep;
@@ -3374,15 +3260,7 @@ pub fn run() {
                     "running cell {}: clients={clients_total}x{clients_active} S={s} {desc}",
                     cell_id(rows.len())
                 );
-                rows.push(run_cell(
-                    s,
-                    clients_total,
-                    clients_active,
-                    cfg,
-                    flow,
-                    *message_bytes,
-                    roles,
-                ));
+                rows.push(run_cell(s, clients_total, clients_active, cfg, flow, roles));
             }
         }
     }

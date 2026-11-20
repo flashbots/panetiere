@@ -63,7 +63,7 @@ picks between (`channel`, `mse`, `prony`, `codec`), which all produce and consum
 | `protocol::*` | the round drivers, verifier, recipient policy |
 | `channel` | recommended payload layer: sizes either encoding for up to $C$ messages of $n$ bytes |
 | `mse` / `prony` | the two multiset encodings (peeling; MDS sketch) |
-| `codec` | raw byte↔poly packing and beacon-driven slot reservation |
+| `codec` | raw byte↔poly packing for disjoint slots |
 | `scaling_bench` | harness behind `panetiere_scaling` / `panetiere_merge` |
 
 ## Ingress modes
@@ -200,9 +200,8 @@ sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to m
 recovery is all-or-nothing for both. The sketch also needs a
 prime plaintext modulus, which `protocol_params` handles by selecting
 `PRONY_PRIME` for that variant. `mse` / `prony` directly when you want to choose
-$\gamma$, $\delta$, $\xi$, capacity or slack yourself. `codec` for non-multiset layouts (disjoint
-slots, or a reservation schedule via `beacon` / `allocate` / `encode_at` /
-`decode_ranges`) — use `encode_raw`/`decode_raw` there, since `encode`/`decode`
+$\gamma$, $\delta$, $\xi$, capacity or slack yourself. `codec` for disjoint byte slots
+— use `encode_raw`/`decode_raw` there, since `encode`/`decode`
 carry a per-coefficient length header that multiplies under summation.
 
 ### Client
@@ -483,18 +482,6 @@ Prony sketch:
 | 1k / 1k / 4k | 9.1 s | 0.54 | 2.0 s | 2.50 | 2.7 s | 1.83 |
 | 1k / 1k / 8k | 4.9 s | 1.01 | 1.8 s | 2.67 | 2.6 s | 1.86 |
 | 1k / 1k / 20k | 2.3 s | 2.12 | 1.8 s | 2.76 | 2.6 s | 1.87 |
-
-Slot reservation:
-
-| Links, client / server / bulletin (Mbit/s) | Direct | MB/s | Aggregated | MB/s | Erasure-coded | MB/s |
-|---|---|---|---|---|---|---|
-| 100 / 1k / 1k | 37.6 s | 0.13 | 2.7 s | 1.79 | 2.9 s | 1.68 |
-| 100 / 4k / 4k | 9.8 s | 0.50 | 1.5 s | 3.22 | 1.9 s | 2.52 |
-| 100 / 1k / 8k | 5.1 s | 0.96 | 1.8 s | 2.74 | 2.7 s | 1.84 |
-| 100 / 1k / 20k | 2.3 s | 2.11 | 1.7 s | 2.85 | 2.7 s | 1.85 |
-| 1k / 1k / 4k | 9.8 s | 0.50 | 1.9 s | 2.55 | 2.7 s | 1.81 |
-| 1k / 1k / 8k | 5.1 s | 0.96 | 1.8 s | 2.74 | 2.7 s | 1.84 |
-| 1k / 1k / 20k | 2.3 s | 2.11 | 1.7 s | 2.85 | 2.7 s | 1.85 |
 
 ### Bytes on each link
 
