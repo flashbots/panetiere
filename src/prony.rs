@@ -828,7 +828,12 @@ impl PronySketch {
                 let mut coeffs = [0i64; N];
                 let start = i * per_poly;
                 let end = (start + per_poly).min(n_elements);
-                for (slot, e) in coeffs.chunks_exact_mut(PRONY_OMEGA).zip(start..end) {
+                for (slot, e) in coeffs
+                    .as_chunks_mut::<PRONY_OMEGA>()
+                    .0
+                    .iter_mut()
+                    .zip(start..end)
+                {
                     let x = element(e);
                     slot[0] = center(x.a, p);
                     slot[1] = center(x.b, p);
@@ -1016,15 +1021,16 @@ impl PronySketch {
             .into_flattened();
         v.truncate(params.total_scalars());
         let c = params.capacity;
-        let k = v
-            .drain(..PRONY_OMEGA * c)
-            .collect::<Vec<i64>>()
-            .chunks_exact(PRONY_OMEGA)
+        let k = v[..PRONY_OMEGA * c]
+            .as_chunks::<PRONY_OMEGA>()
+            .0
+            .iter()
             .map(|s| F2 {
                 a: canon(s[0], p),
                 b: canon(s[1], p),
             })
             .collect();
+        v.drain(..PRONY_OMEGA * c);
         Self {
             params: params.clone(),
             k,
