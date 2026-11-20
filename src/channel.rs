@@ -345,11 +345,7 @@ pub fn encode_symbols<R: CryptoRng + Rng>(
             enc.insert(rng, &element);
             enc.pack()
         }
-        Encoding::Prony(params) => {
-            let mut sketch = PronySketch::new(params.clone());
-            sketch.insert(rng, &element);
-            sketch.pack()
-        }
+        Encoding::Prony(params) => PronySketch::encode(params, rng, &element),
     })
 }
 
