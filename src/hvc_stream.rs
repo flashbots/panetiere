@@ -25,7 +25,6 @@ fn accumulate_product(accumulator: &mut [u64], left: &[u32; N], right: &[u32; N]
     #[cfg(target_arch = "aarch64")]
     unsafe {
         accumulate_product_neon(accumulator, left, right);
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     for ((sum, &left), &right) in accumulator.iter_mut().zip(left).zip(right) {
