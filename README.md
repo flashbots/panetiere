@@ -372,3 +372,8 @@ Same cell (Prony).
   <source media="(prefers-color-scheme: dark)" srcset="docs/traffic-dark.svg">
   <img src="docs/traffic.svg" width="760" alt="Bytes on each connection of one round, at 16 servers and 300 clients of 16 KB with the Prony sketch encoding. Each client posts 7.06 MB and the recipient downloads all 2.12 GB. Key-share envelopes are 70 KB per client per server.">
 </picture>
+
+## Contributing
+
+Taking part means following the [code of conduct](CODE_OF_CONDUCT.md),
+which says how to report a problem and how it is handled.
