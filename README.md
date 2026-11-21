@@ -8,7 +8,7 @@ reveal the *sum* of the clients' encrypted vectors and nothing else, and an appl
 encoding turns that sum back into the individual messages. Not audited — do not use in production.
 
 This file is the integration guide: architecture, roles, and the call sequence.
-Tests, benchmarks and performance numbers are in [TESTING.md](TESTING.md).
+Tests and benchmarks are in [TESTING.md](TESTING.md).
 
 The protocol requires authenticated, consistent broadcast delivery: callers must
 supply the same unmodified client posts, bound to their sender and session, to
@@ -60,7 +60,6 @@ drivers under `protocol::`, and the payload encodings a caller picks between
 | `protocol::*` | the round drivers, verifier, recipient policy |
 | `channel` | recommended payload layer: sizes either encoding for up to $C$ messages of $n$ bytes |
 | `mse` / `prony` | the two multiset encodings (peeling; MDS sketch) |
-| `scaling_bench` | harness behind `panetiere_scaling` / `panetiere_merge` |
 
 ## Ingress
 
