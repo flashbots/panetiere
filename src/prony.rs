@@ -317,6 +317,19 @@ impl Ext {
         }
     }
 
+    /// `x^e`, by square and multiply.
+    fn pow(self, mut x: F2, mut e: u64) -> F2 {
+        let mut r = F2::ONE;
+        while e > 0 {
+            if e & 1 == 1 {
+                r = self.mul(r, x);
+            }
+            x = self.mul(x, x);
+            e >>= 1;
+        }
+        r
+    }
+
     fn random<R: Rng>(self, rng: &mut R) -> F2 {
         F2 {
             a: rng.gen_range(0..self.f.p),
@@ -1019,20 +1032,20 @@ impl PronySketch {
 
         // Unused payload columns must match the recovered payloads. The power
         // ladder depends only on the keys, so it is built once here rather
-        // than per element.
+        // than per element. At full capacity there are no unused columns.
+        let start = if rho_hat < c {
+            r.iter().map(|&ri| ext.pow(ri, rho_hat as u64)).collect()
+        } else {
+            Vec::new()
+        };
         let rpow: Vec<Vec<F2>> = (rho_hat..c)
-            .scan(
-                r.iter()
-                    .map(|&ri| (0..rho_hat).fold(F2::ONE, |acc, _| ext.mul(acc, ri)))
-                    .collect::<Vec<F2>>(),
-                |cur, _| {
-                    let this = cur.clone();
-                    for (pw, &ri) in cur.iter_mut().zip(r.iter()) {
-                        *pw = ext.mul(*pw, ri);
-                    }
-                    Some(this)
-                },
-            )
+            .scan(start, |cur: &mut Vec<F2>, _| {
+                let this = cur.clone();
+                for (pw, &ri) in cur.iter_mut().zip(r.iter()) {
+                    *pw = ext.mul(*pw, ri);
+                }
+                Some(this)
+            })
             .collect();
         let bad = xs.par_iter().enumerate().any(|(l, xrow)| {
             rpow.iter().enumerate().any(|(idx, rj)| {
@@ -1173,20 +1186,15 @@ mod tests {
                 assert_eq!(ext.mul(x, ext.inv(x)), F2::ONE);
             }
         }
-        // Frobenius: x^t = x_a − x_b Z, since Z^t = Z · 3^{(t−1)/2} = −Z.
         let x = rand_f2(&mut rng);
-        let mut xt = F2::ONE;
-        let mut base = x;
-        let mut e = PRONY_PRIME;
-        while e > 0 {
-            if e & 1 == 1 {
-                xt = ext.mul(xt, base);
-            }
-            base = ext.mul(base, base);
-            e >>= 1;
+        let mut xe = F2::ONE;
+        for e in 0..40u64 {
+            assert_eq!(ext.pow(x, e), xe, "e = {e}");
+            xe = ext.mul(xe, x);
         }
+        // Frobenius: x^t = x_a − x_b Z, since Z^t = Z · 3^{(t−1)/2} = −Z.
         assert_eq!(
-            xt,
+            ext.pow(x, PRONY_PRIME),
             F2 {
                 a: x.a,
                 b: f.sub(0, x.b)
