@@ -2488,7 +2488,7 @@ mod tests {
 
     fn setup_and_commit(seed: u8, mu_cs: usize) -> (CsParams, Commitment, Vec<Opening>) {
         let mut rng = ChaCha20Rng::from_seed([seed; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, mu_cs, 5);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, mu_cs, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, mu_cs);
         let (comm, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         (pp, comm, openings)
