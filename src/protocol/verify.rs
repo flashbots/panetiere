@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use crate::{CsPoly, KahePoly};
 use rayon::prelude::*;
@@ -25,15 +24,6 @@ pub enum VerifyError {
     AnonymitySetTooSmall { got: usize, min: usize },
     TooManyClients { got: usize, max: usize },
     ShareRecovery(SssError),
-}
-
-#[derive(Clone, Copy, Default, Debug)]
-pub struct VerifyTimings {
-    pub agg_ctxt_us: f64,
-    pub sum_comm_us: f64,
-    pub opening_verify_us: f64,
-    pub interpolation_us: f64,
-    pub kahe_dec_us: f64,
 }
 
 fn verify_one_server(
@@ -106,16 +96,6 @@ pub fn aggregate_and_decrypt_unverified(
     client_entries: &[(ClientId, ClientBulletinEntry)],
     server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
-    aggregate_and_decrypt_unverified_timed(pp, canonical, client_entries, server_outputs)
-        .map(|(m, _)| m)
-}
-
-pub fn aggregate_and_decrypt_unverified_timed(
-    pp: &ProtocolParams,
-    canonical: &[ClientId],
-    client_entries: &[(ClientId, ClientBulletinEntry)],
-    server_outputs: &[ServerBulletinEntry],
-) -> Result<(Vec<KahePoly>, VerifyTimings), VerifyError> {
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
@@ -148,8 +128,6 @@ pub fn aggregate_and_decrypt_unverified_timed(
         .map(|(i, (cid, _))| (*cid, i))
         .collect();
 
-    let mut tt = VerifyTimings::default();
-    let now = Instant::now();
     let mut ctxts: Vec<&[KahePoly]> = Vec::with_capacity(canonical.len());
     let mut ctxt_len: Option<usize> = None;
     for cid in canonical {
@@ -164,9 +142,7 @@ pub fn aggregate_and_decrypt_unverified_timed(
         ctxts.push(&p.ctxt);
     }
     let summed_ctxt = Kahe::agg_ctxt_refs(&ctxts);
-    tt.agg_ctxt_us = now.elapsed().as_secs_f64() * 1e6;
 
-    let now = Instant::now();
     let comms: Vec<&Commitment> = canonical
         .iter()
         .map(|cid| {
@@ -175,10 +151,8 @@ pub fn aggregate_and_decrypt_unverified_timed(
         })
         .collect();
     let summed_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
-    tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Single CS verification per server (μ_cs = κ_kahe packs all components).
-    let now = Instant::now();
     let results: Vec<Result<(), VerifyError>> = server_outputs
         .par_iter()
         .enumerate()
@@ -187,20 +161,13 @@ pub fn aggregate_and_decrypt_unverified_timed(
     for r in results {
         r?;
     }
-    tt.opening_verify_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Lagrange-interpolate the KAHE key from the first `t` servers' summed
     // Shamir shares (R_{q_cs}), then bridge into R_{q_kahe} via centered-rep
     // lift before wrapping as `KaheAggKey`.
-    let now = Instant::now();
     let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
-    tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
-    let now = Instant::now();
-    let m = Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key);
-    tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
-
-    Ok((m, tt))
+    Ok(Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key))
 }
 
 /// Decrypt from client posts that are already summed over the whole client

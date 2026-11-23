@@ -19,7 +19,6 @@ pub mod protocol;
 #[cfg(test)]
 mod reference_params;
 pub mod rings;
-pub mod scaling_bench;
 pub mod sss;
 
 pub use chipmunk_code::path::Path;
