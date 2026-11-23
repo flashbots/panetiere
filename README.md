@@ -53,7 +53,7 @@ drivers under `protocol::`, and the payload encodings a caller picks between
 | Module | |
 |---|---|
 | `kahe` | key-additive homomorphic encryption, plus the CS↔KAHE bridge |
-| `sss` | Shamir *t*-of-*n* (and additive) sharing over the CS ring |
+| `sss` | Shamir *t*-of-*n* sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
 | `pke` | ML-KEM-768 + AES-GCM envelopes for the key shares |
 | `bulletin` | published entry types and their byte encodings |
