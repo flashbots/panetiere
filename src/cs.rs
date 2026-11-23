@@ -2505,8 +2505,13 @@ mod tests {
     // zero randomness it is zero followed by the shares themselves
     #[test]
     fn leaf_block_with_zero_randomness_is_the_shares() {
+        // leaf_block doesn't use the tree, so any number of servers will do
+        const DUMMY_SERVERS: usize = 4;
+        // more than one committed value, so the loop over them runs more than once
+        const TEST_MU_CS: usize = 3;
         let mut rng = ChaCha20Rng::from_seed([110u8; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 3, 5);
+        let pp =
+            HidingMerkleCommitment::setup_with_dims(&mut rng, DUMMY_SERVERS, TEST_MU_CS, KAPPA_CS);
         let r = vec![CsPoly::default(); pp.kappa_cs];
         let s = rand_share_vec(&mut rng, pp.mu_cs);
         let block = leaf_block(&pp.a_ntt, &pp.b_matrix_ntt, &r, &s);
@@ -2519,7 +2524,7 @@ mod tests {
     // parameters is rejected, even when every poly the check reads is honest
     #[test]
     fn misshapen_opening_rejected() {
-        let (pp, comm, openings) = setup_and_commit(111, 1);
+        let (pp, comm, openings) = setup_and_commit(111, MU_CS);
         let good = &openings[1];
         assert!(HidingMerkleCommitment::verify(&pp, &comm, good).is_some());
         assert!(HidingMerkleCommitment::verify_fresh(&pp, &comm, good));
@@ -2554,10 +2559,11 @@ mod tests {
     // each field the sum relies on has to agree across the set on its own
     #[test]
     fn sum_openings_rejects_each_mismatched_field() {
+        const SERVERS: usize = 4;
         let mut rng = ChaCha20Rng::from_seed([112u8; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let mut open_first = || {
-            let shares = rand_shares(&mut rng, 4, 1);
+            let shares = rand_shares(&mut rng, SERVERS, MU_CS);
             let (_, mut opens) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
             opens.swap_remove(0)
         };
@@ -2594,12 +2600,13 @@ mod tests {
     // range, a missing commitment, or openings from different positions
     #[test]
     fn batch_check_rejects_malformed_input() {
+        const SERVERS: usize = 4;
         let mut rng = ChaCha20Rng::from_seed([114u8; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let mut rounds: Vec<(Commitment, Opening)> = Vec::new();
         let mut elsewhere: Vec<(Commitment, Opening)> = Vec::new();
         for _ in 0..4 {
-            let shares = rand_shares(&mut rng, 4, 1);
+            let shares = rand_shares(&mut rng, SERVERS, MU_CS);
             let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
             elsewhere.push((c.clone(), os.swap_remove(1)));
             rounds.push((c, os.swap_remove(1)));
@@ -2650,11 +2657,12 @@ mod tests {
     // a batch of exactly `batch_capacity` openings is still checked as a batch
     #[test]
     fn batch_check_accepts_a_full_batch() {
+        const SERVERS: usize = 4;
         let mut rng = ChaCha20Rng::from_seed([115u8; 32]);
-        let mut pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 1, 5);
+        let mut pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let rounds: Vec<(Commitment, Opening)> = (0..2)
             .map(|_| {
-                let shares = rand_shares(&mut rng, 4, 1);
+                let shares = rand_shares(&mut rng, SERVERS, MU_CS);
                 let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
                 (c, os.swap_remove(0))
             })
@@ -2713,7 +2721,7 @@ mod tests {
     // or a short body is an error, never a panic or a huge allocation
     #[test]
     fn packed_opening_header_is_validated() {
-        let (pp, _, openings) = setup_and_commit(117, 1);
+        let (pp, _, openings) = setup_and_commit(117, MU_CS);
         let (r_bound, tree_bound) = fresh_opening_pack_bounds(&pp);
         let packed = openings[0].pack(r_bound, tree_bound);
         assert!(Opening::from_packed(&packed).is_ok());
@@ -2799,7 +2807,7 @@ mod tests {
     fn aggregated_size_estimate_matches_the_packed_bytes() {
         let mut rng = ChaCha20Rng::from_seed([119u8; 32]);
         for (n_servers, mu_cs) in [(4usize, 1usize), (5, 2), (16, 1)] {
-            let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, mu_cs, 5);
+            let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, mu_cs, KAPPA_CS);
             let rho = 3u32;
             let openings: Vec<Opening> = (0..rho)
                 .map(|_| {
