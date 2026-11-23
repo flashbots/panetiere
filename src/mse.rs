@@ -99,12 +99,6 @@ impl MseParams {
         }
     }
 
-    /// Convenience: pick `payload_symbols` to fit a message of
-    /// `bits` bits.
-    pub fn payload_symbols_for_bits(bits: usize) -> usize {
-        bits.div_ceil(BITS_PER_SYMBOL)
-    }
-
     pub fn total_cells(&self) -> usize {
         self.gamma * self.delta
     }
@@ -141,7 +135,6 @@ pub enum MseError {
     /// A cell with count one holds a key that does not hash to that cell, so
     /// the table was not produced by `insert`.
     KeyMismatch,
-    ParamsMismatch,
     PayloadArity,
 }
 
@@ -229,22 +222,6 @@ impl MseEncoding {
                 self.v[s][idx] = reduce(self.v[s][idx] + payload_reduced[s]);
             }
         }
-    }
-
-    pub fn add_assign(&mut self, other: &Self) -> Result<(), MseError> {
-        if self.params != other.params {
-            return Err(MseError::ParamsMismatch);
-        }
-        for i in 0..self.c.len() {
-            self.c[i] = reduce(self.c[i] + other.c[i]);
-            for ell in 0..K_LIMBS {
-                self.k[ell][i] = reduce(self.k[ell][i] + other.k[ell][i]);
-            }
-            for s in 0..self.params.payload_symbols {
-                self.v[s][i] = reduce(self.v[s][i] + other.v[s][i]);
-            }
-        }
-        Ok(())
     }
 
     pub fn decode(&self) -> Result<Vec<Vec<i64>>, MseError> {
@@ -472,29 +449,6 @@ mod tests {
     }
 
     #[test]
-    fn union_via_pointwise_add() {
-        let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
-        let pp = params_for(4, 32, 1, 3);
-        let mut a = MseEncoding::new(pp.clone());
-        let mut b = MseEncoding::new(pp.clone());
-        for x in [1, 5, 9, 17] {
-            a.insert(&mut rng, &[x]);
-        }
-        for x in [2, 6, 11, 23] {
-            b.insert(&mut rng, &[x]);
-        }
-        a.add_assign(&b).unwrap();
-        let mut recovered: Vec<i64> = a
-            .decode()
-            .expect("decode")
-            .into_iter()
-            .map(|t| t[0])
-            .collect();
-        recovered.sort();
-        assert_eq!(recovered, vec![1, 2, 5, 6, 9, 11, 17, 23]);
-    }
-
-    #[test]
     fn pack_unpack_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
         let pp = params_for(4, 32, 1, 5);
@@ -567,8 +521,7 @@ mod tests {
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
-        let xi = MseParams::payload_symbols_for_bits(512);
-        assert_eq!(xi, 512usize.div_ceil(BITS_PER_SYMBOL));
+        let xi = 512usize.div_ceil(BITS_PER_SYMBOL);
         let pp = params_for(4, 32, xi, 31);
         let mut enc = MseEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..5)

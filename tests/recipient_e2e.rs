@@ -6,8 +6,7 @@ use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::run_client_round;
 use panetiere::protocol::recipient::{
-    recover_unverified_aggregate, recover_unverified_direct, recover_unverified_once,
-    RecipientError, RejectReason, SetPolicy,
+    recover_unverified_direct, recover_unverified_once, RecipientError, RejectReason, SetPolicy,
 };
 use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use panetiere::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
@@ -251,11 +250,6 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
     let r = round(12, 4, 4);
     assert_eq!(r.pp.shamir.t, 3);
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
-    let groups: Vec<_> = r
-        .publics
-        .iter()
-        .map(|(cid, entry)| (vec![*cid], entry.clone()))
-        .collect();
     let mut anchor = r.canonical.clone();
     anchor.reverse();
     let policy = SetPolicy::anchored(&anchor, 0, NO_CAP);
@@ -265,11 +259,8 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
         outputs[bad].clients.push(r.canonical[0]);
         outputs[(bad + 1) % r.outputs.len()].clients.reverse();
         let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap();
-        let aggregate = recover_unverified_aggregate(&r.pp, &policy, &groups, &outputs).unwrap();
         assert_eq!(direct.plaintext, want);
-        assert_eq!(aggregate.plaintext, want);
         assert_eq!(direct.canonical, r.canonical);
-        assert_eq!(aggregate.canonical, r.canonical);
     }
 
     let mut outputs = r.outputs.clone();
@@ -284,33 +275,18 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
         expected
     );
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &outputs).unwrap_err(),
-        expected
-    );
 }
 
 #[test]
 fn protocol_capacity_cannot_be_raised_by_policy() {
-    use panetiere::protocol::verify::{aggregate_and_decrypt_rs, decrypt_unverified_aggregate};
+    use panetiere::protocol::verify::decrypt_unverified_sum;
 
     let mut r = round(13, 4, 4);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    let groups: Vec<_> = r
-        .publics
-        .iter()
-        .map(|(cid, entry)| (vec![*cid], entry.clone()))
-        .collect();
     r.pp.max_clients = 4;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     assert_eq!(
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs)
-            .unwrap()
-            .plaintext,
-        want
-    );
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs)
             .unwrap()
             .plaintext,
         want
@@ -322,17 +298,13 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
         expected
     );
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs).unwrap_err(),
-        expected
-    );
     let expected = Err(VerifyError::TooManyClients { got: 4, max: 3 });
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs),
         expected
     );
     assert_eq!(
-        decrypt_unverified_aggregate(
+        decrypt_unverified_sum(
             &r.pp,
             &r.publics[0].1.ctxt,
             &r.publics[0].1.comm,
@@ -340,22 +312,6 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         ),
         expected
     );
-
-    let mut rng = ChaCha20Rng::from_seed([93; 32]);
-    let pp = ProtocolParams::setup_rs_mode(
-        &mut rng,
-        4,
-        1,
-        3,
-        4,
-        panetiere::kahe::T_MODULUS_DEFAULT,
-        3,
-        [94; 32],
-    );
-    assert!(matches!(
-        aggregate_and_decrypt_rs(&pp, &SESSION, &r.canonical, &[], &r.outputs, &[]),
-        Err(VerifyError::TooManyClients { got: 4, max: 3 })
-    ));
 }
 
 // a server that reports twice, or under an id outside the roster, voids the
@@ -381,27 +337,27 @@ fn duplicate_or_unknown_server_is_rejected() {
 // already-summed path
 #[test]
 fn summed_recovery_checks_servers_and_ciphertext_length() {
-    use panetiere::protocol::verify::decrypt_unverified_aggregate;
+    use panetiere::protocol::verify::decrypt_unverified_sum;
 
     // one client, so its own post is the sum
     let r = round(15, 5, 1);
     let entry = &r.publics[0].1;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     assert_eq!(
-        decrypt_unverified_aggregate(&r.pp, &entry.ctxt, &entry.comm, &r.outputs),
+        decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &r.outputs),
         Ok(want)
     );
 
     let mut twice = r.outputs.clone();
     twice[1] = twice[0].clone();
     assert_eq!(
-        decrypt_unverified_aggregate(&r.pp, &entry.ctxt, &entry.comm, &twice),
+        decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &twice),
         Err(VerifyError::BadServerCoverage)
     );
     let mut unknown = r.outputs.clone();
     unknown[1].server_id = ServerId(5);
     assert_eq!(
-        decrypt_unverified_aggregate(&r.pp, &entry.ctxt, &entry.comm, &unknown),
+        decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &unknown),
         Err(VerifyError::BadServerCoverage)
     );
 
@@ -409,14 +365,14 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
         r.outputs[0].server_id,
     ));
     assert_eq!(
-        decrypt_unverified_aggregate(&r.pp, &[], &entry.comm, &r.outputs),
+        decrypt_unverified_sum(&r.pp, &[], &entry.comm, &r.outputs),
         bad_len
     );
     let mut long = entry.ctxt.clone();
     long.push(entry.ctxt[0]);
     assert!(long.len() > r.pp.kahe.mu_kahe);
     assert_eq!(
-        decrypt_unverified_aggregate(&r.pp, &long, &entry.comm, &r.outputs),
+        decrypt_unverified_sum(&r.pp, &long, &entry.comm, &r.outputs),
         bad_len
     );
 }
@@ -456,55 +412,14 @@ fn exactly_the_floor_and_the_threshold_are_enough() {
     assert_eq!(r.pp.shamir.t, 3);
     r.pp.min_clients = 4;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
-    let groups: Vec<_> = r
-        .publics
-        .iter()
-        .map(|(cid, entry)| (vec![*cid], entry.clone()))
-        .collect();
     let policy = SetPolicy::anchored(&r.canonical, 4, NO_CAP);
 
     let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..3]).unwrap();
     assert_eq!(direct.plaintext, want);
     assert!(direct.culprits.is_empty());
-    let aggregate = recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs[..3]).unwrap();
-    assert_eq!(aggregate.plaintext, want);
-    assert!(aggregate.culprits.is_empty());
-
     assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &groups, &r.outputs[..2]).unwrap_err(),
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]).unwrap_err(),
         RecipientError::BelowShareThreshold { have: 2, need: 3 }
-    );
-}
-
-// the groups an aggregator hands over cover the canonical set exactly: a
-// missing client is named, and an extra one is a mismatch
-#[test]
-fn groups_must_cover_exactly_the_canonical_set() {
-    let r = round(18, 4, 4);
-    let groups: Vec<_> = r
-        .publics
-        .iter()
-        .map(|(cid, entry)| (vec![*cid], entry.clone()))
-        .collect();
-    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-
-    let mut missing = groups.clone();
-    missing.remove(2);
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &missing, &r.outputs).unwrap_err(),
-        RecipientError::Rejected(RejectReason::GroupAggregateMissing {
-            group_of: ClientId(2)
-        })
-    );
-
-    let mut extra = groups.clone();
-    extra[0].0.push(ClientId(99));
-    assert_eq!(
-        recover_unverified_aggregate(&r.pp, &policy, &extra, &r.outputs).unwrap_err(),
-        RecipientError::Rejected(RejectReason::GroupMembershipMismatch {
-            got: 5,
-            expected: 4
-        })
     );
 }
 

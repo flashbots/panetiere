@@ -1,7 +1,6 @@
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
 use panetiere::bulletin::ClientBulletinEntry;
-use panetiere::codec;
 use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::{run_client_round, ClientRound};
@@ -260,298 +259,11 @@ fn run<R: rand::Rng + rand::CryptoRng>(
     (expected, recovered[0])
 }
 
-/// Several clients write distinct byte payloads into disjoint coefficient slots
-/// of a single `HVCPoly`. The protocol's recovered sum decodes back to a
-/// 1024-byte buffer with each client's bytes intact in its own slot — i.e.
-/// anonymous broadcast in slot mode.
-///
-/// `t = T_MODULUS_DEFAULT = 2^36`; the codec packs 32-bit symbols per
-/// coefficient, comfortably inside t.
-#[test]
-fn slot_mode_disjoint_clients_recover_each_payload() {
-    let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-    let n_servers = 3;
-
-    let messages: &[&[u8]] = &[
-        b"hello from client 0",
-        b"client 1 says hi",
-        b"another from #2",
-        b"#3: anonymous broadcast",
-        b"client 4 here",
-        b"final note from 5",
-    ];
-    let n_clients = messages.len();
-    const SLOT_SIZE: usize = 128;
-    // One KahePoly = N·4 bytes = 8192 at N=2048.
-    const TOTAL_BYTES: usize = codec::BYTES_PER_POLY;
-    assert!(n_clients * SLOT_SIZE <= TOTAL_BYTES);
-
-    let pp = ProtocolParams::setup(&mut rng, n_servers);
-    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
-        .map(|_| pke::PrivateKey::generate(&mut rng))
-        .collect();
-    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
-        .iter()
-        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
-        .collect();
-    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
-
-    let mut client_entries = Vec::new();
-    let mut inboxes: Vec<ServerInbox> = server_ids
-        .iter()
-        .map(|&sid| ServerInbox {
-            server_id: sid,
-            items: vec![],
-        })
-        .collect();
-
-    for (slot, &cid) in client_ids.iter().enumerate() {
-        let payload = messages[slot];
-        let mut buf = vec![0u8; TOTAL_BYTES];
-        let start = slot * SLOT_SIZE;
-        buf[start..start + payload.len()].copy_from_slice(payload);
-
-        let polys = codec::encode_raw(&buf);
-        assert_eq!(polys.len(), 1, "slot buffer sized to one KahePoly");
-
-        let round = run_client_round(&mut rng, &pp, &SESSION, cid, polys, &servers);
-        client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-            assert_eq!(sid, server_ids[idx]);
-            let opening =
-                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
-            inboxes[idx].items.push((cid, opening));
-        }
-    }
-
-    let canonical = client_ids;
-    let commitments: Vec<(ClientId, Commitment)> = client_entries
-        .iter()
-        .map(|(cid, e)| (*cid, e.comm.clone()))
-        .collect();
-    let outputs: Vec<_> = inboxes
-        .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
-        .collect();
-
-    let recovered = aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-        .expect("verify failed");
-    let recovered_bytes = codec::decode_raw(&recovered).expect("decode");
-    assert_eq!(recovered_bytes.len(), TOTAL_BYTES);
-
-    for slot in 0..n_clients {
-        let start = slot * SLOT_SIZE;
-        let payload = messages[slot];
-        assert_eq!(
-            &recovered_bytes[start..start + payload.len()],
-            payload,
-            "slot {} should hold its client's payload",
-            slot
-        );
-        assert!(
-            recovered_bytes[start + payload.len()..start + SLOT_SIZE]
-                .iter()
-                .all(|&b| b == 0),
-            "non-payload bytes in slot {} should be zero",
-            slot
-        );
-    }
-}
-
-/// 16 KB broadcast: total buffer is 2 polys (16384 bytes). Each of 4 clients
-/// writes a 4 KB payload into its own slot; we run the full protocol once per
-/// poly index of the encoded buffer (2 sub-rounds), recover the per-poly sums,
-/// concatenate, and assert each client's slot decodes byte-for-byte.
-///
-#[test]
-fn slot_mode_8kb_message_multi_poly() {
-    let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-    let n_servers = 3;
-    let n_clients = 4;
-    const SLOT_SIZE: usize = 4096;
-    const TOTAL_BYTES: usize = 16 * 1024;
-    // One KahePoly = N·4 bytes = 8192 at N=2048 → 16 KiB spans 2 polys.
-    const N_POLYS: usize = TOTAL_BYTES.div_ceil(panetiere::codec::BYTES_PER_POLY);
-    assert_eq!(n_clients * SLOT_SIZE, TOTAL_BYTES);
-
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(n_clients);
-    let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(n_clients);
-    for slot in 0..n_clients {
-        let payload: Vec<u8> = (0..SLOT_SIZE)
-            .map(|j| ((slot * 131 + j * 17) & 0xFF) as u8)
-            .collect();
-        let mut buf = vec![0u8; TOTAL_BYTES];
-        buf[slot * SLOT_SIZE..(slot + 1) * SLOT_SIZE].copy_from_slice(&payload);
-        payloads.push(payload);
-        buffers.push(buf);
-    }
-
-    let encoded: Vec<Vec<KahePoly>> = buffers
-        .iter()
-        .map(|b| {
-            let polys = panetiere::codec::encode_raw(b);
-            assert_eq!(polys.len(), N_POLYS);
-            polys
-        })
-        .collect();
-
-    let pp = ProtocolParams::setup(&mut rng, n_servers);
-    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
-        .map(|_| pke::PrivateKey::generate(&mut rng))
-        .collect();
-    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
-        .iter()
-        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
-        .collect();
-    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
-    let canonical = client_ids.clone();
-
-    let mut recovered_polys = Vec::with_capacity(N_POLYS);
-    for poly_idx in 0..N_POLYS {
-        let mut client_entries = Vec::new();
-        let mut inboxes: Vec<ServerInbox> = server_ids
-            .iter()
-            .map(|&sid| ServerInbox {
-                server_id: sid,
-                items: vec![],
-            })
-            .collect();
-        for (i, &cid) in client_ids.iter().enumerate() {
-            let m = encoded[i][poly_idx];
-            let round = run_client_round(&mut rng, &pp, &SESSION, cid, vec![m], &servers);
-            client_entries.push((round.client_id, round.encrypted_message));
-            for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                assert_eq!(sid, server_ids[idx]);
-                let opening =
-                    unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
-                inboxes[idx].items.push((cid, opening));
-            }
-        }
-        let commitments: Vec<(ClientId, Commitment)> = client_entries
-            .iter()
-            .map(|(cid, e)| (*cid, e.comm.clone()))
-            .collect();
-        let outputs: Vec<_> = inboxes
-            .iter()
-            .map(|inb| {
-                run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
-            })
-            .collect();
-        let recovered =
-            aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &outputs)
-                .unwrap_or_else(|e| panic!("verify failed at poly {}: {:?}", poly_idx, e));
-        assert_eq!(recovered.len(), 1);
-        recovered_polys.push(recovered[0]);
-    }
-
-    let recovered_bytes = panetiere::codec::decode_raw(&recovered_polys).expect("decode");
-    assert!(recovered_bytes.len() >= TOTAL_BYTES);
-    assert!(recovered_bytes[TOTAL_BYTES..].iter().all(|&b| b == 0));
-
-    for slot in 0..n_clients {
-        let start = slot * SLOT_SIZE;
-        assert_eq!(
-            &recovered_bytes[start..start + SLOT_SIZE],
-            payloads[slot].as_slice(),
-            "slot {} mismatch",
-            slot
-        );
-    }
-}
-
 #[test]
 fn end_to_end_recovers_sum() {
     let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
     let (expected, recovered) = run(&mut rng, 4, 8);
     assert_eq!(expected, recovered);
-}
-
-/// Aggregated flow recovers the same sum as the direct flow: clients' public
-/// ciphertexts/commitments are summed per group, re-summed across groups, and
-/// fed to `decrypt_unverified_aggregate` — openings still go to every server as usual.
-#[test]
-fn aggregated_recovers_same_sum() {
-    use panetiere::cs::{Cs, HidingMerkleCommitment};
-    use panetiere::kahe::{Kahe, KaheScheme};
-    use panetiere::protocol::aggregator::run_aggregator_round;
-    use panetiere::protocol::verify::decrypt_unverified_aggregate;
-
-    let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
-    let n_servers = 4;
-    let n_clients = 45; // > 40, spans 2 groups of ≤ 40
-    let n_groups = 2;
-
-    let pp = ProtocolParams::setup(&mut rng, n_servers);
-    let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
-    let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
-        .map(|_| pke::PrivateKey::generate(&mut rng))
-        .collect();
-    let servers: Vec<(ServerId, pke::PublicKey)> = server_ids
-        .iter()
-        .map(|&sid| (sid, server_keys[sid.0 as usize].public()))
-        .collect();
-    let client_ids: Vec<ClientId> = (0..n_clients as u32).map(ClientId).collect();
-
-    let mut client_entries = Vec::with_capacity(n_clients);
-    let mut inboxes: Vec<ServerInbox> = server_ids
-        .iter()
-        .map(|&sid| ServerInbox {
-            server_id: sid,
-            items: vec![],
-        })
-        .collect();
-
-    for &cid in &client_ids {
-        let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
-        let round = run_client_round(&mut rng, &pp, &SESSION, cid, vec![m], &servers);
-        client_entries.push((round.client_id, round.encrypted_message));
-        for (idx, (sid, sealed)) in round.sealed_openings.into_iter().enumerate() {
-            assert_eq!(sid, server_ids[idx]);
-            let opening =
-                unseal_opening(&server_keys[idx], &SESSION, cid, sid, &sealed).expect("unseal");
-            inboxes[idx].items.push((cid, opening));
-        }
-    }
-
-    let canonical = client_ids.clone();
-    let commitments: Vec<(ClientId, Commitment)> = client_entries
-        .iter()
-        .map(|(cid, e)| (*cid, e.comm.clone()))
-        .collect();
-    let server_outputs: Vec<_> = inboxes
-        .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
-        .collect();
-
-    let direct =
-        aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
-            .expect("direct verify failed");
-
-    // Partition clients into groups; each aggregator sums its group's publics.
-    let groups: Vec<Vec<(ClientId, _)>> = (0..n_groups)
-        .map(|g| {
-            client_entries
-                .iter()
-                .filter(|(cid, _)| cid.0 as usize % n_groups == g)
-                .cloned()
-                .collect()
-        })
-        .collect();
-    let aggregates: Vec<_> = groups.iter().map(|g| run_aggregator_round(g)).collect();
-
-    // Leader re-sums per-group aggregates across groups.
-    let group_ctxts: Vec<Vec<KahePoly>> =
-        aggregates.iter().map(|a| a.summed_ctxt.clone()).collect();
-    let group_comms: Vec<_> = aggregates.iter().map(|a| a.summed_comm.clone()).collect();
-    let total_ctxt = Kahe::agg_ctxt(&group_ctxts);
-    let total_comm = HidingMerkleCommitment::sum_commitments(&group_comms);
-
-    let aggregated = decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
-        .expect("aggregated verify failed");
-
-    assert_eq!(direct, aggregated);
 }
 
 /// An envelope cannot be replayed into another session, re-attributed to another
@@ -652,9 +364,7 @@ fn tampered_agg_share_rejected() {
 
 #[test]
 fn below_floor_anonymity_set_rejected() {
-    use panetiere::cs::{Cs, HidingMerkleCommitment};
-    use panetiere::kahe::{Kahe, KaheScheme};
-    use panetiere::protocol::verify::{decrypt_unverified_aggregate, VerifyError};
+    use panetiere::protocol::verify::VerifyError;
 
     let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
     let n_servers = 4;
@@ -710,23 +420,8 @@ fn below_floor_anonymity_set_rejected() {
         })
     );
 
-    let ctxts: Vec<Vec<KahePoly>> = client_entries.iter().map(|(_, e)| e.ctxt.clone()).collect();
-    let comms: Vec<_> = client_entries.iter().map(|(_, e)| e.comm.clone()).collect();
-    let total_ctxt = Kahe::agg_ctxt(&ctxts);
-    let total_comm = HidingMerkleCommitment::sum_commitments(&comms);
-    let result = decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs);
-    assert_eq!(
-        result,
-        Err(VerifyError::AnonymitySetTooSmall {
-            got: n_clients,
-            min: n_clients + 1
-        })
-    );
-
     pp.min_clients = n_clients;
     aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
-        .expect("at-floor set must verify");
-    decrypt_unverified_aggregate(&pp, &total_ctxt, &total_comm, &server_outputs)
         .expect("at-floor set must verify");
 }
 

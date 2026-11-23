@@ -1,24 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use crate::{CsPoly, KahePoly};
 use rayon::prelude::*;
 
-use crate::bulletin::{
-    ClientBulletinEntry, RsClientBulletinEntry, RsNodeBulletinEntry, ServerBulletinEntry,
-};
+use crate::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
 use crate::cs::{Commitment, Cs, HidingMerkleCommitment};
-use crate::hvc_sum::sum_hvc_polys;
 use crate::kahe::{lift_cs_to_kahe, Kahe, KaheAggKey, KaheScheme};
-use crate::rs::{Rs, RsError};
-use crate::share_commitment::verify_aggregated;
-use crate::sig;
 use crate::sss::{ShamirSharing, SssError};
-use crate::RsNTTPoly;
-use chipmunk_code::HVCPoly;
 
 use super::ProtocolParams;
-use super::{ClientId, NodeId, ServerId, SessionId};
+use super::{ClientId, ServerId};
 
 #[derive(Debug, PartialEq)]
 pub enum VerifyError {
@@ -30,33 +21,9 @@ pub enum VerifyError {
     BadServerCoverage,
     InconsistentCanonical(ServerId),
     InconsistentCiphertextLen(ServerId),
-    AnonymitySetTooSmall {
-        got: usize,
-        min: usize,
-    },
-    TooManyClients {
-        got: usize,
-        max: usize,
-    },
+    AnonymitySetTooSmall { got: usize, min: usize },
+    TooManyClients { got: usize, max: usize },
     ShareRecovery(SssError),
-    /// RS mode only.
-    NotRsMode,
-    NotEnoughNodes,
-    BadNodeCoverage,
-    InconsistentNodeCanonical(NodeId),
-    BadSignature(ClientId),
-    Reconstruct(RsError),
-    /// These lanes' posts do not open the summed signed roots.
-    LaneOpeningFailed(Vec<NodeId>),
-}
-
-#[derive(Clone, Copy, Default, Debug)]
-pub struct VerifyTimings {
-    pub agg_ctxt_us: f64,
-    pub sum_comm_us: f64,
-    pub opening_verify_us: f64,
-    pub interpolation_us: f64,
-    pub kahe_dec_us: f64,
 }
 
 fn verify_one_server(
@@ -129,16 +96,6 @@ pub fn aggregate_and_decrypt_unverified(
     client_entries: &[(ClientId, ClientBulletinEntry)],
     server_outputs: &[ServerBulletinEntry],
 ) -> Result<Vec<KahePoly>, VerifyError> {
-    aggregate_and_decrypt_unverified_timed(pp, canonical, client_entries, server_outputs)
-        .map(|(m, _)| m)
-}
-
-pub fn aggregate_and_decrypt_unverified_timed(
-    pp: &ProtocolParams,
-    canonical: &[ClientId],
-    client_entries: &[(ClientId, ClientBulletinEntry)],
-    server_outputs: &[ServerBulletinEntry],
-) -> Result<(Vec<KahePoly>, VerifyTimings), VerifyError> {
     if server_outputs.is_empty() {
         return Err(VerifyError::NoServers);
     }
@@ -171,8 +128,6 @@ pub fn aggregate_and_decrypt_unverified_timed(
         .map(|(i, (cid, _))| (*cid, i))
         .collect();
 
-    let mut tt = VerifyTimings::default();
-    let now = Instant::now();
     let mut ctxts: Vec<&[KahePoly]> = Vec::with_capacity(canonical.len());
     let mut ctxt_len: Option<usize> = None;
     for cid in canonical {
@@ -187,9 +142,7 @@ pub fn aggregate_and_decrypt_unverified_timed(
         ctxts.push(&p.ctxt);
     }
     let summed_ctxt = Kahe::agg_ctxt_refs(&ctxts);
-    tt.agg_ctxt_us = now.elapsed().as_secs_f64() * 1e6;
 
-    let now = Instant::now();
     let comms: Vec<&Commitment> = canonical
         .iter()
         .map(|cid| {
@@ -198,10 +151,8 @@ pub fn aggregate_and_decrypt_unverified_timed(
         })
         .collect();
     let summed_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
-    tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Single CS verification per server (μ_cs = κ_kahe packs all components).
-    let now = Instant::now();
     let results: Vec<Result<(), VerifyError>> = server_outputs
         .par_iter()
         .enumerate()
@@ -210,190 +161,18 @@ pub fn aggregate_and_decrypt_unverified_timed(
     for r in results {
         r?;
     }
-    tt.opening_verify_us = now.elapsed().as_secs_f64() * 1e6;
 
     // Lagrange-interpolate the KAHE key from the first `t` servers' summed
     // Shamir shares (R_{q_cs}), then bridge into R_{q_kahe} via centered-rep
     // lift before wrapping as `KaheAggKey`.
-    let now = Instant::now();
     let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
-    tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
 
-    let now = Instant::now();
-    let m = Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key);
-    tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
-
-    Ok((m, tt))
+    Ok(Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key))
 }
 
-#[derive(Clone, Copy, Default, Debug)]
-pub struct RsVerifyTimings {
-    pub sig_verify_us: f64,
-    pub sum_comm_us: f64,
-    pub opening_verify_us: f64,
-    pub interpolation_us: f64,
-    /// Per-lane aggregated-opening verification against the summed roots.
-    pub lane_open_us: f64,
-    pub reconstruct_us: f64,
-    /// Re-encode the reconstruction and compare every reporting lane's post.
-    pub crosscheck_us: f64,
-    pub kahe_dec_us: f64,
-}
-
-pub fn aggregate_and_decrypt_rs(
-    pp: &ProtocolParams,
-    sid: &SessionId,
-    canonical: &[ClientId],
-    client_entries: &[(ClientId, RsClientBulletinEntry)],
-    server_outputs: &[ServerBulletinEntry],
-    node_outputs: &[RsNodeBulletinEntry],
-) -> Result<(Vec<KahePoly>, RsVerifyTimings), VerifyError> {
-    let rs = pp.rs.as_ref().ok_or(VerifyError::NotRsMode)?;
-    let scp = pp.share_comm.as_ref().ok_or(VerifyError::NotRsMode)?;
-    if server_outputs.is_empty() {
-        return Err(VerifyError::NoServers);
-    }
-    check_unique_clients(canonical)?;
-    check_client_count(pp, canonical)?;
-    if server_outputs.len() < pp.shamir.t {
-        return Err(VerifyError::BadServerCoverage);
-    }
-    if node_outputs.len() < rs.k {
-        return Err(VerifyError::NotEnoughNodes);
-    }
-
-    let mut seen: HashSet<u32> = HashSet::with_capacity(server_outputs.len());
-    for sp in server_outputs {
-        if (sp.server_id.0 as usize) >= pp.cs.n_servers || !seen.insert(sp.server_id.0) {
-            return Err(VerifyError::BadServerCoverage);
-        }
-        if sp.clients != canonical {
-            return Err(VerifyError::InconsistentCanonical(sp.server_id));
-        }
-    }
-    // `Σ sk` and `Σ ct` must cover exactly the same set or decryption yields
-    // noise, so the lanes are held to the same roster as the servers.
-    let mut seen_nodes: HashSet<u32> = HashSet::with_capacity(node_outputs.len());
-    for np in node_outputs {
-        if (np.node_id.0 as usize) >= rs.n || !seen_nodes.insert(np.node_id.0) {
-            return Err(VerifyError::BadNodeCoverage);
-        }
-        if np.clients != canonical {
-            return Err(VerifyError::InconsistentNodeCanonical(np.node_id));
-        }
-    }
-
-    let pub_index: HashMap<ClientId, usize> = client_entries
-        .iter()
-        .enumerate()
-        .map(|(i, (cid, _))| (*cid, i))
-        .collect();
-    let entries: Vec<&RsClientBulletinEntry> = canonical
-        .iter()
-        .map(|cid| {
-            pub_index
-                .get(cid)
-                .map(|i| &client_entries[*i].1)
-                .ok_or(VerifyError::MissingClient(*cid))
-        })
-        .collect::<Result<_, _>>()?;
-
-    let mut tt = RsVerifyTimings::default();
-
-    let now = Instant::now();
-    let sig_results: Vec<Result<(), VerifyError>> = canonical
-        .par_iter()
-        .zip(entries.par_iter())
-        .map(|(cid, e)| {
-            let vk = sig::VerifyingKey::from_sec1_bytes(&e.pubkey)
-                .map_err(|_| VerifyError::BadSignature(*cid))?;
-            vk.verify(
-                &RsClientBulletinEntry::signing_bytes(sid, *cid, &e.comm, &e.share_root),
-                &e.sig,
-            )
-            .map_err(|_| VerifyError::BadSignature(*cid))
-        })
-        .collect();
-    for r in sig_results {
-        r?;
-    }
-    tt.sig_verify_us = now.elapsed().as_secs_f64() * 1e6;
-
-    let now = Instant::now();
-    let comms: Vec<Commitment> = entries.iter().map(|e| e.comm.clone()).collect();
-    let summed_comm = HidingMerkleCommitment::sum_commitments(&comms);
-    let root_refs: Vec<&HVCPoly> = entries.iter().map(|e| &e.share_root).collect();
-    let summed_root = sum_hvc_polys(&root_refs);
-    tt.sum_comm_us = now.elapsed().as_secs_f64() * 1e6;
-
-    let now = Instant::now();
-    let results: Vec<Result<(), VerifyError>> = server_outputs
-        .par_iter()
-        .enumerate()
-        .map(|(i, sp)| verify_one_server(pp, &summed_comm, i, sp))
-        .collect();
-    for r in results {
-        r?;
-    }
-    tt.opening_verify_us = now.elapsed().as_secs_f64() * 1e6;
-
-    let now = Instant::now();
-    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
-    tt.interpolation_us = now.elapsed().as_secs_f64() * 1e6;
-
-    // Each lane's post is its own proof: `A·share_sum` must open the summed
-    // signed roots at that lane's position.
-    let now = Instant::now();
-    let bad: Vec<NodeId> = node_outputs
-        .par_iter()
-        .filter(|np| {
-            np.agg_open.lane_index != np.node_id.0 as usize
-                || !verify_aggregated(scp, &summed_root, &np.share_sum, &np.agg_open)
-        })
-        .map(|np| np.node_id)
-        .collect();
-    if !bad.is_empty() {
-        return Err(VerifyError::LaneOpeningFailed(bad));
-    }
-    tt.lane_open_us = now.elapsed().as_secs_f64() * 1e6;
-
-    // Reconstruct systematic-first: those sums are individually pinned, and a
-    // full systematic set makes reconstruction a concatenation.
-    let ell = pp.kahe.mu_kahe;
-    let now = Instant::now();
-    let mut ordered: Vec<&RsNodeBulletinEntry> = node_outputs.iter().collect();
-    ordered.sort_by_key(|np| ((np.node_id.0 as usize) >= rs.k, np.node_id.0));
-    let samples: Vec<(usize, &[RsNTTPoly])> = ordered
-        .iter()
-        .map(|np| (np.node_id.0 as usize, np.share_sum.as_slice()))
-        .collect();
-    let summed_ntt = Rs::reconstruct(rs, ell, &samples).map_err(VerifyError::Reconstruct)?;
-    tt.reconstruct_us = now.elapsed().as_secs_f64() * 1e6;
-
-    let now = Instant::now();
-    // Check reporting lanes against the re-encoded reconstruction. Exactly k
-    // lanes provide no independent lane redundancy; unreported lanes are unchecked.
-    let expected = Rs::encode(rs, &summed_ntt);
-    let liars: Vec<NodeId> = node_outputs
-        .iter()
-        .filter(|np| expected[np.node_id.0 as usize] != np.share_sum)
-        .map(|np| np.node_id)
-        .collect();
-    if !liars.is_empty() {
-        return Err(VerifyError::LaneOpeningFailed(liars));
-    }
-    tt.crosscheck_us = now.elapsed().as_secs_f64() * 1e6;
-
-    let now = Instant::now();
-    let plain = Kahe::dec_ntt(&pp.kahe, &summed_ntt, &agg_key);
-    tt.kahe_dec_us = now.elapsed().as_secs_f64() * 1e6;
-
-    Ok((plain, tt))
-}
-
-/// Aggregated-flow verifier: ciphertext and commitment are already summed over
-/// the whole client set, so there is no per-client `canonical` to cross-check.
-pub fn decrypt_unverified_aggregate(
+/// Decrypt from client posts that are already summed over the whole client
+/// set, so there is no per-client `canonical` to cross-check.
+pub fn decrypt_unverified_sum(
     pp: &ProtocolParams,
     summed_ctxt: &[KahePoly],
     summed_comm: &Commitment,

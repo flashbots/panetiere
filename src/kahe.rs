@@ -17,7 +17,6 @@
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
-use crate::rings::boxed_i64_coeffs;
 use crate::rings::{center_half_open_i64, center_i64, MU_MAX};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
@@ -272,48 +271,6 @@ impl Kahe {
                     *out = center_i64(a, q);
                 }
                 KahePoly::from_coeffs(coeffs)
-            })
-            .collect()
-    }
-
-    pub fn enc_ntt<R: Rng>(
-        rng: &mut R,
-        pp: &KaheParams,
-        k: &KaheKey,
-        m: &[KahePoly],
-    ) -> Vec<KaheNTTPoly> {
-        debug_assert!(m.len() <= pp.mu_kahe);
-        let t = pp.t_modulus as i64;
-        let sk_ntt = KaheNTTPoly::from(k.inner());
-        let seeds = crate::fork_seeds(rng, m.len());
-        let mut result: Vec<_> = std::iter::repeat_with(KaheNTTPoly::default)
-            .take(m.len())
-            .collect();
-        result.par_iter_mut().enumerate().for_each(|(i, output)| {
-            let mut item_rng = ChaCha20Rng::from_seed(seeds[i]);
-            let mut noisy_message = boxed_i64_coeffs();
-            for (coefficient, &message) in noisy_message.iter_mut().zip(m[i].coeffs()) {
-                *coefficient = (message + t * sample_dg(&mut item_rng, pp.sigma_e))
-                    .rem_euclid(crate::KAHE_MODULUS);
-            }
-            output.set_from_coeffs(&noisy_message);
-            output.add_product_assign(&pp.a_ntt[i], &sk_ntt);
-        });
-        result
-    }
-
-    pub fn dec_ntt(pp: &KaheParams, c: &[KaheNTTPoly], k: &KaheAggKey) -> Vec<KahePoly> {
-        debug_assert!(c.len() <= pp.mu_kahe);
-        let sk_ntt = KaheNTTPoly::from(k.inner());
-        (0..c.len())
-            .into_par_iter()
-            .map(|i| {
-                let pad = pointwise_dot_kahe(
-                    std::slice::from_ref(&pp.a_ntt[i]),
-                    std::slice::from_ref(&sk_ntt),
-                );
-                let raw = KahePoly::from(c[i] - pad);
-                poly_mod_t(&raw, pp.t_modulus)
             })
             .collect()
     }
@@ -737,33 +694,6 @@ mod tests {
             unmasked.push(c[i] - m[i] - KahePoly::from(&pad_for(&pp, &k, i)));
         }
         assert_scaled_noise(&pp, &unmasked);
-    }
-
-    // the same shape for the ntt-domain encryption the erasure-coded mode uses
-    #[test]
-    fn ntt_ciphertext_is_message_plus_pad_plus_scaled_noise() {
-        let mut rng = ChaCha20Rng::from_seed([46u8; 32]);
-        let pp = Kahe::setup_with_dims(
-            &mut rng,
-            16,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
-        );
-        let k = Kahe::gen(&mut rng, &pp);
-        let m: Vec<KahePoly> = (0..pp.mu_kahe)
-            .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
-            .collect();
-        let c = Kahe::enc_ntt(&mut rng, &pp, &k, &m);
-        assert_eq!(c.len(), m.len());
-
-        let unmasked: Vec<KahePoly> = (0..pp.mu_kahe)
-            .map(|i| KahePoly::from(c[i] - pad_for(&pp, &k, i)) - m[i])
-            .collect();
-        assert_scaled_noise(&pp, &unmasked);
-
-        let agg = Kahe::agg_key(std::slice::from_ref(&k));
-        assert_eq!(Kahe::dec_ntt(&pp, &c, &agg), m);
     }
 
     // two encryptions of one message under one key differ: the noise is fresh

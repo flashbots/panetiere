@@ -1,4 +1,4 @@
-use chipmunk_code::{HVCPoly, ALPHA_H, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
+use chipmunk_code::{HVCPoly, HVC_WIDTH, TWO_ZETA_PLUS_ONE};
 use negacyclic_rings::arithmetic;
 use negacyclic_rings::decomposition;
 use negacyclic_rings::ntt64::{self, Ring64};
@@ -258,24 +258,6 @@ impl KahePoly {
         hasher.finalize().into()
     }
 
-    pub fn infinity_norm(&self) -> u64 {
-        self.coeffs
-            .iter()
-            .map(|x| x.unsigned_abs())
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub fn lift(&mut self) {
-        for coefficient in &mut self.coeffs {
-            *coefficient = lift64(*coefficient, KAHE_MODULUS);
-        }
-    }
-
-    pub fn lift_inplace(&mut self) {
-        self.lift();
-    }
-
     pub fn normalize(&mut self) {
         for coefficient in &mut self.coeffs {
             *coefficient = normalize64(*coefficient, KAHE_MODULUS);
@@ -358,12 +340,6 @@ impl std::ops::Mul for KaheNTTPoly {
 }
 
 impl KaheNTTPoly {
-    pub fn rand_ntt_poly<R: Rng>(rng: &mut R) -> Self {
-        let mut result = Self::default();
-        result.fill_random(rng);
-        result
-    }
-
     pub(crate) fn fill_random<R: Rng>(&mut self, rng: &mut R) {
         let q = KAHE_MODULUS as u64;
         let threshold = (((1u128 << 64) / q as u128) * q as u128) as u64;
@@ -374,50 +350,6 @@ impl KaheNTTPoly {
             }
             *coefficient = value % q;
         }
-    }
-
-    /// NTT-domain coefficients, canonical in `[0, q)`.
-    pub(crate) fn coeffs(&self) -> &[u64; N] {
-        &self.coeffs
-    }
-
-    pub fn ntt_slots(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
-        self.coeffs.iter().copied()
-    }
-
-    pub fn from_ntt_slots(slots: &[u64]) -> Option<Self> {
-        Self::from_canonical(slots.try_into().ok()?)
-    }
-
-    /// Wrap NTT-domain coefficients, rejecting any not in `[0, q)`.
-    pub(crate) fn from_canonical(coeffs: [u64; N]) -> Option<Self> {
-        coeffs
-            .iter()
-            .all(|&x| x < KAHE_MODULUS as u64)
-            .then_some(Self { coeffs })
-    }
-
-    pub fn from_kahe(poly: &KahePoly) -> Self {
-        Self::from(poly)
-    }
-
-    pub(crate) fn set_from_coeffs(&mut self, coeffs: &[i64; N]) {
-        for (out, &c) in self.coeffs.iter_mut().zip(coeffs) {
-            *out = lift64(c, KAHE_MODULUS) as u64;
-        }
-        ntt64::ntt(kahe_ring(), &mut self.coeffs);
-    }
-
-    pub(crate) fn add_product_assign(&mut self, lhs: &Self, rhs: &Self) {
-        let ring = kahe_ring();
-        for i in 0..N {
-            let product = ntt64::mul_mod(lhs.coeffs[i], rhs.coeffs[i], ring);
-            self.coeffs[i] = ntt64::add_mod(self.coeffs[i], product, ring.q);
-        }
-    }
-
-    pub fn to_centered_coeffs(&self) -> [i64; N] {
-        KahePoly::from(self).coeffs
     }
 }
 
@@ -523,44 +455,12 @@ impl CsPoly {
         ))
     }
 
-    pub fn rand_balanced_ternary<R: Rng>(rng: &mut R, half_weight: usize) -> Self {
-        Self::from_coeffs(arithmetic::rand_balanced_ternary_i32(rng, half_weight))
-    }
-
-    pub fn rand_binary<R: Rng>(rng: &mut R) -> Self {
-        Self::from_coeffs(arithmetic::rand_binary_i32(rng))
-    }
-
-    pub fn rand_ternary<R: Rng>(rng: &mut R, weight: usize) -> Self {
-        Self::from_coeffs(arithmetic::rand_ternary_i32(rng, weight))
-    }
-
     pub fn rand_mod_p<R: Rng>(rng: &mut R, p: u32) -> Self {
         Self::from_coeffs(arithmetic::rand_mod_p_i32(rng, p))
     }
 
-    pub fn from_hash_message(msg: &[u8]) -> Self {
-        Self::from_coeffs(arithmetic::from_hash_message_i32(msg, ALPHA_H))
-    }
-
     pub fn digest(&self) -> [u8; 32] {
         arithmetic::digest_i32(&self.coeffs)
-    }
-
-    pub fn is_ternary(&self) -> bool {
-        arithmetic::is_ternary_i32(&self.coeffs)
-    }
-
-    pub fn infinity_norm(&self) -> u32 {
-        arithmetic::infinity_norm_i32(&self.coeffs)
-    }
-
-    pub fn lift(&mut self) {
-        arithmetic::lift_assign_i32(&mut self.coeffs, CS_MODULUS);
-    }
-
-    pub fn lift_inplace(&mut self) {
-        self.lift();
     }
 
     pub fn normalize(&mut self) {
@@ -690,11 +590,6 @@ pub fn pointwise_dot_cs(a: &[CsNTTPoly], b: &[CsNTTPoly]) -> CsNTTPoly {
     cs_aux_rns().pointwise_mac(&mut result.coeffs, &a, &b);
     result
 }
-pub type RsNTTPoly = KaheNTTPoly;
-
-pub fn pointwise_dot_rs(a: &[RsNTTPoly], b: &[RsNTTPoly]) -> RsNTTPoly {
-    pointwise_dot_kahe(a, b)
-}
 
 #[cfg(test)]
 mod ring_tests {
@@ -742,20 +637,6 @@ mod ring_tests {
         let b = KahePoly::rand_poly(&mut rng);
         assert_eq!(KahePoly::from(KaheNTTPoly::from(&a)), a);
         assert_eq!(a * b, KahePoly::schoolbook(&a, &b));
-        let mut acc = KaheNTTPoly::from(&a);
-        acc.add_product_assign(&KaheNTTPoly::from(&a), &KaheNTTPoly::from(&b));
-        assert_eq!(KahePoly::from(acc), a + KahePoly::schoolbook(&a, &b));
-    }
-
-    #[test]
-    fn kahe_ntt_slots_round_trip_and_reject_noncanonical() {
-        let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
-        let p = KaheNTTPoly::rand_ntt_poly(&mut rng);
-        let slots: Vec<u64> = p.ntt_slots().collect();
-        assert_eq!(KaheNTTPoly::from_ntt_slots(&slots), Some(p));
-        let mut bad = slots;
-        bad[0] = KAHE_MODULUS as u64;
-        assert_eq!(KaheNTTPoly::from_ntt_slots(&bad), None);
     }
 }
 

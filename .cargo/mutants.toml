@@ -1,8 +1,6 @@
 # settings for `cargo mutants` (mutation testing)
 
-# mutants that cannot change behaviour: the microsecond timing fields the
-# verifiers report, and debug output
+# mutants that cannot change behaviour: debug output
 exclude_re = [
-    "replace \\* with [+/] in aggregate_and_decrypt_(unverified_timed|rs)$",
     "impl std::fmt::Debug",
 ]
