@@ -2486,7 +2486,7 @@ mod tests {
         }
     }
 
-    fn committed(seed: u8, mu_cs: usize) -> (CsParams, Commitment, Vec<Opening>) {
+    fn setup_and_commit(seed: u8, mu_cs: usize) -> (CsParams, Commitment, Vec<Opening>) {
         let mut rng = ChaCha20Rng::from_seed([seed; 32]);
         let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, mu_cs, 5);
         let shares = rand_shares(&mut rng, 4, mu_cs);
@@ -2518,7 +2518,7 @@ mod tests {
     // parameters is rejected, even when every poly the check reads is honest
     #[test]
     fn misshapen_opening_rejected() {
-        let (pp, comm, openings) = committed(111, 1);
+        let (pp, comm, openings) = setup_and_commit(111, 1);
         let good = &openings[1];
         assert!(HidingMerkleCommitment::verify(&pp, &comm, good).is_some());
         assert!(HidingMerkleCommitment::verify_fresh(&pp, &comm, good));
@@ -2712,7 +2712,7 @@ mod tests {
     // or a short body is an error, never a panic or a huge allocation
     #[test]
     fn packed_opening_header_is_validated() {
-        let (pp, _, openings) = committed(117, 1);
+        let (pp, _, openings) = setup_and_commit(117, 1);
         let (r_bound, tree_bound) = fresh_opening_pack_bounds(&pp);
         let packed = openings[0].pack(r_bound, tree_bound);
         assert!(Opening::from_packed(&packed).is_ok());
@@ -2827,7 +2827,7 @@ mod tests {
     // `path_node` hands out the stored path level by level, left child first
     #[test]
     fn path_node_walks_the_stored_path() {
-        let (pp, _, openings) = committed(120, 2);
+        let (pp, _, openings) = setup_and_commit(120, 2);
         let o = &openings[2];
         let path = &o.data[o.xi() * HVC_WIDTH..];
         assert_eq!(path.len(), pp.stored_path_len() * 2 * HVC_WIDTH);
