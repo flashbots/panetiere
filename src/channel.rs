@@ -152,15 +152,6 @@ impl ChannelParams {
         Self::prony_for_symbols(capacity, payload_symbols(message_bytes))
     }
 
-    /// Sketch channel carrying `payload_bits` per element, sized at the
-    /// sketch's own symbol width rather than the peeling structure's.
-    pub fn prony_for_bits(capacity: u32, payload_bits: usize) -> Self {
-        Self::prony_for_symbols(
-            capacity,
-            payload_bits.div_ceil(PRONY_PRIME.ilog2() as usize),
-        )
-    }
-
     pub fn prony_for_symbols(capacity: u32, payload_symbols: usize) -> Self {
         let capacity = capacity.max(1) as usize;
         let nonce_symbols = nonce_symbols(PRONY_PRIME.ilog2() as usize);
@@ -182,6 +173,7 @@ impl ChannelParams {
     }
 
     /// The sketch parameters underneath, nonce symbols included.
+    #[cfg(test)]
     pub(crate) fn prony(&self) -> Option<&PronyParams> {
         match &self.encoding {
             Encoding::Prony(p) => Some(p),
@@ -614,17 +606,6 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "{p:?}");
         }
-    }
-
-    /// Same element bits either way, so the sketch needs the extra symbol its
-    /// narrower field costs.
-    #[test]
-    fn prony_for_bits_sizes_at_the_sketch_width() {
-        let bits = 911 * mse::BITS_PER_SYMBOL;
-        let p = ChannelParams::prony_for_bits(300, bits);
-        assert_eq!(p.bits_per_symbol(), mse::BITS_PER_SYMBOL);
-        assert_eq!(p.payload_symbols(), bits.div_ceil(mse::BITS_PER_SYMBOL));
-        assert!(p.payload_symbols() * p.bits_per_symbol() >= bits);
     }
 
     /// 300 clients need about 201 bits of nonce, which is six 34-bit symbols:

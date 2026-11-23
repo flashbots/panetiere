@@ -146,7 +146,8 @@ impl CsParams {
     /// (`agg_open` + `agg_share`) over `rho` clients, mirroring
     /// `PackedOpening::to_bytes` and `pack_cs_shares` without materialising them
     /// — for wire-budget planning.
-    pub fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
+    #[cfg(test)]
+    pub(crate) fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
         aggregated_server_crypto_len_for(self.n_servers, self.mu_cs, self.kappa_cs, rho)
     }
 }
@@ -1548,7 +1549,7 @@ pub fn beta_agg_hvc() -> u32 {
     RHO_MAX * chipmunk_code::ZETA
 }
 
-/// [`CsParams::aggregated_server_crypto_len`] from dimensions alone, so a caller
+/// `CsParams::aggregated_server_crypto_len` from dimensions alone, so a caller
 /// sizing a wire budget does not have to sample a CRS to ask.
 pub fn aggregated_server_crypto_len_for(
     n_servers: usize,
