@@ -2530,29 +2530,32 @@ mod tests {
         assert!(HidingMerkleCommitment::verify_fresh(&pp, &comm, good));
         assert!(HidingMerkleCommitment::check_fresh_shape(&pp, good));
 
-        let reshape: [fn(&mut Opening); 7] = [
-            |o| o.kappa_cs -= 1,
-            |o| o.mu_cs += 1,
-            |o| o.stored_path_len += 1,
-            |o| o.stored_path_len -= 1,
-            |o| o.r = with_extra(&o.r),
-            |o| o.data = with_extra(&o.data),
-            |o| o.data = o.data[..o.data.len() - 1].into(),
+        type Change = fn(&mut Opening);
+        let reshape: [(&str, Change); 7] = [
+            ("kappa_cs one less", |o| o.kappa_cs -= 1),
+            ("mu_cs one more", |o| o.mu_cs += 1),
+            ("stored_path_len one more", |o| o.stored_path_len += 1),
+            ("stored_path_len one less", |o| o.stored_path_len -= 1),
+            ("r one longer", |o| o.r = with_extra(&o.r)),
+            ("data one longer", |o| o.data = with_extra(&o.data)),
+            ("data one shorter", |o| {
+                o.data = o.data[..o.data.len() - 1].into()
+            }),
         ];
-        for (which, change) in reshape.iter().enumerate() {
+        for (case, change) in reshape {
             let mut bad = good.clone();
             change(&mut bad);
             assert!(
                 HidingMerkleCommitment::verify(&pp, &comm, &bad).is_none(),
-                "reshape {which}"
+                "{case}"
             );
             assert!(
                 !HidingMerkleCommitment::verify_fresh(&pp, &comm, &bad),
-                "reshape {which}, fresh"
+                "{case}, fresh"
             );
             assert!(
                 !HidingMerkleCommitment::check_fresh_shape(&pp, &bad),
-                "reshape {which}, shape"
+                "{case}, shape"
             );
         }
     }
@@ -2574,24 +2577,40 @@ mod tests {
         let wrong_position = SumError::WrongPosition { index: 1 };
         let wrong_shape = SumError::WrongShape { index: 1 };
         type Change = fn(&mut Opening);
-        let change: [(Change, &SumError); 7] = [
-            (|o| o.server_index += 1, &wrong_position),
-            (|o| o.path_index += 1, &wrong_position),
-            (|o| o.kappa_cs -= 1, &wrong_shape),
-            (|o| o.mu_cs += 1, &wrong_shape),
-            (|o| o.stored_path_len += 1, &wrong_shape),
-            (|o| o.data = with_extra(&o.data), &wrong_shape),
-            (|o| o.r = with_extra(&o.r), &wrong_shape),
+        let change: [(&str, Change, &SumError); 7] = [
+            (
+                "server_index one more",
+                |o| o.server_index += 1,
+                &wrong_position,
+            ),
+            (
+                "path_index one more",
+                |o| o.path_index += 1,
+                &wrong_position,
+            ),
+            ("kappa_cs one less", |o| o.kappa_cs -= 1, &wrong_shape),
+            ("mu_cs one more", |o| o.mu_cs += 1, &wrong_shape),
+            (
+                "stored_path_len one more",
+                |o| o.stored_path_len += 1,
+                &wrong_shape,
+            ),
+            (
+                "data one longer",
+                |o| o.data = with_extra(&o.data),
+                &wrong_shape,
+            ),
+            ("r one longer", |o| o.r = with_extra(&o.r), &wrong_shape),
         ];
-        for (which, (change, expected)) in change.iter().enumerate() {
+        for (case, change, expected) in change {
             let mut other = second.clone();
             change(&mut other);
             assert_eq!(
                 HidingMerkleCommitment::sum_openings(&pp, 0, &[&first, &other])
                     .err()
                     .as_ref(),
-                Some(*expected),
-                "field {which}"
+                Some(expected),
+                "{case}"
             );
         }
     }
@@ -2728,37 +2747,44 @@ mod tests {
         assert!(Opening::from_packed(&packed).is_ok());
 
         let too_large = MAX_OPENING_DIM as u32 + 1;
-        let bad_header: [&dyn Fn(&mut PackedOpening); 5] = [
-            &|p| p.kappa_cs = 0,
-            &|p| p.mu_cs = 0,
-            &|p| p.kappa_cs = too_large,
-            &|p| p.mu_cs = too_large,
-            &|p| p.stored_path_len = too_large,
+        type Change<'a> = &'a dyn Fn(&mut PackedOpening);
+        let bad_header: [(&str, Change); 5] = [
+            ("kappa_cs zero", &|p| p.kappa_cs = 0),
+            ("mu_cs zero", &|p| p.mu_cs = 0),
+            ("kappa_cs too large", &|p| p.kappa_cs = too_large),
+            ("mu_cs too large", &|p| p.mu_cs = too_large),
+            ("stored_path_len too large", &|p| {
+                p.stored_path_len = too_large
+            }),
         ];
-        for (which, change) in bad_header.iter().enumerate() {
+        for (case, change) in bad_header {
             let mut bad = packed.clone();
             change(&mut bad);
             assert_eq!(
                 Opening::from_packed(&bad).err(),
                 Some(OpeningDecodeError::BadHeader),
-                "header {which}"
+                "{case}"
             );
         }
 
         // the largest dimensions the header may claim are still held to the
         // body length
-        let at_limit: [&dyn Fn(&mut PackedOpening); 3] = [
-            &|p| p.kappa_cs = MAX_OPENING_DIM as u32,
-            &|p| p.mu_cs = MAX_OPENING_DIM as u32,
-            &|p| p.stored_path_len = MAX_OPENING_DIM as u32,
+        let at_limit: [(&str, Change); 3] = [
+            ("kappa_cs at the limit", &|p| {
+                p.kappa_cs = MAX_OPENING_DIM as u32
+            }),
+            ("mu_cs at the limit", &|p| p.mu_cs = MAX_OPENING_DIM as u32),
+            ("stored_path_len at the limit", &|p| {
+                p.stored_path_len = MAX_OPENING_DIM as u32
+            }),
         ];
-        for (which, change) in at_limit.iter().enumerate() {
+        for (case, change) in at_limit {
             let mut bad = packed.clone();
             change(&mut bad);
             assert_eq!(
                 Opening::from_packed(&bad).err(),
                 Some(OpeningDecodeError::Truncated),
-                "limit {which}"
+                "{case}"
             );
         }
 
