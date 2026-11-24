@@ -2580,7 +2580,7 @@ mod tests {
         let wrong_position = SumError::WrongPosition { index: 1 };
         let wrong_shape = SumError::WrongShape { index: 1 };
         type Change = fn(&mut Opening);
-        let change: [(&str, Change, &SumError); 12] = [
+        let mismatch: [(&str, Change, &SumError); 12] = [
             (
                 "server_index one more",
                 |o| o.server_index += 1,
@@ -2622,7 +2622,7 @@ mod tests {
                 &wrong_shape,
             ),
         ];
-        for (case, change, expected) in change {
+        for (case, change, expected) in mismatch {
             let mut other = second.clone();
             change(&mut other);
             assert_eq!(
