@@ -23,6 +23,8 @@ The end-to-end tests in `src/e2e/` are the executable spec: `end_to_end.rs` (can
 *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread
 invariance), `mse_e2e.rs` and `prony_e2e.rs` (each encoding carried end-to-end,
 with cover traffic), `recipient_e2e.rs` (anchor admission, culprit exclusion, every `RejectReason`).
+`tests/smoke.rs` runs one round through the public API only, with every
+wire item sent as bytes.
 
 ### Lint
 
