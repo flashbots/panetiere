@@ -631,7 +631,6 @@ dependencies = [
  "aes-gcm",
  "chipmunk_code",
  "criterion",
- "libc",
  "ml-kem",
  "negacyclic-rings",
  "rand",
@@ -641,6 +640,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "sha3",
+]
+
+[[package]]
+name = "paper_bench"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "panetiere",
+ "rand",
+ "rand_chacha",
+ "rayon",
+ "sha2",
 ]
 
 [[package]]

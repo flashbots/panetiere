@@ -1,0 +1,15 @@
+[package]
+name = "paper_bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+panetiere = { path = ".." }
+rand = "0.8"
+rand_chacha = "0.3"
+rayon = "1.10"
+sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
