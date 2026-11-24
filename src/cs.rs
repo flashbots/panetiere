@@ -2641,15 +2641,21 @@ mod tests {
     #[test]
     fn batch_check_rejects_malformed_input() {
         const SERVERS: usize = 4;
+        // each client's commitment adds one opening to the batch
+        const CLIENTS: usize = 4;
+        // the batch is checked at one position; the other is for mixing in
+        const POSITION: usize = 3;
+        const OTHER_POSITION: usize = 1;
+        const ANY_MEMBER: usize = 2;
         let mut rng = ChaCha20Rng::from_seed([114u8; 32]);
         let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let mut rounds: Vec<(Commitment, Opening)> = Vec::new();
         let mut elsewhere: Vec<(Commitment, Opening)> = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..CLIENTS {
             let shares = rand_shares(&mut rng, SERVERS, MU_CS);
-            let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-            elsewhere.push((c.clone(), os.swap_remove(1)));
-            rounds.push((c, os.swap_remove(1)));
+            let (c, os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
+            elsewhere.push((c.clone(), os[OTHER_POSITION].clone()));
+            rounds.push((c, os[POSITION].clone()));
         }
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
@@ -2685,15 +2691,15 @@ mod tests {
         );
 
         // openings that each verify alone, but not all at one position
-        let (other_comm, other_open) = &elsewhere[2];
+        let (other_comm, other_open) = &elsewhere[ANY_MEMBER];
         assert!(HidingMerkleCommitment::verify_fresh(
             &pp, other_comm, other_open
         ));
         assert_ne!(other_open.path_index, opens[0].path_index);
         let mut mixed_comms = comms.clone();
         let mut mixed_opens = opens.clone();
-        mixed_comms[2] = other_comm;
-        mixed_opens[2] = other_open;
+        mixed_comms[ANY_MEMBER] = other_comm;
+        mixed_opens[ANY_MEMBER] = other_open;
         assert!(
             !check(&mixed_comms, &mixed_opens, &weights),
             "mixed positions"
