@@ -457,3 +457,23 @@ fn from_bytes_names_the_first_misbehaving_client() {
         MissingClientPost(ClientId(0))
     );
 }
+
+/// A fold keeps its first fault when valid posts come after it. On one
+/// thread, each fold sees several clients in order, so the malformed post of
+/// client 1 is followed by client 2's valid one in the same fold.
+#[test]
+fn a_fault_is_kept_past_later_valid_posts() {
+    let r = round(36, 4, 6);
+    let mut posts = r.post_bytes();
+    posts[1].as_mut().unwrap().pop();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    match pool.install(|| from_bytes(&r, &posts)) {
+        Err(RecipientError::Rejected(reason)) => {
+            assert_eq!(reason, RejectReason::MalformedClientPost(ClientId(1)))
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
+}
