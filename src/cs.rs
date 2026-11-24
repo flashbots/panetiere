@@ -2635,9 +2635,6 @@ mod tests {
         }
     }
 
-    // the batch check refuses input it cannot soundly combine: no
-    // combinations, a weight row of the wrong length, a weight outside the
-    // range, a missing commitment, or openings from different positions
     #[test]
     fn batch_check_rejects_malformed_input() {
         const SERVERS: usize = 4;
