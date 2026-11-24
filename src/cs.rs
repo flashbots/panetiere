@@ -2528,6 +2528,7 @@ mod tests {
         let good = &openings[1];
         assert!(HidingMerkleCommitment::verify(&pp, &comm, good).is_some());
         assert!(HidingMerkleCommitment::verify_fresh(&pp, &comm, good));
+        assert!(HidingMerkleCommitment::check_fresh_shape(&pp, good));
 
         let reshape: [fn(&mut Opening); 7] = [
             |o| o.kappa_cs -= 1,
