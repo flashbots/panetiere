@@ -2659,33 +2659,42 @@ mod tests {
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
         let weights = batch_weights(&mut rng, COMBINATIONS, rounds.len());
-        let check = |comms: &[&Commitment], opens: &[&Opening], weights: &[Vec<u16>]| {
-            verify_fresh_batch(&pp, comms, opens, weights)
-        };
-        assert!(check(&comms, &opens, &weights));
+        assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
 
-        assert!(!check(&comms, &opens, &[]), "no combinations");
-        assert!(!check(&[], &[], &weights), "empty batch");
+        assert!(
+            !verify_fresh_batch(&pp, &comms, &opens, &[]),
+            "no combinations"
+        );
+        assert!(!verify_fresh_batch(&pp, &[], &[], &weights), "empty batch");
 
         let mut short = weights.clone();
         short[1].pop();
-        assert!(!check(&comms, &opens, &short), "short weight row");
+        assert!(
+            !verify_fresh_batch(&pp, &comms, &opens, &short),
+            "short weight row"
+        );
         let mut long = weights.clone();
         long[1].push(1);
-        assert!(!check(&comms, &opens, &long), "long weight row");
+        assert!(
+            !verify_fresh_batch(&pp, &comms, &opens, &long),
+            "long weight row"
+        );
 
         let mut out_of_range = weights.clone();
         out_of_range[0][0] = BATCH_WEIGHT_BOUND;
-        assert!(!check(&comms, &opens, &out_of_range), "weight out of range");
+        assert!(
+            !verify_fresh_batch(&pp, &comms, &opens, &out_of_range),
+            "weight out of range"
+        );
 
         assert!(
-            !check(&comms[1..], &opens, &weights),
+            !verify_fresh_batch(&pp, &comms[1..], &opens, &weights),
             "one commitment too few"
         );
         // the weight rows follow the openings, so that only the counts differ
         let fewer_weights: Vec<Vec<u16>> = weights.iter().map(|row| row[1..].to_vec()).collect();
         assert!(
-            !check(&comms, &opens[1..], &fewer_weights),
+            !verify_fresh_batch(&pp, &comms, &opens[1..], &fewer_weights),
             "one opening too few"
         );
 
@@ -2699,7 +2708,10 @@ mod tests {
         assert_ne!(other_open.path_index, opens[0].path_index);
         let mut mixed_opens = opens.clone();
         mixed_opens[ANY_MEMBER] = other_open;
-        assert!(!check(&comms, &mixed_opens, &weights), "mixed positions");
+        assert!(
+            !verify_fresh_batch(&pp, &comms, &mixed_opens, &weights),
+            "mixed positions"
+        );
     }
 
     // a batch of exactly `batch_capacity` openings is still checked as a batch
