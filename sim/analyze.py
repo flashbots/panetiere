@@ -123,6 +123,17 @@ def csv_rows(reports):
         row = {"label": r["label"], "round": r["round"], **r["setup"], "total_ms": (end - start) / 1000}
         for p in r["phases"]:
             row[f"{p['name']}_ms"] = round(ms(p), 1)
+        spans = {}
+        for node in r["nodes"]:
+            for span in node["spans"]:
+                spans.setdefault(group(span["name"]), []).append(span)
+        median = lambda name, f: round(statistics.median(map(f, spans[name])), 1) if name in spans else None
+        row["post_kb"] = median("upload_post", lambda s: s["bytes"] / 1e3)
+        row["recipient_download_mb"] = round(
+            sum(s["bytes"] for n in ("download_post", "download_entry") for s in spans.get(n, [])) / 1e6, 2
+        )
+        for name in ("client_round", "unseal", "server_round", "recover", "decode"):
+            row[f"{name}_ms"] = median(name, ms)
         rows.append(row)
     return rows
 

@@ -6,7 +6,7 @@ Docker container with its own shaped link (delay, loss, upload and download
 rate).
 
 ```bash
-sim/run.sh                                        # 4 servers, 8 clients, 6 messages
+sim/run.sh                                        # 4 servers, 8 clients, 8 messages
 SIM_CLIENTS=50 SIM_MESSAGES=40 CLIENT_UP=10mbit SIM_ROUNDS=3 sim/run.sh
 ```
 
@@ -32,8 +32,8 @@ time is the number of cores the step kept busy.
 ```bash
 sim/analyze.py target/sim/results.jsonl                          # table per round
 sim/analyze.py target/sim/results.jsonl --html target/sim/timeline.html
-sim/sweep.sh RECIPIENT_DOWN 50mbit 200mbit 1gbit                 # one run per value
-sim/analyze.py target/sim/sweep-RECIPIENT_DOWN.jsonl --csv       # one row per round
+sim/sweep.sh SIM_CLIENTS=8,16,32 SIM_MESSAGE_BYTES=1024,16384     # every combination
+sim/analyze.py target/sim/sweep.jsonl --csv                      # one row per round
 ```
 
 The table gives, for each step: count, median and slowest time, the slowest
@@ -63,7 +63,8 @@ All settings are environment variables.
 
 | Variable | Default | |
 |---|---|---|
-| `SIM_SERVERS` / `SIM_CLIENTS` / `SIM_MESSAGES` | 4 / 8 / 6 | clients `0..SIM_MESSAGES` send a message, the rest send cover |
+| `SIM_SERVERS` / `SIM_CLIENTS` | 4 / 8 | |
+| `SIM_MESSAGES` | `SIM_CLIENTS` | clients `0..SIM_MESSAGES` send a message, the rest send cover. Every post has room for this many messages, so the recipient downloads about `clients × messages × message bytes × 7` |
 | `SIM_MESSAGE_BYTES` | 32 | |
 | `SIM_ROUNDS` | 1 | the first round includes connection setup, so use 2 or more and compare |
 | `SIM_LABEL` | none | copied into every report; `sweep.sh` sets it |
@@ -72,9 +73,25 @@ All settings are environment variables.
 | `<ROLE>_DELAY` | see `run.sh` | one-way delay on outgoing traffic |
 | `<ROLE>_LOSS` | none | outgoing packet loss, e.g. `0.1%` |
 | `<ROLE>_UP` / `<ROLE>_DOWN` | see `run.sh` | rate limits, e.g. `20mbit` |
+| `<ROLE>_CPUS` | client 1, server 4, recipient 8 | CPU budget per node, as if it were its own machine; empty for no limit |
+| `SIM_READY_TIMEOUT_SECS` | 120 | how long the coordinator waits for every node to start |
 
 `<ROLE>` is `BULLETIN`, `SERVER`, `CLIENT` or `RECIPIENT`. Set a value to the
 empty string to leave that part of the link unshaped.
+
+## How big a run fits
+
+- **CPU.** All clients compute at once. Compute times are only realistic while
+  `SIM_CLIENTS × CLIENT_CPUS` stays under the host's CPU count; `run.sh` warns
+  past that. Network times stay valid either way. To go bigger, give clients a
+  fraction of a CPU (`CLIENT_CPUS=0.5`), which models slower clients.
+- **ARP table.** Every pair of containers that talk needs an entry in one
+  table shared by the whole host, about `2 × clients × (servers + 3)` entries.
+  Linux allows 1024 by default, which is about 70 clients with 4 servers.
+  `run.sh` stops with the `sysctl` command to raise it.
+- **Memory.** About 55 MB per client at 8 messages of 16 kB. The bulletin keeps
+  every post in memory.
+- **Docker.** A bridge network takes at most about 1000 containers.
 
 ## Limits
 

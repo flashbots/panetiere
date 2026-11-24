@@ -13,7 +13,7 @@ cd "$(dirname "$0")/.."
 : "${SIM_SEED:=0}"
 : "${SIM_SERVERS:=4}"
 : "${SIM_CLIENTS:=8}"
-: "${SIM_MESSAGES:=6}"
+: "${SIM_MESSAGES:=$SIM_CLIENTS}"
 : "${SIM_MESSAGE_BYTES:=32}"
 : "${SIM_MIN_CLIENTS:=1}"
 : "${SIM_ROUNDS:=1}"
@@ -25,6 +25,34 @@ cd "$(dirname "$0")/.."
 : "${SERVER_DELAY=10ms}" "${SERVER_LOSS=}" "${SERVER_UP=1gbit}" "${SERVER_DOWN=1gbit}"
 : "${CLIENT_DELAY=40ms}" "${CLIENT_LOSS=}" "${CLIENT_UP=20mbit}" "${CLIENT_DOWN=100mbit}"
 : "${RECIPIENT_DELAY=40ms}" "${RECIPIENT_LOSS=}" "${RECIPIENT_UP=20mbit}" "${RECIPIENT_DOWN=100mbit}"
+
+# cpu budget per node, as if each node were its own machine with this many
+# cores. empty means no limit, and the node's thread pool assumes it has the
+# whole host.
+: "${BULLETIN_CPUS=}" "${SERVER_CPUS=4}" "${CLIENT_CPUS=1}" "${RECIPIENT_CPUS=8}"
+: "${SIM_READY_TIMEOUT_SECS:=120}"
+
+# every container talking to another needs an entry in the kernel's arp
+# table, which is shared by the whole host. clients each talk to the servers,
+# the bulletin and the coordinator, and those talk back to every client.
+arp_needed=$((2 * (SIM_CLIENTS * (SIM_SERVERS + 2) + SIM_CLIENTS + SIM_SERVERS + 2)))
+arp_limit=$(sysctl -n net.ipv4.neigh.default.gc_thresh3 2>/dev/null || echo 1024)
+if [ "$arp_needed" -gt "$arp_limit" ]; then
+    echo "this run needs about $arp_needed arp entries, but the host allows $arp_limit." >&2
+    echo "raise the limit (resets on reboot) with:" >&2
+    echo "  sudo sysctl -w net.ipv4.neigh.default.gc_thresh1=4096 net.ipv4.neigh.default.gc_thresh2=8192 net.ipv4.neigh.default.gc_thresh3=16384" >&2
+    exit 1
+fi
+
+# all clients compute at the same time, so past this point they wait on each
+# other for cpu and their compute times stop being what one machine would see
+if [ -n "$CLIENT_CPUS" ]; then
+    wanted=$(awk -v n="$SIM_CLIENTS" -v c="$CLIENT_CPUS" 'BEGIN { printf "%d", n * c + 0.999 }')
+    if [ "$wanted" -gt "$(nproc)" ]; then
+        echo "warning: $SIM_CLIENTS clients x $CLIENT_CPUS cpus is more than the $(nproc) cpus here;" \
+            "client compute times will be inflated" >&2
+    fi
+fi
 
 out=target/sim
 compose="$out/compose.yml"
@@ -47,11 +75,24 @@ service() {
     local name=$1 profile=$2 role=$3
     shift 3
     local delay="${profile}_DELAY" loss="${profile}_LOSS" up="${profile}_UP" down="${profile}_DOWN"
+    local cpus_var="${profile}_CPUS"
+    local cpus="${!cpus_var}"
     cat <<YAML
   $name:
     <<: *node
     command: ["$role"]
-    environment:
+YAML
+    if [ -n "$cpus" ]; then
+        # the thread pool is sized to the budget so it does not fight itself
+        local threads
+        threads=$(awk -v c="$cpus" 'BEGIN { t = int(c + 0.999); print (t < 1 ? 1 : t) }')
+        echo "    cpus: $cpus"
+        echo "    environment:"
+        echo "      RAYON_NUM_THREADS: \"$threads\""
+    else
+        echo "    environment:"
+    fi
+    cat <<YAML
       <<: *setup
       NET_DELAY: "${!delay}"
       NET_LOSS: "${!loss}"
@@ -97,6 +138,7 @@ YAML
       <<: *setup
       SIM_ROUNDS: "$SIM_ROUNDS"
       SIM_LABEL: "$SIM_LABEL"
+      SIM_READY_TIMEOUT_SECS: "$SIM_READY_TIMEOUT_SECS"
       SIM_BULLETIN: $(url bulletin)
       SIM_SERVER_URLS: $(join "${server_urls[@]}")
       SIM_CLIENT_URLS: $(join "${client_urls[@]}")
