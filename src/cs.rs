@@ -2501,8 +2501,8 @@ mod tests {
         v.into_boxed_slice()
     }
 
-    // the paper's leaf block is `a·r` followed by `b_k·r + s_k`, so with
-    // zero randomness it is zero followed by the shares themselves
+    // the paper's leaf block is `c¹ = a^T r` followed by `c²_k = B[k]·r + s[k]`,
+    // so with zero randomness it is zero followed by the shares themselves
     #[test]
     fn leaf_block_with_zero_randomness_is_the_shares() {
         // leaf_block doesn't use the tree, so any number of servers will do
