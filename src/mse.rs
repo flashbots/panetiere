@@ -12,7 +12,7 @@
 use crate::{KahePoly, N};
 use aes::cipher::{BlockEncrypt as _, KeyInit as _};
 use aes::Aes128;
-use rand::{CryptoRng, Rng};
+use rand::Rng;
 
 use crate::kahe::T_MODULUS_DEFAULT;
 
@@ -61,7 +61,8 @@ impl MseParams {
     /// elements, with a freshly sampled PRF key. For whoever sets up the
     /// session; the key then travels to the other parties with the rest of
     /// the parameters.
-    pub fn new<R: CryptoRng + Rng>(
+    #[cfg(test)]
+    pub fn new<R: rand::CryptoRng + Rng>(
         rng: &mut R,
         gamma: usize,
         delta: usize,

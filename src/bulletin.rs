@@ -4,20 +4,25 @@ use std::sync::Mutex;
 
 use crate::cs::{
     aggregated_opening_pack_bounds, pack_cs_shares, pack_poly64, poly_packed_len,
-    poly_packed_len64, unpack_cs_shares, unpack_poly64, Commitment, CsParams, Opening,
-    PackedOpening,
+    poly_packed_len64, unpack_cs_shares, unpack_poly64, Commitment, Opening, PackedOpening,
 };
-use crate::protocol::{ClientId, ServerId};
+use crate::protocol::{ClientId, ProtocolParams, ServerId};
 use crate::{CsPoly, KahePoly, CS_MODULUS, KAHE_MODULUS};
 use chipmunk_code::HVC_MODULUS;
 
 #[derive(Clone)]
 pub struct ClientBulletinEntry {
-    pub ctxt: Vec<KahePoly>,
-    pub comm: Commitment,
+    pub(crate) ctxt: Vec<KahePoly>,
+    pub(crate) comm: Commitment,
 }
 
 impl ClientBulletinEntry {
+    /// The commitment to the client's key shares, which every server checks
+    /// its opening against.
+    pub fn commitment(&self) -> &Commitment {
+        &self.comm
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             2 + self.ctxt.len() * poly_packed_len64(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS),
@@ -30,11 +35,11 @@ impl ClientBulletinEntry {
         out
     }
 
-    pub fn packed_len(mu_kahe: usize) -> usize {
+    pub(crate) fn packed_len(mu_kahe: usize) -> usize {
         2 + mu_kahe * poly_packed_len64(KAHE_MODULUS) + poly_packed_len(HVC_MODULUS)
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         let n_ctxt = u16::from_le_bytes([*bytes.first()?, *bytes.get(1)?]) as usize;
         let kahe_len = poly_packed_len64(KAHE_MODULUS);
         let hvc_len = poly_packed_len(HVC_MODULUS);
@@ -55,21 +60,30 @@ impl ClientBulletinEntry {
 
 #[derive(Clone)]
 pub struct ServerBulletinEntry {
-    pub server_id: ServerId,
-    pub clients: Vec<ClientId>,
-    pub agg_open: Opening,
-    pub agg_share: CsPoly,
+    pub(crate) server_id: ServerId,
+    pub(crate) clients: Vec<ClientId>,
+    pub(crate) agg_open: Opening,
+    pub(crate) agg_share: CsPoly,
 }
 
 impl ServerBulletinEntry {
+    pub fn server_id(&self) -> ServerId {
+        self.server_id
+    }
+
+    /// The client set this server summed over.
+    pub fn clients(&self) -> &[ClientId] {
+        &self.clients
+    }
+
     /// Wire form: `server_id: u32 LE ‖ |clients|: u32 LE ‖ clients: u32 LE each
     /// ‖ agg_open ‖ agg_share`. The aggregated opening is bit-packed against
     /// the bounds for `|clients|` summed openings
-    /// ([`aggregated_opening_pack_bounds`]) and carries its own header; the
+    /// (`aggregated_opening_pack_bounds`) and carries its own header; the
     /// share is one packed CS polynomial, so it has a fixed length and comes
     /// last.
-    pub fn to_bytes(&self, cs: &CsParams) -> Vec<u8> {
-        let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(cs, self.clients.len() as u32);
+    pub fn to_bytes(&self, pp: &ProtocolParams) -> Vec<u8> {
+        let (r_b, s_b, t_b) = aggregated_opening_pack_bounds(&pp.cs, self.clients.len() as u32);
         let opening = self.agg_open.pack(r_b, s_b, t_b).to_bytes();
         let share = pack_cs_shares(std::slice::from_ref(&self.agg_share));
         let mut out = Vec::with_capacity(8 + 4 * self.clients.len() + opening.len() + share.len());
@@ -83,15 +97,10 @@ impl ServerBulletinEntry {
         out
     }
 
-    /// Length of [`Self::to_bytes`] for an entry over `rho` clients.
-    pub fn packed_len(cs: &CsParams, rho: u32) -> usize {
-        8 + 4 * rho as usize + cs.aggregated_server_crypto_len(rho)
-    }
-
     /// Inverse of [`Self::to_bytes`]. Checks lengths and the opening's header
     /// before allocating; whether the opening has the shape the parameters
     /// require, and whether it verifies, is left to the recipient.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         let word = |i: usize| -> Option<u32> {
             Some(u32::from_le_bytes(
                 bytes.get(4 * i..4 * i + 4)?.try_into().ok()?,
@@ -184,10 +193,10 @@ mod tests {
             };
             let bytes = entry.to_bytes();
             assert_eq!(bytes.len(), ClientBulletinEntry::packed_len(mu_kahe));
-            let back = ClientBulletinEntry::from_bytes(&bytes).unwrap();
+            let back = ClientBulletinEntry::try_from_bytes(&bytes).unwrap();
             assert_eq!(back.ctxt, entry.ctxt);
             assert_eq!(back.comm.root, entry.comm.root);
         }
-        assert!(ClientBulletinEntry::from_bytes(&[0u8]).is_none());
+        assert!(ClientBulletinEntry::try_from_bytes(&[0u8]).is_none());
     }
 }

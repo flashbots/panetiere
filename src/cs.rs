@@ -53,14 +53,12 @@ pub trait Cs {
     type Commitment: Clone;
     type Opening: Clone;
 
-    fn setup<R: Rng>(rng: &mut R, num_servers: usize) -> Self::Params;
     fn commit<R: Rng>(
         rng: &mut R,
         pp: &Self::Params,
         shares: &[Self::Secret],
     ) -> (Self::Commitment, Vec<Self::Opening>);
     fn verify(pp: &Self::Params, c: &Self::Commitment, o: &Self::Opening) -> bool;
-    fn sum_commitments(cs: &[Self::Commitment]) -> Self::Commitment;
     /// Sum of the openings at `position`; the empty sum is the zero opening.
     /// Takes borrowed slices to avoid cloning openings (each can be ~100s of
     /// KB). Fails if an opening does not have the shape `pp` prescribes or is
@@ -148,20 +146,21 @@ impl CsParams {
     /// (`agg_open` + `agg_share`) over `rho` clients, mirroring
     /// `PackedOpening::to_bytes` and `pack_cs_shares` without materialising them
     /// — for wire-budget planning.
-    pub fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
+    #[cfg(test)]
+    pub(crate) fn aggregated_server_crypto_len(&self, rho: u32) -> usize {
         aggregated_server_crypto_len_for(self.n_servers, self.mu_cs, self.kappa_cs, rho)
     }
 }
 
 #[derive(Clone)]
 pub struct Commitment {
-    pub root: HVCPoly,
+    pub(crate) root: HVCPoly,
 }
 
 #[derive(Clone)]
 pub struct Opening {
-    pub server_index: usize,
-    pub path_index: usize,
+    pub(crate) server_index: usize,
+    pub(crate) path_index: usize,
     kappa_cs: usize,
     mu_cs: usize,
     stored_path_len: usize,
@@ -177,36 +176,38 @@ fn opening_data_polys(xi: usize, stored_path_len: usize) -> usize {
 }
 
 impl Opening {
-    pub fn kappa_cs(&self) -> usize {
+    pub(crate) fn kappa_cs(&self) -> usize {
         self.kappa_cs
     }
-    pub fn mu_cs(&self) -> usize {
+    pub(crate) fn mu_cs(&self) -> usize {
         self.mu_cs
     }
-    pub fn xi(&self) -> usize {
+    pub(crate) fn xi(&self) -> usize {
         1 + self.mu_cs
     }
-    pub fn stored_path_len(&self) -> usize {
+    pub(crate) fn stored_path_len(&self) -> usize {
         self.stored_path_len
     }
 
-    pub fn r(&self) -> &[CsPoly] {
+    pub(crate) fn r(&self) -> &[CsPoly] {
         &self.rs[..self.kappa_cs]
     }
-    pub fn r_mut(&mut self) -> &mut [CsPoly] {
+    #[cfg(test)]
+    pub(crate) fn r_mut(&mut self) -> &mut [CsPoly] {
         &mut self.rs[..self.kappa_cs]
     }
 
     /// The committed share vector, length `μ_cs`.
-    pub fn s(&self) -> &[CsPoly] {
+    pub(crate) fn s(&self) -> &[CsPoly] {
         &self.rs[self.kappa_cs..self.kappa_cs + self.mu_cs]
     }
-    pub fn s_mut(&mut self) -> &mut [CsPoly] {
+    #[cfg(test)]
+    pub(crate) fn s_mut(&mut self) -> &mut [CsPoly] {
         &mut self.rs[self.kappa_cs..self.kappa_cs + self.mu_cs]
     }
 
     /// The bridged leaf digits `u = dec_{q_cs}(m)`, `ξ·HVC_WIDTH` long.
-    pub fn u(&self) -> &[HVCPoly] {
+    pub(crate) fn u(&self) -> &[HVCPoly] {
         &self.data[..self.xi() * HVC_WIDTH]
     }
 
@@ -215,7 +216,8 @@ impl Opening {
         &self.data[k * HVC_WIDTH..(k + 1) * HVC_WIDTH]
     }
 
-    pub fn path_node(&self, level: usize) -> (&[HVCPoly], &[HVCPoly]) {
+    #[cfg(test)]
+    pub(crate) fn path_node(&self, level: usize) -> (&[HVCPoly], &[HVCPoly]) {
         let base = self.xi() * HVC_WIDTH + level * 2 * HVC_WIDTH;
         (
             &self.data[base..base + HVC_WIDTH],
@@ -268,7 +270,7 @@ impl HidingMerkleCommitment {
     }
 
     /// The cheap half of [`Self::verify_fresh`]: shape and the fresh norm
-    /// bounds, no ring arithmetic. What [`Self::verify_fresh_batch`] assumes
+    /// bounds, no ring arithmetic. What [`Self::verify_fresh_batch_shaped`] assumes
     /// of every opening it is handed.
     pub fn check_fresh_shape(pp: &CsParams, o: &Opening) -> bool {
         shape_and_norms(pp, o, pp.beta_cs, chipmunk_code::ZETA)
@@ -290,23 +292,11 @@ impl HidingMerkleCommitment {
     /// about which member would fail, so a failing batch is re-checked member
     /// by member.
     ///
-    /// Requires `openings.len() ≤ batch_capacity(pp)`, every opening to pass
-    /// [`Self::check_fresh_shape`], and all of them to sit at one position;
-    /// anything else is rejected.
-    pub fn verify_fresh_batch(
-        pp: &CsParams,
-        comms: &[&Commitment],
-        openings: &[&Opening],
-        weights: &[Vec<u16>],
-    ) -> bool {
-        openings.iter().all(|o| Self::check_fresh_shape(pp, o))
-            && Self::verify_fresh_batch_shaped(pp, comms, openings, weights)
-    }
-
-    /// [`Self::verify_fresh_batch`] for openings that have already passed
-    /// [`Self::check_fresh_shape`], as the server's per-client gate does.
-    /// The norm bounds are the part a linear combination can't check, so
-    /// skipping them on openings nobody has checked is unsound.
+    /// Requires `openings.len() ≤ batch_capacity(pp)`, every opening to have
+    /// passed [`Self::check_fresh_shape`] (as the server's per-client gate
+    /// does), and all of them to sit at one position; anything else is
+    /// rejected. The norm bounds are the part a linear combination can't
+    /// check, so skipping them on openings nobody has checked is unsound.
     pub(crate) fn verify_fresh_batch_shaped(
         pp: &CsParams,
         comms: &[&Commitment],
@@ -765,10 +755,6 @@ impl Cs for HidingMerkleCommitment {
     type Commitment = Commitment;
     type Opening = Opening;
 
-    fn setup<R: Rng>(rng: &mut R, num_servers: usize) -> CsParams {
-        Self::setup_with_dims(rng, num_servers, MU_CS, KAPPA_CS)
-    }
-
     /// Commit per-server share vectors and emit one opening per server.
     ///
     /// 1. **Per-server BDLOP leaf + label.** Draw fresh randomness
@@ -857,11 +843,6 @@ impl Cs for HidingMerkleCommitment {
     /// `β_agg_hvc`. See [`verify_with_bounds`] for the steps.
     fn verify(pp: &CsParams, c: &Commitment, o: &Opening) -> bool {
         verify_with_bounds(pp, c, o, pp.r_bound, pp.beta_agg_hvc)
-    }
-
-    fn sum_commitments(cs: &[Commitment]) -> Commitment {
-        let refs: Vec<&Commitment> = cs.iter().collect();
-        Self::sum_commitment_refs(&refs)
     }
 
     fn sum_openings(pp: &CsParams, position: usize, os: &[&Opening]) -> Result<Opening, SumError> {
@@ -1285,7 +1266,7 @@ pub(crate) fn unpack_poly(
 
 impl Commitment {
     /// Bit-packed wire form: the single HVC root packed against `HVC_MODULUS`.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(poly_packed_len(HVC_MODULUS));
         pack_poly(self.root.coeffs(), HVC_MODULUS, &mut out);
         out
@@ -1293,7 +1274,7 @@ impl Commitment {
 
     /// Inverse of [`Commitment::to_bytes`]; `None` unless `bytes` is exactly one
     /// packed HVC polynomial.
-    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != poly_packed_len(HVC_MODULUS) {
             return None;
         }
@@ -1351,6 +1332,7 @@ pub const PACKED_OPENING_HEADER_LEN: usize = 32;
 
 impl PackedOpening {
     /// Total byte length of the packed payload (header excluded).
+    #[cfg(test)]
     pub fn body_len(&self) -> usize {
         self.bytes.len()
     }
@@ -1422,7 +1404,7 @@ impl Opening {
     /// - `s_bound`: ∞-norm bound on `s` (q_cs/2 for arbitrary share values).
     /// - `tree_bound`: ∞-norm bound on digits (`ZETA` fresh, `ρ·ZETA` after
     ///   summing ρ openings).
-    pub fn pack(&self, r_bound: u32, s_bound: u32, tree_bound: u32) -> PackedOpening {
+    pub(crate) fn pack(&self, r_bound: u32, s_bound: u32, tree_bound: u32) -> PackedOpening {
         let r_bits = bits_for_signed(r_bound);
         let s_bits = bits_for_signed(s_bound);
         let tree_bits = bits_for_signed(tree_bound);
@@ -1456,7 +1438,7 @@ impl Opening {
     }
 
     /// Inverse of `pack`. Validates the (untrusted) header before allocating.
-    pub fn from_packed(p: &PackedOpening) -> Result<Opening, OpeningDecodeError> {
+    pub(crate) fn from_packed(p: &PackedOpening) -> Result<Opening, OpeningDecodeError> {
         let kappa_cs = p.kappa_cs as usize;
         let mu_cs = p.mu_cs as usize;
         let stored_path_len = p.stored_path_len as usize;
@@ -1567,7 +1549,7 @@ pub fn beta_agg_hvc() -> u32 {
     RHO_MAX * chipmunk_code::ZETA
 }
 
-/// [`CsParams::aggregated_server_crypto_len`] from dimensions alone, so a caller
+/// `CsParams::aggregated_server_crypto_len` from dimensions alone, so a caller
 /// sizing a wire budget does not have to sample a CRS to ask.
 pub fn aggregated_server_crypto_len_for(
     n_servers: usize,
@@ -1588,6 +1570,20 @@ pub fn aggregated_server_crypto_len_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// what the server's gate does: the per-opening shape check, then the
+    /// batched equations.
+    fn verify_fresh_batch(
+        pp: &CsParams,
+        comms: &[&Commitment],
+        openings: &[&Opening],
+        weights: &[Vec<u16>],
+    ) -> bool {
+        openings
+            .iter()
+            .all(|o| HidingMerkleCommitment::check_fresh_shape(pp, o))
+            && HidingMerkleCommitment::verify_fresh_batch_shaped(pp, comms, openings, weights)
+    }
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
@@ -1738,9 +1734,7 @@ mod tests {
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
         let weights = batch_weights(&mut rng, 3, rounds.len());
-        assert!(HidingMerkleCommitment::verify_fresh_batch(
-            &pp, &comms, &opens, &weights
-        ));
+        assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
 
         fn unit(i: usize) -> CsPoly {
             let mut c = [0i32; POLY_N];
@@ -1765,7 +1759,7 @@ mod tests {
             let comms: Vec<&Commitment> = bad.iter().map(|(c, _)| c).collect();
             let opens: Vec<&Opening> = bad.iter().map(|(_, o)| o).collect();
             assert!(
-                !HidingMerkleCommitment::verify_fresh_batch(&pp, &comms, &opens, &weights),
+                !verify_fresh_batch(&pp, &comms, &opens, &weights),
                 "tamper {which} slipped through the batch"
             );
         }
@@ -1774,9 +1768,7 @@ mod tests {
         let comms: Vec<&Commitment> = std::iter::repeat_n(&rounds[0].0, one_too_many).collect();
         let opens: Vec<&Opening> = std::iter::repeat_n(&rounds[0].1, one_too_many).collect();
         let weights = batch_weights(&mut rng, 1, one_too_many);
-        assert!(!HidingMerkleCommitment::verify_fresh_batch(
-            &pp, &comms, &opens, &weights
-        ));
+        assert!(!verify_fresh_batch(&pp, &comms, &opens, &weights));
     }
 
     #[test]
@@ -1836,7 +1828,7 @@ mod tests {
     fn commit_verify_mu_1() {
         let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
         for n_servers in [1usize, 2, 3, 4, 7] {
-            let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+            let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, MU_CS, KAPPA_CS);
             assert_eq!(pp.mu_cs, 1);
             let shares = rand_shares(&mut rng, n_servers, pp.mu_cs);
             let (comm, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
@@ -1881,7 +1873,7 @@ mod tests {
     #[test]
     fn high_norm_r_rejected() {
         let mut rng = ChaCha20Rng::from_seed([2u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         // A uniform CS poly has ‖·‖∞ ≈ q_cs/2 = 75206 ≫ r_bound = 36000.
@@ -1892,7 +1884,7 @@ mod tests {
     #[test]
     fn high_norm_hvc_digit_rejected() {
         let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         assert!(HidingMerkleCommitment::verify(&pp, &comm, &openings[0]));
@@ -1906,7 +1898,7 @@ mod tests {
     #[test]
     fn fresh_verify_rejects_oversized_randomness() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         assert!(HidingMerkleCommitment::verify_fresh(
@@ -1955,18 +1947,13 @@ mod tests {
             &[&opening],
             &weights
         ));
-        assert!(!HidingMerkleCommitment::verify_fresh_batch(
-            &pp,
-            &[&comm],
-            &[&opening],
-            &weights
-        ));
+        assert!(!verify_fresh_batch(&pp, &[&comm], &[&opening], &weights));
     }
 
     #[test]
     fn wrong_s_rejected() {
         let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (comm, mut openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         let s_mut = openings[0].s_mut();
@@ -1978,12 +1965,12 @@ mod tests {
     fn sum_homomorphism_mu_1() {
         let mut rng = ChaCha20Rng::from_seed([5u8; 32]);
         let n_servers = 4;
-        let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, MU_CS, KAPPA_CS);
         let shares_a = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let shares_b = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let (comm_a, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
         let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
-        let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
+        let comm_sum = HidingMerkleCommitment::sum_commitment_refs(&[&comm_a, &comm_b]);
         for i in 0..n_servers {
             let summed =
                 HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
@@ -1999,7 +1986,7 @@ mod tests {
     fn sum_openings_rejects_a_mismatched_set() {
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
         let n_servers = 4;
-        let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, MU_CS, KAPPA_CS);
         let shares_a = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let shares_b = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let (_, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
@@ -2091,7 +2078,7 @@ mod tests {
     fn empty_sum_is_the_zero_opening() {
         let mut rng = ChaCha20Rng::from_seed([10u8; 32]);
         let n_servers = 4;
-        let pp = HidingMerkleCommitment::setup(&mut rng, n_servers);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, MU_CS, KAPPA_CS);
         for position in 0..n_servers {
             let zero = HidingMerkleCommitment::sum_openings(&pp, position, &[]).unwrap();
             assert_eq!(zero.server_index, position);
@@ -2115,7 +2102,7 @@ mod tests {
         let shares_b = rand_shares(&mut rng, n_servers, pp.mu_cs);
         let (comm_a, opens_a) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_a);
         let (comm_b, opens_b) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares_b);
-        let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
+        let comm_sum = HidingMerkleCommitment::sum_commitment_refs(&[&comm_a, &comm_b]);
         for i in 0..n_servers {
             let summed =
                 HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]]).unwrap();
@@ -2230,7 +2217,7 @@ mod tests {
     #[test]
     fn unpack_requires_the_exact_body_length() {
         let mut rng = ChaCha20Rng::from_seed([104u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
@@ -2256,7 +2243,7 @@ mod tests {
     #[test]
     fn unpack_rejects_bounds_wider_than_32_bits() {
         let mut rng = ChaCha20Rng::from_seed([106u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
@@ -2360,7 +2347,7 @@ mod tests {
     #[test]
     fn unpack_rejects_opening_values_outside_the_header_bounds() {
         let mut rng = ChaCha20Rng::from_seed([108u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let shares = rand_shares(&mut rng, 4, pp.mu_cs);
         let (_, openings) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
         let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp);
@@ -2450,7 +2437,7 @@ mod tests {
                 );
                 assert_eq!(o.u().len(), pp.xi() * HVC_WIDTH);
             }
-            let comm_sum = HidingMerkleCommitment::sum_commitments(&[comm_a, comm_b]);
+            let comm_sum = HidingMerkleCommitment::sum_commitment_refs(&[&comm_a, &comm_b]);
             for i in 0..n_servers {
                 let summed =
                     HidingMerkleCommitment::sum_openings(&pp, i, &[&opens_a[i], &opens_b[i]])
@@ -2617,7 +2604,7 @@ mod tests {
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
         let weights = batch_weights(&mut rng, 3, rounds.len());
         let check = |comms: &[&Commitment], opens: &[&Opening], weights: &[Vec<u16>]| {
-            HidingMerkleCommitment::verify_fresh_batch(&pp, comms, opens, weights)
+            verify_fresh_batch(&pp, comms, opens, weights)
         };
         assert!(check(&comms, &opens, &weights));
 
@@ -2675,9 +2662,7 @@ mod tests {
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
         let weights = batch_weights(&mut rng, 3, 2);
-        assert!(HidingMerkleCommitment::verify_fresh_batch(
-            &pp, &comms, &opens, &weights
-        ));
+        assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
     }
 
     // with several committed values per opening, the batch check covers
@@ -2696,9 +2681,7 @@ mod tests {
         let weights = batch_weights(&mut rng, 3, rounds.len());
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
-        assert!(HidingMerkleCommitment::verify_fresh_batch(
-            &pp, &comms, &opens, &weights
-        ));
+        assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
 
         for value in 0..3 {
             let mut bad = rounds.clone();
@@ -2706,7 +2689,7 @@ mod tests {
             let comms: Vec<&Commitment> = bad.iter().map(|(c, _)| c).collect();
             let opens: Vec<&Opening> = bad.iter().map(|(_, o)| o).collect();
             assert!(
-                !HidingMerkleCommitment::verify_fresh_batch(&pp, &comms, &opens, &weights),
+                !verify_fresh_batch(&pp, &comms, &opens, &weights),
                 "value {value}"
             );
         }
@@ -2819,7 +2802,7 @@ mod tests {
     #[test]
     fn aggregated_pack_bounds_scale_with_the_set() {
         let mut rng = ChaCha20Rng::from_seed([118u8; 32]);
-        let pp = HidingMerkleCommitment::setup(&mut rng, 4);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
         let q = CS_MODULUS as u32;
         let zeta = chipmunk_code::ZETA;
         assert_eq!(R_BOUND, 300 * BETA_CS);

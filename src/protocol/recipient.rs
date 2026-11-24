@@ -16,9 +16,9 @@ use super::{ClientId, ProtocolParams, ServerId};
 
 /// The canonical-set rule: decode strictly over the anchor the caller names.
 pub struct SetPolicy<'a> {
-    pub anchor: &'a [ClientId],
-    pub max_clients: usize,
-    pub min_clients: usize,
+    anchor: &'a [ClientId],
+    max_clients: usize,
+    min_clients: usize,
 }
 
 impl<'a> SetPolicy<'a> {
@@ -32,10 +32,27 @@ impl<'a> SetPolicy<'a> {
 }
 
 pub struct Recovered {
-    pub canonical: Vec<ClientId>,
-    pub plaintext: Vec<KahePoly>,
+    pub(crate) canonical: Vec<ClientId>,
+    pub(crate) plaintext: Vec<KahePoly>,
     /// Servers dropped to reach the threshold, in exclusion order.
-    pub culprits: Vec<ServerId>,
+    pub(crate) culprits: Vec<ServerId>,
+}
+
+impl Recovered {
+    /// The client set the plaintext was decoded over.
+    pub fn canonical(&self) -> &[ClientId] {
+        &self.canonical
+    }
+
+    /// `Σ m_i mod t` over the canonical set, for the payload layer to decode.
+    pub fn plaintext(&self) -> &[KahePoly] {
+        &self.plaintext
+    }
+
+    /// Servers dropped to reach the threshold, in exclusion order.
+    pub fn culprits(&self) -> &[ServerId] {
+        &self.culprits
+    }
 }
 
 /// Summarised rather than derived: `plaintext` is megabytes at realistic widths.

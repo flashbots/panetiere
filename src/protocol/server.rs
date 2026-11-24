@@ -7,12 +7,11 @@ use rayon::prelude::*;
 
 use crate::bulletin::ServerBulletinEntry;
 use crate::cs::{
-    batch_capacity, batch_weights, Commitment, Cs, CsParams, HidingMerkleCommitment, Opening,
-    PackedOpening,
+    batch_capacity, batch_weights, Commitment, Cs, HidingMerkleCommitment, Opening, PackedOpening,
 };
 use crate::pke;
 
-use super::{opening_aad, ClientId, ServerId, SessionId};
+use super::{opening_aad, ClientId, ProtocolParams, ServerId, SessionId};
 
 pub fn unseal_opening(
     key: &pke::PrivateKey,
@@ -39,8 +38,15 @@ pub fn unseal_openings(
 }
 
 pub struct ServerInbox {
-    pub server_id: ServerId,
-    pub items: Vec<(ClientId, Opening)>,
+    pub(crate) server_id: ServerId,
+    pub(crate) items: Vec<(ClientId, Opening)>,
+}
+
+impl ServerInbox {
+    /// The openings `server_id` unsealed this round, one per client.
+    pub fn new(server_id: ServerId, items: Vec<(ClientId, Opening)>) -> Self {
+        Self { server_id, items }
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -63,11 +69,12 @@ const BATCH_COMBOS: usize = 9;
 /// a bad client can never make an honest server's aggregate fail at the
 /// recipient.
 pub fn run_server_round(
-    cs: &CsParams,
+    pp: &ProtocolParams,
     inbox: &ServerInbox,
     canonical: &[ClientId],
     commitments: &[(ClientId, Commitment)],
 ) -> Result<ServerBulletinEntry, ServerRoundError> {
+    let cs = &pp.cs;
     let index: HashMap<ClientId, usize> = inbox
         .items
         .iter()
@@ -152,6 +159,7 @@ pub fn run_server_round(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cs::CsParams;
 
     const SERVERS: usize = 4;
     const POSITION: u32 = 1;
@@ -179,10 +187,7 @@ mod tests {
                 ((cid, comm), (cid, opening))
             })
             .unzip();
-        let inbox = ServerInbox {
-            server_id: ServerId(POSITION),
-            items,
-        };
+        let inbox = ServerInbox::new(ServerId(POSITION), items);
         (canonical, commitments, inbox)
     }
 
@@ -192,31 +197,34 @@ mod tests {
     #[test]
     fn server_entry_round_trips_through_its_wire_form() {
         let mut rng = ChaCha20Rng::from_seed([80u8; 32]);
-        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
+        let pp = ProtocolParams::setup(&mut rng, SERVERS);
         for clients in [1u32, 5] {
-            let (canonical, commitments, inbox) = round(&mut rng, &cs, clients);
-            let entry = run_server_round(&cs, &inbox, &canonical, &commitments).unwrap();
-            let bytes = entry.to_bytes(&cs);
-            assert_eq!(bytes.len(), ServerBulletinEntry::packed_len(&cs, clients));
+            let (canonical, commitments, inbox) = round(&mut rng, &pp.cs, clients);
+            let entry = run_server_round(&pp, &inbox, &canonical, &commitments).unwrap();
+            let bytes = entry.to_bytes(&pp);
+            assert_eq!(
+                bytes.len(),
+                8 + 4 * clients as usize + pp.cs.aggregated_server_crypto_len(clients)
+            );
 
-            let parsed = ServerBulletinEntry::from_bytes(&bytes).expect("entry parses");
+            let parsed = ServerBulletinEntry::try_from_bytes(&bytes).expect("entry parses");
             assert_eq!(parsed.server_id, entry.server_id);
             assert_eq!(parsed.clients, entry.clients);
             assert_eq!(parsed.agg_share.coeffs(), entry.agg_share.coeffs());
-            assert_eq!(parsed.to_bytes(&cs), bytes);
+            assert_eq!(parsed.to_bytes(&pp), bytes);
             let refs: Vec<&Commitment> = commitments.iter().map(|(_, c)| c).collect();
             let summed = HidingMerkleCommitment::sum_commitment_refs(&refs);
             assert!(HidingMerkleCommitment::verify(
-                &cs,
+                &pp.cs,
                 &summed,
                 &parsed.agg_open
             ));
 
-            assert!(ServerBulletinEntry::from_bytes(&bytes[..bytes.len() - 1]).is_none());
+            assert!(ServerBulletinEntry::try_from_bytes(&bytes[..bytes.len() - 1]).is_none());
             let mut longer = bytes.clone();
             longer.push(0);
-            assert!(ServerBulletinEntry::from_bytes(&longer).is_none());
-            assert!(ServerBulletinEntry::from_bytes(&bytes[..7]).is_none());
+            assert!(ServerBulletinEntry::try_from_bytes(&longer).is_none());
+            assert!(ServerBulletinEntry::try_from_bytes(&bytes[..7]).is_none());
         }
     }
 
@@ -225,13 +233,13 @@ mod tests {
     #[test]
     fn failed_batch_names_the_bad_opening() {
         let mut rng = ChaCha20Rng::from_seed([81u8; 32]);
-        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
-        let (canonical, commitments, mut inbox) = round(&mut rng, &cs, 5);
-        assert!(run_server_round(&cs, &inbox, &canonical, &commitments).is_ok());
+        let pp = ProtocolParams::setup(&mut rng, SERVERS);
+        let (canonical, commitments, mut inbox) = round(&mut rng, &pp.cs, 5);
+        assert!(run_server_round(&pp, &inbox, &canonical, &commitments).is_ok());
 
         inbox.items[3].1.s_mut()[0] += CsPoly::from_coeffs([1; crate::N]);
         assert_eq!(
-            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            run_server_round(&pp, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(3)))
         );
     }
@@ -241,17 +249,17 @@ mod tests {
     #[test]
     fn oversized_randomness_is_turned_away_before_the_batch() {
         let mut rng = ChaCha20Rng::from_seed([82u8; 32]);
-        let mut cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
-        let (canonical, mut commitments, mut inbox) = round(&mut rng, &cs, 5);
+        let mut pp = ProtocolParams::setup(&mut rng, SERVERS);
+        let (canonical, mut commitments, mut inbox) = round(&mut rng, &pp.cs, 5);
 
-        let fresh_bound = cs.beta_cs;
-        cs.beta_cs = cs.r_bound;
-        let (comm, opening) = commit_one(&mut rng, &cs);
-        cs.beta_cs = fresh_bound;
+        let fresh_bound = pp.cs.beta_cs;
+        pp.cs.beta_cs = pp.cs.r_bound;
+        let (comm, opening) = commit_one(&mut rng, &pp.cs);
+        pp.cs.beta_cs = fresh_bound;
         commitments[2].1 = comm;
         inbox.items[2].1 = opening;
         assert_eq!(
-            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            run_server_round(&pp, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(2)))
         );
     }
@@ -262,24 +270,25 @@ mod tests {
     #[test]
     fn empty_round_posts_the_zero_opening() {
         let mut rng = ChaCha20Rng::from_seed([84u8; 32]);
-        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
-        let inbox = ServerInbox {
-            server_id: ServerId(POSITION),
-            items: Vec::new(),
-        };
-        let entry = run_server_round(&cs, &inbox, &[], &[]).expect("an empty round is valid");
+        let pp = ProtocolParams::setup(&mut rng, SERVERS);
+        let inbox = ServerInbox::new(ServerId(POSITION), Vec::new());
+        let entry = run_server_round(&pp, &inbox, &[], &[]).expect("an empty round is valid");
         assert!(entry.clients.is_empty());
         assert_eq!(entry.agg_share, CsPoly::default());
         assert_eq!(entry.agg_open.server_index, POSITION as usize);
         let empty_sum = HidingMerkleCommitment::sum_commitment_refs(&[]);
         assert!(HidingMerkleCommitment::verify(
-            &cs,
+            &pp.cs,
             &empty_sum,
             &entry.agg_open
         ));
         // but not against an actual commitment
-        let (comm, _) = commit_one(&mut rng, &cs);
-        assert!(!HidingMerkleCommitment::verify(&cs, &comm, &entry.agg_open));
+        let (comm, _) = commit_one(&mut rng, &pp.cs);
+        assert!(!HidingMerkleCommitment::verify(
+            &pp.cs,
+            &comm,
+            &entry.agg_open
+        ));
     }
 
     /// More clients than one batch holds still verify, and a bad one is
@@ -287,17 +296,17 @@ mod tests {
     #[test]
     fn round_larger_than_a_batch() {
         let mut rng = ChaCha20Rng::from_seed([83u8; 32]);
-        let mut cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
-        let (canonical, commitments, mut inbox) = round(&mut rng, &cs, 5);
+        let mut pp = ProtocolParams::setup(&mut rng, SERVERS);
+        let (canonical, commitments, mut inbox) = round(&mut rng, &pp.cs, 5);
         // a looser fresh bound still accepts these openings but leaves room
         // for only two per batch
-        cs.beta_cs = i32::MAX as u32 / (2 * (crate::cs::BATCH_WEIGHT_BOUND as u32 - 1));
-        assert_eq!(batch_capacity(&cs), 2);
-        assert!(run_server_round(&cs, &inbox, &canonical, &commitments).is_ok());
+        pp.cs.beta_cs = i32::MAX as u32 / (2 * (crate::cs::BATCH_WEIGHT_BOUND as u32 - 1));
+        assert_eq!(batch_capacity(&pp.cs), 2);
+        assert!(run_server_round(&pp, &inbox, &canonical, &commitments).is_ok());
 
         inbox.items[4].1.s_mut()[0] += CsPoly::from_coeffs([1; crate::N]);
         assert_eq!(
-            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            run_server_round(&pp, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(4)))
         );
     }
@@ -307,8 +316,8 @@ mod tests {
     #[test]
     fn opening_for_another_position_names_the_client() {
         let mut rng = ChaCha20Rng::from_seed([84u8; 32]);
-        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
-        let (canonical, commitments, inbox) = round(&mut rng, &cs, 5);
+        let pp = ProtocolParams::setup(&mut rng, SERVERS);
+        let (canonical, commitments, inbox) = round(&mut rng, &pp.cs, 5);
 
         let mut wrong_server = ServerInbox {
             server_id: inbox.server_id,
@@ -316,7 +325,7 @@ mod tests {
         };
         wrong_server.items[1].1.server_index += 1;
         assert_eq!(
-            run_server_round(&cs, &wrong_server, &canonical, &commitments).err(),
+            run_server_round(&pp, &wrong_server, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(1)))
         );
 
@@ -326,7 +335,7 @@ mod tests {
         };
         wrong_position.items[3].1.path_index += 1;
         assert_eq!(
-            run_server_round(&cs, &wrong_position, &canonical, &commitments).err(),
+            run_server_round(&pp, &wrong_position, &canonical, &commitments).err(),
             Some(ServerRoundError::BadOpening(ClientId(3)))
         );
     }
@@ -335,17 +344,17 @@ mod tests {
     #[test]
     fn missing_client_is_named() {
         let mut rng = ChaCha20Rng::from_seed([85u8; 32]);
-        let cs = HidingMerkleCommitment::setup(&mut rng, SERVERS);
-        let (canonical, mut commitments, mut inbox) = round(&mut rng, &cs, 4);
+        let pp = ProtocolParams::setup(&mut rng, SERVERS);
+        let (canonical, mut commitments, mut inbox) = round(&mut rng, &pp.cs, 4);
         let (cid, comm) = commitments.remove(2);
         assert_eq!(
-            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            run_server_round(&pp, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::MissingClient(cid))
         );
         commitments.push((cid, comm));
         inbox.items.remove(0);
         assert_eq!(
-            run_server_round(&cs, &inbox, &canonical, &commitments).err(),
+            run_server_round(&pp, &inbox, &canonical, &commitments).err(),
             Some(ServerRoundError::MissingClient(ClientId(0)))
         );
     }

@@ -52,7 +52,7 @@ impl PrivateKey {
             .to_vec()
     }
 
-    pub fn from_bytes(b: &[u8]) -> Result<Self, PkeError> {
+    pub fn try_from_bytes(b: &[u8]) -> Result<Self, PkeError> {
         let seed: [u8; PRIVKEY_LEN] = b.try_into().map_err(|_| PkeError::BadKey)?;
         Ok(Self(Dk::from_seed(Seed::from(seed))))
     }
@@ -63,7 +63,7 @@ impl PublicKey {
         self.0.to_bytes().to_vec()
     }
 
-    pub fn from_bytes(b: &[u8]) -> Result<Self, PkeError> {
+    pub fn try_from_bytes(b: &[u8]) -> Result<Self, PkeError> {
         let encoded = ml_kem::Key::<Ek>::try_from(b).map_err(|_| PkeError::BadKey)?;
         Ek::new(&encoded).map(Self).map_err(|_| PkeError::BadKey)
     }
@@ -95,7 +95,7 @@ fn derive_key_nonce(kem_ct: &[u8], shared_secret: &[u8]) -> ([u8; 32], [u8; NONC
 
 /// Seal `plaintext` to `recipient` under a fresh encapsulation, bound to `aad`.
 /// [`decrypt`] must be given the identical `aad` or it returns [`PkeError::Aead`].
-pub fn encrypt<R: CryptoRng + RngCore>(
+pub(crate) fn encrypt<R: CryptoRng + RngCore>(
     rng: &mut R,
     recipient: &PublicKey,
     plaintext: &[u8],
@@ -126,7 +126,11 @@ pub fn encrypt<R: CryptoRng + RngCore>(
 }
 
 /// Open an envelope sealed by [`encrypt`] under the same `aad`.
-pub fn decrypt(recipient: &PrivateKey, sealed: &[u8], aad: &[u8]) -> Result<Vec<u8>, PkeError> {
+pub(crate) fn decrypt(
+    recipient: &PrivateKey,
+    sealed: &[u8],
+    aad: &[u8],
+) -> Result<Vec<u8>, PkeError> {
     if sealed.len() < SEAL_OVERHEAD {
         return Err(PkeError::TooShort);
     }
@@ -178,9 +182,9 @@ mod tests {
         let other = PrivateKey::generate(&mut rng);
         assert_eq!(decrypt(&other, &sealed, b"ctx"), Err(PkeError::Aead));
 
-        let re = PrivateKey::from_bytes(&sk.to_bytes()).unwrap();
+        let re = PrivateKey::try_from_bytes(&sk.to_bytes()).unwrap();
         assert_eq!(decrypt(&re, &sealed, b"ctx").unwrap(), b"hello panetiere");
-        let re_pk = PublicKey::from_bytes(&pk.to_bytes()).unwrap();
+        let re_pk = PublicKey::try_from_bytes(&pk.to_bytes()).unwrap();
         assert_eq!(re_pk, pk);
     }
 
