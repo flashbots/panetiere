@@ -63,6 +63,7 @@ async fn every_role_over_localhost_recovers_the_messages() -> eyre::Result<()> {
             servers,
             clients,
             recipient,
+            label: "test".into(),
             rounds: 2,
             ready_timeout_secs: 30,
         },
@@ -71,9 +72,20 @@ async fn every_role_over_localhost_recovers_the_messages() -> eyre::Result<()> {
 
     assert_eq!(reports.len(), 2);
     for r in &reports {
-        assert_eq!(r.recipient.messages.len(), setup.messages);
-        assert_eq!(r.servers.len(), setup.servers);
-        assert_eq!(r.clients.len(), setup.clients);
+        // clients, servers, recipient and bulletin each report once
+        assert_eq!(r.nodes.len(), setup.clients + setup.servers + 2);
+        assert_eq!(r.phases.len(), 4);
+        let recipient = r
+            .nodes
+            .iter()
+            .find(|n| n.node == "recipient")
+            .ok_or_else(|| eyre::eyre!("no recipient report"))?;
+        let posts = recipient
+            .spans
+            .iter()
+            .filter(|s| s.name.starts_with("download_post_"))
+            .count();
+        assert_eq!(posts, setup.clients);
     }
     Ok(())
 }

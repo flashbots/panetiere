@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::extract::{Path, State};
 use axum::routing::post;
@@ -16,7 +15,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
 use crate::http;
-use crate::report::ClientReport;
+use crate::metrics::{self, Span, Timer};
+use crate::report::NodeReport;
 use crate::setup::{Params, Setup};
 
 #[derive(clap::Args)]
@@ -56,30 +56,32 @@ pub(crate) async fn run(listener: TcpListener, setup: Setup, args: Args) -> eyre
 async fn round(
     State(node): State<Arc<Node>>,
     Path(session): Path<String>,
-) -> Result<Json<ClientReport>, http::Error> {
+) -> Result<Json<NodeReport>, http::Error> {
     let sid = http::parse_session(&session)?;
     let index = node.args.index;
+    let mut spans = Vec::new();
 
-    // keys are fetched every round, outside the timed part: a real client
-    // would already know them
-    let urls = node
+    let requests = node
         .args
         .servers
         .iter()
-        .map(|s| format!("{s}/key"))
+        .enumerate()
+        .map(|(i, s)| (format!("download_key_{i}"), format!("{s}/key")))
         .collect();
-    let servers = http::get_all(&node.http, urls)
-        .await?
+    let keys = http::get_all(&node.http, requests).await?;
+    let servers = keys
         .iter()
         .enumerate()
-        .map(|(i, bytes)| {
+        .map(|(i, (bytes, _))| {
             let key = pke::PublicKey::from_bytes(bytes)
                 .map_err(|e| eyre::eyre!("key of server {i} does not parse: {e:?}"))?;
             Ok((ServerId(i as u32), key))
         })
         .collect::<eyre::Result<Vec<_>>>()?;
+    let key_spans: Vec<Span> = keys.into_iter().map(|(_, span)| span).collect();
+    spans.push(metrics::merge("download_keys", &key_spans));
 
-    let start = Instant::now();
+    let timer = Timer::start_cpu("client_round");
     let worker = node.clone();
     let output = tokio::task::spawn_blocking(move || -> eyre::Result<_> {
         let mut rng = ChaCha20Rng::from_entropy();
@@ -101,36 +103,37 @@ async fn round(
     })
     .await
     .wrap_err("client round task panicked")??;
-    let compute_ms = start.elapsed().as_millis();
+    spans.push(timer.finish());
 
     // the post and every opening share this client's uplink, so send them together
-    let start = Instant::now();
-    let post = output.encrypted_message.to_bytes();
-    let post_bytes = post.len();
-    let mut opening_bytes = 0;
     let mut uploads = JoinSet::new();
+    let post = output.encrypted_message.to_bytes();
     let url = format!("{}/{session}/client/{index}", node.args.bulletin);
-    let http_client = node.http.clone();
-    uploads.spawn(async move { http::post_bytes(&http_client, url, post).await });
+    uploads.spawn(upload(node.http.clone(), "upload_post".into(), url, post));
     for (sid, sealed) in output.sealed_openings {
-        opening_bytes += sealed.len();
-        let url = format!(
-            "{}/opening/{session}/{index}",
-            node.args.servers[sid.0 as usize]
-        );
-        let http_client = node.http.clone();
-        uploads.spawn(async move { http::post_bytes(&http_client, url, sealed).await });
+        let server = sid.0 as usize;
+        let url = format!("{}/opening/{session}/{index}", node.args.servers[server]);
+        let name = format!("upload_opening_{server}");
+        uploads.spawn(upload(node.http.clone(), name, url, sealed));
     }
     while let Some(joined) = uploads.join_next().await {
-        joined.wrap_err("upload task panicked")??;
+        spans.push(joined.wrap_err("upload task panicked")??);
     }
-    let upload_ms = start.elapsed().as_millis();
 
-    Ok(Json(ClientReport {
-        index,
-        compute_ms,
-        upload_ms,
-        post_bytes,
-        opening_bytes,
+    Ok(Json(NodeReport {
+        node: format!("client-{index}"),
+        spans,
     }))
+}
+
+async fn upload(
+    http: reqwest::Client,
+    name: String,
+    url: String,
+    body: Vec<u8>,
+) -> eyre::Result<Span> {
+    let timer = Timer::start(name);
+    let len = body.len();
+    http::post_bytes(&http, url, body).await?;
+    Ok(timer.finish_bytes(len))
 }

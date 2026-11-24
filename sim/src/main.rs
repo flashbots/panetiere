@@ -5,6 +5,7 @@ mod bulletin;
 mod client;
 mod coordinator;
 mod http;
+mod metrics;
 mod recipient;
 mod report;
 mod server;

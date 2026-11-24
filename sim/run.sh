@@ -2,7 +2,8 @@
 # runs one simulated deployment in docker: a bulletin, the servers, the
 # clients and a recipient, each in its own container with its own shaped link,
 # then a coordinator that drives the rounds. one json line per round is written
-# to target/sim/results.jsonl.
+# to $SIM_RESULTS (target/sim/results.jsonl by default); read it with
+# sim/analyze.py.
 #
 # every setting is an environment variable, for example:
 #   SIM_SERVERS=5 SIM_CLIENTS=20 SIM_MESSAGES=10 CLIENT_UP=10mbit sim/run.sh
@@ -16,6 +17,7 @@ cd "$(dirname "$0")/.."
 : "${SIM_MESSAGE_BYTES:=32}"
 : "${SIM_MIN_CLIENTS:=1}"
 : "${SIM_ROUNDS:=1}"
+: "${SIM_LABEL:=}"
 
 # link profiles: one-way delay, loss, upload and download rate per role.
 # an empty value leaves that part of the link unshaped.
@@ -26,6 +28,7 @@ cd "$(dirname "$0")/.."
 
 out=target/sim
 compose="$out/compose.yml"
+: "${SIM_RESULTS:=$out/results.jsonl}"
 mkdir -p "$out"
 
 cargo build --release -p panetiere-sim
@@ -93,6 +96,7 @@ YAML
     environment:
       <<: *setup
       SIM_ROUNDS: "$SIM_ROUNDS"
+      SIM_LABEL: "$SIM_LABEL"
       SIM_BULLETIN: $(url bulletin)
       SIM_SERVER_URLS: $(join "${server_urls[@]}")
       SIM_CLIENT_URLS: $(join "${client_urls[@]}")
@@ -104,5 +108,5 @@ dc() { docker compose -f "$compose" "$@"; }
 trap 'dc --profile coordinator down --remove-orphans >/dev/null 2>&1' EXIT
 
 dc up -d --quiet-pull
-dc run --rm -T coordinator | tee "$out/results.jsonl"
-echo "results written to $out/results.jsonl" >&2
+dc run --rm -T coordinator >"$SIM_RESULTS"
+echo "results written to $SIM_RESULTS" >&2

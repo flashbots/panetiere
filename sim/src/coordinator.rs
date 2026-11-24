@@ -5,7 +5,8 @@ use serde::de::DeserializeOwned;
 use tokio::task::JoinSet;
 
 use crate::http;
-use crate::report::RoundReport;
+use crate::metrics::Timer;
+use crate::report::{NodeReport, RecipientReport, RoundReport};
 use crate::setup::Setup;
 
 #[derive(clap::Args)]
@@ -20,6 +21,9 @@ pub(crate) struct Args {
     pub(crate) clients: Vec<String>,
     #[arg(long, env = "SIM_RECIPIENT")]
     pub(crate) recipient: String,
+    /// Free text copied into every report, to tell runs of a sweep apart.
+    #[arg(long, env = "SIM_LABEL", default_value = "")]
+    pub(crate) label: String,
     #[arg(long, env = "SIM_ROUNDS", default_value_t = 1)]
     pub(crate) rounds: usize,
     /// How long to wait for every node to come up.
@@ -55,15 +59,16 @@ pub(crate) async fn run(setup: &Setup, args: &Args) -> eyre::Result<Vec<RoundRep
     for round in 0..args.rounds {
         let session = hex::encode(rand::random::<[u8; 32]>());
         tracing::info!(round, %session, "starting round");
-        let round_start = Instant::now();
+        let mut phases = Vec::new();
 
-        let start = Instant::now();
-        let clients = start_all(&http, &args.clients, &session)
+        let timer = Timer::start("clients");
+        let mut nodes: Vec<NodeReport> = start_all(&http, &args.clients, &session)
             .await
             .wrap_err("client phase failed")?;
-        let clients_ms = start.elapsed().as_millis();
+        phases.push(timer.finish());
 
         // every client is honest here, so all of them make the canonical set
+        let timer = Timer::start("canonical");
         let canonical: Vec<u32> = (0..setup.clients as u32).collect();
         let url = format!("{}/{session}/canonical", args.bulletin);
         let resp = http
@@ -78,19 +83,21 @@ pub(crate) async fn run(setup: &Setup, args: &Args) -> eyre::Result<Vec<RoundRep
             "{url} answered {}",
             resp.status()
         );
+        phases.push(timer.finish());
 
-        let start = Instant::now();
-        let servers = start_all(&http, &args.servers, &session)
+        let timer = Timer::start("servers");
+        let servers: Vec<NodeReport> = start_all(&http, &args.servers, &session)
             .await
             .wrap_err("server phase failed")?;
-        let servers_ms = start.elapsed().as_millis();
+        phases.push(timer.finish());
+        nodes.extend(servers);
 
-        let start = Instant::now();
-        let recipient: crate::report::RecipientReport =
+        let timer = Timer::start("recipient");
+        let recipient: RecipientReport =
             http::post_for_json(&http, format!("{}/round/{session}", args.recipient))
                 .await
                 .wrap_err("recipient phase failed")?;
-        let recipient_ms = start.elapsed().as_millis();
+        phases.push(timer.finish());
 
         if recipient.messages != expected {
             bail!(
@@ -99,17 +106,20 @@ pub(crate) async fn run(setup: &Setup, args: &Args) -> eyre::Result<Vec<RoundRep
                 expected
             );
         }
+        nodes.push(recipient.report);
+
+        let bulletin = http::get_bytes(&http, format!("{}/{session}/report", args.bulletin))
+            .await
+            .wrap_err("failed to fetch bulletin report")?;
+        nodes.push(serde_json::from_slice(&bulletin).wrap_err("bulletin report is not json")?);
 
         let report = RoundReport {
+            label: args.label.clone(),
             round,
             session,
-            clients_ms,
-            servers_ms,
-            recipient_ms,
-            total_ms: round_start.elapsed().as_millis(),
-            clients,
-            servers,
-            recipient,
+            setup: setup.clone(),
+            phases,
+            nodes,
         };
         println!(
             "{}",

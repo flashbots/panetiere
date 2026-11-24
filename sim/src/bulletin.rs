@@ -12,6 +12,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::http;
+use crate::metrics::Window;
+use crate::report::NodeReport;
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
@@ -19,13 +21,18 @@ pub(crate) struct Args {
     pub(crate) listen: SocketAddr,
 }
 
-/// Everything published for one session, kept as the bytes that were posted.
+/// Everything published for one session, kept as the bytes that were posted,
+/// and when posts and entries arrived. Serving is not timed here: a handler
+/// returns long before its response finishes sending, so the recipient and
+/// servers time their own downloads instead.
 #[derive(Default)]
 struct Session {
     clients: HashMap<u32, Bytes>,
     commitments: HashMap<u32, Bytes>,
     servers: HashMap<u32, Bytes>,
     canonical: Option<Vec<u32>>,
+    received_posts: Window,
+    received_entries: Window,
 }
 
 type Sessions = Arc<Mutex<HashMap<String, Session>>>;
@@ -39,6 +46,7 @@ pub(crate) async fn run(listener: TcpListener) -> eyre::Result<()> {
             "/{session}/canonical",
             post(post_canonical).get(get_canonical),
         )
+        .route("/{session}/report", get(report))
         .with_state(Sessions::default());
     http::serve(listener, router).await
 }
@@ -57,6 +65,7 @@ async fn post_client(
     let commitment = Bytes::from(entry.comm.to_bytes());
     let mut sessions = sessions.lock().await;
     let s = sessions.entry(session).or_default();
+    s.received_posts.record(body.len());
     s.clients.insert(id, body);
     s.commitments.insert(id, commitment);
     Ok(())
@@ -90,11 +99,9 @@ async fn post_server(
     body: Bytes,
 ) {
     let mut sessions = sessions.lock().await;
-    sessions
-        .entry(session)
-        .or_default()
-        .servers
-        .insert(id, body);
+    let s = sessions.entry(session).or_default();
+    s.received_entries.record(body.len());
+    s.servers.insert(id, body);
 }
 
 async fn get_server(
@@ -127,4 +134,20 @@ async fn get_canonical(
         .and_then(|s| s.canonical.clone())
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn report(
+    State(sessions): State<Sessions>,
+    Path(session): Path<String>,
+) -> Result<Json<NodeReport>, StatusCode> {
+    let sessions = sessions.lock().await;
+    let s = sessions.get(&session).ok_or(StatusCode::NOT_FOUND)?;
+    let spans = [
+        s.received_posts.span("receive_posts"),
+        s.received_entries.span("receive_entries"),
+    ];
+    Ok(Json(NodeReport {
+        node: "bulletin".into(),
+        spans: spans.into_iter().flatten().collect(),
+    }))
 }

@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -17,7 +16,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::http;
-use crate::report::ServerReport;
+use crate::metrics::{self, Span, Timer, Window};
+use crate::report::NodeReport;
 use crate::setup::{Params, Setup};
 
 #[derive(clap::Args)]
@@ -31,8 +31,12 @@ pub(crate) struct Args {
     pub(crate) bulletin: String,
 }
 
-/// Sealed openings received so far, by session.
-type Inbox = HashMap<String, Vec<(ClientId, Vec<u8>)>>;
+/// Sealed openings received for one session, and when they arrived.
+#[derive(Default)]
+struct Inbox {
+    sealed: Vec<(ClientId, Vec<u8>)>,
+    received: Window,
+}
 
 struct Node {
     params: Params,
@@ -40,7 +44,7 @@ struct Node {
     key: pke::PrivateKey,
     bulletin: String,
     http: reqwest::Client,
-    inbox: Mutex<Inbox>,
+    inboxes: Mutex<HashMap<String, Inbox>>,
 }
 
 pub(crate) async fn run(listener: TcpListener, setup: Setup, args: Args) -> eyre::Result<()> {
@@ -50,7 +54,7 @@ pub(crate) async fn run(listener: TcpListener, setup: Setup, args: Args) -> eyre
         key: pke::PrivateKey::generate(&mut OsRng),
         bulletin: args.bulletin,
         http: reqwest::Client::new(),
-        inbox: Mutex::default(),
+        inboxes: Mutex::default(),
     });
     let router = Router::new()
         .route("/key", get(key))
@@ -69,77 +73,94 @@ async fn opening(
     Path((session, client)): Path<(String, u32)>,
     body: Bytes,
 ) {
-    let mut inbox = node.inbox.lock().await;
-    inbox
-        .entry(session)
-        .or_default()
-        .push((ClientId(client), body.to_vec()));
+    let mut inboxes = node.inboxes.lock().await;
+    let inbox = inboxes.entry(session).or_default();
+    inbox.received.record(body.len());
+    inbox.sealed.push((ClientId(client), body.to_vec()));
 }
 
 async fn round(
     State(node): State<Arc<Node>>,
     Path(session): Path<String>,
-) -> Result<Json<ServerReport>, http::Error> {
+) -> Result<Json<NodeReport>, http::Error> {
     let sid = http::parse_session(&session)?;
     let base = format!("{}/{session}", node.bulletin);
+    let mut spans = Vec::new();
 
-    let start = Instant::now();
+    let timer = Timer::start("download_canonical");
+    let body = http::get_bytes(&node.http, format!("{base}/canonical")).await?;
+    spans.push(timer.finish_bytes(body.len()));
     let canonical: Vec<u32> =
-        serde_json::from_slice(&http::get_bytes(&node.http, format!("{base}/canonical")).await?)
-            .wrap_err("canonical set is not json")?;
-    let urls = canonical
+        serde_json::from_slice(&body).wrap_err("canonical set is not json")?;
+
+    let requests = canonical
         .iter()
-        .map(|c| format!("{base}/commitment/{c}"))
+        .map(|c| {
+            (
+                format!("download_commitment_{c}"),
+                format!("{base}/commitment/{c}"),
+            )
+        })
         .collect();
-    let commitments = http::get_all(&node.http, urls)
-        .await?
+    let downloads = http::get_all(&node.http, requests).await?;
+    let commitments = downloads
         .iter()
         .zip(&canonical)
-        .map(|(bytes, c)| {
+        .map(|((bytes, _), c)| {
             Commitment::from_bytes(bytes)
                 .map(|comm| (ClientId(*c), comm))
                 .ok_or_else(|| eyre!("commitment of client {c} does not parse"))
         })
         .collect::<eyre::Result<Vec<_>>>()?;
-    let download_ms = start.elapsed().as_millis();
+    let download_spans: Vec<Span> = downloads.into_iter().map(|(_, span)| span).collect();
+    spans.push(metrics::merge("download_commitments", &download_spans));
 
-    let sealed = node.inbox.lock().await.remove(&session).unwrap_or_default();
-    let start = Instant::now();
+    let inbox = node
+        .inboxes
+        .lock()
+        .await
+        .remove(&session)
+        .unwrap_or_default();
+    spans.extend(inbox.received.span("receive_openings"));
+
     let worker = node.clone();
-    let entry = tokio::task::spawn_blocking(move || -> eyre::Result<Vec<u8>> {
-        let opened = unseal_openings(&worker.key, &sid, worker.id, &sealed);
-        let items = sealed
-            .iter()
-            .zip(opened)
-            .map(|((cid, _), op)| {
-                op.map(|op| (*cid, op))
-                    .ok_or_else(|| eyre!("opening from client {} does not unseal", cid.0))
-            })
-            .collect::<eyre::Result<Vec<_>>>()?;
-        let inbox = ServerInbox {
-            server_id: worker.id,
-            items,
-        };
-        let canonical: Vec<ClientId> = canonical.into_iter().map(ClientId).collect();
-        let cs = &worker.params.protocol.cs;
-        let entry = run_server_round(cs, &inbox, &canonical, &commitments)
-            .map_err(|e| eyre!("server round failed: {e:?}"))?;
-        Ok(entry.to_bytes(cs))
-    })
-    .await
-    .wrap_err("server round task panicked")??;
-    let compute_ms = start.elapsed().as_millis();
+    let (entry, compute_spans) =
+        tokio::task::spawn_blocking(move || -> eyre::Result<(Vec<u8>, Vec<Span>)> {
+            let timer = Timer::start_cpu("unseal");
+            let opened = unseal_openings(&worker.key, &sid, worker.id, &inbox.sealed);
+            let unseal = timer.finish();
+            let items = inbox
+                .sealed
+                .iter()
+                .zip(opened)
+                .map(|((cid, _), op)| {
+                    op.map(|op| (*cid, op))
+                        .ok_or_else(|| eyre!("opening from client {} does not unseal", cid.0))
+                })
+                .collect::<eyre::Result<Vec<_>>>()?;
+            let server_inbox = ServerInbox {
+                server_id: worker.id,
+                items,
+            };
+            let canonical: Vec<ClientId> = canonical.into_iter().map(ClientId).collect();
+            let cs = &worker.params.protocol.cs;
+            let timer = Timer::start_cpu("server_round");
+            let entry = run_server_round(cs, &server_inbox, &canonical, &commitments)
+                .map_err(|e| eyre!("server round failed: {e:?}"))?;
+            let bytes = entry.to_bytes(cs);
+            Ok((bytes, vec![unseal, timer.finish()]))
+        })
+        .await
+        .wrap_err("server round task panicked")??;
+    spans.extend(compute_spans);
 
-    let start = Instant::now();
-    let entry_bytes = entry.len();
+    let timer = Timer::start("upload_entry");
+    let len = entry.len();
     http::post_bytes(&node.http, format!("{base}/server/{}", node.id.0), entry).await?;
-    let upload_ms = start.elapsed().as_millis();
+    spans.push(timer.finish_bytes(len));
 
-    Ok(Json(ServerReport {
-        index: node.id.0,
-        download_ms,
-        compute_ms,
-        upload_ms,
-        entry_bytes,
+    Ok(Json(NodeReport {
+        node: format!("server-{}", node.id.0),
+        spans,
     }))
 }

@@ -4,10 +4,11 @@ use panetiere::channel::ChannelParams;
 use panetiere::protocol::ProtocolParams;
 use rand::SeedableRng as _;
 use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
 
 /// Round shape shared by every node. Every node must get the same values,
 /// since each one derives the public parameters from them on its own.
-#[derive(Args, Clone, Debug)]
+#[derive(Args, Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Setup {
     /// Seed for the shared public parameters.
     #[arg(long, env = "SIM_SEED", default_value_t = 0)]

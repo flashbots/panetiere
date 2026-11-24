@@ -10,6 +10,8 @@ use serde::de::DeserializeOwned;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 
+use crate::metrics::{Span, Timer};
+
 /// Handler error: answers 500 with the whole error chain as the body.
 pub(crate) struct Error(eyre::Report);
 
@@ -109,21 +111,32 @@ pub(crate) async fn post_for_json<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).wrap_err_with(|| format!("bad json from {url}"))
 }
 
-/// GETs every url at once and returns the bodies in the same order.
+/// GETs every url at once. Returns each body in request order, with a span
+/// named after the request.
 pub(crate) async fn get_all(
     http: &reqwest::Client,
-    urls: Vec<String>,
-) -> eyre::Result<Vec<Vec<u8>>> {
+    requests: Vec<(String, String)>,
+) -> eyre::Result<Vec<(Vec<u8>, Span)>> {
     let mut tasks = JoinSet::new();
-    let n = urls.len();
-    for (i, url) in urls.into_iter().enumerate() {
+    let n = requests.len();
+    for (i, (name, url)) in requests.into_iter().enumerate() {
         let http = http.clone();
-        tasks.spawn(async move { (i, get_bytes(&http, url).await) });
+        tasks.spawn(async move {
+            let timer = Timer::start(name);
+            let body = get_bytes(&http, url).await;
+            (
+                i,
+                body.map(|b| {
+                    let span = timer.finish_bytes(b.len());
+                    (b, span)
+                }),
+            )
+        });
     }
-    let mut out = vec![Vec::new(); n];
+    let mut out: Vec<Option<(Vec<u8>, Span)>> = (0..n).map(|_| None).collect();
     while let Some(joined) = tasks.join_next().await {
         let (i, body) = joined.wrap_err("download task panicked")?;
-        out[i] = body?;
+        out[i] = Some(body?);
     }
-    Ok(out)
+    Ok(out.into_iter().flatten().collect())
 }
