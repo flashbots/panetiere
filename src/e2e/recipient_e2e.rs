@@ -6,7 +6,8 @@ use crate::cs::Commitment;
 use crate::pke;
 use crate::protocol::client::run_client_round;
 use crate::protocol::recipient::{
-    recover_unverified_direct, recover_unverified_once, RecipientError, RejectReason, SetPolicy,
+    recover_unverified_direct, recover_unverified_direct_from_bytes, recover_unverified_once,
+    RecipientError, Recovered, RejectReason, SetPolicy,
 };
 use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use crate::protocol::verify::{aggregate_and_decrypt_unverified, VerifyError};
@@ -37,6 +38,15 @@ struct Round {
 }
 
 impl Round {
+    /// Every client's post as wire bytes, indexed by client id.
+    fn post_bytes(&self) -> Vec<Option<Vec<u8>>> {
+        let mut out = vec![None; self.canonical.len()];
+        for (cid, e) in &self.publics {
+            out[cid.0 as usize] = Some(e.to_bytes());
+        }
+        out
+    }
+
     fn lookup(&self) -> impl Fn(ClientId) -> Option<ClientBulletinEntry> + '_ {
         |cid| {
             self.publics
@@ -118,6 +128,36 @@ fn recover_once_names_the_faulty_server() {
     );
 }
 
+/// Recover through both direct entry points, from the parsed posts and from
+/// their bytes, and check that they agree.
+fn recover_direct<L>(
+    r: &Round,
+    policy: &SetPolicy,
+    posts: L,
+    outputs: &[ServerBulletinEntry],
+) -> Result<Recovered, RecipientError>
+where
+    L: Fn(ClientId) -> Option<ClientBulletinEntry> + Sync,
+{
+    let parsed = recover_unverified_direct(&r.pp, policy, &posts, outputs);
+    let bytes = recover_unverified_direct_from_bytes(
+        &r.pp,
+        policy,
+        |cid: ClientId| posts(cid).map(|e| e.to_bytes()),
+        outputs,
+    );
+    match (&parsed, &bytes) {
+        (Ok(a), Ok(b)) => {
+            assert_eq!(a.canonical, b.canonical);
+            assert_eq!(a.plaintext, b.plaintext);
+            assert_eq!(a.culprits, b.culprits);
+        }
+        (Err(a), Err(b)) => assert_eq!(a, b),
+        _ => panic!("the entry points disagree: {parsed:?} and {bytes:?}"),
+    }
+    bytes
+}
+
 /// The wrapper drops exactly the corrupted servers and reports them, because
 /// t-of-n decryption does not need them.
 #[test]
@@ -136,7 +176,7 @@ fn recover_direct_excludes_culprits() {
     .unwrap();
 
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    let got = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap();
+    let got = recover_direct(&r, &policy, r.lookup(), &r.outputs).unwrap();
     assert_eq!(got.plaintext, honest);
     let mut culprits: Vec<u32> = got.culprits.iter().map(|s| s.0).collect();
     culprits.sort();
@@ -154,7 +194,7 @@ fn recover_direct_reports_exhausted_shares() {
         r.outputs[i].agg_share += CsPoly::rand_poly(&mut rng);
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    match recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs) {
+    match recover_direct(&r, &policy, r.lookup(), &r.outputs) {
         Err(RecipientError::Rejected(reason)) => assert!(
             matches!(reason, RejectReason::ExhaustedShares { need: 3, .. }),
             "got {reason:?}"
@@ -167,7 +207,7 @@ fn recover_direct_reports_exhausted_shares() {
 fn below_share_threshold_is_its_own_error() {
     let r = round(5, 5, 4);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
-    match recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]) {
+    match recover_direct(&r, &policy, r.lookup(), &r.outputs[..2]) {
         Err(e) => assert_eq!(e, RecipientError::BelowShareThreshold { have: 2, need: 3 }),
         Ok(other) => panic!("expected BelowShareThreshold, got {other:?}"),
     }
@@ -180,7 +220,7 @@ fn max_clients_rejects_an_oversized_anchor() {
     let r = round(6, 4, 6);
     let policy = SetPolicy::anchored(&r.canonical, 0, 4);
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        recover_direct(&r, &policy, r.lookup(), &r.outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::AboveMaxClients { got: 6, max: 4 })
     );
 }
@@ -191,8 +231,8 @@ fn missing_client_public_is_rejected() {
     r.publics.remove(2);
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
-        RecipientError::Rejected(RejectReason::MissingClientPublics { have: 4, need: 5 })
+        recover_direct(&r, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        RecipientError::Rejected(RejectReason::MissingClientPost(ClientId(2)))
     );
 }
 
@@ -211,7 +251,7 @@ fn servers_disagreeing_with_the_anchor_do_not_count() {
     }
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
+        recover_direct(&r, &policy, r.lookup(), &outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::TooFewAgreeingServers {
             agreeing: 2,
             need: 3
@@ -225,7 +265,7 @@ fn anonymity_floor_rejects_a_small_set() {
     r.pp.min_clients = 5;
     let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        recover_direct(&r, &policy, r.lookup(), &r.outputs).unwrap_err(),
         RecipientError::Rejected(RejectReason::BelowAnonymityFloor { got: 4, min: 5 })
     );
 }
@@ -258,7 +298,7 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
         let mut outputs = r.outputs.clone();
         outputs[bad].clients.push(r.canonical[0]);
         outputs[(bad + 1) % r.outputs.len()].clients.reverse();
-        let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap();
+        let direct = recover_direct(&r, &policy, r.lookup(), &outputs).unwrap();
         assert_eq!(direct.plaintext, want);
         assert_eq!(direct.canonical, r.canonical);
     }
@@ -272,7 +312,7 @@ fn roster_duplicates_are_excluded_and_order_is_normalized() {
         need: 3,
     });
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &outputs).unwrap_err(),
+        recover_direct(&r, &policy, r.lookup(), &outputs).unwrap_err(),
         expected
     );
 }
@@ -286,7 +326,7 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
     r.pp.max_clients = 4;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs)
+        recover_direct(&r, &policy, r.lookup(), &r.outputs)
             .unwrap()
             .plaintext,
         want
@@ -295,7 +335,7 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
     r.pp.max_clients = 3;
     let expected = RecipientError::Rejected(RejectReason::AboveMaxClients { got: 4, max: 3 });
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs).unwrap_err(),
+        recover_direct(&r, &policy, r.lookup(), &r.outputs).unwrap_err(),
         expected
     );
     let expected = Err(VerifyError::TooManyClients { got: 4, max: 3 });
@@ -312,6 +352,138 @@ fn protocol_capacity_cannot_be_raised_by_policy() {
         ),
         expected
     );
+}
+
+/// Each client ciphertext has exactly `μ` ring elements. With several
+/// misbehaving clients, the first in the set's order is named, whatever the
+/// kind of fault.
+#[test]
+fn the_first_misbehaving_client_is_named() {
+    let r = round(33, 4, 5);
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    let longer = |cid: u32| {
+        let (_, e) = &r.publics[cid as usize];
+        ClientBulletinEntry {
+            ctxt: [e.ctxt.clone(), e.ctxt.clone()].concat(),
+            comm: e.comm.clone(),
+        }
+    };
+    let direct = |missing: &[u32], long: &[u32]| {
+        let lookup = |cid: ClientId| {
+            if missing.contains(&cid.0) {
+                None
+            } else if long.contains(&cid.0) {
+                Some(longer(cid.0))
+            } else {
+                r.lookup()(cid)
+            }
+        };
+        match recover_direct(&r, &policy, lookup, &r.outputs) {
+            Err(RecipientError::Rejected(reason)) => reason,
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        direct(&[3, 1], &[]),
+        RejectReason::MissingClientPost(ClientId(1))
+    );
+    assert_eq!(
+        direct(&[], &[4, 2]),
+        RejectReason::WrongCiphertextLength(ClientId(2))
+    );
+    assert_eq!(
+        direct(&[3], &[1]),
+        RejectReason::WrongCiphertextLength(ClientId(1))
+    );
+    assert_eq!(
+        direct(&[1], &[3]),
+        RejectReason::MissingClientPost(ClientId(1))
+    );
+
+    let mut publics = r.publics.clone();
+    publics[2].1 = longer(2);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &publics, &r.outputs),
+        Err(VerifyError::WrongCiphertextLength(ClientId(2)))
+    );
+}
+
+fn from_bytes(r: &Round, posts: &[Option<Vec<u8>>]) -> Result<Recovered, RecipientError> {
+    let policy = SetPolicy::anchored(&r.canonical, 0, NO_CAP);
+    recover_unverified_direct_from_bytes(
+        &r.pp,
+        &policy,
+        |cid: ClientId| posts.get(cid.0 as usize)?.as_deref(),
+        &r.outputs,
+    )
+}
+
+/// From the posts' bytes, the first misbehaving client in the set's
+/// order is named, whatever the kind of fault.
+#[test]
+fn from_bytes_names_the_first_misbehaving_client() {
+    let r = round(35, 4, 6);
+    let reject = |posts: &[Option<Vec<u8>>]| match from_bytes(&r, posts) {
+        Err(RecipientError::Rejected(reason)) => reason,
+        other => panic!("expected Rejected, got {other:?}"),
+    };
+    let (_, e) = &r.publics[0];
+    let longer = ClientBulletinEntry {
+        ctxt: [e.ctxt.clone(), e.ctxt.clone()].concat(),
+        comm: e.comm.clone(),
+    }
+    .to_bytes();
+    let with = |faults: &[(usize, &str)]| {
+        let mut posts = r.post_bytes();
+        for &(i, kind) in faults {
+            match kind {
+                "missing" => posts[i] = None,
+                "malformed" => {
+                    posts[i].as_mut().unwrap().pop();
+                }
+                _ => posts[i] = Some(longer.clone()),
+            }
+        }
+        reject(&posts)
+    };
+    use RejectReason::*;
+    assert_eq!(
+        with(&[(4, "missing"), (2, "missing")]),
+        MissingClientPost(ClientId(2))
+    );
+    assert_eq!(
+        with(&[(5, "malformed"), (1, "malformed")]),
+        MalformedClientPost(ClientId(1))
+    );
+    assert_eq!(with(&[(3, "long")]), WrongCiphertextLength(ClientId(3)));
+    assert_eq!(
+        with(&[(4, "missing"), (2, "malformed"), (3, "long")]),
+        MalformedClientPost(ClientId(2))
+    );
+    assert_eq!(
+        with(&[(1, "long"), (0, "missing"), (5, "malformed")]),
+        MissingClientPost(ClientId(0))
+    );
+}
+
+/// A fold keeps its first fault when valid posts come after it. On one
+/// thread, each fold sees several clients in order, so the malformed post of
+/// client 1 is followed by client 2's valid one in the same fold.
+#[test]
+fn a_fault_is_kept_past_later_valid_posts() {
+    let r = round(36, 4, 6);
+    let mut posts = r.post_bytes();
+    posts[1].as_mut().unwrap().pop();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    match pool.install(|| from_bytes(&r, &posts)) {
+        Err(RecipientError::Rejected(reason)) => {
+            assert_eq!(reason, RejectReason::MalformedClientPost(ClientId(1)))
+        }
+        other => panic!("expected Rejected, got {other:?}"),
+    }
 }
 
 // a server that reports twice, or under an id outside the roster, voids the
@@ -361,9 +533,7 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
         Err(VerifyError::BadServerCoverage)
     );
 
-    let bad_len = Err(VerifyError::InconsistentCiphertextLen(
-        r.outputs[0].server_id,
-    ));
+    let bad_len = Err(VerifyError::WrongAggregateLength);
     assert_eq!(
         decrypt_unverified_sum(&r.pp, &[], &entry.comm, &r.outputs),
         bad_len
@@ -383,15 +553,12 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
 fn ciphertext_lengths_must_agree_and_fit() {
     let r = round(16, 4, 3);
     let extra = r.publics[0].1.ctxt[0];
-    let bad_len = Err(VerifyError::InconsistentCiphertextLen(
-        r.outputs[0].server_id,
-    ));
 
     let mut ragged = r.publics.clone();
     ragged[1].1.ctxt.push(extra);
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &ragged, &r.outputs),
-        bad_len
+        Err(VerifyError::WrongCiphertextLength(ClientId(1)))
     );
 
     let mut long = r.publics.clone();
@@ -400,7 +567,7 @@ fn ciphertext_lengths_must_agree_and_fit() {
     }
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &long, &r.outputs),
-        bad_len
+        Err(VerifyError::WrongCiphertextLength(ClientId(0)))
     );
 }
 
