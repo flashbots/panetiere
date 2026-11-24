@@ -64,7 +64,7 @@ All settings are environment variables.
 | Variable | Default | |
 |---|---|---|
 | `SIM_SERVERS` / `SIM_CLIENTS` | 4 / 8 | |
-| `SIM_MESSAGES` | `SIM_CLIENTS` | clients `0..SIM_MESSAGES` send a message, the rest send cover. Every post has room for this many messages, so the recipient downloads about `clients × messages × message bytes × 7` |
+| `SIM_MESSAGES` | `SIM_CLIENTS` | clients `0..SIM_MESSAGES` send a message, the rest send cover. Every post has room for this many messages, so a post grows with `messages × message bytes` (measured: about 16–18× that payload at 8 messages, about 5.5× at 64), and the recipient downloads every post |
 | `SIM_MESSAGE_BYTES` | 32 | |
 | `SIM_ROUNDS` | 1 | the first round includes connection setup, so use 2 or more and compare |
 | `SIM_LABEL` | none | copied into every report; `sweep.sh` sets it |
