@@ -1,16 +1,14 @@
 #![allow(clippy::needless_range_loop, clippy::type_complexity)]
 
-use panetiere::bulletin::ClientBulletinEntry;
-use panetiere::cs::Commitment;
-use panetiere::pke;
-use panetiere::protocol::client::{run_client_round, ClientRound};
-use panetiere::protocol::server::{
-    run_server_round, unseal_opening, ServerInbox, ServerRoundError,
-};
-use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
-use panetiere::protocol::ProtocolParams;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
-use panetiere::{CsPoly, KahePoly, N};
+use crate::bulletin::ClientBulletinEntry;
+use crate::cs::Commitment;
+use crate::pke;
+use crate::protocol::client::{run_client_round, ClientRound};
+use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox, ServerRoundError};
+use crate::protocol::verify::aggregate_and_decrypt_unverified;
+use crate::protocol::ProtocolParams;
+use crate::protocol::{ClientId, ServerId, SessionId};
+use crate::{CsPoly, KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 
@@ -79,7 +77,7 @@ fn run_full_round_bytes(
         .collect();
     let server_outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("missing client"))
         .collect();
     let recovered =
         aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs)
@@ -170,7 +168,7 @@ fn client_round_accepts_message_after_offline_work() {
             unseal_opening(&server_keys[i], &SESSION, ClientId(0), *server_id, sealed).unwrap();
         outputs.push(
             run_server_round(
-                &pp.cs,
+                &pp,
                 &ServerInbox {
                     server_id: *server_id,
                     items: vec![(ClientId(0), opening)],
@@ -241,7 +239,7 @@ fn run<R: rand::Rng + rand::CryptoRng>(
         .collect();
     let server_outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("missing client"))
         .collect();
 
     let recovered =
@@ -350,7 +348,7 @@ fn tampered_agg_share_rejected() {
         .collect();
     let mut server_outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("missing client"))
         .collect();
 
     server_outputs[0].agg_share += CsPoly::rand_poly(&mut rng);
@@ -358,13 +356,15 @@ fn tampered_agg_share_rejected() {
         aggregate_and_decrypt_unverified(&pp, &canonical, &client_entries, &server_outputs);
     assert!(matches!(
         result,
-        Err(panetiere::protocol::verify::VerifyError::ShareOpeningMismatch(_))
+        Err(crate::protocol::verify::VerifyError::ShareOpeningMismatch(
+            _
+        ))
     ));
 }
 
 #[test]
 fn below_floor_anonymity_set_rejected() {
-    use panetiere::protocol::verify::VerifyError;
+    use crate::protocol::verify::VerifyError;
 
     let mut rng = ChaCha20Rng::from_seed([21u8; 32]);
     let n_servers = 4;
@@ -407,7 +407,7 @@ fn below_floor_anonymity_set_rejected() {
         .collect();
     let server_outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("missing client"))
         .collect();
 
     let result =
@@ -492,7 +492,7 @@ fn bad_opening_is_named_by_server_not_blamed_on_it() {
     let results: Vec<_> = round
         .inboxes
         .iter()
-        .map(|inb| run_server_round(&round.pp.cs, inb, &round.canonical, &round.commitments))
+        .map(|inb| run_server_round(&round.pp, inb, &round.canonical, &round.commitments))
         .collect();
     assert!(matches!(
         results[0],
@@ -517,7 +517,7 @@ fn opening_against_wrong_commitment_rejected() {
     round.commitments[2].1 = round.commitments[3].1.clone();
 
     for inb in &round.inboxes {
-        let result = run_server_round(&round.pp.cs, inb, &round.canonical, &round.commitments);
+        let result = run_server_round(&round.pp, inb, &round.canonical, &round.commitments);
         assert!(matches!(
             result,
             Err(ServerRoundError::BadOpening(ClientId(2)))
@@ -535,7 +535,7 @@ fn opening_for_other_position_rejected() {
     round.inboxes[0].items[0].1 = from_server_1;
 
     let result = run_server_round(
-        &round.pp.cs,
+        &round.pp,
         &round.inboxes[0],
         &round.canonical,
         &round.commitments,
@@ -555,7 +555,7 @@ fn missing_commitment_is_missing_client() {
     round.commitments.pop();
 
     let result = run_server_round(
-        &round.pp.cs,
+        &round.pp,
         &round.inboxes[0],
         &round.canonical,
         &round.commitments,
@@ -622,7 +622,7 @@ fn recovers_from_t_of_n_servers() {
         .collect();
     let outputs: Vec<_> = inboxes
         .iter()
-        .map(|inb| run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client"))
+        .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("missing client"))
         .collect();
 
     let expected = reduce_centered_mod_t(

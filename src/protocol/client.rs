@@ -13,7 +13,7 @@ use crate::pke;
 use crate::sss::ShamirSharing;
 
 /// Pack one per-server opening, bound to `(sid, client_id, server_id)`.
-pub fn seal_opening<R: CryptoRng + Rng>(
+pub(crate) fn seal_opening<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     sid: &SessionId,
@@ -32,7 +32,7 @@ pub fn seal_opening<R: CryptoRng + Rng>(
 }
 
 /// Batch form of [`seal_opening`]
-pub fn seal_openings<R: CryptoRng + Rng>(
+pub(crate) fn seal_openings<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     sid: &SessionId,
@@ -64,12 +64,12 @@ pub fn seal_openings<R: CryptoRng + Rng>(
 }
 
 /// Sample a fresh KAHE secret key.
-pub fn kahe_keygen<R: Rng>(rng: &mut R, pp: &ProtocolParams) -> KaheKey {
+pub(crate) fn kahe_keygen<R: Rng>(rng: &mut R, pp: &ProtocolParams) -> KaheKey {
     Kahe::gen(rng, &pp.kahe)
 }
 
 /// Encrypt `message` under `key`.
-pub fn kahe_encrypt<R: Rng>(
+pub(crate) fn kahe_encrypt<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     key: &KaheKey,
@@ -82,13 +82,13 @@ pub fn kahe_encrypt<R: Rng>(
 /// share per server, `pp.shamir.n` of them.
 /// The protocol assumes clients execute this honestly: the share commitment
 /// does not prove degree consistency.
-pub fn shamir_share<R: Rng>(rng: &mut R, pp: &ProtocolParams, key: &KaheKey) -> Vec<CsPoly> {
+pub(crate) fn shamir_share<R: Rng>(rng: &mut R, pp: &ProtocolParams, key: &KaheKey) -> Vec<CsPoly> {
     ShamirSharing::share(rng, &pp.shamir, &kahe_to_cs_centered(key.inner()))
 }
 
 /// Commit to the per-server shares.
 /// Returns the public commitment and the per-server openings.
-pub fn cs_commit<R: Rng>(
+pub(crate) fn cs_commit<R: Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     shares_per_server: &[CsPoly],
@@ -144,9 +144,30 @@ impl ClientRound {
 
 /// Output of a single client round.
 pub struct ClientRoundOutput {
-    pub client_id: ClientId,
-    pub encrypted_message: ClientBulletinEntry,
-    pub sealed_openings: Vec<(ServerId, Vec<u8>)>,
+    pub(crate) client_id: ClientId,
+    pub(crate) encrypted_message: ClientBulletinEntry,
+    pub(crate) sealed_openings: Vec<(ServerId, Vec<u8>)>,
+}
+
+impl ClientRoundOutput {
+    pub fn client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    /// The client's bulletin post: its ciphertext and commitment.
+    pub fn post(&self) -> &ClientBulletinEntry {
+        &self.encrypted_message
+    }
+
+    /// One sealed opening per server, each for that server only.
+    pub fn sealed_openings(&self) -> &[(ServerId, Vec<u8>)] {
+        &self.sealed_openings
+    }
+
+    /// The post and the sealed openings, without copying either.
+    pub fn into_parts(self) -> (ClientBulletinEntry, Vec<(ServerId, Vec<u8>)>) {
+        (self.encrypted_message, self.sealed_openings)
+    }
 }
 
 pub fn run_client_round<R: CryptoRng + Rng>(
@@ -154,7 +175,7 @@ pub fn run_client_round<R: CryptoRng + Rng>(
     pp: &ProtocolParams,
     sid: &SessionId,
     client_id: ClientId,
-    message: <Kahe as KaheScheme>::Message,
+    message: Vec<KahePoly>,
     servers: &[(ServerId, pke::PublicKey)],
 ) -> ClientRoundOutput {
     ClientRound::new(rng, pp, sid, client_id, servers).finalize(&message)

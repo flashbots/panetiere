@@ -5,27 +5,29 @@
 pub mod bulletin;
 pub mod channel;
 mod chunking;
-pub mod cs;
+pub(crate) mod cs;
+#[cfg(test)]
+mod e2e;
 #[doc(hidden)]
 pub mod hvc_stream;
 #[doc(hidden)]
 pub mod hvc_sum;
 mod iblt_shape;
-pub mod kahe;
-pub mod mse;
+pub(crate) mod kahe;
+pub(crate) mod mse;
 pub mod pke;
-pub mod prony;
+pub(crate) mod prony;
 pub mod protocol;
 #[cfg(test)]
 mod reference_params;
-pub mod rings;
-pub mod sss;
+pub(crate) mod rings;
+pub(crate) mod sss;
 
-pub use chipmunk_code::path::Path;
-pub use chipmunk_code::{HVCHash, HVCPoly, Tree};
-pub use rings::{
-    pointwise_dot_cs, pointwise_dot_kahe, CsNTTPoly, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS,
-    CS_MODULUS_OVER_TWO, KAHE_MODULUS, KAHE_MODULUS_OVER_TWO, N,
+pub use rings::{KahePoly, N};
+
+pub(crate) use rings::{
+    pointwise_dot_cs, pointwise_dot_kahe, CsNTTPoly, CsPoly, KaheNTTPoly, CS_MODULUS,
+    CS_MODULUS_OVER_TWO, KAHE_MODULUS, KAHE_MODULUS_OVER_TWO,
 };
 
 /// Draw `n` independent 256-bit seeds from `rng`, serially and in order

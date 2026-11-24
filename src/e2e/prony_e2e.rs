@@ -7,16 +7,16 @@
 //! — KAHE, Shamir, CS, the verifier's per-poly sum — is untouched, which is the
 //! point: the sketch is just another additively homomorphic plaintext.
 
-use panetiere::cs::Commitment;
-use panetiere::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
-use panetiere::pke;
-use panetiere::prony::{PronyParams, PronySketch, PRONY_PRIME};
-use panetiere::protocol::client::run_client_round;
-use panetiere::protocol::server::{run_server_round, unseal_opening, ServerInbox};
-use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
-use panetiere::protocol::ProtocolParams;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
-use panetiere::KahePoly;
+use crate::cs::Commitment;
+use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::pke;
+use crate::prony::{PronyParams, PronySketch, PRONY_PRIME};
+use crate::protocol::client::run_client_round;
+use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
+use crate::protocol::verify::aggregate_and_decrypt_unverified;
+use crate::protocol::ProtocolParams;
+use crate::protocol::{ClientId, ServerId, SessionId};
+use crate::KahePoly;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 
@@ -80,7 +80,7 @@ fn round_trip(
             let outputs: Vec<_> = inboxes
                 .iter()
                 .map(|inb| {
-                    run_server_round(&pp.cs, inb, &canonical, &commitments).expect("missing client")
+                    run_server_round(&pp, inb, &canonical, &commitments).expect("missing client")
                 })
                 .collect();
             let recovered =

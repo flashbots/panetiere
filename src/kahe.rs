@@ -44,7 +44,9 @@ pub trait KaheScheme {
         m: &Self::Message,
     ) -> Self::Ciphertext;
     fn dec(pp: &Self::Params, c: &Self::Ciphertext, k: &Self::AggKey) -> Self::Message;
+    #[cfg(test)]
     fn agg_ctxt(cs: &[Self::Ciphertext]) -> Self::Ciphertext;
+    #[cfg(test)]
     fn agg_key(ks: &[Self::Key]) -> Self::AggKey;
 }
 
@@ -337,11 +339,13 @@ impl KaheScheme for Kahe {
             .collect()
     }
 
+    #[cfg(test)]
     fn agg_ctxt(cs: &[Vec<KahePoly>]) -> Vec<KahePoly> {
         let refs: Vec<&[KahePoly]> = cs.iter().map(Vec::as_slice).collect();
         Self::agg_ctxt_refs(&refs)
     }
 
+    #[cfg(test)]
     fn agg_key(ks: &[KaheKey]) -> KaheAggKey {
         KaheAggKey(
             ks.iter()

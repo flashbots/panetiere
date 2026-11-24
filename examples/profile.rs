@@ -15,7 +15,6 @@
 //!   PROFILE_N=16        canonical client count (default 16)
 //!   PROFILE_ITERS=10    iterations of the timed inner loop (default 10)
 //!   PROFILE_MU=0        KAHE width in polys (0 = the default parameter set)
-//!   PROFILE_T=0         plaintext modulus, only with PROFILE_MU (0 = default)
 //!   PROFILE_THRESHOLD=0 Shamir threshold (0 = honest majority, ⌊S/2⌋ + 1)
 //!   PROFILE_ROLE=all    which party's work the timed loop repeats:
 //!                       `all` runs the whole round per iteration;
@@ -25,34 +24,24 @@
 //!
 //! Each role is parallelised the way a deployment is: client rounds run
 //! concurrently across clients, every server unseals and sums its inbox in
-//! parallel with the others, and the recipient runs alone. Messages are drawn
-//! once, outside the loop, so the profile is the protocol and not the RNG.
+//! parallel with the others, and the recipient runs alone. Messages are all
+//! zero: the protocol's cost does not depend on their values, so the profile
+//! is the protocol and not the RNG.
 //!
 //! Tip: keep ITERS low under callgrind (it adds ~50× overhead). For perf
 //! sampling, push ITERS to 100+ to dilute startup noise.
 
 use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
-use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::client::ClientRound;
+use panetiere::protocol::recipient::recover_unverified_once;
 use panetiere::protocol::server::{run_server_round, unseal_openings, ServerInbox};
-use panetiere::protocol::verify::aggregate_and_decrypt_unverified;
-use panetiere::protocol::ProtocolParams;
-use panetiere::protocol::{ClientId, ServerId, SessionId};
+use panetiere::protocol::{ClientId, Commitment, ProtocolParams, ServerId, SessionId};
 use panetiere::KahePoly;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
-
-fn rand_message_poly<R: Rng>(rng: &mut R, t: u64) -> KahePoly {
-    let half = t as i64 / 2;
-    let mut coeffs = [0i64; panetiere::N];
-    for c in coeffs.iter_mut() {
-        *c = rng.gen_range(0..t) as i64 - half;
-    }
-    KahePoly::from_coeffs(coeffs)
-}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -84,7 +73,7 @@ impl Role {
 fn session(iter: usize) -> SessionId {
     let mut sid_bytes = [0u8; 32];
     sid_bytes[..8].copy_from_slice(&(iter as u64).to_le_bytes());
-    SessionId(sid_bytes)
+    SessionId::new(sid_bytes)
 }
 
 struct Cell {
@@ -122,9 +111,11 @@ impl Cell {
             .map(|_| Vec::with_capacity(rounds.len()))
             .collect();
         for round in rounds {
-            entries.push((round.client_id, round.encrypted_message));
-            for (idx, (_, sealed)) in round.sealed_openings.into_iter().enumerate() {
-                sealed_per_server[idx].push((round.client_id, sealed));
+            let cid = round.client_id();
+            let (post, sealed_openings) = round.into_parts();
+            entries.push((cid, post));
+            for (idx, (_, sealed)) in sealed_openings.into_iter().enumerate() {
+                sealed_per_server[idx].push((cid, sealed));
             }
         }
         ClientPhase {
@@ -144,7 +135,7 @@ impl Cell {
             .par_iter()
             .enumerate()
             .map(|(idx, sealed)| {
-                let server_id = ServerId(idx as u32);
+                let server_id = ServerId::new(idx as u32);
                 let items = unseal_openings(&self.server_keys[idx], sid, server_id, sealed)
                     .into_iter()
                     .zip(sealed)
@@ -155,8 +146,8 @@ impl Cell {
                         )
                     })
                     .collect();
-                let inbox = ServerInbox { server_id, items };
-                run_server_round(&self.pp.cs, &inbox, &self.client_ids, commitments)
+                let inbox = ServerInbox::new(server_id, items);
+                run_server_round(&self.pp, &inbox, &self.client_ids, commitments)
                     .expect("every canonical client posted")
             })
             .collect()
@@ -167,7 +158,7 @@ impl Cell {
         entries: &[(ClientId, ClientBulletinEntry)],
         outputs: &[ServerBulletinEntry],
     ) -> Vec<KahePoly> {
-        aggregate_and_decrypt_unverified(&self.pp, &self.client_ids, entries, outputs)
+        recover_unverified_once(&self.pp, &self.client_ids, entries, outputs)
             .expect("honest round verifies")
     }
 }
@@ -175,7 +166,7 @@ impl Cell {
 fn commitments_of(entries: &[(ClientId, ClientBulletinEntry)]) -> Vec<(ClientId, Commitment)> {
     entries
         .iter()
-        .map(|(cid, e)| (*cid, e.comm.clone()))
+        .map(|(cid, e)| (*cid, e.commitment().clone()))
         .collect()
 }
 
@@ -184,20 +175,10 @@ fn main() {
     let n = env_usize("PROFILE_N", 16);
     let iters = env_usize("PROFILE_ITERS", 10);
     let mu = env_usize("PROFILE_MU", 0);
-    let t_modulus = env_usize("PROFILE_T", 0) as u64;
     let role = Role::from_env();
 
     let mut rng = ChaCha20Rng::from_seed([(s as u8).wrapping_mul(7) ^ n as u8; 32]);
-    let pp = if mu > 0 && t_modulus > 0 {
-        ProtocolParams::setup_with_kahe_dims_full(
-            &mut rng,
-            s,
-            mu,
-            panetiere::kahe::SIGMA_S_DEFAULT,
-            panetiere::kahe::SIGMA_E_DEFAULT,
-            t_modulus,
-        )
-    } else if mu > 0 {
+    let pp = if mu > 0 {
         ProtocolParams::setup_with_kahe_dims(&mut rng, s, mu)
     } else {
         ProtocolParams::setup(&mut rng, s)
@@ -209,18 +190,14 @@ fn main() {
     };
 
     eprintln!(
-        "profile: S={} N={} iters={} role={} threads={} (μ_kahe={}, μ_cs={}, σ_s={:.3}, σ_e={:.3}, t={}, threshold={})",
+        "profile: S={} N={} iters={} role={} threads={} (μ_kahe={}, threshold={})",
         s,
         n,
         iters,
         std::env::var("PROFILE_ROLE").unwrap_or_else(|_| "all".into()),
         rayon::current_num_threads(),
-        pp.kahe.mu_kahe,
-        pp.cs.mu_cs,
-        pp.kahe.sigma_s,
-        pp.kahe.sigma_e,
-        pp.kahe.t_modulus,
-        pp.shamir.t
+        pp.message_polys(),
+        pp.threshold()
     );
     let server_keys: Vec<pke::PrivateKey> = (0..s)
         .map(|_| pke::PrivateKey::generate(&mut rng))
@@ -228,16 +205,10 @@ fn main() {
     let servers: Vec<(ServerId, pke::PublicKey)> = server_keys
         .iter()
         .enumerate()
-        .map(|(idx, key)| (ServerId(idx as u32), key.public()))
+        .map(|(idx, key)| (ServerId::new(idx as u32), key.public()))
         .collect();
-    let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId).collect();
-    let messages: Vec<Vec<KahePoly>> = (0..n)
-        .map(|_| {
-            (0..pp.kahe.mu_kahe)
-                .map(|_| rand_message_poly(&mut rng, pp.kahe.t_modulus))
-                .collect()
-        })
-        .collect();
+    let client_ids: Vec<ClientId> = (0..n as u32).map(ClientId::new).collect();
+    let messages = vec![vec![KahePoly::default(); pp.message_polys()]; n];
     let cell = Cell {
         pp,
         servers,
