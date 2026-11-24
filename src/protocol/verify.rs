@@ -21,9 +21,18 @@ pub enum VerifyError {
     NoServers,
     BadServerCoverage,
     InconsistentCanonical(ServerId),
-    InconsistentCiphertextLen(ServerId),
-    AnonymitySetTooSmall { got: usize, min: usize },
-    TooManyClients { got: usize, max: usize },
+    /// This client's ciphertext does not have exactly `μ` ring elements.
+    WrongCiphertextLength(ClientId),
+    /// The summed ciphertext does not have exactly `μ` ring elements.
+    WrongAggregateLength,
+    AnonymitySetTooSmall {
+        got: usize,
+        min: usize,
+    },
+    TooManyClients {
+        got: usize,
+        max: usize,
+    },
     ShareRecovery(SssError),
 }
 
@@ -102,9 +111,8 @@ pub(crate) fn aggregate_and_decrypt_unverified(
     }
     check_unique_clients(canonical)?;
     check_client_count(pp, canonical)?;
-    // A ciphertext may be shorter than μ; all clients must agree on the exact
-    // length, since agg_ctxt sums positionally.
-    let max_ctxt_len = pp.kahe.mu_kahe;
+    // Every ciphertext has exactly μ ring elements, so the sum is positional.
+    let mu = pp.kahe.mu_kahe;
     let t = pp.shamir.t;
 
     if server_outputs.len() < t {
@@ -130,19 +138,20 @@ pub(crate) fn aggregate_and_decrypt_unverified(
         .collect();
 
     let mut ctxts: Vec<&[KahePoly]> = Vec::with_capacity(canonical.len());
-    let mut ctxt_len: Option<usize> = None;
     for cid in canonical {
         let i = *pub_index.get(cid).ok_or(VerifyError::MissingClient(*cid))?;
         let (_, p) = &client_entries[i];
-        let expected = *ctxt_len.get_or_insert(p.ctxt.len());
-        if p.ctxt.len() != expected || p.ctxt.len() > max_ctxt_len {
-            return Err(VerifyError::InconsistentCiphertextLen(
-                server_outputs[0].server_id,
-            ));
+        if p.ctxt.len() != mu {
+            return Err(VerifyError::WrongCiphertextLength(*cid));
         }
         ctxts.push(&p.ctxt);
     }
-    let summed_ctxt = Kahe::agg_ctxt_refs(&ctxts);
+    // An empty set sums to zero.
+    let summed_ctxt = if ctxts.is_empty() {
+        vec![KahePoly::default(); mu]
+    } else {
+        Kahe::agg_ctxt_refs(&ctxts)
+    };
 
     let comms: Vec<&Commitment> = canonical
         .iter()
@@ -187,11 +196,8 @@ pub fn decrypt_unverified_sum(
     if server_outputs.len() < t {
         return Err(VerifyError::BadServerCoverage);
     }
-    // Shorter than μ is allowed; μ bounds the length.
-    if summed_ctxt.is_empty() || summed_ctxt.len() > pp.kahe.mu_kahe {
-        return Err(VerifyError::InconsistentCiphertextLen(
-            server_outputs[0].server_id,
-        ));
+    if summed_ctxt.len() != pp.kahe.mu_kahe {
+        return Err(VerifyError::WrongAggregateLength);
     }
     let mut seen: HashSet<u32> = HashSet::with_capacity(server_outputs.len());
     for sp in server_outputs {
