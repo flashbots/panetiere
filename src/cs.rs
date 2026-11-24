@@ -2718,11 +2718,12 @@ mod tests {
     #[test]
     fn batch_check_accepts_a_full_batch() {
         const SERVERS: usize = 4;
+        const CAPACITY: usize = 2;
         // random weightings of the batch that the batch check tries
         const COMBINATIONS: usize = 3;
         let mut rng = ChaCha20Rng::from_seed([115u8; 32]);
         let mut pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
-        let rounds: Vec<(Commitment, Opening)> = (0..2)
+        let rounds: Vec<(Commitment, Opening)> = (0..CAPACITY)
             .map(|_| {
                 let shares = rand_shares(&mut rng, SERVERS, MU_CS);
                 let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
@@ -2730,12 +2731,12 @@ mod tests {
             })
             .collect();
         // a looser fresh bound still accepts these openings but leaves room
-        // for only two per batch
-        pp.beta_cs = i32::MAX as u32 / (2 * (BATCH_WEIGHT_BOUND as u32 - 1));
-        assert_eq!(batch_capacity(&pp), 2);
+        // for only `CAPACITY` per batch
+        pp.beta_cs = i32::MAX as u32 / (CAPACITY as u32 * (BATCH_WEIGHT_BOUND as u32 - 1));
+        assert_eq!(batch_capacity(&pp), CAPACITY);
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
-        let weights = batch_weights(&mut rng, COMBINATIONS, 2);
+        let weights = batch_weights(&mut rng, COMBINATIONS, rounds.len());
         assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
     }
 
