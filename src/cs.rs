@@ -2531,12 +2531,15 @@ mod tests {
         assert!(HidingMerkleCommitment::check_fresh_shape(&pp, good));
 
         type Change = fn(&mut Opening);
-        let reshape: [(&str, Change); 7] = [
+        let reshape: [(&str, Change); 10] = [
+            ("kappa_cs one more", |o| o.kappa_cs += 1),
             ("kappa_cs one less", |o| o.kappa_cs -= 1),
             ("mu_cs one more", |o| o.mu_cs += 1),
+            ("mu_cs one less", |o| o.mu_cs -= 1),
             ("stored_path_len one more", |o| o.stored_path_len += 1),
             ("stored_path_len one less", |o| o.stored_path_len -= 1),
             ("r one longer", |o| o.r = with_extra(&o.r)),
+            ("r one shorter", |o| o.r = o.r[..o.r.len() - 1].into()),
             ("data one longer", |o| o.data = with_extra(&o.data)),
             ("data one shorter", |o| {
                 o.data = o.data[..o.data.len() - 1].into()
@@ -2577,7 +2580,7 @@ mod tests {
         let wrong_position = SumError::WrongPosition { index: 1 };
         let wrong_shape = SumError::WrongShape { index: 1 };
         type Change = fn(&mut Opening);
-        let change: [(&str, Change, &SumError); 7] = [
+        let change: [(&str, Change, &SumError); 12] = [
             (
                 "server_index one more",
                 |o| o.server_index += 1,
@@ -2588,11 +2591,18 @@ mod tests {
                 |o| o.path_index += 1,
                 &wrong_position,
             ),
+            ("kappa_cs one more", |o| o.kappa_cs += 1, &wrong_shape),
             ("kappa_cs one less", |o| o.kappa_cs -= 1, &wrong_shape),
             ("mu_cs one more", |o| o.mu_cs += 1, &wrong_shape),
+            ("mu_cs one less", |o| o.mu_cs -= 1, &wrong_shape),
             (
                 "stored_path_len one more",
                 |o| o.stored_path_len += 1,
+                &wrong_shape,
+            ),
+            (
+                "stored_path_len one less",
+                |o| o.stored_path_len -= 1,
                 &wrong_shape,
             ),
             (
@@ -2600,7 +2610,17 @@ mod tests {
                 |o| o.data = with_extra(&o.data),
                 &wrong_shape,
             ),
+            (
+                "data one shorter",
+                |o| o.data = o.data[..o.data.len() - 1].into(),
+                &wrong_shape,
+            ),
             ("r one longer", |o| o.r = with_extra(&o.r), &wrong_shape),
+            (
+                "r one shorter",
+                |o| o.r = o.r[..o.r.len() - 1].into(),
+                &wrong_shape,
+            ),
         ];
         for (case, change, expected) in change {
             let mut other = second.clone();
@@ -2656,6 +2676,12 @@ mod tests {
         assert!(
             !check(&comms[1..], &opens, &weights),
             "one commitment too few"
+        );
+        // the weight rows follow the openings, so that only the counts differ
+        let fewer_weights: Vec<Vec<u16>> = weights.iter().map(|row| row[1..].to_vec()).collect();
+        assert!(
+            !check(&comms, &opens[1..], &fewer_weights),
+            "one opening too few"
         );
 
         // openings that each verify alone, but not all at one position
