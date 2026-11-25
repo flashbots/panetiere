@@ -504,10 +504,9 @@ fn duplicate_or_unknown_server_is_rejected() {
     );
 }
 
-// the same roster checks, and the ciphertext length bounds, on the
-// already-summed path
+// the same roster checks on the already-summed path
 #[test]
-fn summed_recovery_checks_servers_and_ciphertext_length() {
+fn summed_recovery_checks_servers() {
     use crate::protocol::verify::decrypt_unverified_sum;
 
     // one client, so its own post is the sum
@@ -532,7 +531,16 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
         decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &unknown),
         Err(VerifyError::BadServerCoverage)
     );
+}
 
+// the summed ciphertext must have exactly μ elements
+#[test]
+fn summed_recovery_checks_ciphertext_length() {
+    use crate::protocol::verify::decrypt_unverified_sum;
+
+    // one client, so its own post is the sum
+    let r = round(18, 5, 1);
+    let entry = &r.publics[0].1;
     let bad_len = Err(VerifyError::WrongAggregateLength);
     assert_eq!(
         decrypt_unverified_sum(&r.pp, &[], &entry.comm, &r.outputs),
