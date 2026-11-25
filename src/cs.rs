@@ -2843,13 +2843,6 @@ mod tests {
                 "{case}"
             );
         }
-
-        let mut short = packed.clone();
-        short.bytes.pop();
-        assert_eq!(
-            Opening::from_packed(&short).err(),
-            Some(OpeningDecodeError::Truncated)
-        );
     }
 
     // a packed opening survives its wire form, and bytes too short for a
