@@ -240,14 +240,24 @@ than "no output". `RecipientError::BelowShareThreshold` is expected early in a
 round and is worth demoting to trace level.
 
 On the payload side, an over-subscribed peeling table surfaces as
-`ChannelError::PeelStalled`. For the sketch, more contributors than the
-capacity make `Λ` fail to split, which surfaces as
-`ChannelError::SketchFailed(PronyError::NotSplit)`. This detection is
-probabilistic: with honest contributors, `Λ` still splits with probability
-about 1/C!, and the round then decodes to garbage. Malicious contributions can
-also cancel each other out and look like an empty round.
-`PronyError::CheckFailed` means the payload columns the solve did not use
-disagree with the solution. A
+`ChannelError::PeelStalled`. The sketch is the paper's Newton–Girard
+encoding, which only guarantees a correct decoding for at most $C$ elements
+from honest clients, and its decoder does not detect every round outside that:
+
+- More contributors than the capacity make `Λ` fail to split, which surfaces
+  as `ChannelError::SketchFailed(PronyError::NotSplit)`. With honest
+  contributors, `Λ` still splits with probability about 1/C!, and the round
+  then decodes to garbage.
+- A malicious client can change payload cells, and the round then decodes to
+  garbled messages. Below capacity, the payload columns the solve did not use
+  usually catch this as `PronyError::CheckFailed`. In a full round, with
+  exactly $C$ contributors, there are no such columns, so nothing does, and a
+  malicious client can add elements to make a round full.
+- Malicious contributions can also cancel each other out and look like an
+  empty round.
+
+Detecting every incorrect decoding would need a check above the encoding, such
+as a tag on each element, which is not part of the construction. A
 peeling table that is not an honest sum comes back as
 `ChannelError::MalformedEncoding(MseError::{OverCapacity, KeyMismatch})`: the
 decoder checks, as the paper's does, that each peeled key hashes to the cell it
