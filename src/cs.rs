@@ -2524,8 +2524,9 @@ mod tests {
     // parameters is rejected, even when every poly the check reads is honest
     #[test]
     fn misshapen_opening_rejected() {
+        const ANY_POSITION: usize = 1;
         let (pp, comm, openings) = setup_and_commit(111, MU_CS);
-        let good = &openings[1];
+        let good = &openings[ANY_POSITION];
         assert!(HidingMerkleCommitment::verify(&pp, &comm, good).is_some());
         assert!(HidingMerkleCommitment::verify_fresh(&pp, &comm, good));
         assert!(HidingMerkleCommitment::check_fresh_shape(&pp, good));
@@ -2566,16 +2567,18 @@ mod tests {
     // each field the sum relies on has to agree across the set on its own
     #[test]
     fn sum_openings_rejects_each_mismatched_field() {
+        // the openings are summed at the position they were taken from
+        const POSITION: usize = 0;
         const SERVERS: usize = 4;
         let mut rng = ChaCha20Rng::from_seed([112u8; 32]);
         let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let mut open_first = || {
             let shares = rand_shares(&mut rng, SERVERS, MU_CS);
             let (_, mut opens) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-            opens.swap_remove(0)
+            opens.swap_remove(POSITION)
         };
         let (first, second) = (open_first(), open_first());
-        assert!(HidingMerkleCommitment::sum_openings(&pp, 0, &[&first, &second]).is_ok());
+        assert!(HidingMerkleCommitment::sum_openings(&pp, POSITION, &[&first, &second]).is_ok());
 
         let wrong_position = SumError::WrongPosition { index: 1 };
         let wrong_shape = SumError::WrongShape { index: 1 };
@@ -2626,7 +2629,7 @@ mod tests {
             let mut other = second.clone();
             change(&mut other);
             assert_eq!(
-                HidingMerkleCommitment::sum_openings(&pp, 0, &[&first, &other])
+                HidingMerkleCommitment::sum_openings(&pp, POSITION, &[&first, &other])
                     .err()
                     .as_ref(),
                 Some(expected),
@@ -2801,9 +2804,10 @@ mod tests {
     // or a short body is an error, never a panic or a huge allocation
     #[test]
     fn packed_opening_header_is_validated() {
+        const ANY_POSITION: usize = 0;
         let (pp, _, openings) = setup_and_commit(117, MU_CS);
         let (r_bound, tree_bound) = fresh_opening_pack_bounds(&pp);
-        let packed = openings[0].pack(r_bound, tree_bound);
+        let packed = openings[ANY_POSITION].pack(r_bound, tree_bound);
         assert!(Opening::from_packed(&packed).is_ok());
 
         let too_large = MAX_OPENING_DIM as u32 + 1;
@@ -2853,9 +2857,10 @@ mod tests {
     // header do not parse
     #[test]
     fn packed_opening_wire_round_trips() {
+        const ANY_POSITION: usize = 0;
         let (pp, _, openings) = setup_and_commit(121, MU_CS);
         let (r_bound, tree_bound) = fresh_opening_pack_bounds(&pp);
-        let packed = openings[0].pack(r_bound, tree_bound);
+        let packed = openings[ANY_POSITION].pack(r_bound, tree_bound);
         let wire = packed.to_bytes();
         assert_eq!(PackedOpening::from_bytes(&wire), Some(packed));
         assert!(PackedOpening::from_bytes(&wire[..PACKED_OPENING_HEADER_LEN - 1]).is_none());
@@ -2895,6 +2900,8 @@ mod tests {
     // the size a caller budgets for a server's post is the size it packs to
     #[test]
     fn aggregated_size_estimate_matches_the_packed_bytes() {
+        // the openings are summed at the position they were taken from
+        const POSITION: usize = 0;
         let mut rng = ChaCha20Rng::from_seed([119u8; 32]);
         for (n_servers, mu_cs) in [(4usize, 1usize), (5, 2), (16, 1)] {
             let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, n_servers, mu_cs, KAPPA_CS);
@@ -2903,12 +2910,12 @@ mod tests {
                 .map(|_| {
                     let shares = rand_shares(&mut rng, n_servers, mu_cs);
                     let (_, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-                    os.swap_remove(0)
+                    os.swap_remove(POSITION)
                 })
                 .collect();
             let refs: Vec<&Opening> = openings.iter().collect();
-            let agg = HidingMerkleCommitment::sum_openings(&pp, 0, &refs)
-                .expect("openings are for position 0 under the same parameters");
+            let agg = HidingMerkleCommitment::sum_openings(&pp, POSITION, &refs)
+                .expect("openings are for one position under the same parameters");
             let (r_bound, tree_bound) = aggregated_opening_pack_bounds(&pp, rho);
             let wire = agg.pack(r_bound, tree_bound).to_bytes().len();
             assert_eq!(
@@ -2927,8 +2934,9 @@ mod tests {
     // `path_node` hands out the stored path level by level, left child first
     #[test]
     fn path_node_walks_the_stored_path() {
+        const ANY_POSITION: usize = 2;
         let (pp, _, openings) = setup_and_commit(120, 2);
-        let o = &openings[2];
+        let o = &openings[ANY_POSITION];
         let path = &o.data[o.xi() * HVC_WIDTH..];
         assert_eq!(path.len(), pp.stored_path_len() * 2 * HVC_WIDTH);
         for level in 0..pp.stored_path_len() {
