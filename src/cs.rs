@@ -2850,7 +2850,15 @@ mod tests {
             Opening::from_packed(&short).err(),
             Some(OpeningDecodeError::Truncated)
         );
+    }
 
+    // a packed opening survives its wire form, and bytes too short for a
+    // header do not parse
+    #[test]
+    fn packed_opening_wire_round_trips() {
+        let (pp, _, openings) = setup_and_commit(121, MU_CS);
+        let (r_bound, tree_bound) = fresh_opening_pack_bounds(&pp);
+        let packed = openings[0].pack(r_bound, tree_bound);
         let wire = packed.to_bytes();
         assert_eq!(PackedOpening::from_bytes(&wire), Some(packed));
         assert!(PackedOpening::from_bytes(&wire[..PACKED_OPENING_HEADER_LEN - 1]).is_none());
