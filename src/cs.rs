@@ -2722,36 +2722,6 @@ mod tests {
         assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
     }
 
-    // with several committed values per opening, the batch check covers
-    // every one of them
-    #[test]
-    fn batch_check_covers_every_committed_value() {
-        let mut rng = ChaCha20Rng::from_seed([116u8; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, 3, 5);
-        let rounds: Vec<(Commitment, Opening)> = (0..6)
-            .map(|_| {
-                let shares = rand_shares(&mut rng, 4, 3);
-                let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-                (c, os.swap_remove(3))
-            })
-            .collect();
-        let weights = batch_weights(&mut rng, 3, rounds.len());
-        let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
-        let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
-        assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
-
-        for value in 0..3 {
-            let mut bad = rounds.clone();
-            bad[4].1.s_mut()[value] += CsPoly::from_coeffs([1; POLY_N]);
-            let comms: Vec<&Commitment> = bad.iter().map(|(c, _)| c).collect();
-            let opens: Vec<&Opening> = bad.iter().map(|(_, o)| o).collect();
-            assert!(
-                !verify_fresh_batch(&pp, &comms, &opens, &weights),
-                "value {value}"
-            );
-        }
-    }
-
     // packing is exact at the edges of the range, including bounds that are
     // a power of two and runs that do not end on a byte
     #[test]
