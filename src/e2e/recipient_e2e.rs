@@ -560,17 +560,21 @@ fn summed_recovery_checks_ciphertext_length() {
 #[test]
 fn exactly_the_floor_and_the_threshold_are_enough() {
     let mut r = round(17, 5, 4);
-    assert_eq!(r.pp.shamir.t, 3);
-    r.pp.min_clients = 4;
+    let t = r.pp.threshold();
+    let floor = r.canonical.len();
+    r.pp.min_clients = floor;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
-    let policy = SetPolicy::anchored(&r.canonical, 4, NO_CAP);
+    let policy = SetPolicy::anchored(&r.canonical, floor, NO_CAP);
 
-    let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..3]).unwrap();
+    let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..t]).unwrap();
     assert_eq!(direct.plaintext, want);
     assert!(direct.culprits.is_empty());
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]).unwrap_err(),
-        RecipientError::BelowShareThreshold { have: 2, need: 3 }
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..t - 1]).unwrap_err(),
+        RecipientError::BelowShareThreshold {
+            have: t - 1,
+            need: t
+        }
     );
 }
 
