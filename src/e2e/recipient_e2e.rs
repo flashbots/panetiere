@@ -488,6 +488,7 @@ fn a_fault_is_kept_past_later_valid_posts() {
 #[test]
 fn duplicate_or_unknown_server_is_rejected() {
     let r = round(14, 5, 4);
+    assert!(recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).is_ok());
     let mut twice = r.outputs.clone();
     twice[1] = twice[0].clone();
     assert_eq!(
