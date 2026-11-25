@@ -2717,17 +2717,21 @@ mod tests {
     // a batch of exactly `batch_capacity` openings is still checked as a batch
     #[test]
     fn batch_check_accepts_a_full_batch() {
-        const SERVERS: usize = 4;
+        // the capacity doesn't depend on the tree, so any number of servers
+        // and any position will do
+        const DUMMY_SERVERS: usize = 4;
+        const ANY_POSITION: usize = 0;
         const CAPACITY: usize = 2;
         // random weightings of the batch that the batch check tries
         const COMBINATIONS: usize = 3;
         let mut rng = ChaCha20Rng::from_seed([115u8; 32]);
-        let mut pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
+        let mut pp =
+            HidingMerkleCommitment::setup_with_dims(&mut rng, DUMMY_SERVERS, MU_CS, KAPPA_CS);
         let rounds: Vec<(Commitment, Opening)> = (0..CAPACITY)
             .map(|_| {
-                let shares = rand_shares(&mut rng, SERVERS, MU_CS);
+                let shares = rand_shares(&mut rng, DUMMY_SERVERS, MU_CS);
                 let (c, mut os) = HidingMerkleCommitment::commit(&mut rng, &pp, &shares);
-                (c, os.swap_remove(0))
+                (c, os.swap_remove(ANY_POSITION))
             })
             .collect();
         // a looser fresh bound still accepts these openings but leaves room
