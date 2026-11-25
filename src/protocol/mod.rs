@@ -176,6 +176,28 @@ impl ProtocolParams {
     pub fn message_polys(&self) -> usize {
         self.kahe.mu_kahe
     }
+
+    /// The KAHE plaintext modulus `t`.
+    pub fn plaintext_modulus(&self) -> u64 {
+        self.kahe.t_modulus
+    }
+
+    /// The KAHE ciphertext modulus `q`.
+    pub fn ciphertext_modulus(&self) -> u64 {
+        crate::rings::KAHE_MODULUS as u64
+    }
+
+    /// The parameter `σ` of the discrete Gaussian distribution of the KAHE
+    /// key's coefficients, with probabilities proportional to `exp(−x²/(2σ²))`.
+    pub fn key_sigma(&self) -> f64 {
+        self.kahe.sigma_s
+    }
+
+    /// The parameter `σ` of the discrete Gaussian distribution of the KAHE
+    /// error's coefficients, with probabilities proportional to `exp(−x²/(2σ²))`.
+    pub fn error_sigma(&self) -> f64 {
+        self.kahe.sigma_e
+    }
 }
 
 fn aggregate_capacity(kahe: &KaheParams, cs: &crate::cs::CsParams) -> usize {
