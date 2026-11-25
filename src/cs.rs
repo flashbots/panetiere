@@ -2867,17 +2867,19 @@ mod tests {
     // the pack bounds grow with the set and stop at what the verifier accepts
     #[test]
     fn aggregated_pack_bounds_scale_with_the_set() {
+        // the pack bounds don't depend on the tree, so any number of servers will do
+        const DUMMY_SERVERS: usize = 4;
         let mut rng = ChaCha20Rng::from_seed([118u8; 32]);
-        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, 4, MU_CS, KAPPA_CS);
+        let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, DUMMY_SERVERS, MU_CS, KAPPA_CS);
         let zeta = chipmunk_code::ZETA;
-        assert_eq!(R_BOUND, 300 * BETA_CS);
+        assert_eq!(R_BOUND, RHO_MAX * BETA_CS);
         assert_eq!(fresh_opening_pack_bounds(&pp), (BETA_CS, zeta));
         assert_eq!(aggregated_opening_pack_bounds(&pp, 1), (BETA_CS, zeta));
         assert_eq!(
             aggregated_opening_pack_bounds(&pp, 7),
             (7 * BETA_CS, 7 * zeta)
         );
-        for rho in [300, 301, u32::MAX] {
+        for rho in [RHO_MAX, RHO_MAX + 1, u32::MAX] {
             assert_eq!(
                 aggregated_opening_pack_bounds(&pp, rho),
                 (R_BOUND, beta_agg_hvc()),
