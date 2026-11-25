@@ -2751,14 +2751,18 @@ mod tests {
                 let values: Vec<i32> = (0..len).map(|i| [b, -b, 0, b - 1][i % 4]).collect();
                 let mut bytes = Vec::new();
                 pack_bits(&mut bytes, &values, bound, bits);
-                assert_eq!(bytes.len(), (len * bits as usize).div_ceil(8));
+                assert_eq!(
+                    bytes.len(),
+                    (len * bits as usize).div_ceil(8),
+                    "bound {bound}, len {len}"
+                );
                 let mut back = vec![0i32; len];
                 assert_eq!(
                     unpack_bits(&bytes, 0, &mut back, bound, bits),
                     Some(bytes.len()),
-                    "bound {bound}"
+                    "bound {bound}, len {len}"
                 );
-                assert_eq!(back, values, "bound {bound}");
+                assert_eq!(back, values, "bound {bound}, len {len}");
             }
         }
         for bound in [1u64, 4, 1 << 40, crate::KAHE_MODULUS as u64] {
@@ -2768,14 +2772,18 @@ mod tests {
                 let values: Vec<i64> = (0..len).map(|i| [b, -b, 0, b - 1][i % 4]).collect();
                 let mut bytes = Vec::new();
                 pack_bits64(&mut bytes, &values, bound, bits);
-                assert_eq!(bytes.len(), (len * bits as usize).div_ceil(8));
+                assert_eq!(
+                    bytes.len(),
+                    (len * bits as usize).div_ceil(8),
+                    "bound {bound}, len {len}"
+                );
                 let mut back = vec![0i64; len];
                 assert_eq!(
                     unpack_bits64(&bytes, 0, &mut back, bound, bits),
                     Some(bytes.len()),
-                    "bound {bound}"
+                    "bound {bound}, len {len}"
                 );
-                assert_eq!(back, values, "bound {bound}");
+                assert_eq!(back, values, "bound {bound}, len {len}");
             }
         }
     }
