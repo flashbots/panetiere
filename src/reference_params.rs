@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::cs::{beta_agg_hvc, HidingMerkleCommitment, BETA_CS, KAPPA_CS, MU_CS, R_BOUND};
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 use crate::mse::{BITS_PER_SYMBOL, K_LIMBS};
+use crate::protocol::ProtocolParams;
 use crate::rings::{CS_MODULUS, KAHE_MODULUS, MU_MAX, RHO_MAX};
 use crate::N;
 
@@ -68,4 +69,16 @@ fn constants_match_reference() {
     );
     assert_eq!(int(&r, "/chipmunk/xi"), cs.xi() as u64);
     assert_eq!(int(&r, "/chipmunk/tau"), cs.total_path_len() as u64);
+}
+
+/// The protocol parameters report the reference set's `t`, `q` and `σ`.
+#[test]
+fn protocol_params_report_the_reference_values() {
+    let r = reference();
+    let pp = ProtocolParams::setup(&mut ChaCha20Rng::from_seed([0; 32]), 8);
+    assert_eq!(pp.plaintext_modulus(), int(&r, "/kahe/t"));
+    assert_eq!(pp.ciphertext_modulus(), int(&r, "/kahe/q"));
+    let sigma = r.pointer("/kahe/sigma").and_then(Value::as_f64);
+    assert_eq!(Some(pp.key_sigma()), sigma);
+    assert_eq!(Some(pp.error_sigma()), sigma);
 }

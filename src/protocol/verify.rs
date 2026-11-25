@@ -17,7 +17,6 @@ pub enum VerifyError {
     MissingClient(ClientId),
     DuplicateClient(ClientId),
     InvalidServerOpening(usize),
-    ShareOpeningMismatch(usize),
     NoServers,
     BadServerCoverage,
     InconsistentCanonical(ServerId),
@@ -36,22 +35,36 @@ pub enum VerifyError {
     ShareRecovery(SssError),
 }
 
+/// Verify server `i`'s aggregated opening against the summed commitment, at
+/// its own position, and return the share it opens to: the server's Shamir
+/// share of the summed key.
 fn verify_one_server(
     pp: &ProtocolParams,
     summed_comm: &Commitment,
     i: usize,
     sp: &ServerBulletinEntry,
-) -> Result<(), VerifyError> {
-    if !HidingMerkleCommitment::verify(&pp.cs, summed_comm, &sp.agg_open) {
-        return Err(VerifyError::InvalidServerOpening(i));
-    }
+) -> Result<CsPoly, VerifyError> {
     if sp.agg_open.path_index != sp.server_id.0 as usize {
         return Err(VerifyError::InvalidServerOpening(i));
     }
-    if sp.agg_share != sp.agg_open.s()[0] {
-        return Err(VerifyError::ShareOpeningMismatch(i));
-    }
-    Ok(())
+    HidingMerkleCommitment::verify(&pp.cs, summed_comm, &sp.agg_open)
+        .map(|share| share[0])
+        .ok_or(VerifyError::InvalidServerOpening(i))
+}
+
+/// [`verify_one_server`] for every server, in parallel; the first failing
+/// server in `server_outputs`' order is reported.
+fn verify_servers(
+    pp: &ProtocolParams,
+    summed_comm: &Commitment,
+    server_outputs: &[ServerBulletinEntry],
+) -> Result<Vec<CsPoly>, VerifyError> {
+    let results: Vec<Result<CsPoly, VerifyError>> = server_outputs
+        .par_iter()
+        .enumerate()
+        .map(|(i, sp)| verify_one_server(pp, summed_comm, i, sp))
+        .collect();
+    results.into_iter().collect()
 }
 
 // Valid openings do not prove degree consistency. With inconsistent client
@@ -59,11 +72,13 @@ fn verify_one_server(
 fn recover_agg_key(
     pp: &ProtocolParams,
     server_outputs: &[ServerBulletinEntry],
+    shares: &[CsPoly],
 ) -> Result<KahePoly, VerifyError> {
     let samples: Vec<(usize, CsPoly)> = server_outputs
         .iter()
+        .zip(shares)
         .take(pp.shamir.t)
-        .map(|sp| (sp.server_id.0 as usize, sp.agg_share))
+        .map(|(sp, &share)| (sp.server_id.0 as usize, share))
         .collect();
     let recovered_cs =
         ShamirSharing::recover(&pp.shamir, &samples).map_err(VerifyError::ShareRecovery)?;
@@ -163,19 +178,12 @@ pub(crate) fn aggregate_and_decrypt_unverified(
     let summed_comm = HidingMerkleCommitment::sum_commitment_refs(&comms);
 
     // Single CS verification per server (μ_cs = κ_kahe packs all components).
-    let results: Vec<Result<(), VerifyError>> = server_outputs
-        .par_iter()
-        .enumerate()
-        .map(|(i, sp)| verify_one_server(pp, &summed_comm, i, sp))
-        .collect();
-    for r in results {
-        r?;
-    }
+    let shares = verify_servers(pp, &summed_comm, server_outputs)?;
 
     // Lagrange-interpolate the KAHE key from the first `t` servers' summed
     // Shamir shares (R_{q_cs}), then bridge into R_{q_kahe} via centered-rep
     // lift before wrapping as `KaheAggKey`.
-    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
+    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs, &shares)?);
 
     Ok(Kahe::dec(&pp.kahe, &summed_ctxt, &agg_key))
 }
@@ -214,16 +222,9 @@ pub fn decrypt_unverified_sum(
     check_unique_clients(&server_outputs[0].clients)?;
     check_client_count(pp, &server_outputs[0].clients)?;
 
-    let results: Vec<Result<(), VerifyError>> = server_outputs
-        .par_iter()
-        .enumerate()
-        .map(|(i, sp)| verify_one_server(pp, summed_comm, i, sp))
-        .collect();
-    for r in results {
-        r?;
-    }
+    let shares = verify_servers(pp, summed_comm, server_outputs)?;
 
-    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs)?);
+    let agg_key = KaheAggKey::from_component(recover_agg_key(pp, server_outputs, &shares)?);
 
     Ok(Kahe::dec(&pp.kahe, &summed_ctxt.to_vec(), &agg_key))
 }

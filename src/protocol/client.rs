@@ -22,11 +22,11 @@ pub(crate) fn seal_opening<R: CryptoRng + Rng>(
     opening: &Opening,
     recipient: &pke::PublicKey,
 ) -> Vec<u8> {
-    let (r_b, s_b, t_b) = fresh_opening_pack_bounds(&pp.cs);
+    let (r_b, t_b) = fresh_opening_pack_bounds(&pp.cs);
     pke::encrypt(
         rng,
         recipient,
-        &opening.pack(r_b, s_b, t_b).to_bytes(),
+        &opening.pack(r_b, t_b).to_bytes(),
         &opening_aad(sid, client_id, server_id),
     )
 }
