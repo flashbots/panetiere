@@ -2647,6 +2647,8 @@ mod tests {
         const POSITION: usize = 3;
         const OTHER_POSITION: usize = 1;
         const ANY_MEMBER: usize = 2;
+        // random weightings of the batch that the batch check tries
+        const COMBINATIONS: usize = 3;
         let mut rng = ChaCha20Rng::from_seed([114u8; 32]);
         let pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let mut rounds: Vec<(Commitment, Opening)> = Vec::new();
@@ -2659,7 +2661,7 @@ mod tests {
         }
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
-        let weights = batch_weights(&mut rng, 3, rounds.len());
+        let weights = batch_weights(&mut rng, COMBINATIONS, rounds.len());
         let check = |comms: &[&Commitment], opens: &[&Opening], weights: &[Vec<u16>]| {
             verify_fresh_batch(&pp, comms, opens, weights)
         };
@@ -2707,6 +2709,8 @@ mod tests {
     #[test]
     fn batch_check_accepts_a_full_batch() {
         const SERVERS: usize = 4;
+        // random weightings of the batch that the batch check tries
+        const COMBINATIONS: usize = 3;
         let mut rng = ChaCha20Rng::from_seed([115u8; 32]);
         let mut pp = HidingMerkleCommitment::setup_with_dims(&mut rng, SERVERS, MU_CS, KAPPA_CS);
         let rounds: Vec<(Commitment, Opening)> = (0..2)
@@ -2722,7 +2726,7 @@ mod tests {
         assert_eq!(batch_capacity(&pp), 2);
         let comms: Vec<&Commitment> = rounds.iter().map(|(c, _)| c).collect();
         let opens: Vec<&Opening> = rounds.iter().map(|(_, o)| o).collect();
-        let weights = batch_weights(&mut rng, 3, 2);
+        let weights = batch_weights(&mut rng, COMBINATIONS, 2);
         assert!(verify_fresh_batch(&pp, &comms, &opens, &weights));
     }
 
