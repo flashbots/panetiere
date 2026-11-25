@@ -346,10 +346,10 @@ mod tests {
             Some(ServerRoundError::MissingClient(cid))
         );
         commitments.push((cid, comm));
-        inbox.items.remove(0);
+        let (absent, _) = inbox.items.remove(0);
         assert_eq!(
             run_server_round(&pp, &inbox, &canonical, &commitments).err(),
-            Some(ServerRoundError::MissingClient(ClientId(0)))
+            Some(ServerRoundError::MissingClient(absent))
         );
     }
 }
