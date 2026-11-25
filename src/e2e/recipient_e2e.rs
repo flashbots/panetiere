@@ -496,7 +496,8 @@ fn duplicate_or_unknown_server_is_rejected() {
         Err(VerifyError::BadServerCoverage)
     );
     let mut unknown = r.outputs.clone();
-    unknown[1].server_id = ServerId(5);
+    // the first id outside the roster `0..n_servers`
+    unknown[1].server_id = ServerId(r.pp.n_servers() as u32);
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &r.publics, &unknown),
         Err(VerifyError::BadServerCoverage)
@@ -525,7 +526,8 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
         Err(VerifyError::BadServerCoverage)
     );
     let mut unknown = r.outputs.clone();
-    unknown[1].server_id = ServerId(5);
+    // the first id outside the roster `0..n_servers`
+    unknown[1].server_id = ServerId(r.pp.n_servers() as u32);
     assert_eq!(
         decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &unknown),
         Err(VerifyError::BadServerCoverage)
