@@ -621,8 +621,10 @@ mod tests {
     // widths; the seed is fixed, so this cannot flake
     #[test]
     fn gaussian_sampler_has_the_requested_width() {
+        // any width other than the default, so the sampler must use its argument
+        const ANOTHER_WIDTH: f64 = 3.2;
         let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
-        for sigma in [SIGMA_S_DEFAULT, 3.2] {
+        for sigma in [SIGMA_S_DEFAULT, ANOTHER_WIDTH] {
             let samples: Vec<i64> = (0..200_000).map(|_| sample_dg(&mut rng, sigma)).collect();
             assert_gaussian(&samples, sigma, 0.02);
         }
@@ -659,14 +661,6 @@ mod tests {
         assert_gaussian(&noise, pp.sigma_e, 0.1);
     }
 
-    fn pad_for(pp: &KaheParams, k: &KaheKey, i: usize) -> KaheNTTPoly {
-        let sk_ntt = KaheNTTPoly::from(k.inner());
-        pointwise_dot_kahe(
-            std::slice::from_ref(&pp.a_ntt[i]),
-            std::slice::from_ref(&sk_ntt),
-        )
-    }
-
     // the paper's ciphertext is `m + a·sk + t·e`: the pad puts it far from
     // the message, and removing the pad leaves gaussian noise scaled by t
     #[test]
@@ -684,8 +678,6 @@ mod tests {
             .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
             .collect();
         let c = Kahe::enc(&mut rng, &pp, &k, &m);
-
-        let mut unmasked = Vec::new();
         for i in 0..pp.mu_kahe {
             let mut masked = c[i] - m[i];
             masked.normalize();
@@ -695,8 +687,17 @@ mod tests {
                 .filter(|x| x.abs() > crate::KAHE_MODULUS / 8)
                 .count();
             assert!(far > N / 2, "position {i} is not masked: {far} of {N}");
-            unmasked.push(c[i] - m[i] - KahePoly::from(&pad_for(&pp, &k, i)));
         }
+
+        // under the key 1 the pad is `a` itself, so removing it needs no
+        // multiplication and leaves only the noise
+        let mut one = [0i64; N];
+        one[0] = 1;
+        let unit_key = KaheKey(KahePoly::from_coeffs(one));
+        let c_unit = Kahe::enc(&mut rng, &pp, &unit_key, &m);
+        let unmasked: Vec<KahePoly> = (0..pp.mu_kahe)
+            .map(|i| c_unit[i] - m[i] - KahePoly::from(&pp.a_ntt[i]))
+            .collect();
         assert_scaled_noise(&pp, &unmasked);
     }
 

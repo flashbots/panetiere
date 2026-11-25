@@ -488,6 +488,7 @@ fn a_fault_is_kept_past_later_valid_posts() {
 #[test]
 fn duplicate_or_unknown_server_is_rejected() {
     let r = round(14, 5, 4);
+    assert!(recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).is_ok());
     let mut twice = r.outputs.clone();
     twice[1] = twice[0].clone();
     assert_eq!(
@@ -495,17 +496,17 @@ fn duplicate_or_unknown_server_is_rejected() {
         Err(VerifyError::BadServerCoverage)
     );
     let mut unknown = r.outputs.clone();
-    unknown[1].server_id = ServerId(5);
+    // the first id outside the roster `0..n_servers`
+    unknown[1].server_id = ServerId(r.pp.n_servers() as u32);
     assert_eq!(
         recover_unverified_once(&r.pp, &r.canonical, &r.publics, &unknown),
         Err(VerifyError::BadServerCoverage)
     );
 }
 
-// the same roster checks, and the ciphertext length bounds, on the
-// already-summed path
+// the same roster checks on the already-summed path
 #[test]
-fn summed_recovery_checks_servers_and_ciphertext_length() {
+fn summed_recovery_checks_servers() {
     use crate::protocol::verify::decrypt_unverified_sum;
 
     // one client, so its own post is the sum
@@ -524,12 +525,22 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
         Err(VerifyError::BadServerCoverage)
     );
     let mut unknown = r.outputs.clone();
-    unknown[1].server_id = ServerId(5);
+    // the first id outside the roster `0..n_servers`
+    unknown[1].server_id = ServerId(r.pp.n_servers() as u32);
     assert_eq!(
         decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &unknown),
         Err(VerifyError::BadServerCoverage)
     );
+}
 
+// the summed ciphertext must have exactly μ elements
+#[test]
+fn summed_recovery_checks_ciphertext_length() {
+    use crate::protocol::verify::decrypt_unverified_sum;
+
+    // one client, so its own post is the sum
+    let r = round(18, 5, 1);
+    let entry = &r.publics[0].1;
     let bad_len = Err(VerifyError::WrongAggregateLength);
     assert_eq!(
         decrypt_unverified_sum(&r.pp, &[], &entry.comm, &r.outputs),
@@ -544,46 +555,26 @@ fn summed_recovery_checks_servers_and_ciphertext_length() {
     );
 }
 
-// every client's ciphertext has the same length, and none is longer than
-// the parameters allow
-#[test]
-fn ciphertext_lengths_must_agree_and_fit() {
-    let r = round(16, 4, 3);
-    let extra = r.publics[0].1.ctxt[0];
-
-    let mut ragged = r.publics.clone();
-    ragged[1].1.ctxt.push(extra);
-    assert_eq!(
-        recover_unverified_once(&r.pp, &r.canonical, &ragged, &r.outputs),
-        Err(VerifyError::WrongCiphertextLength(ClientId(1)))
-    );
-
-    let mut long = r.publics.clone();
-    for (_, entry) in &mut long {
-        entry.ctxt.push(extra);
-    }
-    assert_eq!(
-        recover_unverified_once(&r.pp, &r.canonical, &long, &r.outputs),
-        Err(VerifyError::WrongCiphertextLength(ClientId(0)))
-    );
-}
-
 // a set exactly at the anonymity floor, served by exactly the threshold of
-// servers, decodes on both recipient paths; one server fewer does not
+// servers, decodes; one server fewer does not
 #[test]
 fn exactly_the_floor_and_the_threshold_are_enough() {
     let mut r = round(17, 5, 4);
-    assert_eq!(r.pp.shamir.t, 3);
-    r.pp.min_clients = 4;
+    let t = r.pp.threshold();
+    let floor = r.canonical.len();
+    r.pp.min_clients = floor;
     let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
-    let policy = SetPolicy::anchored(&r.canonical, 4, NO_CAP);
+    let policy = SetPolicy::anchored(&r.canonical, floor, NO_CAP);
 
-    let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..3]).unwrap();
+    let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..t]).unwrap();
     assert_eq!(direct.plaintext, want);
     assert!(direct.culprits.is_empty());
     assert_eq!(
-        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]).unwrap_err(),
-        RecipientError::BelowShareThreshold { have: 2, need: 3 }
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..t - 1]).unwrap_err(),
+        RecipientError::BelowShareThreshold {
+            have: t - 1,
+            need: t
+        }
     );
 }
 

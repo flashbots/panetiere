@@ -315,17 +315,23 @@ mod tests {
     // with noise to spare, the commitment bounds alone cap the set
     #[test]
     fn commitment_bounds_cap_the_set_when_noise_does_not() {
+        // the capacity doesn't depend on the tree or on the ciphertext width
+        const DUMMY_SERVERS: usize = 4;
+        const DUMMY_MU_KAHE: usize = 1;
+        // one-bit messages: the noise budget is then far above any set size
+        const SMALLEST_T_MODULUS: u64 = 2;
         let mut rng = ChaCha20Rng::from_seed([97; 32]);
         let pp = ProtocolParams::setup_with_kahe_dims_full(
             &mut rng,
-            4,
-            1,
+            DUMMY_SERVERS,
+            DUMMY_MU_KAHE,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            2,
+            SMALLEST_T_MODULUS,
         );
-        assert_eq!(pp.cs.r_bound / pp.cs.beta_cs, 300);
-        assert_eq!(pp.cs.beta_agg_hvc / chipmunk_code::ZETA, 300);
-        assert_eq!(pp.max_clients, 300);
+        let rho_max = crate::rings::RHO_MAX;
+        assert_eq!(pp.cs.r_bound / pp.cs.beta_cs, rho_max);
+        assert_eq!(pp.cs.beta_agg_hvc / chipmunk_code::ZETA, rho_max);
+        assert_eq!(pp.max_clients, rho_max as usize);
     }
 }
