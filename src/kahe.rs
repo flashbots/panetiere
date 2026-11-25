@@ -621,8 +621,10 @@ mod tests {
     // widths; the seed is fixed, so this cannot flake
     #[test]
     fn gaussian_sampler_has_the_requested_width() {
+        // any width other than the default, so the sampler must use its argument
+        const ANOTHER_WIDTH: f64 = 3.2;
         let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
-        for sigma in [SIGMA_S_DEFAULT, 3.2] {
+        for sigma in [SIGMA_S_DEFAULT, ANOTHER_WIDTH] {
             let samples: Vec<i64> = (0..200_000).map(|_| sample_dg(&mut rng, sigma)).collect();
             assert_gaussian(&samples, sigma, 0.02);
         }
