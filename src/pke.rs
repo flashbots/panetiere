@@ -246,9 +246,9 @@ mod tests {
     }
 
     // an envelope may carry nothing at all; anything shorter is not an
-    // envelope, and distinct keys do not compare equal
+    // envelope
     #[test]
-    fn empty_plaintext_and_key_equality() {
+    fn empty_plaintext_round_trips() {
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
         let sk = PrivateKey::generate(&mut rng);
         let pk = sk.public();
@@ -259,7 +259,14 @@ mod tests {
             decrypt(&sk, &sealed[..SEAL_OVERHEAD - 1], b"ctx"),
             Err(PkeError::TooShort)
         );
+    }
 
+    // distinct keys do not compare equal
+    #[test]
+    fn public_keys_compare_by_key() {
+        let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
+        let sk = PrivateKey::generate(&mut rng);
+        let pk = sk.public();
         let other = PrivateKey::generate(&mut rng).public();
         assert!(pk != other);
         assert!(pk == sk.public());
