@@ -556,7 +556,7 @@ fn summed_recovery_checks_ciphertext_length() {
 }
 
 // a set exactly at the anonymity floor, served by exactly the threshold of
-// servers, decodes on both recipient paths; one server fewer does not
+// servers, decodes; one server fewer does not
 #[test]
 fn exactly_the_floor_and_the_threshold_are_enough() {
     let mut r = round(17, 5, 4);
