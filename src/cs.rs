@@ -2743,7 +2743,7 @@ mod tests {
     // packing is exact at the edges of the range, including bounds that are
     // a power of two and runs that do not end on a byte
     #[test]
-    fn bit_packing_round_trips_at_the_bound() {
+    fn bit_packing32_round_trips_at_the_bound() {
         for bound in [1u32, 4, chipmunk_code::ZETA, BETA_CS, 1 << 15, R_BOUND] {
             let bits = bits_for_signed(bound);
             let b = bound as i32;
@@ -2765,6 +2765,11 @@ mod tests {
                 assert_eq!(back, values, "bound {bound}, len {len}");
             }
         }
+    }
+
+    // the same for the 64-bit packing the KAHE ciphertexts use
+    #[test]
+    fn bit_packing64_round_trips_at_the_bound() {
         for bound in [1u64, 4, 1 << 40, crate::KAHE_MODULUS as u64] {
             let bits = bits_for_signed64(bound);
             let b = bound as i64;
