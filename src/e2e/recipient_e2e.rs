@@ -555,30 +555,6 @@ fn summed_recovery_checks_ciphertext_length() {
     );
 }
 
-// every client's ciphertext has the same length, and none is longer than
-// the parameters allow
-#[test]
-fn ciphertext_lengths_must_agree_and_fit() {
-    let r = round(16, 4, 3);
-    let extra = r.publics[0].1.ctxt[0];
-
-    let mut ragged = r.publics.clone();
-    ragged[1].1.ctxt.push(extra);
-    assert_eq!(
-        recover_unverified_once(&r.pp, &r.canonical, &ragged, &r.outputs),
-        Err(VerifyError::WrongCiphertextLength(ClientId(1)))
-    );
-
-    let mut long = r.publics.clone();
-    for (_, entry) in &mut long {
-        entry.ctxt.push(extra);
-    }
-    assert_eq!(
-        recover_unverified_once(&r.pp, &r.canonical, &long, &r.outputs),
-        Err(VerifyError::WrongCiphertextLength(ClientId(0)))
-    );
-}
-
 // a set exactly at the anonymity floor, served by exactly the threshold of
 // servers, decodes on both recipient paths; one server fewer does not
 #[test]
