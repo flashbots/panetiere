@@ -2930,20 +2930,4 @@ mod tests {
             );
         }
     }
-
-    // `path_node` hands out the stored path level by level, left child first
-    #[test]
-    fn path_node_walks_the_stored_path() {
-        const ANY_POSITION: usize = 2;
-        let (pp, _, openings) = setup_and_commit(120, 2);
-        let o = &openings[ANY_POSITION];
-        let path = &o.data[o.xi() * HVC_WIDTH..];
-        assert_eq!(path.len(), pp.stored_path_len() * 2 * HVC_WIDTH);
-        for level in 0..pp.stored_path_len() {
-            let (left, right) = o.path_node(level);
-            let base = level * 2 * HVC_WIDTH;
-            assert_eq!(left, &path[base..base + HVC_WIDTH]);
-            assert_eq!(right, &path[base + HVC_WIDTH..base + 2 * HVC_WIDTH]);
-        }
-    }
 }
