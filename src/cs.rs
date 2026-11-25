@@ -2917,8 +2917,9 @@ mod tests {
                 "n_servers={n_servers} μ_cs={mu_cs}"
             );
             assert_eq!(
-                aggregated_server_crypto_len_for(n_servers, mu_cs, 5, rho),
-                wire
+                aggregated_server_crypto_len_for(n_servers, mu_cs, KAPPA_CS, rho),
+                wire,
+                "n_servers={n_servers} μ_cs={mu_cs}"
             );
         }
     }
