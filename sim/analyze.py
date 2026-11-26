@@ -115,13 +115,21 @@ def summarise(report, out):
         out.write(f"    {role:<10}{statistics.median(shares) * 100:>5.0f}%\n")
 
     out.write("\n  whole-process use per node since the previous report:\n")
-    out.write(f"    {'role':<10}{'n':>4}{'cpu ms':>9}{'max':>9}{'peak MB':>9}{'max':>9}\n")
+    out.write(
+        f"    {'role':<10}{'n':>4}{'cpu ms':>9}{'max':>9}{'peak MB':>9}{'max':>9}"
+        f"{'sent MB':>9}{'recv MB':>9}  link\n"
+    )
     for role, nodes in by_role(report).items():
         cpu = [n["usage"]["cpu_us"] / 1000 for n in nodes]
         peak = [n["usage"]["peak_rss_bytes"] / 1e6 for n in nodes if "peak_rss_bytes" in n["usage"]]
+        sent = [n["usage"].get("sent_bytes", 0) / 1e6 for n in nodes]
+        received = [n["usage"].get("received_bytes", 0) / 1e6 for n in nodes]
+        link = nodes[0].get("link", {})
+        link = " ".join(f"{k} {v}" for k, v in link.items()) or "unshaped"
         out.write(
             f"    {role:<10}{len(nodes):>4}{statistics.median(cpu):>9.0f}{max(cpu):>9.0f}"
-            f"{statistics.median(peak) if peak else 0:>9.0f}{max(peak) if peak else 0:>9.0f}\n"
+            f"{statistics.median(peak) if peak else 0:>9.0f}{max(peak) if peak else 0:>9.0f}"
+            f"{statistics.median(sent):>9.1f}{statistics.median(received):>9.1f}  {link}\n"
         )
     out.write("\n")
 
@@ -156,6 +164,11 @@ def csv_rows(reports):
             row[f"{role}_cpu_ms"] = round(max(n["usage"]["cpu_us"] for n in nodes) / 1000, 1)
             peaks = [n["usage"]["peak_rss_bytes"] for n in nodes if "peak_rss_bytes" in n["usage"]]
             row[f"{role}_peak_mb"] = round(max(peaks) / 1e6, 1) if peaks else None
+            for key in ("sent_bytes", "received_bytes"):
+                total = max(n["usage"].get(key, 0) for n in nodes)
+                row[f"{role}_{key.removesuffix('_bytes')}_mb"] = round(total / 1e6, 2)
+            for key, value in nodes[0].get("link", {}).items():
+                row[f"{role}_{key}"] = value
         rows.append(row)
     return rows
 

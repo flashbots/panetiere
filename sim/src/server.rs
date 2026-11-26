@@ -164,5 +164,6 @@ async fn round(
         node: format!("server-{}", node.id.get()),
         spans,
         usage: metrics::take_usage(),
+        link: metrics::Link::from_env(),
     }))
 }

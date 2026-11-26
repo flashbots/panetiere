@@ -98,6 +98,7 @@ YAML
       NET_LOSS: "${!loss}"
       NET_UP: "${!up}"
       NET_DOWN: "${!down}"
+      SIM_CPUS: "$cpus"
 YAML
     for line in "$@"; do echo "      $line"; done
 }

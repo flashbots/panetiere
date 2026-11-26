@@ -125,6 +125,7 @@ async fn round(
         node: format!("client-{index}"),
         spans,
         usage: metrics::take_usage(),
+        link: metrics::Link::from_env(),
     }))
 }
 

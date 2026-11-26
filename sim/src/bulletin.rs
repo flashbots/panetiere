@@ -150,5 +150,6 @@ async fn report(
         node: "bulletin".into(),
         spans: spans.into_iter().flatten().collect(),
         usage: metrics::take_usage(),
+        link: metrics::Link::from_env(),
     }))
 }

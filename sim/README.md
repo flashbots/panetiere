@@ -31,7 +31,9 @@ time is the number of cores the step kept busy.
 
 Every node report also has `usage`, measured over the whole process since that
 node's previous report: CPU time (including networking and serialization, not
-only the CPU spans), peak memory and memory at the time of the report. From
+only the CPU spans), peak memory, memory at the time of the report, and
+bytes sent and received on the network interface (headers and resent
+packets included). From
 the second round on that is one round. The bulletin keeps every round's posts,
 so its memory grows from round to round.
 
@@ -81,6 +83,17 @@ All settings are environment variables.
 | `<ROLE>_UP` / `<ROLE>_DOWN` | see `run.sh` | rate limits, e.g. `20mbit` |
 | `<ROLE>_CPUS` | client 1, server 4, recipient 8 | CPU budget per node, as if it were its own machine; empty for no limit |
 | `SIM_READY_TIMEOUT_SECS` | 120 | how long the coordinator waits for every node to start |
+
+Default links:
+
+| `<ROLE>` | delay | up | down | CPUs |
+|---|---|---|---|---|
+| `CLIENT` | 40ms | 20mbit | 100mbit | 1 |
+| `RECIPIENT` | 40ms | 20mbit | 100mbit | 8 |
+| `SERVER` | 10ms | 1gbit | 1gbit | 4 |
+| `BULLETIN` | 5ms | 1gbit | 1gbit | no limit |
+
+Every node report records the link and CPUs it ran with (`link`).
 
 `<ROLE>` is `BULLETIN`, `SERVER`, `CLIENT` or `RECIPIENT`. Set a value to the
 empty string to leave that part of the link unshaped.

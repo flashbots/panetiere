@@ -129,6 +129,7 @@ async fn round(
             node: "recipient".into(),
             spans,
             usage: metrics::take_usage(),
+            link: metrics::Link::from_env(),
         },
         messages: messages
             .iter()

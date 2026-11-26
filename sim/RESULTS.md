@@ -2,11 +2,21 @@
 
 First runs of the network sim, 2026-11-25, on one 32-core host.
 
-Every client sends a message (`SIM_MESSAGES = SIM_CLIENTS`). Links are the
-`run.sh` defaults: clients and recipient 40 ms delay, 20 Mbit/s up and
-100 Mbit/s down; servers 10 ms at 1 Gbit/s; bulletin 5 ms at 1 Gbit/s. Servers
-get 2 CPUs, clients 1 CPU (0.5 at 64 clients), the recipient 8. Every number is
+Every client sends a message (`SIM_MESSAGES = SIM_CLIENTS`). Every number is
 from the second round, so connection setup is not included. Times are seconds.
+
+Links and CPUs, unless a section says otherwise. Delay is added to each
+node's outgoing traffic, so a client to bulletin round trip is about 45 ms.
+No packets are dropped.
+
+| node | delay | upload | download | CPUs |
+|---|---|---|---|---|
+| client | 40 ms | 20 Mbit/s | 100 Mbit/s | 1 (0.5 at 64 clients) |
+| recipient | 40 ms | 20 Mbit/s | 100 Mbit/s | 8 |
+| server | 10 ms | 1 Gbit/s | 1 Gbit/s | 2 |
+| bulletin | 5 ms | 1 Gbit/s | 1 Gbit/s | no limit |
+
+Newer results record each node's link and CPUs in its report (`link`).
 
 ## Grid
 

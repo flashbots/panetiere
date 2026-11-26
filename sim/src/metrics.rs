@@ -121,17 +121,38 @@ pub(crate) struct Usage {
     /// Memory held at the time of the report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rss_bytes: Option<u64>,
+    /// Bytes sent and received on the network interface, so with HTTP, TCP
+    /// and IP headers and resent packets. `None` outside a container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sent_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) received_bytes: Option<u64>,
 }
 
-static REPORTED_CPU: Mutex<Duration> = Mutex::new(Duration::ZERO);
+struct Reported {
+    cpu: Duration,
+    sent: u64,
+    received: u64,
+}
+
+static REPORTED: Mutex<Reported> = Mutex::new(Reported {
+    cpu: Duration::ZERO,
+    sent: 0,
+    received: 0,
+});
 
 /// Measures [`Usage`] and starts the next measurement. Covers the whole
 /// process, so it only means something with one node per process.
 pub(crate) fn take_usage() -> Usage {
     let cpu = ProcessTime::now().as_duration();
-    let mut reported = REPORTED_CPU.lock().unwrap_or_else(PoisonError::into_inner);
-    let cpu_us = cpu.saturating_sub(*reported).as_micros() as u64;
-    *reported = cpu;
+    let sent = interface_counter("tx_bytes");
+    let received = interface_counter("rx_bytes");
+    let mut reported = REPORTED.lock().unwrap_or_else(PoisonError::into_inner);
+    let cpu_us = cpu.saturating_sub(reported.cpu).as_micros() as u64;
+    reported.cpu = cpu;
+    let sent_bytes = sent.map(|n| n.saturating_sub(std::mem::replace(&mut reported.sent, n)));
+    let received_bytes =
+        received.map(|n| n.saturating_sub(std::mem::replace(&mut reported.received, n)));
 
     let status = std::fs::read_to_string("/proc/self/status").ok();
     let field = |name: &str| {
@@ -146,10 +167,45 @@ pub(crate) fn take_usage() -> Usage {
         cpu_us,
         peak_rss_bytes: field("VmHWM:"),
         rss_bytes: field("VmRSS:"),
+        sent_bytes,
+        received_bytes,
     };
     // resets the peak to the current size
     if let Err(e) = std::fs::write("/proc/self/clear_refs", "5") {
         tracing::debug!(%e, "could not reset peak memory");
     }
     usage
+}
+
+fn interface_counter(name: &str) -> Option<u64> {
+    let path = format!("/sys/class/net/eth0/statistics/{name}");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// The link and CPU budget `run.sh` gave this node's container.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct Link {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) delay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) loss: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) up: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) down: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cpus: Option<String>,
+}
+
+impl Link {
+    pub(crate) fn from_env() -> Self {
+        let var = |name| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Self {
+            delay: var("NET_DELAY"),
+            loss: var("NET_LOSS"),
+            up: var("NET_UP"),
+            down: var("NET_DOWN"),
+            cpus: var("SIM_CPUS"),
+        }
+    }
 }
