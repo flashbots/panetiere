@@ -48,7 +48,7 @@ which is what makes the round work. Panetière owns its ring parameters and thin
 semantic types in `src/rings.rs`; `negacyclic-rings` provides the arithmetic.
 The layers above are, bottom-up, the schemes (`kahe`, `sss`, `cs`, `pke`), the round
 drivers under `protocol::`, and the payload encodings a caller picks between
-(`channel`, `mse`, `prony`), which all produce and consume
+(`channel`, `iblt`, `ng`), which all produce and consume
 `Vec<KahePoly>`. Only `protocol`, `bulletin`, `channel` and `pke` are public;
 the schemes underneath are internal.
 
@@ -61,7 +61,7 @@ the schemes underneath are internal.
 | `bulletin` | published entry types and their byte encodings |
 | `protocol::*` | the round drivers, verifier, recipient policy |
 | `channel` | recommended payload layer: sizes either encoding for up to $C$ messages of $n$ bytes |
-| `mse` / `prony` | the two multiset encodings (peeling; MDS sketch) |
+| `iblt` / `ng` | the two multiset encodings (IBLT with peeling; Newton–Girard, MDS) |
 
 ## Ingress
 
@@ -248,12 +248,12 @@ encoding, which only guarantees a correct decoding for at most $C$ elements
 from honest clients, and its decoder does not detect every round outside that:
 
 - More contributors than the capacity make `Λ` fail to split, which surfaces
-  as `ChannelError::SketchFailed(PronyError::NotSplit)`. With honest
+  as `ChannelError::SketchFailed(NgError::NotSplit)`. With honest
   contributors, `Λ` still splits with probability about 1/C!, and the round
   then decodes to garbage.
 - A malicious client can change payload cells, and the round then decodes to
   garbled messages. Below capacity, the payload columns the solve did not use
-  usually catch this as `PronyError::CheckFailed`. In a full round, with
+  usually catch this as `NgError::CheckFailed`. In a full round, with
   exactly $C$ contributors, there are no such columns, so nothing does, and a
   malicious client can add elements to make a round full.
 - Malicious contributions can also cancel each other out and look like an
@@ -262,7 +262,7 @@ from honest clients, and its decoder does not detect every round outside that:
 Detecting every incorrect decoding would need a check above the encoding, such
 as a tag on each element, which is not part of the construction. A
 peeling table that is not an honest sum comes back as
-`ChannelError::MalformedEncoding(MseError::{OverCapacity, KeyMismatch})`: the
+`ChannelError::MalformedEncoding(IbltError::{OverCapacity, KeyMismatch})`: the
 decoder checks, as the paper's does, that each peeled key hashes to the cell it
 was read from and stops after `capacity` elements, so a forged contribution
 costs the recipient at most `capacity` peels.
@@ -277,8 +277,8 @@ validated and rejected by value: `PackedOpening::from_bytes` and
 distinctness, and the verifier rejects an out-of-range or duplicated
 `ServerId` before using it. The `assert!`s that remain are on locally
 supplied arguments — parameter constructors (`ShamirParams::new`,
-`MseParams::new`, `PronyParams::new`) and payload arity in
-`MseEncoding::insert` / `PronySketch::encode` — where a violation is a
+`IbltParams::new`, `NgParams::new`) and payload arity in
+`IbltEncoding::insert` / `NgEncoding::encode` — where a violation is a
 caller bug, not an attack. Range checks on the ring bridges are `debug_assert!`,
 so they only run in the debug test profile.
 

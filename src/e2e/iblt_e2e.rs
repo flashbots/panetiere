@@ -1,6 +1,6 @@
-//! Paper-aligned MSE (`src/mse.rs`) carried through the Panetière protocol.
+//! The IBLT (`src/iblt.rs`) carried through the Panetière protocol.
 //!
-//! Each client builds a 1-element MSE encoding, packs it into KahePolys, and
+//! Each client builds a 1-element IBLT encoding, packs it into KahePolys, and
 //! contributes them to the protocol. The verifier's recovered per-poly sums
 //! unpack into the multiset union, which decodes to all clients' elements.
 
@@ -8,7 +8,7 @@
 
 use crate::channel::ChannelParams;
 use crate::cs::Commitment;
-use crate::mse::{MseEncoding, MseParams};
+use crate::iblt::{IbltEncoding, IbltParams};
 use crate::pke;
 use crate::protocol::client::run_client_round;
 use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
@@ -26,33 +26,32 @@ fn session_for(k: usize) -> SessionId {
     SessionId(bytes)
 }
 
-/// MSE arithmetic now lives in `Z_t` (KAHE plaintext modulus, default
-/// `t = 262_144`), large enough to carry random `r` values and small element
+/// IBLT arithmetic lives in `Z_t` (the KAHE plaintext modulus), large enough to carry random `r` values and small element
 /// values without wrap. The protocol's recovered sum decodes back to the
 /// multiset union.
 #[test]
-fn mse_recovers_through_panetiere() {
+fn iblt_recovers_through_panetiere() {
     let mut rng = ChaCha20Rng::from_seed([0xFEu8; 32]);
     let n_servers = 3;
     let n_clients: usize = 6;
 
     // Pick γ = 4 (paper Theorem 3 sweet spot), δ = ⌈0.75·ρ⌉, ξ = 1.
-    let mse_params = MseParams::new(&mut rng, 4, (3 * n_clients).div_ceil(4), n_clients, 1);
+    let iblt_params = IbltParams::new(&mut rng, 4, (3 * n_clients).div_ceil(4), n_clients, 1);
 
     // Each client picks a unique element x ∈ Z_q with small magnitude.
     let elements: Vec<i64> = (0..n_clients).map(|i| 1000 + i as i64).collect();
     let client_polys: Vec<Vec<KahePoly>> = elements
         .iter()
         .map(|&x| {
-            let mut enc = MseEncoding::new(mse_params.clone());
+            let mut enc = IbltEncoding::new(iblt_params.clone());
             // Per-client random `r ∈ [0, t^K_LIMBS)` drawn from the protocol RNG.
-            let r: u128 = rng.gen_range(0..mse_params.r_space());
+            let r: u128 = rng.gen_range(0..iblt_params.r_space());
             enc.insert_with_r(&[x], r);
             enc.pack()
         })
         .collect();
     let n_polys = client_polys[0].len();
-    assert_eq!(n_polys, MseEncoding::n_polys(&mse_params));
+    assert_eq!(n_polys, IbltEncoding::n_polys(&iblt_params));
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
@@ -104,10 +103,10 @@ fn mse_recovers_through_panetiere() {
         recovered_polys.push(recovered[0]);
     }
 
-    let union = MseEncoding::unpack(&mse_params, &recovered_polys);
+    let union = IbltEncoding::unpack(&iblt_params, &recovered_polys);
     let mut got: Vec<i64> = union
         .decode()
-        .expect("MSE decode")
+        .expect("IBLT decode")
         .into_iter()
         .map(|t| t[0])
         .collect();
@@ -118,7 +117,7 @@ fn mse_recovers_through_panetiere() {
 }
 
 /// Cover traffic: `n_active` clients carry real elements, `n_cover` send
-/// `MseEncoding::cover` (zero polys). All `n_active + n_cover` clients run the
+/// `IbltEncoding::cover` (zero polys). All `n_active + n_cover` clients run the
 /// full protocol — they're in the canonical set and the anonymity set — but the
 /// IBLT is sized only to `n_active` and the recovered multiset is exactly the
 /// active elements. The cover clients add nothing to peeling.
@@ -131,22 +130,22 @@ fn cover_clients_do_not_inflate_iblt() {
     let n_total = n_active + n_cover;
 
     // IBLT sized to the active count, not the anonymity set.
-    let mse_params = MseParams::new(&mut rng, 4, (3 * n_active).div_ceil(4), n_active, 1);
+    let iblt_params = IbltParams::new(&mut rng, 4, (3 * n_active).div_ceil(4), n_active, 1);
 
     let elements: Vec<i64> = (0..n_active).map(|i| 1000 + i as i64).collect();
     let client_polys: Vec<Vec<KahePoly>> = (0..n_total)
         .map(|i| {
             if i < n_active {
-                let mut enc = MseEncoding::new(mse_params.clone());
-                let r: u128 = rng.gen_range(0..mse_params.r_space());
+                let mut enc = IbltEncoding::new(iblt_params.clone());
+                let r: u128 = rng.gen_range(0..iblt_params.r_space());
                 enc.insert_with_r(&[elements[i]], r);
                 enc.pack()
             } else {
-                MseEncoding::cover(&mse_params)
+                IbltEncoding::cover(&iblt_params)
             }
         })
         .collect();
-    let n_polys = MseEncoding::n_polys(&mse_params);
+    let n_polys = IbltEncoding::n_polys(&iblt_params);
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
     let pp = ProtocolParams::setup(&mut rng, n_servers);
@@ -198,9 +197,9 @@ fn cover_clients_do_not_inflate_iblt() {
         recovered_polys.push(recovered[0]);
     }
 
-    let mut got: Vec<i64> = MseEncoding::unpack(&mse_params, &recovered_polys)
+    let mut got: Vec<i64> = IbltEncoding::unpack(&iblt_params, &recovered_polys)
         .decode()
-        .expect("MSE decode")
+        .expect("IBLT decode")
         .into_iter()
         .map(|t| t[0])
         .collect();
@@ -220,12 +219,12 @@ fn multi_symbol_cover_through_panetiere() {
     let n_cover = 2;
     let n_total = n_active + n_cover;
 
-    let mse_params = ChannelParams::for_symbols(&mut rng, n_active as u32, 32)
-        .mse()
+    let iblt_params = ChannelParams::for_symbols(&mut rng, n_active as u32, 32)
+        .iblt()
         .expect("peeling channel")
         .clone();
     // the channel's elements carry its nonce symbols ahead of the 32 payload ones
-    let xi = mse_params.payload_symbols;
+    let xi = iblt_params.payload_symbols;
 
     let payloads: Vec<Vec<i64>> = (0..n_active)
         .map(|i| {
@@ -237,16 +236,16 @@ fn multi_symbol_cover_through_panetiere() {
     let client_polys: Vec<Vec<KahePoly>> = (0..n_total)
         .map(|i| {
             if i < n_active {
-                let mut enc = MseEncoding::new(mse_params.clone());
-                let r: u128 = rng.gen_range(0..mse_params.r_space());
+                let mut enc = IbltEncoding::new(iblt_params.clone());
+                let r: u128 = rng.gen_range(0..iblt_params.r_space());
                 enc.insert_with_r(&payloads[i], r);
                 enc.pack()
             } else {
-                MseEncoding::cover(&mse_params)
+                IbltEncoding::cover(&iblt_params)
             }
         })
         .collect();
-    let n_polys = MseEncoding::n_polys(&mse_params);
+    let n_polys = IbltEncoding::n_polys(&iblt_params);
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
     // one poly per round below, as in the tests above
@@ -299,9 +298,9 @@ fn multi_symbol_cover_through_panetiere() {
         recovered_polys.push(recovered[0]);
     }
 
-    let mut got = MseEncoding::unpack(&mse_params, &recovered_polys)
+    let mut got = IbltEncoding::unpack(&iblt_params, &recovered_polys)
         .decode()
-        .expect("MSE decode");
+        .expect("IBLT decode");
     let mut expected = payloads.clone();
     got.sort();
     expected.sort();
@@ -313,13 +312,13 @@ fn multi_symbol_cover_through_panetiere() {
 
 /// Guards the cover/insert distinction: `cover` adds nothing, but a
 /// zero-*payload* `insert(&[0])` occupies cells and peels back out as a real
-/// element. MSE-level, no protocol needed.
+/// element. IBLT-level, no protocol needed.
 #[test]
 fn zero_payload_insert_is_not_cover() {
     let mut rng = ChaCha20Rng::from_seed([0x11u8; 32]);
-    let mse_params = MseParams::new(&mut rng, 4, 16, 2, 1);
+    let iblt_params = IbltParams::new(&mut rng, 4, 16, 2, 1);
 
-    let mut enc = MseEncoding::new(mse_params.clone());
+    let mut enc = IbltEncoding::new(iblt_params.clone());
     enc.insert(&mut rng, &[7]);
     enc.insert(&mut rng, &[0]); // zero payload — still a real insert
     let recovered = enc.decode().expect("decode");
@@ -328,7 +327,7 @@ fn zero_payload_insert_is_not_cover() {
     assert_eq!(got, vec![0, 7]);
 
     // cover() leaves the matrices empty: nothing to peel.
-    assert!(MseEncoding::cover(&mse_params).iter().all(|p| {
+    assert!(IbltEncoding::cover(&iblt_params).iter().all(|p| {
         let mut q = *p;
         q.normalize();
         q.coeffs().iter().all(|&c| c == 0)

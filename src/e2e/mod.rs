@@ -2,6 +2,6 @@
 //! internals: tampered openings, raw ring elements, the encodings directly.
 
 mod end_to_end;
-mod mse_e2e;
-mod prony_e2e;
+mod iblt_e2e;
+mod ng_e2e;
 mod recipient_e2e;

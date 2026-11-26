@@ -8,9 +8,9 @@ use rand_chacha::ChaCha20Rng;
 use serde_json::Value;
 
 use crate::cs::{beta_agg_hvc, HidingMerkleCommitment, BETA_CS, KAPPA_CS, MU_CS, R_BOUND};
+use crate::iblt::BITS_PER_SYMBOL;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
-use crate::mse::BITS_PER_SYMBOL;
-use crate::prony::PRONY_OMEGA;
+use crate::ng::NG_OMEGA;
 use crate::protocol::ProtocolParams;
 use crate::rings::{CS_MODULUS, KAHE_MODULUS, MU_MAX, PLAINTEXT_MODULUS, RHO_MAX};
 use crate::N;
@@ -44,7 +44,7 @@ fn constants_match_reference() {
     assert_eq!(int(&r, "/kahe/mse/rho"), u64::from(RHO_MAX));
     assert_eq!(int(&r, "/kahe/mse/chunk_bits"), BITS_PER_SYMBOL as u64);
     // the reference set's encoding is Newton–Girard over F_{t^ω}
-    assert_eq!(int(&r, "/kahe/mse/omega"), PRONY_OMEGA as u64);
+    assert_eq!(int(&r, "/kahe/mse/omega"), NG_OMEGA as u64);
 
     assert_eq!(int(&r, "/leaf/p"), CS_MODULUS as u64);
     assert_eq!(int(&r, "/leaf/beta"), u64::from(BETA_CS));

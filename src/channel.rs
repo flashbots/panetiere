@@ -6,25 +6,25 @@ use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
 use sha3::Shake256;
 
 use crate::chunking;
+pub use crate::iblt::IbltError;
+use crate::iblt::{self, IbltEncoding, IbltParams};
 use crate::iblt_shape::iblt_shape;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
-pub use crate::mse::MseError;
-use crate::mse::{self, MseEncoding, MseParams};
-pub use crate::prony::PronyError;
-use crate::prony::{PronyParams, PronySketch, PRONY_OMEGA};
+pub use crate::ng::NgError;
+use crate::ng::{NgEncoding, NgParams, NG_OMEGA};
 use crate::protocol::{ProtocolParams, SessionId};
 use crate::rings::{PLAINTEXT_MODULUS, RHO_MAX};
 
 /// Message bits packed into one symbol: `⌊log₂ t⌋`, so every chunk is a
 /// distinct residue of the plaintext modulus both encodings share.
-pub const BITS_PER_CHUNK: usize = mse::BITS_PER_SYMBOL;
+pub const BITS_PER_CHUNK: usize = iblt::BITS_PER_SYMBOL;
 
 const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PLAINTEXT_MODULUS);
 // Two of `RHO_MAX` sketch keys collide with probability at most
 // `RHO_MAX²/t^ω`, which must not exceed the multiset encoding's error bound.
 const _: () = assert!(
     ((RHO_MAX as u128 * RHO_MAX as u128) << EPS_MSE)
-        <= (PLAINTEXT_MODULUS as u128).pow(PRONY_OMEGA as u32)
+        <= (PLAINTEXT_MODULUS as u128).pow(NG_OMEGA as u32)
 );
 
 /// The paper's `ε_MSE`: a round's encoding fails to decode with probability at
@@ -51,10 +51,10 @@ pub enum ChannelError {
     PeelStalled,
     /// The peeling table is not an honest sum: over capacity, or a cell whose
     /// key does not hash to it.
-    MalformedEncoding(MseError),
-    /// The Prony sketch could not be resolved — over capacity, or a malformed
+    MalformedEncoding(IbltError),
+    /// The NG encoding could not be decoded — over capacity, or a malformed
     /// contribution.
-    SketchFailed(PronyError),
+    SketchFailed(NgError),
     /// Fewer polys than the parameters describe.
     ShortPlaintext { got: usize, need: usize },
     /// Recovered element count disagrees with what the caller expected.
@@ -71,12 +71,12 @@ pub enum ChannelError {
 /// The multiset encoding a channel sits on.
 #[derive(Clone, Debug, PartialEq)]
 enum Encoding {
-    Mse(MseParams),
-    Prony(PronyParams),
+    Iblt(IbltParams),
+    Ng(NgParams),
 }
 
-/// Sizing and keying for one channel, over either multiset encoding. `Mse`
-/// peels; `Prony` is ~3× smaller. Both are all-or-nothing.
+/// Sizing and keying for one channel, over either multiset encoding. `Iblt`
+/// peels; `Ng` is ~3× smaller. Both are all-or-nothing.
 ///
 /// Every element is `(s, m + RO(s))`: a fresh nonce `s`, then the payload
 /// masked by a random oracle on that nonce, so no client can make its own
@@ -106,7 +106,7 @@ impl ChannelParams {
     pub fn for_messages_with_key(
         capacity: u32,
         message_bytes: usize,
-        prf_key: [u8; mse::PRF_KEY_BYTES],
+        prf_key: [u8; iblt::PRF_KEY_BYTES],
     ) -> Self {
         Self::for_symbols_with_key(capacity, payload_symbols(message_bytes), prf_key)
     }
@@ -120,7 +120,7 @@ impl ChannelParams {
         capacity: u32,
         payload_symbols: usize,
     ) -> Self {
-        let mut prf_key = [0u8; mse::PRF_KEY_BYTES];
+        let mut prf_key = [0u8; iblt::PRF_KEY_BYTES];
         rng.fill(&mut prf_key);
         Self::for_symbols_with_key(capacity, payload_symbols, prf_key)
     }
@@ -130,13 +130,13 @@ impl ChannelParams {
     pub fn for_symbols_with_key(
         capacity: u32,
         payload_symbols: usize,
-        prf_key: [u8; mse::PRF_KEY_BYTES],
+        prf_key: [u8; iblt::PRF_KEY_BYTES],
     ) -> Self {
         let capacity = capacity.max(1) as usize;
-        let nonce_symbols = nonce_symbols(mse::BITS_PER_SYMBOL);
+        let nonce_symbols = nonce_symbols(iblt::BITS_PER_SYMBOL);
         let (theta, delta) = iblt_shape(capacity, EPS_MSE);
         Self {
-            encoding: Encoding::Mse(MseParams::with_key(
+            encoding: Encoding::Iblt(IbltParams::with_key(
                 theta,
                 delta,
                 capacity,
@@ -149,8 +149,8 @@ impl ChannelParams {
 
     /// The PRF key of a peeling channel, to send to the session's other
     /// parties. `None` for a sketch channel, which has no key.
-    pub fn prf_key(&self) -> Option<[u8; mse::PRF_KEY_BYTES]> {
-        self.mse().map(|p| p.prf_key)
+    pub fn prf_key(&self) -> Option<[u8; iblt::PRF_KEY_BYTES]> {
+        self.iblt().map(|p| p.prf_key)
     }
 
     /// Sketch channel for up to `capacity` payloads of `message_bytes` each.
@@ -162,7 +162,7 @@ impl ChannelParams {
         let capacity = capacity.max(1) as usize;
         let nonce_symbols = nonce_symbols(PLAINTEXT_MODULUS.ilog2() as usize);
         Self {
-            encoding: Encoding::Prony(PronyParams::new(
+            encoding: Encoding::Ng(NgParams::new(
                 capacity,
                 nonce_symbols + payload_symbols.max(1),
             )),
@@ -171,19 +171,19 @@ impl ChannelParams {
     }
 
     /// The peeling parameters underneath, nonce symbols included.
-    pub(crate) fn mse(&self) -> Option<&MseParams> {
+    pub(crate) fn iblt(&self) -> Option<&IbltParams> {
         match &self.encoding {
-            Encoding::Mse(p) => Some(p),
-            Encoding::Prony(_) => None,
+            Encoding::Iblt(p) => Some(p),
+            Encoding::Ng(_) => None,
         }
     }
 
     /// The sketch parameters underneath, nonce symbols included.
     #[cfg(test)]
-    pub(crate) fn prony(&self) -> Option<&PronyParams> {
+    pub(crate) fn ng(&self) -> Option<&NgParams> {
         match &self.encoding {
-            Encoding::Prony(p) => Some(p),
-            Encoding::Mse(_) => None,
+            Encoding::Ng(p) => Some(p),
+            Encoding::Iblt(_) => None,
         }
     }
 
@@ -191,16 +191,16 @@ impl ChannelParams {
     /// many, real or cover.
     pub fn n_polys(&self) -> usize {
         match &self.encoding {
-            Encoding::Mse(p) => MseEncoding::n_polys(p),
-            Encoding::Prony(p) => PronySketch::n_polys(p),
+            Encoding::Iblt(p) => IbltEncoding::n_polys(p),
+            Encoding::Ng(p) => NgEncoding::n_polys(p),
         }
     }
 
     /// Symbols of payload per element, not counting the nonce.
     pub fn payload_symbols(&self) -> usize {
         let element = match &self.encoding {
-            Encoding::Mse(p) => p.payload_symbols,
-            Encoding::Prony(p) => p.payload_symbols,
+            Encoding::Iblt(p) => p.payload_symbols,
+            Encoding::Ng(p) => p.payload_symbols,
         };
         element - self.nonce_symbols
     }
@@ -209,16 +209,16 @@ impl ChannelParams {
     /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — the same `t`.
     pub fn bits_per_symbol(&self) -> usize {
         match &self.encoding {
-            Encoding::Mse(_) => mse::BITS_PER_SYMBOL,
-            Encoding::Prony(p) => p.bits_per_symbol(),
+            Encoding::Iblt(_) => iblt::BITS_PER_SYMBOL,
+            Encoding::Ng(p) => p.bits_per_symbol(),
         }
     }
 
     /// KAHE plaintext modulus the symbols live in. The sketch needs a prime.
     pub fn plaintext_modulus(&self) -> u64 {
         match &self.encoding {
-            Encoding::Mse(_) => PLAINTEXT_MODULUS,
-            Encoding::Prony(p) => p.p,
+            Encoding::Iblt(_) => PLAINTEXT_MODULUS,
+            Encoding::Ng(p) => p.p,
         }
     }
 
@@ -340,19 +340,19 @@ pub fn encode_symbols<R: CryptoRng + Rng>(
     let mut element = nonce;
     element.extend(payload.iter().zip(&mask).map(|(&m, &r)| m ^ r));
     Ok(match &p.encoding {
-        Encoding::Mse(params) => {
-            let mut enc = MseEncoding::new(params.clone());
+        Encoding::Iblt(params) => {
+            let mut enc = IbltEncoding::new(params.clone());
             enc.insert(rng, &element);
             enc.pack()
         }
-        Encoding::Prony(params) => PronySketch::encode(params, rng, &element),
+        Encoding::Ng(params) => NgEncoding::encode(params, rng, &element),
     })
 }
 
 pub fn cover(p: &ChannelParams) -> Vec<KahePoly> {
     match &p.encoding {
-        Encoding::Mse(params) => MseEncoding::cover(params),
-        Encoding::Prony(params) => PronySketch::cover(params),
+        Encoding::Iblt(params) => IbltEncoding::cover(params),
+        Encoding::Ng(params) => NgEncoding::cover(params),
     }
 }
 
@@ -373,7 +373,7 @@ pub fn decode_messages(
 
 /// `expect` optionally checks the total decoded item count, not items per client.
 /// Leave it `None` when the active-sender count is unknown (e.g. with cover traffic).
-/// MSE residual and Prony column checks test decoding consistency, not per-client
+/// The IBLT's residual and NG's column checks test decoding consistency, not per-client
 /// input validity or payload authenticity. Each element's nonce is stripped,
 /// its mask removed, and the unmasked payloads come back sorted.
 pub fn decode_symbols(
@@ -390,15 +390,15 @@ pub fn decode_symbols(
         });
     }
     let elements = match &p.encoding {
-        Encoding::Mse(params) => MseEncoding::unpack(params, &plaintext[..need])
+        Encoding::Iblt(params) => IbltEncoding::unpack(params, &plaintext[..need])
             .decode()
             .map_err(|e| match e {
-                MseError::OverCapacity | MseError::KeyMismatch => {
+                IbltError::OverCapacity | IbltError::KeyMismatch => {
                     ChannelError::MalformedEncoding(e)
                 }
                 _ => ChannelError::PeelStalled,
             })?,
-        Encoding::Prony(params) => PronySketch::unpack(params, &plaintext[..need])
+        Encoding::Ng(params) => NgEncoding::unpack(params, &plaintext[..need])
             .decode()
             .map_err(ChannelError::SketchFailed)?,
     };
@@ -623,7 +623,7 @@ mod tests {
     /// the reference parameter set's nonce length.
     #[test]
     fn nonce_sized_for_the_security_target() {
-        assert_eq!(mse::BITS_PER_SYMBOL, 34);
+        assert_eq!(iblt::BITS_PER_SYMBOL, 34);
         assert_eq!(nonce_symbols(34), 6);
         assert_eq!(nonce_symbols(33), 7);
         assert_eq!(nonce_symbols(201), 1);
@@ -655,9 +655,9 @@ mod tests {
 
     /// The decoded elements of the encoding underneath, before unmasking.
     fn raw_elements(p: &ChannelParams, plain: &[KahePoly]) -> Vec<Vec<i64>> {
-        match (p.mse(), p.prony()) {
-            (Some(params), _) => MseEncoding::unpack(params, plain).decode().unwrap(),
-            (_, Some(params)) => PronySketch::unpack(params, plain).decode().unwrap(),
+        match (p.iblt(), p.ng()) {
+            (Some(params), _) => IbltEncoding::unpack(params, plain).decode().unwrap(),
+            (_, Some(params)) => NgEncoding::unpack(params, plain).decode().unwrap(),
             (None, None) => unreachable!("a channel is peeling or sketch"),
         }
     }

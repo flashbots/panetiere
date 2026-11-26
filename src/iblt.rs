@@ -42,7 +42,7 @@ const R_SPACE: u128 = {
 const _: () = assert!(R_SPACE <= 1u128 << ((16 - ROW_BYTES) * 8));
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct MseParams {
+pub struct IbltParams {
     pub gamma: usize,
     /// Buckets per row.
     pub delta: usize,
@@ -56,7 +56,7 @@ pub struct MseParams {
     pub prf_key: [u8; PRF_KEY_BYTES],
 }
 
-impl MseParams {
+impl IbltParams {
     /// Uniform `γ × δ` layout (standard IBLT shape) for up to `capacity`
     /// elements, with a freshly sampled PRF key. For whoever sets up the
     /// session; the key then travels to the other parties with the rest of
@@ -117,8 +117,8 @@ impl MseParams {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct MseEncoding {
-    pub params: MseParams,
+pub struct IbltEncoding {
+    pub params: IbltParams,
     /// Counters per cell; row-major `gamma × delta`.
     pub c: Vec<i64>,
     /// Randomness accumulator limbs. `k[ℓ]` has `gamma*delta` entries.
@@ -128,7 +128,7 @@ pub struct MseEncoding {
 }
 
 #[derive(Debug, PartialEq)]
-pub enum MseError {
+pub enum IbltError {
     PeelStalled,
     /// Peeling produced more than `capacity` elements, so the table is not an
     /// honest sum of at most `capacity` insertions.
@@ -171,8 +171,8 @@ fn prf_bucket(cipher: &Aes128, row: usize, r: u128, delta: usize) -> usize {
     (u128::from_le_bytes(block) % delta as u128) as usize
 }
 
-impl MseEncoding {
-    pub fn new(params: MseParams) -> Self {
+impl IbltEncoding {
+    pub fn new(params: IbltParams) -> Self {
         let n = params.total_cells();
         let k = (0..K_LIMBS).map(|_| vec![0i64; n]).collect();
         let v = (0..params.payload_symbols).map(|_| vec![0i64; n]).collect();
@@ -225,7 +225,7 @@ impl MseEncoding {
         }
     }
 
-    pub fn decode(&self) -> Result<Vec<Vec<i64>>, MseError> {
+    pub fn decode(&self) -> Result<Vec<Vec<i64>>, IbltError> {
         let mut c = self.c.clone();
         let mut k = self.k.clone();
         let mut v = self.v.clone();
@@ -260,10 +260,10 @@ impl MseEncoding {
             // the paper's two guards: an honest sum never trips them, and a
             // forged table cannot make peeling run past `capacity` elements
             if emitted.len() >= self.params.capacity {
-                return Err(MseError::OverCapacity);
+                return Err(IbltError::OverCapacity);
             }
             if prf_bucket(&cipher, row, r_star, self.params.delta) != col {
-                return Err(MseError::KeyMismatch);
+                return Err(IbltError::KeyMismatch);
             }
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
@@ -289,18 +289,18 @@ impl MseEncoding {
             || k.iter().any(|limb| limb.iter().any(|&x| x != 0))
             || v.iter().any(|sym| sym.iter().any(|&x| x != 0))
         {
-            return Err(MseError::PeelStalled);
+            return Err(IbltError::PeelStalled);
         }
         emitted.sort();
         Ok(emitted)
     }
 
-    pub fn n_polys(params: &MseParams) -> usize {
+    pub fn n_polys(params: &IbltParams) -> usize {
         params.total_scalars().div_ceil(N)
     }
 
     /// Cover-traffic message: zero polys
-    pub fn cover(params: &MseParams) -> Vec<KahePoly> {
+    pub fn cover(params: &IbltParams) -> Vec<KahePoly> {
         Self::new(params.clone()).pack()
     }
 
@@ -338,7 +338,7 @@ impl MseEncoding {
         polys
     }
 
-    pub fn unpack(params: &MseParams, polys: &[KahePoly]) -> Self {
+    pub fn unpack(params: &IbltParams, polys: &[KahePoly]) -> Self {
         let total = params.total_scalars();
         assert_eq!(polys.len(), total.div_ceil(N));
         let mut flat: Vec<i64> = Vec::with_capacity(polys.len() * N);
@@ -372,11 +372,11 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> MseParams {
+    fn params_for(gamma: usize, delta: usize, payload_symbols: usize, seed: u8) -> IbltParams {
         // sized the way `channel` does: γ·δ = 3ρ cells hold ρ elements
         let capacity = (gamma * delta).div_ceil(3);
         let mut rng = ChaCha20Rng::from_seed([seed; 32]);
-        MseParams::new(&mut rng, gamma, delta, capacity, payload_symbols)
+        IbltParams::new(&mut rng, gamma, delta, capacity, payload_symbols)
     }
 
     /// An honest table with one element, whose cell keys are then moved so
@@ -385,7 +385,7 @@ mod tests {
     fn forged_cell_key_rejected() {
         let mut rng = ChaCha20Rng::from_seed([7u8; 32]);
         let pp = params_for(4, 16, 1, 3);
-        let mut enc = MseEncoding::new(pp);
+        let mut enc = IbltEncoding::new(pp);
         enc.insert(&mut rng, &[42]);
         for limb in enc.k.iter_mut() {
             for cell in limb.iter_mut() {
@@ -394,7 +394,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(enc.decode(), Err(MseError::KeyMismatch));
+        assert_eq!(enc.decode(), Err(IbltError::KeyMismatch));
     }
 
     /// One more honest element than the capacity peels fine but is refused,
@@ -402,19 +402,19 @@ mod tests {
     #[test]
     fn over_capacity_rejected() {
         let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let pp = MseParams::new(&mut rng, 4, 64, 3, 1);
-        let mut enc = MseEncoding::new(pp);
+        let pp = IbltParams::new(&mut rng, 4, 64, 3, 1);
+        let mut enc = IbltEncoding::new(pp);
         for x in [1, 2, 3, 4] {
             enc.insert(&mut rng, &[x]);
         }
-        assert_eq!(enc.decode(), Err(MseError::OverCapacity));
+        assert_eq!(enc.decode(), Err(IbltError::OverCapacity));
     }
 
     /// Decoded symbols are canonical in `[0, t)`, whatever the input's sign.
     #[test]
     fn decoded_symbols_are_canonical() {
         let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let mut enc = MseEncoding::new(params_for(4, 16, 1, 9));
+        let mut enc = IbltEncoding::new(params_for(4, 16, 1, 9));
         enc.insert(&mut rng, &[-1]);
         assert_eq!(enc.decode(), Ok(vec![vec![T - 1]]));
     }
@@ -423,7 +423,7 @@ mod tests {
     fn single_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
         let pp = params_for(4, 16, 1, 1);
-        let mut enc = MseEncoding::new(pp.clone());
+        let mut enc = IbltEncoding::new(pp.clone());
         enc.insert(&mut rng, &[42]);
         let recovered = enc.decode().expect("decode");
         assert_eq!(recovered, vec![vec![42]]);
@@ -433,7 +433,7 @@ mod tests {
     fn multi_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
         let pp = params_for(4, 64, 1, 2);
-        let mut enc = MseEncoding::new(pp);
+        let mut enc = IbltEncoding::new(pp);
         let mut elements = vec![1, 7, 13, 19, 100, 200, 300, 400];
         for &x in &elements {
             enc.insert(&mut rng, &[x]);
@@ -453,13 +453,13 @@ mod tests {
     fn pack_unpack_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([4u8; 32]);
         let pp = params_for(4, 32, 1, 5);
-        let mut enc = MseEncoding::new(pp.clone());
+        let mut enc = IbltEncoding::new(pp.clone());
         for x in [11, 22, 33, 44, 55] {
             enc.insert(&mut rng, &[x]);
         }
         let polys = enc.pack();
-        assert_eq!(polys.len(), MseEncoding::n_polys(&pp));
-        let restored = MseEncoding::unpack(&pp, &polys);
+        assert_eq!(polys.len(), IbltEncoding::n_polys(&pp));
+        let restored = IbltEncoding::unpack(&pp, &polys);
         assert_eq!(restored, enc);
         let mut got: Vec<i64> = restored
             .decode()
@@ -475,8 +475,8 @@ mod tests {
     fn pack_sum_unpacks_to_union() {
         let mut rng = ChaCha20Rng::from_seed([6u8; 32]);
         let pp = params_for(4, 32, 1, 7);
-        let mut a = MseEncoding::new(pp.clone());
-        let mut b = MseEncoding::new(pp.clone());
+        let mut a = IbltEncoding::new(pp.clone());
+        let mut b = IbltEncoding::new(pp.clone());
         for x in [100, 200, 300] {
             a.insert(&mut rng, &[x]);
         }
@@ -486,7 +486,7 @@ mod tests {
         let pa = a.pack();
         let pb = b.pack();
         let summed: Vec<KahePoly> = pa.iter().zip(pb.iter()).map(|(x, y)| *x + *y).collect();
-        let unioned = MseEncoding::unpack(&pp, &summed);
+        let unioned = IbltEncoding::unpack(&pp, &summed);
         let mut got: Vec<i64> = unioned
             .decode()
             .expect("decode")
@@ -504,7 +504,7 @@ mod tests {
     fn multi_symbol_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
         let pp = params_for(4, 64, 4, 17);
-        let mut enc = MseEncoding::new(pp);
+        let mut enc = IbltEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..10)
             .map(|i| vec![i * 11, i * 13 + 1, i * 17 + 2, i * 19 + 3])
             .collect();
@@ -524,7 +524,7 @@ mod tests {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
         let xi = 512usize.div_ceil(BITS_PER_SYMBOL);
         let pp = params_for(4, 32, xi, 31);
-        let mut enc = MseEncoding::new(pp);
+        let mut enc = IbltEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..5)
             .map(|i| (0..xi).map(|s| (i * 7 + s * 13) as i64).collect())
             .collect();
@@ -542,7 +542,7 @@ mod tests {
     fn payload_arity_mismatch_panics() {
         let mut rng = ChaCha20Rng::from_seed([29u8; 32]);
         let pp = params_for(4, 32, 3, 41);
-        let mut enc = MseEncoding::new(pp);
+        let mut enc = IbltEncoding::new(pp);
         enc.insert(&mut rng, &[1, 2]);
     }
 }

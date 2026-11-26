@@ -1,5 +1,5 @@
-//! Prony sketch (`src/prony.rs`) carried through the Panetière protocol,
-//! mirroring `tests/mse_e2e.rs`.
+//! The NG encoding (`src/ng.rs`) carried through the Panetière protocol,
+//! mirroring `iblt_e2e.rs`.
 //!
 //! The protocol is set up as for the IBLT, with the same plaintext modulus
 //! `PLAINTEXT_MODULUS`, passed through
@@ -9,8 +9,8 @@
 
 use crate::cs::Commitment;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::ng::{NgEncoding, NgParams};
 use crate::pke;
-use crate::prony::{PronyParams, PronySketch};
 use crate::protocol::client::run_client_round;
 use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use crate::protocol::verify::aggregate_and_decrypt_unverified;
@@ -94,23 +94,23 @@ fn round_trip(
 }
 
 #[test]
-fn prony_recovers_through_panetiere() {
+fn ng_recovers_through_panetiere() {
     let mut rng = ChaCha20Rng::from_seed([0xFEu8; 32]);
     let n_clients = 6;
-    let params = PronyParams::new(n_clients, 2);
+    let params = NgParams::new(n_clients, 2);
 
     let messages: Vec<Vec<i64>> = (0..n_clients)
         .map(|i| vec![1000 + i as i64, (i as i64 + 1) << 27])
         .collect();
     let client_polys: Vec<Vec<KahePoly>> = messages
         .iter()
-        .map(|m| PronySketch::encode(&params, &mut rng, m))
+        .map(|m| NgEncoding::encode(&params, &mut rng, m))
         .collect();
 
     let recovered = round_trip(&mut rng, 3, &client_polys);
-    let mut got = PronySketch::unpack(&params, &recovered)
+    let mut got = NgEncoding::unpack(&params, &recovered)
         .decode()
-        .expect("prony decode");
+        .expect("NG decode");
     let mut want = messages;
     got.sort();
     want.sort();
@@ -124,19 +124,19 @@ fn prony_recovers_through_panetiere() {
 fn cover_clients_do_not_consume_capacity() {
     let mut rng = ChaCha20Rng::from_seed([0x5Au8; 32]);
     let (n_active, n_cover) = (4, 8);
-    let params = PronyParams::new(n_active, 1);
+    let params = NgParams::new(n_active, 1);
 
     let elements: Vec<i64> = (0..n_active).map(|i| 7 * i as i64 + 3).collect();
     let mut client_polys: Vec<Vec<KahePoly>> = elements
         .iter()
-        .map(|&x| PronySketch::encode(&params, &mut rng, &[x]))
+        .map(|&x| NgEncoding::encode(&params, &mut rng, &[x]))
         .collect();
-    client_polys.extend((0..n_cover).map(|_| PronySketch::cover(&params)));
+    client_polys.extend((0..n_cover).map(|_| NgEncoding::cover(&params)));
 
     let recovered = round_trip(&mut rng, 3, &client_polys);
-    let mut got: Vec<i64> = PronySketch::unpack(&params, &recovered)
+    let mut got: Vec<i64> = NgEncoding::unpack(&params, &recovered)
         .decode()
-        .expect("prony decode")
+        .expect("NG decode")
         .into_iter()
         .map(|t| t[0])
         .collect();

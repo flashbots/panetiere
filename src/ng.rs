@@ -1,6 +1,7 @@
-//! Prony / Reed–Solomon syndrome sketch — an MDS alternative to `mse.rs`.
+//! Newton–Girard encoding (a Prony / Reed–Solomon syndrome sketch) — an MDS
+//! alternative to the IBLT in `iblt.rs`.
 //!
-//! Same contract as [`crate::mse::MseEncoding`]: an additively homomorphic
+//! Same contract as [`crate::iblt::IbltEncoding`]: an additively homomorphic
 //! sketch over the KAHE plaintext modulus, packed into `KahePoly` slots, whose
 //! coefficient-wise sum decodes to the multiset union. Different mechanism:
 //! instead of hashing each element into `γ` of `δ` buckets and peeling, each
@@ -48,10 +49,10 @@ use sha3::Shake256;
 /// The extension degree `ω` of the sketch's field `F = F_{t^ω}`. Two of `C`
 /// contributors draw the same key, and the round fails to decode, with
 /// probability at most `C²/t^ω`: about `2^-51.5` at `C = 300`.
-pub const PRONY_OMEGA: usize = 2;
+pub const NG_OMEGA: usize = 2;
 
 // An element's coordinates never straddle two packed polynomials.
-const _: () = assert!(N.is_multiple_of(PRONY_OMEGA));
+const _: () = assert!(N.is_multiple_of(NG_OMEGA));
 
 /// `F_{t²} = F_t[Z]/(Z² − NONRESIDUE)`; `Z² − 3` is irreducible since 3 is
 /// not a square mod `t`.
@@ -532,7 +533,7 @@ fn powmod_linear(c: F2, e: u128, m: &[F2], ext: Ext) -> Vec<F2> {
 /// The seed of the root finder's shifts: a hash of the polynomial.
 fn split_seed(lam: &[F2]) -> [u8; 32] {
     let mut hasher = Shake256::default();
-    hasher.update(b"panetiere/prony-roots/v1");
+    hasher.update(b"panetiere/ng-roots/v1");
     for c in lam {
         hasher.update(&c.a.to_le_bytes());
         hasher.update(&c.b.to_le_bytes());
@@ -775,7 +776,7 @@ fn solve_symbol(d: &DualLimbs, w: &[u64], f: Fp) -> Vec<u64> {
 // ---------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct PronyParams {
+pub struct NgParams {
     /// Maximum number of contributors the sketch can resolve.
     pub(crate) capacity: usize,
     /// Symbols of `Z_t` per element; total payload is `payload_symbols · log₂ p`
@@ -784,7 +785,7 @@ pub struct PronyParams {
     pub(crate) p: u64,
 }
 
-impl PronyParams {
+impl NgParams {
     pub fn new(capacity: usize, payload_symbols: usize) -> Self {
         let p = PLAINTEXT_MODULUS;
         assert!(capacity >= 1, "capacity must be ≥ 1");
@@ -801,40 +802,40 @@ impl PronyParams {
     }
 
     /// Bits of payload per symbol: every `⌊log₂ p⌋`-bit pattern is a distinct
-    /// residue. Equal to `mse::BITS_PER_SYMBOL`, since both encodings use `t`.
+    /// residue. Equal to `iblt::BITS_PER_SYMBOL`, since both encodings use `t`.
     pub(crate) fn bits_per_symbol(&self) -> usize {
         self.p.ilog2() as usize
     }
 
     /// `ξ_F`: elements of `F` per payload, `ω` symbols each.
     fn payload_elements(&self) -> usize {
-        self.payload_symbols.div_ceil(PRONY_OMEGA)
+        self.payload_symbols.div_ceil(NG_OMEGA)
     }
 
     /// `capacity` power sums plus `ξ_F · capacity` payload cells, `ω` scalars
     /// each.
     fn total_scalars(&self) -> usize {
-        PRONY_OMEGA * self.capacity * (1 + self.payload_elements())
+        NG_OMEGA * self.capacity * (1 + self.payload_elements())
     }
 }
 
 /// A round's summed sketch, for decoding. Clients don't build one: each
-/// encodes its single element with [`PronySketch::encode`], and summing the
+/// encodes its single element with [`NgEncoding::encode`], and summing the
 /// encodings, as KAHE does, gives the sketch of the union.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PronySketch {
-    params: PronyParams,
+pub struct NgEncoding {
+    params: NgParams,
     /// `k[j − 1] = Σ_i r_i^j`, `j ∈ [1, capacity]`.
     k: Vec<F2>,
     /// `V[ℓ][j] = Σ_i x_{i,ℓ} · r_i^j`, `j ∈ [0, C)`, one row of `C` per
     /// payload element `ℓ`, as the summed plaintext holds them: coordinates
     /// in turn, each the centered representative mod `q`. The decoder
-    /// reduces mod `t` only the cells it reads; see [`PronySketch::cell`].
+    /// reduces mod `t` only the cells it reads; see [`NgEncoding::cell`].
     v: Vec<i64>,
 }
 
 #[derive(Debug, PartialEq)]
-pub enum PronyError {
+pub enum NgError {
     /// `Λ` does not split into distinct nonzero linear factors: two
     /// contributors drew the same key, there were more contributors than the
     /// capacity, or a contribution was malformed.
@@ -844,10 +845,10 @@ pub enum PronyError {
     CheckFailed,
 }
 
-impl PronySketch {
+impl NgEncoding {
     /// The encoding of one element under a fresh random key, packed into
     /// `n_polys(params)` `KahePoly`s.
-    pub fn encode<R: Rng>(params: &PronyParams, rng: &mut R, payload: &[i64]) -> Vec<KahePoly> {
+    pub fn encode<R: Rng>(params: &NgParams, rng: &mut R, payload: &[i64]) -> Vec<KahePoly> {
         let ext = Ext::new(params.p);
         let r = loop {
             let r = ext.random(rng);
@@ -861,7 +862,7 @@ impl PronySketch {
     /// The encoding of one element under the key `r`, a nonzero element of
     /// `F`: `r^j` for `j ∈ [1, C]`, then `x_ℓ · r^j` for `j ∈ [0, C)` per payload
     /// element, each element of `F` as its two coordinates.
-    fn encode_with_key(params: &PronyParams, payload: &[i64], r: F2) -> Vec<KahePoly> {
+    fn encode_with_key(params: &NgParams, payload: &[i64], r: F2) -> Vec<KahePoly> {
         assert_eq!(
             payload.len(),
             params.payload_symbols,
@@ -888,7 +889,7 @@ impl PronySketch {
         // `3·x_b` precomputed: with `x` fixed per row, each coordinate of
         // `x·r^j` is then a sum of two products.
         let xs: Vec<[u64; 3]> = payload
-            .chunks(PRONY_OMEGA)
+            .chunks(NG_OMEGA)
             .map(|s| {
                 let xa = canon(s[0], p);
                 let xb = s.get(1).map_or(0, |&y| canon(y, p));
@@ -908,7 +909,7 @@ impl PronySketch {
         };
         // Each polynomial holds `N / ω` consecutive elements; the last one is
         // padded with zeros.
-        let per_poly = N / PRONY_OMEGA;
+        let per_poly = N / NG_OMEGA;
         let n_elements = c * (1 + xs.len());
         (0..Self::n_polys(params))
             .into_par_iter()
@@ -917,7 +918,7 @@ impl PronySketch {
                 let start = i * per_poly;
                 let end = (start + per_poly).min(n_elements);
                 for (slot, e) in coeffs
-                    .as_chunks_mut::<PRONY_OMEGA>()
+                    .as_chunks_mut::<NG_OMEGA>()
                     .0
                     .iter_mut()
                     .zip(start..end)
@@ -932,7 +933,7 @@ impl PronySketch {
     }
 
     /// Recover `(r_i, payload_i)` for every contributor, sorted by `r_i`.
-    fn decode_with_keys(&self) -> Result<Vec<(F2, Vec<i64>)>, PronyError> {
+    fn decode_with_keys(&self) -> Result<Vec<(F2, Vec<i64>)>, NgError> {
         let p = self.params.p;
         let ext = Ext::new(p);
         let f = ext.f;
@@ -960,7 +961,7 @@ impl PronySketch {
             return if self.v.iter().all(|&x| x == 0) {
                 Ok(Vec::new())
             } else {
-                Err(PronyError::CheckFailed)
+                Err(NgError::CheckFailed)
             };
         }
         // Λ(X) = Σ_m (−1)^m e_m X^{ρ̂−m}, monic of degree ρ̂.
@@ -969,9 +970,9 @@ impl PronySketch {
             lam[rho_hat - m] = if m % 2 == 0 { e[m] } else { ext.neg(e[m]) };
         }
 
-        let r = roots_of_split(&lam, ext).ok_or(PronyError::NotSplit)?;
+        let r = roots_of_split(&lam, ext).ok_or(NgError::NotSplit)?;
         if r.len() != rho_hat || r.iter().any(|x| x.is_zero()) {
-            return Err(PronyError::NotSplit);
+            return Err(NgError::NotSplit);
         }
 
         // Lagrange duals: b_i = Λ/(X − r_i) by synthetic division, scaled by
@@ -1053,7 +1054,7 @@ impl PronySketch {
             })
         });
         if bad {
-            return Err(PronyError::CheckFailed);
+            return Err(NgError::CheckFailed);
         }
 
         let symbols = self.params.payload_symbols;
@@ -1071,8 +1072,8 @@ impl PronySketch {
     }
 
     /// Recover the multiset of payloads, sorted lexicographically —
-    /// signature-compatible with `MseEncoding::decode`.
-    pub fn decode(&self) -> Result<Vec<Vec<i64>>, PronyError> {
+    /// signature-compatible with `IbltEncoding::decode`.
+    pub fn decode(&self) -> Result<Vec<Vec<i64>>, NgError> {
         let mut out: Vec<Vec<i64>> = self
             .decode_with_keys()?
             .into_iter()
@@ -1083,19 +1084,19 @@ impl PronySketch {
     }
 
     /// Number of `KahePoly`s an encoding takes.
-    pub fn n_polys(params: &PronyParams) -> usize {
+    pub fn n_polys(params: &NgParams) -> usize {
         params.total_scalars().div_ceil(N)
     }
 
     /// Cover traffic: the encoding of nothing, all zero. Contributes nothing
     /// to the sum, so it does not consume capacity.
-    pub fn cover(params: &PronyParams) -> Vec<KahePoly> {
+    pub fn cover(params: &NgParams) -> Vec<KahePoly> {
         vec![KahePoly::default(); Self::n_polys(params)]
     }
 
     /// The sketch in a round's summed plaintext. `polys.len()` must equal
     /// `n_polys(params)`.
-    pub fn unpack(params: &PronyParams, polys: &[KahePoly]) -> Self {
+    pub fn unpack(params: &NgParams, polys: &[KahePoly]) -> Self {
         assert_eq!(polys.len(), Self::n_polys(params));
         let p = params.p;
         let mut v: Vec<i64> = polys
@@ -1109,8 +1110,8 @@ impl PronySketch {
             .into_flattened();
         v.truncate(params.total_scalars());
         let c = params.capacity;
-        let k = v[..PRONY_OMEGA * c]
-            .as_chunks::<PRONY_OMEGA>()
+        let k = v[..NG_OMEGA * c]
+            .as_chunks::<NG_OMEGA>()
             .0
             .iter()
             .map(|s| F2 {
@@ -1118,7 +1119,7 @@ impl PronySketch {
                 b: canon(s[1], p),
             })
             .collect();
-        v.drain(..PRONY_OMEGA * c);
+        v.drain(..NG_OMEGA * c);
         Self {
             params: params.clone(),
             k,
@@ -1130,8 +1131,8 @@ impl PronySketch {
     fn cell(&self, idx: usize) -> F2 {
         let p = self.params.p;
         F2 {
-            a: canon(self.v[PRONY_OMEGA * idx], p),
-            b: canon(self.v[PRONY_OMEGA * idx + 1], p),
+            a: canon(self.v[NG_OMEGA * idx], p),
+            b: canon(self.v[NG_OMEGA * idx + 1], p),
         }
     }
 }
@@ -1346,7 +1347,7 @@ mod tests {
     fn capacity_300_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([47u8; 32]);
         let cap = 300;
-        let pp = PronyParams::new(cap, 8);
+        let pp = NgParams::new(cap, 8);
         let mut msgs: Vec<Vec<i64>> = (0..cap)
             .map(|i| {
                 (0..8)
@@ -1362,7 +1363,7 @@ mod tests {
     #[test]
     fn single_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-        let pp = PronyParams::new(4, 1);
+        let pp = NgParams::new(4, 1);
         let sk = sketch_of(&pp, &mut rng, &[vec![42]]);
         assert_eq!(sk.decode().unwrap(), vec![vec![42]]);
     }
@@ -1370,7 +1371,7 @@ mod tests {
     #[test]
     fn multi_element_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([1u8; 32]);
-        let pp = PronyParams::new(8, 1);
+        let pp = NgParams::new(8, 1);
         let msgs = singletons(&[400, 7, 13, 19, 100, 200, 300, 1]);
         let got = sketch_of(&pp, &mut rng, &msgs).decode().unwrap();
         let mut want = msgs;
@@ -1384,7 +1385,7 @@ mod tests {
     fn full_capacity_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([9u8; 32]);
         let cap = 32;
-        let pp = PronyParams::new(cap, 3);
+        let pp = NgParams::new(cap, 3);
         let mut msgs: Vec<Vec<i64>> = (0..cap)
             .map(|i| vec![i as i64 * 7 + 1, i as i64 * 11, 1 << 33])
             .collect();
@@ -1394,8 +1395,8 @@ mod tests {
     }
 
     /// The sum of encodings, as KAHE computes it, unpacked.
-    fn sum_encodings(pp: &PronyParams, encodings: &[Vec<KahePoly>]) -> PronySketch {
-        let summed: Vec<KahePoly> = (0..PronySketch::n_polys(pp))
+    fn sum_encodings(pp: &NgParams, encodings: &[Vec<KahePoly>]) -> NgEncoding {
+        let summed: Vec<KahePoly> = (0..NgEncoding::n_polys(pp))
             .map(|i| {
                 encodings
                     .iter()
@@ -1403,14 +1404,14 @@ mod tests {
                     .fold(KahePoly::default(), |a, b| a + b)
             })
             .collect();
-        PronySketch::unpack(pp, &summed)
+        NgEncoding::unpack(pp, &summed)
     }
 
     /// The summed sketch of one client per message.
-    fn sketch_of<R: Rng>(pp: &PronyParams, rng: &mut R, msgs: &[Vec<i64>]) -> PronySketch {
+    fn sketch_of<R: Rng>(pp: &NgParams, rng: &mut R, msgs: &[Vec<i64>]) -> NgEncoding {
         let encodings: Vec<Vec<KahePoly>> = msgs
             .iter()
-            .map(|m| PronySketch::encode(pp, rng, m))
+            .map(|m| NgEncoding::encode(pp, rng, m))
             .collect();
         sum_encodings(pp, &encodings)
     }
@@ -1422,10 +1423,10 @@ mod tests {
     #[test]
     fn cover_adds_nothing() {
         let mut rng = ChaCha20Rng::from_seed([3u8; 32]);
-        let pp = PronyParams::new(8, 2);
-        let a = PronySketch::encode(&pp, &mut rng, &[5, 6]);
-        let cover = PronySketch::cover(&pp);
-        assert_eq!(cover.len(), PronySketch::n_polys(&pp));
+        let pp = NgParams::new(8, 2);
+        let a = NgEncoding::encode(&pp, &mut rng, &[5, 6]);
+        let cover = NgEncoding::cover(&pp);
+        assert_eq!(cover.len(), NgEncoding::n_polys(&pp));
         let sum = sum_encodings(&pp, &[a, cover.clone()]);
         assert_eq!(sum.decode().unwrap(), vec![vec![5, 6]]);
         assert_eq!(
@@ -1439,11 +1440,11 @@ mod tests {
     #[test]
     fn encoded_cells_are_centered() {
         let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
-        let pp = PronyParams::new(16, 3);
+        let pp = NgParams::new(16, 3);
         let half = (pp.p / 2) as i64;
         for i in 0..16 {
-            let enc = PronySketch::encode(&pp, &mut rng, &[i, i * 3, -i]);
-            assert_eq!(enc.len(), PronySketch::n_polys(&pp));
+            let enc = NgEncoding::encode(&pp, &mut rng, &[i, i * 3, -i]);
+            assert_eq!(enc.len(), NgEncoding::n_polys(&pp));
             for poly in enc {
                 assert!(poly.coeffs().iter().all(|&c| c >= -half && c < half));
             }
@@ -1454,11 +1455,11 @@ mod tests {
     /// `unpack` reads, including the zero padding of an odd payload.
     #[test]
     fn encoding_layout() {
-        let pp = PronyParams::new(5, 3);
+        let pp = NgParams::new(5, 3);
         let ext = Ext::new(pp.p);
         let r = F2 { a: 12345, b: 678 };
         let payload = [7i64, -2, 9];
-        let sk = sum_encodings(&pp, &[PronySketch::encode_with_key(&pp, &payload, r)]);
+        let sk = sum_encodings(&pp, &[NgEncoding::encode_with_key(&pp, &payload, r)]);
         let c = pp.capacity;
         let pow = |j: usize| (0..j).fold(F2::ONE, |acc, _| ext.mul(acc, r));
         let xs = [F2 { a: 7, b: pp.p - 2 }, F2 { a: 9, b: 0 }];
@@ -1476,10 +1477,10 @@ mod tests {
     #[test]
     fn overflowing_capacity_is_detected() {
         let mut rng = ChaCha20Rng::from_seed([11u8; 32]);
-        let pp = PronyParams::new(16, 1);
+        let pp = NgParams::new(16, 1);
         let msgs = singletons(&(0..20).collect::<Vec<_>>());
         let sk = sketch_of(&pp, &mut rng, &msgs);
-        assert_eq!(sk.decode(), Err(PronyError::NotSplit));
+        assert_eq!(sk.decode(), Err(NgError::NotSplit));
     }
 
     /// The number of contributors comes from the power sums alone, for every
@@ -1488,7 +1489,7 @@ mod tests {
     fn contributor_count_from_power_sums() {
         let mut rng = ChaCha20Rng::from_seed([12u8; 32]);
         let cap = 12;
-        let pp = PronyParams::new(cap, 2);
+        let pp = NgParams::new(cap, 2);
         for k in [0usize, 1, 2, cap - 1, cap] {
             let mut want: Vec<Vec<i64>> = (0..k as i64).map(|i| vec![i, 1000 - i]).collect();
             let got = sketch_of(&pp, &mut rng, &want).decode().unwrap();
@@ -1501,26 +1502,26 @@ mod tests {
     #[test]
     fn payload_without_contributors_is_detected() {
         let mut rng = ChaCha20Rng::from_seed([14u8; 32]);
-        let pp = PronyParams::new(8, 2);
+        let pp = NgParams::new(8, 2);
         let mut sk = sketch_of(&pp, &mut rng, &[]);
-        sk.v[PRONY_OMEGA * 3] = 5;
-        assert_eq!(sk.decode(), Err(PronyError::CheckFailed));
+        sk.v[NG_OMEGA * 3] = 5;
+        assert_eq!(sk.decode(), Err(NgError::CheckFailed));
     }
 
     /// Two contributors with the same key: `Λ` is not squarefree. Detected,
     /// not returned as garbage.
     #[test]
     fn duplicate_key_is_detected() {
-        let pp = PronyParams::new(8, 1);
+        let pp = NgParams::new(8, 1);
         let r = F2 { a: 12345, b: 678 };
         let encodings = [
-            PronySketch::encode_with_key(&pp, &[11], r),
-            PronySketch::encode_with_key(&pp, &[22], r),
-            PronySketch::encode_with_key(&pp, &[33], F2 { a: 999, b: 1 }),
+            NgEncoding::encode_with_key(&pp, &[11], r),
+            NgEncoding::encode_with_key(&pp, &[22], r),
+            NgEncoding::encode_with_key(&pp, &[33], F2 { a: 999, b: 1 }),
         ];
         assert_eq!(
             sum_encodings(&pp, &encodings).decode(),
-            Err(PronyError::NotSplit)
+            Err(NgError::NotSplit)
         );
     }
 
@@ -1529,16 +1530,16 @@ mod tests {
     #[test]
     fn malformed_contribution_is_detected() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-        let pp = PronyParams::new(8, 1);
+        let pp = NgParams::new(8, 1);
         let mut sk = sketch_of(&pp, &mut rng, &singletons(&[3, 4, 5]));
-        sk.v[PRONY_OMEGA * 2] += 7;
-        assert_eq!(sk.decode(), Err(PronyError::CheckFailed));
+        sk.v[NG_OMEGA * 2] += 7;
+        assert_eq!(sk.decode(), Err(NgError::CheckFailed));
     }
 
     #[test]
     #[should_panic(expected = "payload arity must match")]
     fn payload_arity_mismatch_panics() {
         let mut rng = ChaCha20Rng::from_seed([29u8; 32]);
-        PronySketch::encode(&PronyParams::new(8, 3), &mut rng, &[1, 2]);
+        NgEncoding::encode(&NgParams::new(8, 3), &mut rng, &[1, 2]);
     }
 }
