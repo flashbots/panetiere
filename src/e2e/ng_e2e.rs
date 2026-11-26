@@ -8,7 +8,6 @@
 //! just another additively homomorphic plaintext.
 
 use crate::cs::Commitment;
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::ng::{NgEncoding, NgParams};
 use crate::pke;
 use crate::protocol::client::run_client_round;
@@ -31,14 +30,7 @@ fn round_trip(
     let n_polys = client_polys[0].len();
     assert!(client_polys.iter().all(|p| p.len() == n_polys));
 
-    let pp = ProtocolParams::setup_with_kahe_dims_full(
-        rng,
-        n_servers,
-        1,
-        SIGMA_S_DEFAULT,
-        SIGMA_E_DEFAULT,
-        PLAINTEXT_MODULUS,
-    );
+    let pp = ProtocolParams::setup_with_kahe_dims_full(rng, n_servers, 1, PLAINTEXT_MODULUS);
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..n_servers)
         .map(|_| pke::PrivateKey::generate(rng))

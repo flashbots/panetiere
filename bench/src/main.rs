@@ -422,7 +422,7 @@ fn run_cell(c: &Cell, reps: usize, run_seed: u64) -> CellResult {
         mu: pp.message_polys(),
         t: pp.plaintext_modulus(),
         q: pp.ciphertext_modulus(),
-        sigma: pp.key_sigma(),
+        sigma: pp.sigma(),
         payload_symbols: ch.payload_symbols(),
         post_b,
         opening_b,

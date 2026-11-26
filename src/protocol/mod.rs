@@ -9,7 +9,7 @@ use crate::KahePoly;
 use rand::Rng;
 
 use crate::cs::{Cs, HidingMerkleCommitment, KAPPA_CS, MU_CS};
-use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA};
 use crate::rings::PLAINTEXT_MODULUS;
 use crate::sss::ShamirParams;
 
@@ -109,26 +109,17 @@ impl ProtocolParams {
     }
 
     pub fn setup_with_kahe_dims<R: Rng>(rng: &mut R, n_servers: usize, mu_kahe: usize) -> Self {
-        Self::setup_with_kahe_dims_full(
-            rng,
-            n_servers,
-            mu_kahe,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            PLAINTEXT_MODULUS,
-        )
+        Self::setup_with_kahe_dims_full(rng, n_servers, mu_kahe, PLAINTEXT_MODULUS)
     }
 
     pub(crate) fn setup_with_kahe_dims_full<R: Rng>(
         rng: &mut R,
         n_servers: usize,
         mu_kahe: usize,
-        sigma_s: f64,
-        sigma_e: f64,
         t_modulus: u64,
     ) -> Self {
         let t = honest_majority_threshold(n_servers);
-        let kahe = Kahe::setup_with_dims(rng, mu_kahe, sigma_s, sigma_e, t_modulus);
+        let kahe = Kahe::setup_with_dims(rng, mu_kahe, t_modulus);
         let cs = HidingMerkleCommitment::setup_with_dims(rng, n_servers, MU_CS, KAPPA_CS);
         let shamir = ShamirParams::new(t, n_servers);
         Self {
@@ -186,16 +177,11 @@ impl ProtocolParams {
         crate::rings::KAHE_MODULUS as u64
     }
 
-    /// The parameter `σ` of the discrete Gaussian distribution of the KAHE
-    /// key's coefficients, with probabilities proportional to `exp(−x²/(2σ²))`.
-    pub fn key_sigma(&self) -> f64 {
-        self.kahe.sigma_s
-    }
-
-    /// The parameter `σ` of the discrete Gaussian distribution of the KAHE
-    /// error's coefficients, with probabilities proportional to `exp(−x²/(2σ²))`.
-    pub fn error_sigma(&self) -> f64 {
-        self.kahe.sigma_e
+    /// The parameter `σ` of the discrete Gaussian distribution of the
+    /// coefficients of KAHE keys and errors, with probabilities proportional
+    /// to `exp(−x²/(2σ²))`.
+    pub fn sigma(&self) -> f64 {
+        SIGMA
     }
 }
 
@@ -207,8 +193,7 @@ fn aggregate_capacity(kahe: &KaheParams, cs: &crate::cs::CsParams) -> usize {
     (1..=commitment_cap)
         .take_while(|&rho| {
             let rho = rho as f64;
-            t * (8.0 * kahe.sigma_e * rho.sqrt() + rho / 2.0)
-                < crate::rings::KAHE_MODULUS as f64 / 2.0
+            t * (8.0 * SIGMA * rho.sqrt() + rho / 2.0) < crate::rings::KAHE_MODULUS as f64 / 2.0
         })
         .last()
         .unwrap_or(0)
@@ -266,14 +251,8 @@ mod tests {
         for gamma in [7, 8] {
             let t = honest_majority_threshold(gamma);
             assert_eq!(ProtocolParams::setup(&mut rng, gamma).shamir.t, t);
-            let pp = ProtocolParams::setup_with_kahe_dims_full(
-                &mut rng,
-                gamma,
-                1,
-                SIGMA_S_DEFAULT,
-                SIGMA_E_DEFAULT,
-                PLAINTEXT_MODULUS,
-            );
+            let pp =
+                ProtocolParams::setup_with_kahe_dims_full(&mut rng, gamma, 1, PLAINTEXT_MODULUS);
             assert_eq!(pp.shamir.t, t);
             let pp = pp.with_threshold(gamma - 1);
             assert_eq!((pp.shamir.t, pp.shamir.n), (gamma - 1, gamma));
@@ -293,18 +272,10 @@ mod tests {
             Err(verify::VerifyError::TooManyClients { got: 301, max: 300 })
         );
 
-        let pp = ProtocolParams::setup_with_kahe_dims_full(
-            &mut rng,
-            4,
-            1,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            PLAINTEXT_MODULUS * 2,
-        );
+        let pp = ProtocolParams::setup_with_kahe_dims_full(&mut rng, 4, 1, PLAINTEXT_MODULUS * 2);
         assert!(pp.max_clients > 0 && pp.max_clients < 300);
         let budget = |rho: usize| {
-            pp.kahe.t_modulus as f64
-                * (8.0 * pp.kahe.sigma_e * (rho as f64).sqrt() + rho as f64 / 2.0)
+            pp.kahe.t_modulus as f64 * (8.0 * SIGMA * (rho as f64).sqrt() + rho as f64 / 2.0)
         };
         let half_q = crate::rings::KAHE_MODULUS as f64 / 2.0;
         assert!(budget(pp.max_clients) < half_q);

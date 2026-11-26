@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::channel::BITS_PER_CHUNK;
 use crate::cs::{beta_agg_hvc, HidingMerkleCommitment, BETA_CS, KAPPA_CS, MU_CS, R_BOUND};
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::kahe::SIGMA;
 use crate::ng::NG_OMEGA;
 use crate::protocol::ProtocolParams;
 use crate::rings::{CS_MODULUS, KAHE_MODULUS, MU_MAX, PLAINTEXT_MODULUS, RHO_MAX};
@@ -39,8 +39,7 @@ fn constants_match_reference() {
     assert_eq!(int(&r, "/kahe/q"), KAHE_MODULUS as u64);
     assert_eq!(int(&r, "/kahe/mu"), MU_MAX as u64);
     let sigma = r.pointer("/kahe/sigma").and_then(Value::as_f64);
-    assert_eq!(sigma, Some(SIGMA_S_DEFAULT));
-    assert_eq!(sigma, Some(SIGMA_E_DEFAULT));
+    assert_eq!(sigma, Some(SIGMA));
     assert_eq!(int(&r, "/kahe/mse/rho"), u64::from(RHO_MAX));
     assert_eq!(int(&r, "/kahe/mse/chunk_bits"), BITS_PER_CHUNK as u64);
     // the reference set's encoding is Newton–Girard over F_{t^ω}
@@ -79,6 +78,5 @@ fn protocol_params_report_the_reference_values() {
     assert_eq!(pp.plaintext_modulus(), int(&r, "/kahe/t"));
     assert_eq!(pp.ciphertext_modulus(), int(&r, "/kahe/q"));
     let sigma = r.pointer("/kahe/sigma").and_then(Value::as_f64);
-    assert_eq!(Some(pp.key_sigma()), sigma);
-    assert_eq!(Some(pp.error_sigma()), sigma);
+    assert_eq!(Some(pp.sigma()), sigma);
 }

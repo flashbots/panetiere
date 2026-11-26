@@ -6,25 +6,26 @@
 //! Per-poly form:
 //!
 //! ```text
-//! Enc(m, sk):  sample e ← D_{σ_e}^μ;  c = m + a·sk + t·e   mod q_kahe
+//! Enc(m, sk):  sample e ← D_σ^μ;  c = m + a·sk + t·e   mod q_kahe
 //! Dec(c, sk):  ((c − a·sk) mod q_kahe) reduced mod t   (centered representatives)
 //! ```
 //!
 //! Parameters:
 //! - `a ∈ R_{q_kahe}^μ` — public vector.
-//! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 6.80).
-//! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 6.80).
+//! - `sk ← D_σ` — a single discrete-Gaussian ring element.
+//! - `e ← D_σ^μ` — discrete Gaussian fresh error.
+//! - `σ =` [`SIGMA`] for both, sampled by [`crate::dgauss`].
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
-use crate::rings::{center_half_open_i64, center_i64, MU_MAX, PLAINTEXT_MODULUS};
+use crate::dgauss;
+use crate::rings::{center_half_open_i64, center_i64, MU_MAX, PLAINTEXT_MODULUS, RHO_MAX};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
 };
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
-use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 
 /// KAHE scheme contract.
@@ -53,8 +54,6 @@ pub trait KaheScheme {
 pub struct KaheParams {
     pub a_ntt: Vec<KaheNTTPoly>,
     pub mu_kahe: usize,
-    pub sigma_s: f64,
-    pub sigma_e: f64,
     pub t_modulus: u64,
 }
 
@@ -80,25 +79,6 @@ impl KaheAggKey {
     pub fn from_component(component: KahePoly) -> Self {
         Self(component)
     }
-}
-
-fn sample_dg<R: Rng>(rng: &mut R, sigma: f64) -> i64 {
-    let normal = Normal::new(0.0, sigma).expect("σ > 0");
-    let tail = (8.0 * sigma).ceil() as i64;
-    loop {
-        let x = normal.sample(rng).round() as i64;
-        if x.abs() <= tail {
-            return x;
-        }
-    }
-}
-
-fn sample_dg_poly<R: Rng>(rng: &mut R, sigma: f64) -> KahePoly {
-    let mut coeffs = [0i64; N];
-    for c in coeffs.iter_mut() {
-        *c = sample_dg(rng, sigma);
-    }
-    KahePoly::from_coeffs(coeffs)
 }
 
 fn pad_poly(a_ntt: &[KaheNTTPoly], sk_ntt: &KaheNTTPoly, i: usize) -> KahePoly {
@@ -188,9 +168,11 @@ fn poly_mod_t(poly: &KahePoly, t: u64) -> KahePoly {
 
 /// Lift a `CsPoly` (centered repr in `[-q_cs/2, q_cs/2]`) into a `KahePoly`
 /// at q_kahe by reinterpreting coefficients as signed integers. Lossless iff
-/// `‖input‖_∞ ≤ q_cs/2`, which holds for Shamir-recovered sums of small
-/// Gaussian keys (`‖Σ sk‖_∞ ≪ q_cs/2` at any realistic n_clients).
+/// `‖input‖_∞ ≤ q_cs/2`, which holds for Shamir-recovered sums of up to
+/// `RHO_MAX` fresh keys (checked below).
 pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
+    // A key's coefficients are at most `MAX_ABS` in absolute value.
+    const _: () = assert!(RHO_MAX as i64 * dgauss::MAX_ABS <= CS_MODULUS_OVER_TWO as i64);
     let mut q = *p;
     q.normalize();
     debug_assert!(
@@ -201,8 +183,8 @@ pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
     KahePoly::from_signed_coeffs(&coeffs)
 }
 
-/// Reduce a small `KahePoly` (a fresh KAHE secret key — Gaussian σ_s ≈ 6.80,
-/// `‖·‖_∞ ≤ ⌈8σ_s⌉ = 55`) into a `CsPoly` by centered-rep re-interpretation.
+/// Reduce a small `KahePoly` (a fresh KAHE secret key, `‖·‖_∞ ≤`
+/// [`dgauss::MAX_ABS`] `= 101`) into a `CsPoly` by centered-rep re-interpretation.
 /// Lossless iff `‖input‖_∞ ≤ q_cs/2`. Used at the client side to feed Shamir
 /// sharing, which operates over `R_{q_cs}`.
 pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
@@ -223,13 +205,7 @@ pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
 pub struct Kahe;
 
 impl Kahe {
-    pub fn setup_with_dims<R: Rng>(
-        rng: &mut R,
-        mu_kahe: usize,
-        sigma_s: f64,
-        sigma_e: f64,
-        t_modulus: u64,
-    ) -> KaheParams {
+    pub fn setup_with_dims<R: Rng>(rng: &mut R, mu_kahe: usize, t_modulus: u64) -> KaheParams {
         assert!(mu_kahe >= 1, "μ_kahe must be ≥ 1");
         assert!(
             mu_kahe <= MU_MAX,
@@ -250,8 +226,6 @@ impl Kahe {
         KaheParams {
             a_ntt,
             mu_kahe,
-            sigma_s,
-            sigma_e,
             t_modulus,
         }
     }
@@ -278,8 +252,10 @@ impl Kahe {
     }
 }
 
-pub const SIGMA_S_DEFAULT: f64 = 6.80;
-pub const SIGMA_E_DEFAULT: f64 = 6.80;
+/// The parameter `σ` of the discrete Gaussian distribution of keys and errors,
+/// with probabilities proportional to `exp(−x²/(2σ²))`: the reference
+/// parameter set's, for which [`dgauss`]'s table is generated.
+pub(crate) const SIGMA: f64 = dgauss::SIGMA;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -288,17 +264,17 @@ impl KaheScheme for Kahe {
     type Message = Vec<KahePoly>;
     type Ciphertext = Vec<KahePoly>;
 
-    /// `μ = 1`, σ_s=σ_e=6.80, `t = 17183014913` at q_kahe ≈ 2^46.0.
+    /// `μ = 1` and the reference `t`.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
-        Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, PLAINTEXT_MODULUS)
+        Self::setup_with_dims(rng, 1, PLAINTEXT_MODULUS)
     }
 
-    fn gen<R: Rng>(rng: &mut R, pp: &KaheParams) -> KaheKey {
-        KaheKey(sample_dg_poly(rng, pp.sigma_s))
+    fn gen<R: Rng>(rng: &mut R, _pp: &KaheParams) -> KaheKey {
+        KaheKey(dgauss::sample_poly(rng))
     }
 
     /// Encrypt up to `μ` plaintext polys under one key `sk`. For position
-    /// `i ∈ [0, μ)`: `c_i = m_i + a_i·sk + t·e_i`, with a fresh `e_i ← D_{σ_e}`.
+    /// `i ∈ [0, μ)`: `c_i = m_i + a_i·sk + t·e_i`, with a fresh `e_i ← D_σ`.
     fn enc<R: Rng>(rng: &mut R, pp: &KaheParams, k: &KaheKey, m: &Vec<KahePoly>) -> Vec<KahePoly> {
         debug_assert!(m.len() <= pp.mu_kahe);
         let t = pp.t_modulus as i64;
@@ -310,7 +286,7 @@ impl KaheScheme for Kahe {
             .map(|i| {
                 let pad = pad_poly(&pp.a_ntt, &sk_ntt, i);
                 let mut item_rng = ChaCha20Rng::from_seed(seeds[i]);
-                let e = sample_dg_poly(&mut item_rng, pp.sigma_e);
+                let e = dgauss::sample_poly(&mut item_rng);
                 let te = scale_poly(&e, t);
                 m[i] + pad + te
             })
@@ -472,13 +448,7 @@ mod tests {
     #[test]
     fn round_trip_wide_mu() {
         let mut rng = ChaCha20Rng::from_seed([13u8; 32]);
-        let pp = Kahe::setup_with_dims(
-            &mut rng,
-            20,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            PLAINTEXT_MODULUS,
-        );
+        let pp = Kahe::setup_with_dims(&mut rng, 20, PLAINTEXT_MODULUS);
         let k = Kahe::gen(&mut rng, &pp);
         let m: Vec<KahePoly> = (0..pp.mu_kahe)
             .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
@@ -493,26 +463,14 @@ mod tests {
     #[should_panic(expected = "μ_kahe must be ≤")]
     fn setup_rejects_mu_above_max() {
         let mut rng = ChaCha20Rng::from_seed([14u8; 32]);
-        Kahe::setup_with_dims(
-            &mut rng,
-            MU_MAX + 1,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            PLAINTEXT_MODULUS,
-        );
+        Kahe::setup_with_dims(&mut rng, MU_MAX + 1, PLAINTEXT_MODULUS);
     }
 
     /// A message shorter than `μ` is legal — the trailing positions are unused.
     #[test]
     fn round_trip_partial_width() {
         let mut rng = ChaCha20Rng::from_seed([19u8; 32]);
-        let pp = Kahe::setup_with_dims(
-            &mut rng,
-            20,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            PLAINTEXT_MODULUS,
-        );
+        let pp = Kahe::setup_with_dims(&mut rng, 20, PLAINTEXT_MODULUS);
         let k = Kahe::gen(&mut rng, &pp);
         let m: Vec<KahePoly> = (0..13)
             .map(|_| rand_message_poly(&mut rng, pp.t_modulus))
@@ -526,13 +484,7 @@ mod tests {
     #[test]
     fn additive_homomorphism_wide_mu() {
         let mut rng = ChaCha20Rng::from_seed([17u8; 32]);
-        let pp = Kahe::setup_with_dims(
-            &mut rng,
-            12,
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
-            PLAINTEXT_MODULUS,
-        );
+        let pp = Kahe::setup_with_dims(&mut rng, 12, PLAINTEXT_MODULUS);
         let n = 5;
         let keys: Vec<KaheKey> = (0..n).map(|_| Kahe::gen(&mut rng, &pp)).collect();
         let msgs: Vec<Vec<KahePoly>> = (0..n)
@@ -560,12 +512,16 @@ mod tests {
 
     #[test]
     fn bridge_round_trip_small_values() {
-        // Realistic Shamir-recovered range: |coef| ≤ N_clients · 8σ_s ≈ 3600.
+        // The sum of up to `RHO_MAX` keys, as Shamir recovers it.
+        let bound = RHO_MAX as i32 * dgauss::MAX_ABS as i32;
         let mut rng = ChaCha20Rng::from_seed([41u8; 32]);
-        for _ in 0..50 {
+        for i in 0..50 {
             let mut coeffs = [0i32; N];
             for c in coeffs.iter_mut() {
-                *c = rng.gen_range(-3600i32..=3600);
+                *c = rng.gen_range(-bound..=bound);
+            }
+            if i == 0 {
+                (coeffs[0], coeffs[1]) = (bound, -bound);
             }
             let cs = CsPoly::from_coeffs(coeffs);
             let kahe = lift_cs_to_kahe(&cs);

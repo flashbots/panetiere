@@ -55,6 +55,7 @@ the schemes underneath are internal.
 | Module | |
 |---|---|
 | `kahe` | key-additive homomorphic encryption, plus the CS↔KAHE bridge |
+| `dgauss` | constant-time discrete Gaussian sampler for KAHE keys and errors |
 | `sss` | Shamir *t*-of-*n* sharing over the CS ring |
 | `cs` | additive vector commitment with addition hiding; `Opening` wire form |
 | `pke` | ML-KEM-768 + AES-GCM envelopes for the key shares |
@@ -281,6 +282,14 @@ supplied arguments — parameter constructors (`ShamirParams::new`,
 `IbltEncoding::insert` / `NgEncoding::encode` — where a violation is a
 caller bug, not an attack. Range checks on the ring bridges are `debug_assert!`,
 so they only run in the debug test profile.
+
+## Side channels
+
+Only the sampler of KAHE keys and errors (`dgauss`) is constant time: it
+compares every sample with its whole table, without branches or memory accesses
+that depend on the sample. The rest of the code makes no such attempt. For
+example, the IBLT accesses memory at positions derived from a client's key, and
+reductions with `%` on secret values compile to divisions.
 
 ## Wire formats
 
