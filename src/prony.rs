@@ -1221,6 +1221,8 @@ mod tests {
         let quad = poly_mul(&lam, &[ext.neg(z), F2::ZERO, F2::ONE], ext);
         let norm_is_square = ext.f.pow(PRONY_PRIME - NONRESIDUE, (PRONY_PRIME - 1) / 2) == 1;
         assert_eq!(roots_of_split(&quad, ext).is_some(), norm_is_square);
+        // A nonzero constant has no roots.
+        assert!(split_roots(vec![F2::ONE], ext).is_empty());
     }
 
     /// Barrett must agree with the reference remainder everywhere it is used:
@@ -1290,6 +1292,10 @@ mod tests {
                 poly_mul(&a, &b, ext)
             );
         }
+        // The zero polynomial, with no coefficients, times anything is zero.
+        let a = rand_poly(&mut rng, 5);
+        assert!(poly_mul_low_par(&[], &a, usize::MAX, ext).is_empty());
+        assert!(poly_mul_low_par(&a, &[], usize::MAX, ext).is_empty());
     }
 
     /// The vector kernels must be bit-identical to the scalar one.
