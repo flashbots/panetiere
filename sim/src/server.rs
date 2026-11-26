@@ -163,5 +163,6 @@ async fn round(
     Ok(Json(NodeReport {
         node: format!("server-{}", node.id.get()),
         spans,
+        usage: metrics::take_usage(),
     }))
 }

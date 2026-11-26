@@ -29,6 +29,12 @@ spans from different nodes line up on one timeline.
 CPU spans record the whole process's CPU time, so CPU time divided by wall
 time is the number of cores the step kept busy.
 
+Every node report also has `usage`, measured over the whole process since that
+node's previous report: CPU time (including networking and serialization, not
+only the CPU spans), peak memory and memory at the time of the report. From
+the second round on that is one round. The bulletin keeps every round's posts,
+so its memory grows from round to round.
+
 ```bash
 sim/analyze.py target/sim/results.jsonl                          # table per round
 sim/analyze.py target/sim/results.jsonl --html target/sim/timeline.html
@@ -38,7 +44,7 @@ sim/analyze.py target/sim/sweep.jsonl --csv                      # one row per r
 
 The table gives, for each step: count, median and slowest time, the slowest
 node, bytes, throughput and cores used, and for each role the share of the
-round it spent busy. The HTML page draws every node's spans on one timeline,
+round it spent busy, and each role's CPU time and peak memory. The HTML page draws every node's spans on one timeline,
 so idle time and the critical path are visible at a glance.
 
 Needs Docker with Compose. The containers need `NET_ADMIN`, and the host needs

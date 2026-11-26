@@ -1,4 +1,5 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cpu_time::ProcessTime;
 use serde::{Deserialize, Serialize};
@@ -106,4 +107,49 @@ pub(crate) fn merge(name: &str, spans: &[Span]) -> Span {
         bytes: Some(spans.iter().filter_map(|s| s.bytes).sum()),
         cpu_us: None,
     }
+}
+
+/// What the node's whole process used since its previous report, which is
+/// one round from the second round on (the first also covers startup).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct Usage {
+    /// CPU time, user and system, including networking and serialization.
+    pub(crate) cpu_us: u64,
+    /// Most memory the process held at once. `None` without linux's `/proc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) peak_rss_bytes: Option<u64>,
+    /// Memory held at the time of the report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rss_bytes: Option<u64>,
+}
+
+static REPORTED_CPU: Mutex<Duration> = Mutex::new(Duration::ZERO);
+
+/// Measures [`Usage`] and starts the next measurement. Covers the whole
+/// process, so it only means something with one node per process.
+pub(crate) fn take_usage() -> Usage {
+    let cpu = ProcessTime::now().as_duration();
+    let mut reported = REPORTED_CPU.lock().unwrap_or_else(PoisonError::into_inner);
+    let cpu_us = cpu.saturating_sub(*reported).as_micros() as u64;
+    *reported = cpu;
+
+    let status = std::fs::read_to_string("/proc/self/status").ok();
+    let field = |name: &str| {
+        let line = status
+            .as_deref()?
+            .lines()
+            .find_map(|l| l.strip_prefix(name))?;
+        let kb: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+        Some(kb * 1024)
+    };
+    let usage = Usage {
+        cpu_us,
+        peak_rss_bytes: field("VmHWM:"),
+        rss_bytes: field("VmRSS:"),
+    };
+    // resets the peak to the current size
+    if let Err(e) = std::fs::write("/proc/self/clear_refs", "5") {
+        tracing::debug!(%e, "could not reset peak memory");
+    }
+    usage
 }

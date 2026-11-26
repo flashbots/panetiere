@@ -113,7 +113,25 @@ def summarise(report, out):
         roles.setdefault(role, []).append(busy_ms(node["spans"]) / ((end - start) / 1000))
     for role, shares in roles.items():
         out.write(f"    {role:<10}{statistics.median(shares) * 100:>5.0f}%\n")
+
+    out.write("\n  whole-process use per node since the previous report:\n")
+    out.write(f"    {'role':<10}{'n':>4}{'cpu ms':>9}{'max':>9}{'peak MB':>9}{'max':>9}\n")
+    for role, nodes in by_role(report).items():
+        cpu = [n["usage"]["cpu_us"] / 1000 for n in nodes]
+        peak = [n["usage"]["peak_rss_bytes"] / 1e6 for n in nodes if "peak_rss_bytes" in n["usage"]]
+        out.write(
+            f"    {role:<10}{len(nodes):>4}{statistics.median(cpu):>9.0f}{max(cpu):>9.0f}"
+            f"{statistics.median(peak) if peak else 0:>9.0f}{max(peak) if peak else 0:>9.0f}\n"
+        )
     out.write("\n")
+
+
+def by_role(report):
+    roles = {}
+    for node in report["nodes"]:
+        if "usage" in node:
+            roles.setdefault(re.sub(r"-\d+$", "", node["node"]), []).append(node)
+    return roles
 
 
 def csv_rows(reports):
@@ -134,6 +152,10 @@ def csv_rows(reports):
         )
         for name in ("client_round", "unseal", "server_round", "recover", "decode"):
             row[f"{name}_ms"] = median(name, ms)
+        for role, nodes in by_role(r).items():
+            row[f"{role}_cpu_ms"] = round(max(n["usage"]["cpu_us"] for n in nodes) / 1000, 1)
+            peaks = [n["usage"]["peak_rss_bytes"] for n in nodes if "peak_rss_bytes" in n["usage"]]
+            row[f"{role}_peak_mb"] = round(max(peaks) / 1e6, 1) if peaks else None
         rows.append(row)
     return rows
 

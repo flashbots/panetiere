@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::http;
-use crate::metrics::Window;
+use crate::metrics::{self, Window};
 use crate::report::NodeReport;
 
 #[derive(clap::Args)]
@@ -149,5 +149,6 @@ async fn report(
     Ok(Json(NodeReport {
         node: "bulletin".into(),
         spans: spans.into_iter().flatten().collect(),
+        usage: metrics::take_usage(),
     }))
 }

@@ -13,7 +13,7 @@ use panetiere::protocol::ClientId;
 use tokio::net::TcpListener;
 
 use crate::http;
-use crate::metrics::{Span, Timer};
+use crate::metrics::{self, Span, Timer};
 use crate::report::{NodeReport, RecipientReport};
 use crate::setup::{Params, Setup};
 
@@ -128,6 +128,7 @@ async fn round(
         report: NodeReport {
             node: "recipient".into(),
             spans,
+            usage: metrics::take_usage(),
         },
         messages: messages
             .iter()

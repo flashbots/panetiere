@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::Span;
+use crate::metrics::{Span, Usage};
 use crate::setup::Setup;
 
 /// Everything one node timed during a round.
@@ -8,6 +8,7 @@ use crate::setup::Setup;
 pub(crate) struct NodeReport {
     pub(crate) node: String,
     pub(crate) spans: Vec<Span>,
+    pub(crate) usage: Usage,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
