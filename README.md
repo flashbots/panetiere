@@ -149,8 +149,8 @@ extra 34-bit symbols per element.
 `prony_for_messages` / `prony_for_symbols` the Vandermonde
 sketch. The sketch is \~3× smaller per client, hence \~3× less ciphertext to move;
 recovery is all-or-nothing for both. The sketch also needs a
-prime plaintext modulus, which `protocol_params` handles by selecting
-`PRONY_PRIME` for that variant. Its keys and payload are elements of
+prime plaintext modulus $t$; both variants use the same prime,
+`PLAINTEXT_MODULUS`. The sketch's keys and payload are elements of
 $F_{t^2} = F_t[Z]/(Z^2 - 3)$, two plaintext slots each, so two of $C$ keys
 collide with probability at most $C^2/t^2$ (about $2^{-51.5}$ at $C = 300$).
 

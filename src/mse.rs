@@ -14,21 +14,21 @@ use aes::cipher::{BlockEncrypt as _, KeyInit as _};
 use aes::Aes128;
 use rand::Rng;
 
-use crate::kahe::T_MODULUS_DEFAULT;
+use crate::rings::PLAINTEXT_MODULUS;
 
-const T: i64 = T_MODULUS_DEFAULT as i64;
+const T: i64 = PLAINTEXT_MODULUS as i64;
 const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
 /// Bits of payload carried per symbol: `⌊log₂ t⌋`.
-pub const BITS_PER_SYMBOL: usize = T_MODULUS_DEFAULT.ilog2() as usize;
+pub const BITS_PER_SYMBOL: usize = PLAINTEXT_MODULUS.ilog2() as usize;
 /// AES-128 key length for the position PRF.
 pub const PRF_KEY_BYTES: usize = 16;
 /// Bytes of the AES block that carry the row index; `r` takes the rest.
 const ROW_BYTES: usize = 4;
 /// `t^K_LIMBS`, the size of the randomness space. `t^2 ≈ 2^68`, so u128.
 const R_SPACE: u128 = {
-    let t = T_MODULUS_DEFAULT as u128;
+    let t = PLAINTEXT_MODULUS as u128;
     let mut p: u128 = 1;
     let mut i = 0;
     while i < K_LIMBS {
@@ -87,7 +87,7 @@ impl MseParams {
         assert!(delta >= 1, "δ must be ≥ 1");
         assert!(capacity >= 1, "capacity must be ≥ 1");
         assert!(
-            (capacity as u64) < T_MODULUS_DEFAULT,
+            (capacity as u64) < PLAINTEXT_MODULUS,
             "capacity must be below the modulus t"
         );
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
@@ -203,7 +203,7 @@ impl MseEncoding {
             "payload arity must match params.payload_symbols",
         );
         debug_assert!(r < self.params.r_space(), "r must be in [0, t^K_LIMBS)");
-        let t = T_MODULUS_DEFAULT as u128;
+        let t = PLAINTEXT_MODULUS as u128;
         let mut limbs = [0i64; K_LIMBS];
         let mut acc = r;
         for limb in limbs.iter_mut() {
@@ -242,7 +242,7 @@ impl MseEncoding {
         let mut emitted: Vec<Vec<i64>> = Vec::new();
         let mut limb_signed = [0i64; K_LIMBS];
         let mut x_star_buf = vec![0i64; self.params.payload_symbols];
-        let t_u128 = T_MODULUS_DEFAULT as u128;
+        let t_u128 = PLAINTEXT_MODULUS as u128;
         let cipher = prf_cipher(&self.params.prf_key);
         while let Some((row, col)) = queue.pop() {
             let idx = row * self.params.delta + col;

@@ -7,24 +7,24 @@ use sha3::Shake256;
 
 use crate::chunking;
 use crate::iblt_shape::iblt_shape;
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
+use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 pub use crate::mse::MseError;
 use crate::mse::{self, MseEncoding, MseParams};
 pub use crate::prony::PronyError;
-use crate::prony::{PronyParams, PronySketch, PRONY_OMEGA, PRONY_PRIME};
+use crate::prony::{PronyParams, PronySketch, PRONY_OMEGA};
 use crate::protocol::{ProtocolParams, SessionId};
-use crate::rings::RHO_MAX;
+use crate::rings::{PLAINTEXT_MODULUS, RHO_MAX};
 
 /// Message bits packed into one symbol: `⌊log₂ t⌋`, so every chunk is a
 /// distinct residue of the plaintext modulus both encodings share.
 pub const BITS_PER_CHUNK: usize = mse::BITS_PER_SYMBOL;
 
-const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PRONY_PRIME);
+const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PLAINTEXT_MODULUS);
 // Two of `RHO_MAX` sketch keys collide with probability at most
 // `RHO_MAX²/t^ω`, which must not exceed the multiset encoding's error bound.
 const _: () = assert!(
     ((RHO_MAX as u128 * RHO_MAX as u128) << EPS_MSE)
-        <= (PRONY_PRIME as u128).pow(PRONY_OMEGA as u32)
+        <= (PLAINTEXT_MODULUS as u128).pow(PRONY_OMEGA as u32)
 );
 
 /// The paper's `ε_MSE`: a round's encoding fails to decode with probability at
@@ -160,7 +160,7 @@ impl ChannelParams {
 
     pub fn prony_for_symbols(capacity: u32, payload_symbols: usize) -> Self {
         let capacity = capacity.max(1) as usize;
-        let nonce_symbols = nonce_symbols(PRONY_PRIME.ilog2() as usize);
+        let nonce_symbols = nonce_symbols(PLAINTEXT_MODULUS.ilog2() as usize);
         Self {
             encoding: Encoding::Prony(PronyParams::new(
                 capacity,
@@ -217,7 +217,7 @@ impl ChannelParams {
     /// KAHE plaintext modulus the symbols live in. The sketch needs a prime.
     pub fn plaintext_modulus(&self) -> u64 {
         match &self.encoding {
-            Encoding::Mse(_) => T_MODULUS_DEFAULT,
+            Encoding::Mse(_) => PLAINTEXT_MODULUS,
             Encoding::Prony(p) => p.p,
         }
     }

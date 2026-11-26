@@ -37,17 +37,13 @@
 //! Newton's identities divide by `1..C`, so the characteristic `t` must exceed
 //! the capacity.
 
-use crate::kahe::T_MODULUS_DEFAULT;
-use crate::rings::center_canonical_half_open_i64;
+use crate::rings::{center_canonical_half_open_i64, PLAINTEXT_MODULUS};
 use crate::{KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
 use sha3::Shake256;
-
-/// The prime `t` underneath the sketch's field: the KAHE plaintext modulus.
-pub const PRONY_PRIME: u64 = T_MODULUS_DEFAULT;
 
 /// The extension degree `ω` of the sketch's field `F = F_{t^ω}`. Two of `C`
 /// contributors draw the same key, and the round fails to decode, with
@@ -790,7 +786,7 @@ pub struct PronyParams {
 
 impl PronyParams {
     pub fn new(capacity: usize, payload_symbols: usize) -> Self {
-        let p = PRONY_PRIME;
+        let p = PLAINTEXT_MODULUS;
         assert!(capacity >= 1, "capacity must be ≥ 1");
         assert!(payload_symbols >= 1, "payload_symbols must be ≥ 1");
         assert!(
@@ -1149,21 +1145,24 @@ mod tests {
     const SMALL_P: u64 = 1_048_583; // smallest prime > 2^20
 
     fn rand_f2(rng: &mut ChaCha20Rng) -> F2 {
-        Ext::new(PRONY_PRIME).random(rng)
+        Ext::new(PLAINTEXT_MODULUS).random(rng)
     }
 
     /// 3 is not a square mod `t`, so `Z² − 3` is irreducible and `F_t[Z]/(Z² − 3)`
     /// is a field.
     #[test]
     fn nonresidue_is_not_a_square() {
-        let f = Fp::new(PRONY_PRIME);
-        assert_eq!(f.pow(NONRESIDUE, (PRONY_PRIME - 1) / 2), PRONY_PRIME - 1);
+        let f = Fp::new(PLAINTEXT_MODULUS);
+        assert_eq!(
+            f.pow(NONRESIDUE, (PLAINTEXT_MODULUS - 1) / 2),
+            PLAINTEXT_MODULUS - 1
+        );
     }
 
     #[test]
     fn extension_field_arithmetic() {
         let mut rng = ChaCha20Rng::from_seed([40u8; 32]);
-        let ext = Ext::new(PRONY_PRIME);
+        let ext = Ext::new(PLAINTEXT_MODULUS);
         let f = ext.f;
         let z = F2 { a: 0, b: 1 };
         assert_eq!(
@@ -1194,7 +1193,7 @@ mod tests {
         }
         // Frobenius: x^t = x_a − x_b Z, since Z^t = Z · 3^{(t−1)/2} = −Z.
         assert_eq!(
-            ext.pow(x, PRONY_PRIME),
+            ext.pow(x, PLAINTEXT_MODULUS),
             F2 {
                 a: x.a,
                 b: f.sub(0, x.b)
@@ -1205,7 +1204,7 @@ mod tests {
     #[test]
     fn roots_in_the_extension_field() {
         let mut rng = ChaCha20Rng::from_seed([42u8; 32]);
-        let ext = Ext::new(PRONY_PRIME);
+        let ext = Ext::new(PLAINTEXT_MODULUS);
         let mut want: Vec<F2> = (0..12).map(|_| rand_f2(&mut rng)).collect();
         let lam = want.iter().fold(vec![F2::ONE], |acc, &r| {
             poly_mul(&acc, &[ext.neg(r), F2::ONE], ext)
@@ -1219,7 +1218,10 @@ mod tests {
         // unless Z is a square, and Z's norm −3 decides that.
         let z = F2 { a: 0, b: 1 };
         let quad = poly_mul(&lam, &[ext.neg(z), F2::ZERO, F2::ONE], ext);
-        let norm_is_square = ext.f.pow(PRONY_PRIME - NONRESIDUE, (PRONY_PRIME - 1) / 2) == 1;
+        let norm_is_square = ext
+            .f
+            .pow(PLAINTEXT_MODULUS - NONRESIDUE, (PLAINTEXT_MODULUS - 1) / 2)
+            == 1;
         assert_eq!(roots_of_split(&quad, ext).is_some(), norm_is_square);
         // A nonzero constant has no roots.
         assert!(split_roots(vec![F2::ONE], ext).is_empty());
@@ -1231,7 +1233,7 @@ mod tests {
     #[test]
     fn barrett_matches_reference() {
         let mut rng = ChaCha20Rng::from_seed([41u8; 32]);
-        for &p in &[SMALL_P, PRONY_PRIME, 3, 5] {
+        for &p in &[SMALL_P, PLAINTEXT_MODULUS, 3, 5] {
             let f = Fp::new(p);
             let pp = p as u128 * p as u128;
             for x in [0u128, 1, p as u128 - 1, p as u128, pp - 1] {
@@ -1269,7 +1271,7 @@ mod tests {
     #[test]
     fn parallel_reduction_matches_division() {
         let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
-        let ext = Ext::new(PRONY_PRIME);
+        let ext = Ext::new(PLAINTEXT_MODULUS);
         let rand_poly = |rng: &mut ChaCha20Rng, len: usize| -> Vec<F2> {
             (0..len).map(|_| ext.random(rng)).collect()
         };
@@ -1302,7 +1304,7 @@ mod tests {
     #[test]
     fn solve_kernel_matches_scalar() {
         let mut rng = ChaCha20Rng::from_seed([43u8; 32]);
-        let f = Fp::new(PRONY_PRIME);
+        let f = Fp::new(PLAINTEXT_MODULUS);
         for k in [1usize, 3, 4, 7, 8, 17, 64, 301] {
             let dual: Vec<Vec<u64>> = (0..k)
                 .map(|_| (0..k).map(|_| rng.gen_range(0..f.p)).collect())

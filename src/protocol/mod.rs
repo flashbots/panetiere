@@ -9,9 +9,8 @@ use crate::KahePoly;
 use rand::Rng;
 
 use crate::cs::{Cs, HidingMerkleCommitment, KAPPA_CS, MU_CS};
-use crate::kahe::{
-    Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT,
-};
+use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
+use crate::rings::PLAINTEXT_MODULUS;
 use crate::sss::ShamirParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
@@ -116,7 +115,7 @@ impl ProtocolParams {
             mu_kahe,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
+            PLAINTEXT_MODULUS,
         )
     }
 
@@ -273,7 +272,7 @@ mod tests {
                 1,
                 SIGMA_S_DEFAULT,
                 SIGMA_E_DEFAULT,
-                T_MODULUS_DEFAULT,
+                PLAINTEXT_MODULUS,
             );
             assert_eq!(pp.shamir.t, t);
             let pp = pp.with_threshold(gamma - 1);
@@ -300,7 +299,7 @@ mod tests {
             1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT * 2,
+            PLAINTEXT_MODULUS * 2,
         );
         assert!(pp.max_clients > 0 && pp.max_clients < 300);
         let budget = |rho: usize| {
