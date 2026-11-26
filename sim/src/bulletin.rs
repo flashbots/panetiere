@@ -58,11 +58,11 @@ async fn post_client(
     Path((session, id)): Path<(String, u32)>,
     body: Bytes,
 ) -> Result<(), (StatusCode, String)> {
-    let entry = ClientBulletinEntry::from_bytes(&body).ok_or((
+    let entry = ClientBulletinEntry::try_from_bytes(&body).ok_or((
         StatusCode::BAD_REQUEST,
         format!("post from client {id} does not parse"),
     ))?;
-    let commitment = Bytes::from(entry.comm.to_bytes());
+    let commitment = Bytes::from(entry.commitment().to_bytes());
     let mut sessions = sessions.lock().await;
     let s = sessions.entry(session).or_default();
     s.received_posts.record(body.len());

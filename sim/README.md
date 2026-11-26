@@ -23,7 +23,7 @@ spans from different nodes line up on one timeline.
 |---|---|
 | client | `download_keys`, `client_round` (CPU), `upload_post`, `upload_opening_<server>` |
 | server | `download_canonical`, `download_commitments`, `receive_openings` (first to last arrival), `unseal` (CPU), `server_round` (CPU), `upload_entry` |
-| recipient | `download_canonical`, `download_entry_<server>`, `download_post_<client>`, `parse`, `recover`, `decode` (all CPU) |
+| recipient | `download_canonical`, `download_entry_<server>`, `download_post_<client>`, `recover` (parses and sums the posts), `decode` (both CPU) |
 | bulletin | `receive_posts`, `receive_entries` (first to last arrival) |
 
 CPU spans record the whole process's CPU time, so CPU time divided by wall

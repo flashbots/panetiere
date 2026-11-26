@@ -73,9 +73,9 @@ async fn round(
         .iter()
         .enumerate()
         .map(|(i, (bytes, _))| {
-            let key = pke::PublicKey::from_bytes(bytes)
+            let key = pke::PublicKey::try_from_bytes(bytes)
                 .map_err(|e| eyre::eyre!("key of server {i} does not parse: {e:?}"))?;
-            Ok((ServerId(i as u32), key))
+            Ok((ServerId::new(i as u32), key))
         })
         .collect::<eyre::Result<Vec<_>>>()?;
     let key_spans: Vec<Span> = keys.into_iter().map(|(_, span)| span).collect();
@@ -96,7 +96,7 @@ async fn round(
             &mut rng,
             pp,
             &sid,
-            ClientId(index),
+            ClientId::new(index),
             contribution,
             &servers,
         ))
@@ -107,11 +107,12 @@ async fn round(
 
     // the post and every opening share this client's uplink, so send them together
     let mut uploads = JoinSet::new();
-    let post = output.encrypted_message.to_bytes();
+    let (post, sealed_openings) = output.into_parts();
+    let post = post.to_bytes();
     let url = format!("{}/{session}/client/{index}", node.args.bulletin);
     uploads.spawn(upload(node.http.clone(), "upload_post".into(), url, post));
-    for (sid, sealed) in output.sealed_openings {
-        let server = sid.0 as usize;
+    for (sid, sealed) in sealed_openings {
+        let server = sid.get() as usize;
         let url = format!("{}/opening/{session}/{index}", node.args.servers[server]);
         let name = format!("upload_opening_{server}");
         uploads.spawn(upload(node.http.clone(), name, url, sealed));

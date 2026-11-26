@@ -7,10 +7,9 @@ use axum::extract::{Path, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use eyre::{eyre, WrapErr as _};
-use panetiere::cs::Commitment;
 use panetiere::pke;
 use panetiere::protocol::server::{run_server_round, unseal_openings, ServerInbox};
-use panetiere::protocol::{ClientId, ServerId};
+use panetiere::protocol::{ClientId, Commitment, ServerId};
 use rand::rngs::OsRng;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -50,7 +49,7 @@ struct Node {
 pub(crate) async fn run(listener: TcpListener, setup: Setup, args: Args) -> eyre::Result<()> {
     let node = Arc::new(Node {
         params: setup.params().wrap_err("failed to derive parameters")?,
-        id: ServerId(args.index),
+        id: ServerId::new(args.index),
         key: pke::PrivateKey::generate(&mut OsRng),
         bulletin: args.bulletin,
         http: reqwest::Client::new(),
@@ -76,7 +75,7 @@ async fn opening(
     let mut inboxes = node.inboxes.lock().await;
     let inbox = inboxes.entry(session).or_default();
     inbox.received.record(body.len());
-    inbox.sealed.push((ClientId(client), body.to_vec()));
+    inbox.sealed.push((ClientId::new(client), body.to_vec()));
 }
 
 async fn round(
@@ -107,8 +106,8 @@ async fn round(
         .iter()
         .zip(&canonical)
         .map(|((bytes, _), c)| {
-            Commitment::from_bytes(bytes)
-                .map(|comm| (ClientId(*c), comm))
+            Commitment::try_from_bytes(bytes)
+                .map(|comm| (ClientId::new(*c), comm))
                 .ok_or_else(|| eyre!("commitment of client {c} does not parse"))
         })
         .collect::<eyre::Result<Vec<_>>>()?;
@@ -135,19 +134,16 @@ async fn round(
                 .zip(opened)
                 .map(|((cid, _), op)| {
                     op.map(|op| (*cid, op))
-                        .ok_or_else(|| eyre!("opening from client {} does not unseal", cid.0))
+                        .ok_or_else(|| eyre!("opening from client {} does not unseal", cid.get()))
                 })
                 .collect::<eyre::Result<Vec<_>>>()?;
-            let server_inbox = ServerInbox {
-                server_id: worker.id,
-                items,
-            };
-            let canonical: Vec<ClientId> = canonical.into_iter().map(ClientId).collect();
-            let cs = &worker.params.protocol.cs;
+            let server_inbox = ServerInbox::new(worker.id, items);
+            let canonical: Vec<ClientId> = canonical.into_iter().map(ClientId::new).collect();
+            let pp = &worker.params.protocol;
             let timer = Timer::start_cpu("server_round");
-            let entry = run_server_round(cs, &server_inbox, &canonical, &commitments)
+            let entry = run_server_round(pp, &server_inbox, &canonical, &commitments)
                 .map_err(|e| eyre!("server round failed: {e:?}"))?;
-            let bytes = entry.to_bytes(cs);
+            let bytes = entry.to_bytes(pp);
             Ok((bytes, vec![unseal, timer.finish()]))
         })
         .await
@@ -156,11 +152,16 @@ async fn round(
 
     let timer = Timer::start("upload_entry");
     let len = entry.len();
-    http::post_bytes(&node.http, format!("{base}/server/{}", node.id.0), entry).await?;
+    http::post_bytes(
+        &node.http,
+        format!("{base}/server/{}", node.id.get()),
+        entry,
+    )
+    .await?;
     spans.push(timer.finish_bytes(len));
 
     Ok(Json(NodeReport {
-        node: format!("server-{}", node.id.0),
+        node: format!("server-{}", node.id.get()),
         spans,
     }))
 }

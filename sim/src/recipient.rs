@@ -6,9 +6,9 @@ use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use eyre::{eyre, WrapErr as _};
-use panetiere::bulletin::{ClientBulletinEntry, ServerBulletinEntry};
+use panetiere::bulletin::ServerBulletinEntry;
 use panetiere::channel;
-use panetiere::protocol::recipient::{recover_unverified_direct, SetPolicy};
+use panetiere::protocol::recipient::{recover_unverified_direct_from_bytes, SetPolicy};
 use panetiere::protocol::ClientId;
 use tokio::net::TcpListener;
 
@@ -79,48 +79,46 @@ async fn round(
     let worker = node.clone();
     let (messages, compute_spans) =
         tokio::task::spawn_blocking(move || -> eyre::Result<(Vec<Vec<u8>>, Vec<Span>)> {
-            let timer = Timer::start_cpu("parse");
+            let timer = Timer::start_cpu("recover");
             let servers = server_bytes
                 .iter()
                 .enumerate()
                 .map(|(i, b)| {
-                    ServerBulletinEntry::from_bytes(b)
+                    ServerBulletinEntry::try_from_bytes(b)
                         .ok_or_else(|| eyre!("entry of server {i} does not parse"))
                 })
                 .collect::<eyre::Result<Vec<_>>>()?;
-            let posts = client_bytes
+            let posts: HashMap<ClientId, Vec<u8>> = canonical
                 .iter()
-                .zip(&canonical)
-                .map(|(b, c)| {
-                    ClientBulletinEntry::from_bytes(b)
-                        .map(|p| (ClientId(*c), p))
-                        .ok_or_else(|| eyre!("post of client {c} does not parse"))
-                })
-                .collect::<eyre::Result<HashMap<_, _>>>()?;
-            let parse = timer.finish();
-            let canonical: Vec<ClientId> = canonical.into_iter().map(ClientId).collect();
-
-            let timer = Timer::start_cpu("recover");
+                .map(|c| ClientId::new(*c))
+                .zip(client_bytes)
+                .collect();
+            let canonical: Vec<ClientId> = canonical.into_iter().map(ClientId::new).collect();
             let pp = &worker.params.protocol;
-            let policy = SetPolicy::anchored(&canonical, pp.min_clients, pp.max_clients);
-            let recovered =
-                recover_unverified_direct(pp, &policy, |cid| posts.get(&cid).cloned(), &servers)
-                    .map_err(|e| eyre!("recovery failed: {e:?}"))?;
+            let policy =
+                SetPolicy::anchored(&canonical, worker.setup.min_clients, pp.max_clients());
+            let recovered = recover_unverified_direct_from_bytes(
+                pp,
+                &policy,
+                |cid| posts.get(&cid).map(Vec::as_slice),
+                &servers,
+            )
+            .map_err(|e| eyre!("recovery failed: {e:?}"))?;
             let recover = timer.finish();
 
             let timer = Timer::start_cpu("decode");
             let expected = canonical
                 .iter()
-                .filter(|c| worker.setup.message(c.0).is_some())
+                .filter(|c| worker.setup.message(c.get()).is_some())
                 .count();
             let messages = channel::decode_messages(
                 &worker.params.channel,
                 &sid,
-                &recovered.plaintext,
+                recovered.plaintext(),
                 Some(expected),
             )
             .map_err(|e| eyre!("decoding failed: {e:?}"))?;
-            Ok((messages, vec![parse, recover, timer.finish()]))
+            Ok((messages, vec![recover, timer.finish()]))
         })
         .await
         .wrap_err("recovery task panicked")??;

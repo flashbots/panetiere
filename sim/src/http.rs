@@ -52,7 +52,7 @@ pub(crate) fn parse_session(hex: &str) -> eyre::Result<SessionId> {
     let id: [u8; 32] = bytes
         .try_into()
         .map_err(|_| eyre::eyre!("session id is not 32 bytes"))?;
-    Ok(SessionId(id))
+    Ok(SessionId::new(id))
 }
 
 async fn check(resp: reqwest::Response, url: &str) -> eyre::Result<reqwest::Response> {

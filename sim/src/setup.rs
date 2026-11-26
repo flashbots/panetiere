@@ -48,13 +48,14 @@ impl Setup {
         seed[..8].copy_from_slice(&self.seed.to_le_bytes());
         let mut rng = ChaCha20Rng::from_seed(seed);
         let channel = ChannelParams::for_messages(&mut rng, capacity, self.message_bytes);
-        let mut protocol = channel.protocol_params(&mut rng, self.servers);
-        protocol.min_clients = self.min_clients;
+        let protocol = channel
+            .protocol_params(&mut rng, self.servers)
+            .with_min_clients(self.min_clients);
         ensure!(
-            self.clients <= protocol.max_clients,
+            self.clients <= protocol.max_clients(),
             "{} clients is more than the {} these parameters can sum",
             self.clients,
-            protocol.max_clients,
+            protocol.max_clients(),
         );
         Ok(Params { channel, protocol })
     }
