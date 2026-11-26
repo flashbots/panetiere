@@ -285,3 +285,8 @@ retries and authenticated delivery are the caller's.
 
 `bulletin::InMemoryBulletin` is a `Mutex`-backed vector for tests and the demo —
 no persistence, ordering or authentication. It is not a bulletin board.
+
+## Contributing
+
+Taking part means following the [code of conduct](CODE_OF_CONDUCT.md),
+which says how to report a problem and how it is handled.
