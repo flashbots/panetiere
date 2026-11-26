@@ -3,6 +3,10 @@ name = "panetiere"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+members = ["sim"]
+default-members = [".", "sim"]
+
 [dependencies]
 chipmunk_code = { git = "https://github.com/noot/Chipmunk", rev = "93b8cea86880b7ce9e7f46aaf85d13b0e1de25bf", default-features = false }
 negacyclic-rings = { git = "https://github.com/Ruteri/negacyclic-rings", branch = "main" }

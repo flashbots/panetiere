@@ -55,7 +55,7 @@ impl ClientBulletinEntry {
             start = next;
             ctxt.push(KahePoly::from_coeffs(coeffs));
         }
-        let comm = Commitment::from_bytes(&bytes[start..])?;
+        let comm = Commitment::try_from_bytes(&bytes[start..])?;
         Some(ClientBulletinEntry { ctxt, comm })
     }
 }
@@ -112,7 +112,7 @@ impl PostSum {
             return Err(PostError::Malformed);
         }
         let ctxt_end = 2 + self.mu * poly_packed_len64(KAHE_MODULUS);
-        let comm = Commitment::from_bytes(&post[ctxt_end..]).ok_or(PostError::Malformed)?;
+        let comm = Commitment::try_from_bytes(&post[ctxt_end..]).ok_or(PostError::Malformed)?;
         self.start_post();
         let mut start = 2;
         for (k, acc) in self.ctxt.iter_mut().enumerate() {

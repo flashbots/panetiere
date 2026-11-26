@@ -1284,7 +1284,7 @@ pub(crate) fn unpack_poly(
 
 impl Commitment {
     /// Bit-packed wire form: the single HVC root packed against `HVC_MODULUS`.
-    pub(crate) fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(poly_packed_len(HVC_MODULUS));
         pack_poly(self.root.coeffs(), HVC_MODULUS, &mut out);
         out
@@ -1292,7 +1292,7 @@ impl Commitment {
 
     /// Inverse of [`Commitment::to_bytes`]; `None` unless `bytes` is exactly one
     /// packed HVC polynomial.
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+    pub fn try_from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() != poly_packed_len(HVC_MODULUS) {
             return None;
         }
@@ -1685,8 +1685,8 @@ mod tests {
         let bytes = comm.to_bytes();
         assert_eq!(bytes.len(), poly_packed_len(HVC_MODULUS));
         assert!(bytes.len() < POLY_N * 4);
-        assert_eq!(Commitment::from_bytes(&bytes).unwrap().root, comm.root);
-        assert!(Commitment::from_bytes(&[0u8; 3]).is_none());
+        assert_eq!(Commitment::try_from_bytes(&bytes).unwrap().root, comm.root);
+        assert!(Commitment::try_from_bytes(&[0u8; 3]).is_none());
     }
 
     /// The top weight may be one below the smaller modulus, never equal to it.
@@ -2340,14 +2340,14 @@ mod tests {
             })),
         };
         let mut bytes = comm.to_bytes();
-        assert!(Commitment::from_bytes(&bytes).is_some());
+        assert!(Commitment::try_from_bytes(&bytes).is_some());
         set_field(
             &mut bytes,
             0,
             bits_for_signed((HVC_MODULUS / 2) as u32),
             HVC_MODULUS as u64,
         );
-        assert!(Commitment::from_bytes(&bytes).is_none());
+        assert!(Commitment::try_from_bytes(&bytes).is_none());
     }
 
     /// An opening's coefficients lie within the bounds in its header; a field
