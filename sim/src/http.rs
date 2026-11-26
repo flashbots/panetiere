@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use axum::body::Bytes;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -64,18 +65,23 @@ async fn check(resp: reqwest::Response, url: &str) -> eyre::Result<reqwest::Resp
     Ok(resp)
 }
 
-pub(crate) async fn get_bytes(http: &reqwest::Client, url: String) -> eyre::Result<Vec<u8>> {
+pub(crate) async fn get_bytes(http: &reqwest::Client, url: String) -> eyre::Result<Bytes> {
     let resp = http
         .get(&url)
         .send()
         .await
         .wrap_err_with(|| format!("failed to send request to {url}"))?;
-    let bytes = check(resp, &url)
-        .await?
-        .bytes()
+    let mut resp = check(resp, &url).await?;
+    // filled chunk by chunk so a large body is never held twice
+    let mut body = Vec::with_capacity(resp.content_length().unwrap_or(0) as usize);
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .wrap_err_with(|| format!("failed to read body from {url}"))?;
-    Ok(bytes.to_vec())
+        .wrap_err_with(|| format!("failed to read body from {url}"))?
+    {
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 pub(crate) async fn post_bytes(
@@ -116,7 +122,7 @@ pub(crate) async fn post_for_json<T: DeserializeOwned>(
 pub(crate) async fn get_all(
     http: &reqwest::Client,
     requests: Vec<(String, String)>,
-) -> eyre::Result<Vec<(Vec<u8>, Span)>> {
+) -> eyre::Result<Vec<(Bytes, Span)>> {
     let mut tasks = JoinSet::new();
     let n = requests.len();
     for (i, (name, url)) in requests.into_iter().enumerate() {
@@ -133,7 +139,7 @@ pub(crate) async fn get_all(
             )
         });
     }
-    let mut out: Vec<Option<(Vec<u8>, Span)>> = (0..n).map(|_| None).collect();
+    let mut out: Vec<Option<(Bytes, Span)>> = (0..n).map(|_| None).collect();
     while let Some(joined) = tasks.join_next().await {
         let (i, body) = joined.wrap_err("download task panicked")?;
         out[i] = Some(body?);

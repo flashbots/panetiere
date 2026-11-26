@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -88,7 +89,7 @@ async fn round(
                         .ok_or_else(|| eyre!("entry of server {i} does not parse"))
                 })
                 .collect::<eyre::Result<Vec<_>>>()?;
-            let posts: HashMap<ClientId, Vec<u8>> = canonical
+            let posts: HashMap<ClientId, Bytes> = canonical
                 .iter()
                 .map(|c| ClientId::new(*c))
                 .zip(client_bytes)
@@ -100,7 +101,7 @@ async fn round(
             let recovered = recover_unverified_direct_from_bytes(
                 pp,
                 &policy,
-                |cid| posts.get(&cid).map(Vec::as_slice),
+                |cid| posts.get(&cid).map(Bytes::as_ref),
                 &servers,
             )
             .map_err(|e| eyre!("recovery failed: {e:?}"))?;
