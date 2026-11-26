@@ -11,7 +11,7 @@ use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
 pub use crate::mse::MseError;
 use crate::mse::{self, MseEncoding, MseParams};
 pub use crate::prony::PronyError;
-use crate::prony::{PronyParams, PronySketch, PRONY_PRIME};
+use crate::prony::{PronyParams, PronySketch, PRONY_OMEGA, PRONY_PRIME};
 use crate::protocol::{ProtocolParams, SessionId};
 use crate::rings::RHO_MAX;
 
@@ -20,6 +20,12 @@ use crate::rings::RHO_MAX;
 pub const BITS_PER_CHUNK: usize = mse::BITS_PER_SYMBOL;
 
 const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PRONY_PRIME);
+// Two of `RHO_MAX` sketch keys collide with probability at most
+// `RHO_MAX²/t^ω`, which must not exceed the multiset encoding's error bound.
+const _: () = assert!(
+    ((RHO_MAX as u128 * RHO_MAX as u128) << EPS_MSE)
+        <= (PRONY_PRIME as u128).pow(PRONY_OMEGA as u32)
+);
 
 /// The paper's `ε_MSE`: a round's encoding fails to decode with probability at
 /// most `2^-EPS_MSE`.
@@ -339,11 +345,7 @@ pub fn encode_symbols<R: CryptoRng + Rng>(
             enc.insert(rng, &element);
             enc.pack()
         }
-        Encoding::Prony(params) => {
-            let mut sketch = PronySketch::new(params.clone());
-            sketch.insert(rng, &element);
-            sketch.pack()
-        }
+        Encoding::Prony(params) => PronySketch::encode(params, rng, &element),
     })
 }
 

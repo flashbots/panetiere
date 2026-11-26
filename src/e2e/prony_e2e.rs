@@ -103,11 +103,7 @@ fn prony_recovers_through_panetiere() {
         .collect();
     let client_polys: Vec<Vec<KahePoly>> = messages
         .iter()
-        .map(|m| {
-            let mut sk = PronySketch::new(params.clone());
-            sk.insert(&mut rng, m);
-            sk.pack()
-        })
+        .map(|m| PronySketch::encode(&params, &mut rng, m))
         .collect();
 
     let recovered = round_trip(&mut rng, 3, &client_polys);
@@ -132,11 +128,7 @@ fn cover_clients_do_not_consume_capacity() {
     let elements: Vec<i64> = (0..n_active).map(|i| 7 * i as i64 + 3).collect();
     let mut client_polys: Vec<Vec<KahePoly>> = elements
         .iter()
-        .map(|&x| {
-            let mut sk = PronySketch::new(params.clone());
-            sk.insert(&mut rng, &[x]);
-            sk.pack()
-        })
+        .map(|&x| PronySketch::encode(&params, &mut rng, &[x]))
         .collect();
     client_polys.extend((0..n_cover).map(|_| PronySketch::cover(&params)));
 
