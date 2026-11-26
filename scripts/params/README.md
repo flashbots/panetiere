@@ -12,6 +12,7 @@ The other files in this directory:
 | `reference.json` | The reference parameter set this implementation is built for (see below) |
 | `params.schema.json` | JSON Schema of the parameter files (written by `--json`, read by `--check-only`) |
 | `iblt_common.py`, `iblt_empirical.py` | IBLT shape search and simulation, imported by `generate_params.py`; `iblt_empirical.py` can also be run on its own |
+| `dgauss_cdt.py` | Table of the discrete Gaussian sampler for KAHE keys and errors (`src/dgauss_table.rs`), from σ and the round size in `reference.json`; `--check` verifies the table in the repository |
 
 ## The reference parameter set
 
