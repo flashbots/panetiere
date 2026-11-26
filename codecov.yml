@@ -1,0 +1,9 @@
+# CI uploads two coverage reports per commit, one from x86-64 and one from
+# arm64. Wait for both before posting statuses and the PR comment, so they
+# never show the coverage of one architecture alone.
+codecov:
+  notify:
+    after_n_builds: 2
+
+comment:
+  after_n_builds: 2
