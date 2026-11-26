@@ -20,8 +20,6 @@ const T: i64 = PLAINTEXT_MODULUS as i64;
 const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
-/// Bits of payload carried per symbol: `⌊log₂ t⌋`.
-pub const BITS_PER_SYMBOL: usize = PLAINTEXT_MODULUS.ilog2() as usize;
 /// AES-128 key length for the position PRF.
 pub const PRF_KEY_BYTES: usize = 16;
 /// Bytes of the AES block that carry the row index; `r` takes the rest.
@@ -517,12 +515,12 @@ mod tests {
         assert_eq!(recovered, messages);
     }
 
-    /// 512-bit message → `⌈512 / BITS_PER_SYMBOL⌉` symbols. Smaller multiset
+    /// 512-bit message → `⌈512 / ⌊log₂ t⌋⌉` symbols. Smaller multiset
     /// but exercises the fat-payload code path end-to-end.
     #[test]
     fn five_hundred_twelve_bit_message_round_trip() {
         let mut rng = ChaCha20Rng::from_seed([23u8; 32]);
-        let xi = 512usize.div_ceil(BITS_PER_SYMBOL);
+        let xi = 512usize.div_ceil(PLAINTEXT_MODULUS.ilog2() as usize);
         let pp = params_for(4, 32, xi, 31);
         let mut enc = IbltEncoding::new(pp);
         let mut messages: Vec<Vec<i64>> = (0..5)

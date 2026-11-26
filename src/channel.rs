@@ -17,7 +17,7 @@ use crate::rings::{PLAINTEXT_MODULUS, RHO_MAX};
 
 /// Message bits packed into one symbol: `⌊log₂ t⌋`, so every chunk is a
 /// distinct residue of the plaintext modulus both encodings share.
-pub const BITS_PER_CHUNK: usize = iblt::BITS_PER_SYMBOL;
+pub const BITS_PER_CHUNK: usize = PLAINTEXT_MODULUS.ilog2() as usize;
 
 const _: () = assert!((1u64 << BITS_PER_CHUNK) <= PLAINTEXT_MODULUS);
 // Two of `RHO_MAX` sketch keys collide with probability at most
@@ -133,7 +133,7 @@ impl ChannelParams {
         prf_key: [u8; iblt::PRF_KEY_BYTES],
     ) -> Self {
         let capacity = capacity.max(1) as usize;
-        let nonce_symbols = nonce_symbols(iblt::BITS_PER_SYMBOL);
+        let nonce_symbols = nonce_symbols(BITS_PER_CHUNK);
         let (theta, delta) = iblt_shape(capacity, EPS_MSE);
         Self {
             encoding: Encoding::Iblt(IbltParams::with_key(
@@ -209,7 +209,7 @@ impl ChannelParams {
     /// `Z_t`, `⌊log₂ p⌋` in the sketch's prime field — the same `t`.
     pub fn bits_per_symbol(&self) -> usize {
         match &self.encoding {
-            Encoding::Iblt(_) => iblt::BITS_PER_SYMBOL,
+            Encoding::Iblt(_) => BITS_PER_CHUNK,
             Encoding::Ng(p) => p.bits_per_symbol(),
         }
     }
@@ -623,7 +623,7 @@ mod tests {
     /// the reference parameter set's nonce length.
     #[test]
     fn nonce_sized_for_the_security_target() {
-        assert_eq!(iblt::BITS_PER_SYMBOL, 34);
+        assert_eq!(BITS_PER_CHUNK, 34);
         assert_eq!(nonce_symbols(34), 6);
         assert_eq!(nonce_symbols(33), 7);
         assert_eq!(nonce_symbols(201), 1);

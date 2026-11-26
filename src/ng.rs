@@ -802,7 +802,7 @@ impl NgParams {
     }
 
     /// Bits of payload per symbol: every `⌊log₂ p⌋`-bit pattern is a distinct
-    /// residue. Equal to `iblt::BITS_PER_SYMBOL`, since both encodings use `t`.
+    /// residue. The same for the IBLT, since both encodings use `t`.
     pub(crate) fn bits_per_symbol(&self) -> usize {
         self.p.ilog2() as usize
     }

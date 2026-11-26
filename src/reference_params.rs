@@ -7,8 +7,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
 use serde_json::Value;
 
+use crate::channel::BITS_PER_CHUNK;
 use crate::cs::{beta_agg_hvc, HidingMerkleCommitment, BETA_CS, KAPPA_CS, MU_CS, R_BOUND};
-use crate::iblt::BITS_PER_SYMBOL;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::ng::NG_OMEGA;
 use crate::protocol::ProtocolParams;
@@ -42,7 +42,7 @@ fn constants_match_reference() {
     assert_eq!(sigma, Some(SIGMA_S_DEFAULT));
     assert_eq!(sigma, Some(SIGMA_E_DEFAULT));
     assert_eq!(int(&r, "/kahe/mse/rho"), u64::from(RHO_MAX));
-    assert_eq!(int(&r, "/kahe/mse/chunk_bits"), BITS_PER_SYMBOL as u64);
+    assert_eq!(int(&r, "/kahe/mse/chunk_bits"), BITS_PER_CHUNK as u64);
     // the reference set's encoding is Newton–Girard over F_{t^ω}
     assert_eq!(int(&r, "/kahe/mse/omega"), NG_OMEGA as u64);
 
