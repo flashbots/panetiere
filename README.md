@@ -240,9 +240,25 @@ remain; everything else fails the round. A rejected round comes back as
 than "no output". `RecipientError::BelowShareThreshold` is expected early in a
 round and is worth demoting to trace level.
 
-On the payload side, an over-subscribed structure surfaces as
-`ChannelError::PeelStalled` or `ChannelError::SketchFailed(PronyError::{CapacityExceeded,
-NotSplit, CheckFailed})` — never as a successfully decoded empty round. A
+On the payload side, an over-subscribed peeling table surfaces as
+`ChannelError::PeelStalled`. The sketch is the paper's Newton–Girard
+encoding, which only guarantees a correct decoding for at most $C$ elements
+from honest clients, and its decoder does not detect every round outside that:
+
+- More contributors than the capacity make `Λ` fail to split, which surfaces
+  as `ChannelError::SketchFailed(PronyError::NotSplit)`. With honest
+  contributors, `Λ` still splits with probability about 1/C!, and the round
+  then decodes to garbage.
+- A malicious client can change payload cells, and the round then decodes to
+  garbled messages. Below capacity, the payload columns the solve did not use
+  usually catch this as `PronyError::CheckFailed`. In a full round, with
+  exactly $C$ contributors, there are no such columns, so nothing does, and a
+  malicious client can add elements to make a round full.
+- Malicious contributions can also cancel each other out and look like an
+  empty round.
+
+Detecting every incorrect decoding would need a check above the encoding, such
+as a tag on each element, which is not part of the construction. A
 peeling table that is not an honest sum comes back as
 `ChannelError::MalformedEncoding(MseError::{OverCapacity, KeyMismatch})`: the
 decoder checks, as the paper's does, that each peeled key hashes to the cell it
@@ -260,7 +276,7 @@ distinctness, and the verifier rejects an out-of-range or duplicated
 `ServerId` before using it. The `assert!`s that remain are on locally
 supplied arguments — parameter constructors (`ShamirParams::new`,
 `MseParams::new`, `PronyParams::new`) and payload arity in
-`MseEncoding::insert` / `PronyEncoding::insert_with_z` — where a violation is a
+`MseEncoding::insert` / `PronySketch::insert` — where a violation is a
 caller bug, not an attack. Range checks on the ring bridges are `debug_assert!`,
 so they only run in the debug test profile.
 
