@@ -1,6 +1,7 @@
-//! Records the git revision the benchmark is built from, to report with its
-//! numbers: `PANETIERE_REVISION` is the commit, with `-dirty` if tracked files
-//! have uncommitted changes, or `unknown` outside a git checkout.
+//! Records what the benchmark is built from, to report with its numbers:
+//! `PANETIERE_REVISION` is the commit, with `-dirty` if tracked files have
+//! uncommitted changes, or `unknown` outside a git checkout, and
+//! `PANETIERE_RUSTC` is the compiler's version.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -40,6 +41,18 @@ fn main() {
         None => "unknown".into(),
     };
     println!("cargo:rustc-env=PANETIERE_REVISION={revision}");
+
+    // Cargo tells every build script which compiler it uses. A new compiler
+    // rebuilds this script, so the version stays current.
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let version = Command::new(&rustc)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    println!("cargo:rustc-env=PANETIERE_RUSTC={version}");
 
     // Rerun when the checked-out commit or a tracked file changes: the
     // repository's HEAD, index and refs, and every top-level entry with
