@@ -19,7 +19,10 @@ domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
 channels dispatch to scalar, AVX2, or NEON. CS and NG retain their own
 field arithmetic. The discrete Gaussian sampler (`src/dgauss.rs`) has an AVX2
 and a scalar kernel; its tests compare both with a plain comparison at every
-threshold of its table.
+threshold of its table. Whether the compiled kernels are free of branches on
+the sample depends on the compiler and the target, so after changing the sampler
+or the toolchain, run `python3 scripts/dgauss_branches.py`. It checks the
+assembly for x86-64 and aarch64 and needs both Rust targets installed.
 
 The end-to-end tests in `src/e2e/` are the executable spec: `end_to_end.rs` (canonical round,
 *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread

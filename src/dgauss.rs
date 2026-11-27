@@ -11,7 +11,9 @@
 //! without branches or memory accesses that depend on it, and the sign is applied
 //! arithmetically. An AVX2 kernel is chosen at run time where the CPU has it, and
 //! a scalar kernel otherwise. The scalar kernel is written with masks, but Rust
-//! doesn't guarantee that the compiler keeps it free of branches.
+//! doesn't guarantee that the compiler keeps it free of branches, and what it
+//! does depends on the target (see [`opaque`]). `scripts/dgauss_branches.py`
+//! checks the compiled kernels for branches on the sample.
 //!
 //! The kernels compare 192-bit numbers as words `(hi, mid, lo)`, using the
 //! table's three tiers:
@@ -110,6 +112,25 @@ fn mask(bit: u64) -> u64 {
     bit.wrapping_neg()
 }
 
+/// `x`, hidden from the optimizer on x86-64. There, without it, LLVM turns the
+/// masked selection in tier 1 into a branch on the sample. On aarch64, it
+/// vectorizes the loop with NEON instead, which has no such branch, and a
+/// barrier would prevent that.
+#[inline(always)]
+fn opaque(x: u64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut y = x;
+        // SAFETY: an empty instruction sequence; it only hides `y`'s value.
+        unsafe {
+            core::arch::asm!("/* {0} */", inout(reg) y, options(pure, nomem, nostack, preserves_flags));
+        }
+        y
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    x
+}
+
 fn count_scalar(u: &Words) -> [i64; LANES] {
     let mut out = [0i64; LANES];
     for (k, o) in out.iter_mut().enumerate() {
@@ -123,7 +144,7 @@ fn count_one(hi: u64, mid: u64, lo: u64) -> u64 {
     let (mut n1, mut found, mut sel_mid, mut sel_lo) = (0u64, 0u64, 0u64, 0u64);
     for t in &TABLE[..TIER1] {
         n1 += gt(hi, t[0]);
-        let e = mask(eq(hi, t[0]));
+        let e = opaque(mask(eq(hi, t[0])));
         found |= e;
         sel_mid |= e & t[1];
         sel_lo |= e & t[2];
@@ -135,7 +156,7 @@ fn count_one(hi: u64, mid: u64, lo: u64) -> u64 {
     let (mut n2, mut found2, mut sel2) = (0u64, 0u64, 0u64);
     for t in &TABLE[TIER1..TIER2] {
         n2 += gt(mid, t[1]);
-        let e = mask(eq(mid, t[1]));
+        let e = opaque(mask(eq(mid, t[1])));
         found2 |= e;
         sel2 |= e & t[2];
     }
