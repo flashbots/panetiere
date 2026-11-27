@@ -482,3 +482,148 @@ fn a_fault_is_kept_past_later_valid_posts() {
         other => panic!("expected Rejected, got {other:?}"),
     }
 }
+
+// a server that reports twice, or under an id outside the roster, voids the
+// attempt instead of counting towards the threshold
+#[test]
+fn duplicate_or_unknown_server_is_rejected() {
+    let r = round(14, 5, 4);
+    let mut twice = r.outputs.clone();
+    twice[1] = twice[0].clone();
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &r.publics, &twice),
+        Err(VerifyError::BadServerCoverage)
+    );
+    let mut unknown = r.outputs.clone();
+    unknown[1].server_id = ServerId(5);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &r.publics, &unknown),
+        Err(VerifyError::BadServerCoverage)
+    );
+}
+
+// the same roster checks, and the ciphertext length bounds, on the
+// already-summed path
+#[test]
+fn summed_recovery_checks_servers_and_ciphertext_length() {
+    use crate::protocol::verify::decrypt_unverified_sum;
+
+    // one client, so its own post is the sum
+    let r = round(15, 5, 1);
+    let entry = &r.publics[0].1;
+    let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    assert_eq!(
+        decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &r.outputs),
+        Ok(want)
+    );
+
+    let mut twice = r.outputs.clone();
+    twice[1] = twice[0].clone();
+    assert_eq!(
+        decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &twice),
+        Err(VerifyError::BadServerCoverage)
+    );
+    let mut unknown = r.outputs.clone();
+    unknown[1].server_id = ServerId(5);
+    assert_eq!(
+        decrypt_unverified_sum(&r.pp, &entry.ctxt, &entry.comm, &unknown),
+        Err(VerifyError::BadServerCoverage)
+    );
+
+    let bad_len = Err(VerifyError::WrongAggregateLength);
+    assert_eq!(
+        decrypt_unverified_sum(&r.pp, &[], &entry.comm, &r.outputs),
+        bad_len
+    );
+    let mut long = entry.ctxt.clone();
+    long.push(entry.ctxt[0]);
+    assert!(long.len() > r.pp.kahe.mu_kahe);
+    assert_eq!(
+        decrypt_unverified_sum(&r.pp, &long, &entry.comm, &r.outputs),
+        bad_len
+    );
+}
+
+// every client's ciphertext has the same length, and none is longer than
+// the parameters allow
+#[test]
+fn ciphertext_lengths_must_agree_and_fit() {
+    let r = round(16, 4, 3);
+    let extra = r.publics[0].1.ctxt[0];
+
+    let mut ragged = r.publics.clone();
+    ragged[1].1.ctxt.push(extra);
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &ragged, &r.outputs),
+        Err(VerifyError::WrongCiphertextLength(ClientId(1)))
+    );
+
+    let mut long = r.publics.clone();
+    for (_, entry) in &mut long {
+        entry.ctxt.push(extra);
+    }
+    assert_eq!(
+        recover_unverified_once(&r.pp, &r.canonical, &long, &r.outputs),
+        Err(VerifyError::WrongCiphertextLength(ClientId(0)))
+    );
+}
+
+// a set exactly at the anonymity floor, served by exactly the threshold of
+// servers, decodes on both recipient paths; one server fewer does not
+#[test]
+fn exactly_the_floor_and_the_threshold_are_enough() {
+    let mut r = round(17, 5, 4);
+    assert_eq!(r.pp.shamir.t, 3);
+    r.pp.min_clients = 4;
+    let want = recover_unverified_once(&r.pp, &r.canonical, &r.publics, &r.outputs).unwrap();
+    let policy = SetPolicy::anchored(&r.canonical, 4, NO_CAP);
+
+    let direct = recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..3]).unwrap();
+    assert_eq!(direct.plaintext, want);
+    assert!(direct.culprits.is_empty());
+    assert_eq!(
+        recover_unverified_direct(&r.pp, &policy, r.lookup(), &r.outputs[..2]).unwrap_err(),
+        RecipientError::BelowShareThreshold { have: 2, need: 3 }
+    );
+}
+
+// unsealing a whole inbox gives what unsealing one envelope at a time
+// gives, in order, with a damaged envelope left out rather than failing all
+#[test]
+fn unseal_openings_matches_one_at_a_time() {
+    use crate::protocol::server::unseal_openings;
+
+    let mut rng = ChaCha20Rng::from_seed([19u8; 32]);
+    let pp = ProtocolParams::setup(&mut rng, 3);
+    let keys: Vec<pke::PrivateKey> = (0..3)
+        .map(|_| pke::PrivateKey::generate(&mut rng))
+        .collect();
+    let servers: Vec<(ServerId, pke::PublicKey)> = keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (ServerId(i as u32), k.public()))
+        .collect();
+    let me = ServerId(1);
+    let mut sealed: Vec<(ClientId, Vec<u8>)> = (0..3u32)
+        .map(|c| {
+            let m = rand_message_poly(&mut rng, pp.kahe.t_modulus);
+            let mut r = run_client_round(&mut rng, &pp, &SESSION, ClientId(c), vec![m], &servers);
+            let (sid, bytes) = r.sealed_openings.swap_remove(1);
+            assert_eq!(sid, me);
+            (ClientId(c), bytes)
+        })
+        .collect();
+    let last = sealed[1].1.len() - 1;
+    sealed[1].1[last] ^= 1;
+
+    let got = unseal_openings(&keys[1], &SESSION, me, &sealed);
+    assert_eq!(got.len(), 3);
+    assert!(got[1].is_none());
+    for i in [0usize, 2] {
+        let (cid, bytes) = &sealed[i];
+        let one = unseal_opening(&keys[1], &SESSION, *cid, me, bytes).expect("unseal");
+        let batch = got[i].as_ref().expect("unseal");
+        assert_eq!(batch.r(), one.r());
+        assert_eq!(batch.server_index, 1);
+    }
+}

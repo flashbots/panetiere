@@ -1,0 +1,6 @@
+# settings for `cargo mutants` (mutation testing)
+
+# mutants that cannot change behaviour: debug output
+exclude_re = [
+    "impl std::fmt::Debug",
+]
