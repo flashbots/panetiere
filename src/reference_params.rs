@@ -8,11 +8,11 @@ use rand_chacha::ChaCha20Rng;
 use serde_json::Value;
 
 use crate::cs::{beta_agg_hvc, HidingMerkleCommitment, BETA_CS, KAPPA_CS, MU_CS, R_BOUND};
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT, T_MODULUS_DEFAULT};
+use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::mse::BITS_PER_SYMBOL;
 use crate::prony::PRONY_OMEGA;
 use crate::protocol::ProtocolParams;
-use crate::rings::{CS_MODULUS, KAHE_MODULUS, MU_MAX, RHO_MAX};
+use crate::rings::{CS_MODULUS, KAHE_MODULUS, MU_MAX, PLAINTEXT_MODULUS, RHO_MAX};
 use crate::N;
 
 pub(crate) fn reference() -> Value {
@@ -35,7 +35,7 @@ fn constants_match_reference() {
     assert_eq!(int(&r, "/setting/rho"), u64::from(RHO_MAX));
     assert_eq!(int(&r, "/setting/n"), N as u64);
 
-    assert_eq!(int(&r, "/kahe/t"), T_MODULUS_DEFAULT);
+    assert_eq!(int(&r, "/kahe/t"), PLAINTEXT_MODULUS);
     assert_eq!(int(&r, "/kahe/q"), KAHE_MODULUS as u64);
     assert_eq!(int(&r, "/kahe/mu"), MU_MAX as u64);
     let sigma = r.pointer("/kahe/sigma").and_then(Value::as_f64);

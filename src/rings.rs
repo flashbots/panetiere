@@ -29,6 +29,14 @@ pub const CS_MODULUS_OVER_TWO: i32 = (CS_MODULUS - 1) / 2;
 pub const KAHE_MODULUS: i64 = 70_230_058_844_161;
 pub const KAHE_MODULUS_OVER_TWO: i64 = (KAHE_MODULUS - 1) / 2;
 
+/// KAHE plaintext modulus `t` of the reference parameter set: the smallest
+/// prime above `2^34` with `t ≡ 1 mod 2^20`, shared by both multiset
+/// encodings. The paper needs `t` prime and above the capacity, since the
+/// peeling counters and Newton's identities both live in `Z_t`; the congruence
+/// gives `Z_t` NTTs up to length `2^20`. Messages are chunked into
+/// `⌊log₂ t⌋ = 34` bits per coordinate.
+pub const PLAINTEXT_MODULUS: u64 = 17_183_014_913;
+
 const CS_AUX_RNS_MODULI: [u32; 2] = [1_073_692_673, 1_073_668_097];
 
 fn kahe_ring() -> &'static Ring64<N> {

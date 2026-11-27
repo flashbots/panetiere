@@ -1,21 +1,22 @@
 //! Prony sketch (`src/prony.rs`) carried through the Panetière protocol,
 //! mirroring `tests/mse_e2e.rs`.
 //!
-//! The only protocol-level change against the MSE flow is the plaintext
-//! modulus: `t = PRONY_PRIME = 2^36 − 5` instead of `T_MODULUS_DEFAULT = 2^36`,
-//! passed through `ProtocolParams::setup_with_kahe_dims_full`. Everything else
-//! — KAHE, Shamir, CS, the verifier's per-poly sum — is untouched, which is the
-//! point: the sketch is just another additively homomorphic plaintext.
+//! The protocol is set up as for the IBLT, with the same plaintext modulus
+//! `PLAINTEXT_MODULUS`, passed through
+//! `ProtocolParams::setup_with_kahe_dims_full`. KAHE, Shamir, CS and the
+//! verifier's per-poly sum are untouched, which is the point: the sketch is
+//! just another additively homomorphic plaintext.
 
 use crate::cs::Commitment;
 use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 use crate::pke;
-use crate::prony::{PronyParams, PronySketch, PRONY_PRIME};
+use crate::prony::{PronyParams, PronySketch};
 use crate::protocol::client::run_client_round;
 use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox};
 use crate::protocol::verify::aggregate_and_decrypt_unverified;
 use crate::protocol::ProtocolParams;
 use crate::protocol::{ClientId, ServerId, SessionId};
+use crate::rings::PLAINTEXT_MODULUS;
 use crate::KahePoly;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
@@ -36,7 +37,7 @@ fn round_trip(
         1,
         SIGMA_S_DEFAULT,
         SIGMA_E_DEFAULT,
-        PRONY_PRIME,
+        PLAINTEXT_MODULUS,
     );
     let server_ids: Vec<ServerId> = (0..n_servers as u32).map(ServerId).collect();
     let server_keys: Vec<pke::PrivateKey> = (0..n_servers)

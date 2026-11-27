@@ -17,7 +17,7 @@
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
 //!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
 
-use crate::rings::{center_half_open_i64, center_i64, MU_MAX};
+use crate::rings::{center_half_open_i64, center_i64, MU_MAX, PLAINTEXT_MODULUS};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
@@ -280,13 +280,6 @@ impl Kahe {
 
 pub const SIGMA_S_DEFAULT: f64 = 6.80;
 pub const SIGMA_E_DEFAULT: f64 = 6.80;
-/// Plaintext modulus of the reference parameter set: the smallest prime above
-/// `2^34` with `t ≡ 1 mod 2^20`, shared by both multiset encodings. The paper
-/// needs `t` prime and above the capacity, since the peeling counters and
-/// Newton's identities both live in `Z_t`; the congruence gives `Z_t` NTTs up
-/// to length `2^20`. Messages are chunked into `⌊log₂ t⌋ = 34` bits per
-/// coordinate.
-pub const T_MODULUS_DEFAULT: u64 = 17_183_014_913;
 
 impl KaheScheme for Kahe {
     type Params = KaheParams;
@@ -297,7 +290,7 @@ impl KaheScheme for Kahe {
 
     /// `μ = 1`, σ_s=σ_e=6.80, `t = 17183014913` at q_kahe ≈ 2^46.0.
     fn setup<R: Rng>(rng: &mut R) -> KaheParams {
-        Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, T_MODULUS_DEFAULT)
+        Self::setup_with_dims(rng, 1, SIGMA_S_DEFAULT, SIGMA_E_DEFAULT, PLAINTEXT_MODULUS)
     }
 
     fn gen<R: Rng>(rng: &mut R, pp: &KaheParams) -> KaheKey {
@@ -484,7 +477,7 @@ mod tests {
             20,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
+            PLAINTEXT_MODULUS,
         );
         let k = Kahe::gen(&mut rng, &pp);
         let m: Vec<KahePoly> = (0..pp.mu_kahe)
@@ -505,7 +498,7 @@ mod tests {
             MU_MAX + 1,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
+            PLAINTEXT_MODULUS,
         );
     }
 
@@ -518,7 +511,7 @@ mod tests {
             20,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
+            PLAINTEXT_MODULUS,
         );
         let k = Kahe::gen(&mut rng, &pp);
         let m: Vec<KahePoly> = (0..13)
@@ -538,7 +531,7 @@ mod tests {
             12,
             SIGMA_S_DEFAULT,
             SIGMA_E_DEFAULT,
-            T_MODULUS_DEFAULT,
+            PLAINTEXT_MODULUS,
         );
         let n = 5;
         let keys: Vec<KaheKey> = (0..n).map(|_| Kahe::gen(&mut rng, &pp)).collect();
