@@ -8,8 +8,10 @@
 #   python3 scripts/dgauss_branches.py --target aarch64-unknown-linux-gnu
 #
 # Needs the Rust targets (e.g. rustup target add aarch64-unknown-linux-gnu), but no
-# linker, since only the library's assembly is emitted.  Run it after changing the
-# sampler or the toolchain: what the compiler does with the kernels depends on both.
+# linker, since only the library's assembly is emitted.  CI runs it with the latest
+# stable toolchain; run it locally after changing the sampler: what the compiler does
+# with the kernels depends on both.  It builds with RUSTFLAGS="", like CI, so a local
+# target-cpu=native doesn't change what is checked.
 #
 # For each target, the script builds the library in release mode with --emit asm and
 # reads the functions that handle the sample: dgauss::count (the kernels' dispatch,
@@ -115,6 +117,7 @@ def main():
   args = ap.parse_args()
   root = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
   target_dir = os.path.join(root, "target", "dgauss-asm")
+  env = dict(os.environ, RUSTFLAGS="")
   failed = False
   for target in args.target or TARGETS:
     arch = target.split("-")[0]
@@ -125,9 +128,9 @@ def main():
     # Rebuild the library, so that the assembly is current: cargo only writes it when
     # it compiles, and doesn't compile what it considers up to date.
     subprocess.run(["cargo", "clean", "--quiet", "-p", "panetiere", "--release", "--target", target,
-                    "--target-dir", target_dir], cwd=root, check=True)
+                    "--target-dir", target_dir], cwd=root, env=env, check=True)
     subprocess.run(["cargo", "rustc", "--quiet", "-p", "panetiere", "--release", "--lib", "--target", target,
-                    "--target-dir", target_dir, "--", "--emit", "asm"], cwd=root, check=True)
+                    "--target-dir", target_dir, "--", "--emit", "asm"], cwd=root, env=env, check=True)
     [path] = glob.glob(os.path.join(deps, "panetiere-*.s"))
     print(target)
     with open(path) as f:
