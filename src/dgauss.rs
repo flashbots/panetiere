@@ -29,7 +29,7 @@
 #[path = "dgauss_table.rs"]
 mod table;
 
-use rand::RngCore;
+use rand::{CryptoRng, RngCore};
 
 use crate::{KahePoly, N};
 
@@ -53,14 +53,14 @@ struct Words {
 }
 
 /// A polynomial with independent coefficients from the discrete Gaussian.
-pub(crate) fn sample_poly<R: RngCore>(rng: &mut R) -> KahePoly {
+pub(crate) fn sample_poly<R: CryptoRng + RngCore>(rng: &mut R) -> KahePoly {
     let mut coeffs = [0i64; N];
     sample(rng, &mut coeffs);
     KahePoly::from_coeffs(coeffs)
 }
 
 /// Fills `out` with independent samples, drawing 25 random bytes per sample.
-pub(crate) fn sample<R: RngCore>(rng: &mut R, out: &mut [i64]) {
+pub(crate) fn sample<R: CryptoRng + RngCore>(rng: &mut R, out: &mut [i64]) {
     let mut buf = [0u8; BYTES * LANES];
     for chunk in out.chunks_mut(LANES) {
         let bytes = &mut buf[..BYTES * chunk.len()];
@@ -72,13 +72,25 @@ pub(crate) fn sample<R: RngCore>(rng: &mut R, out: &mut [i64]) {
             u.mid[k] = u64::from_le_bytes(b[8..16].try_into().unwrap());
             u.hi[k] = u64::from_le_bytes(b[16..24].try_into().unwrap());
         }
-        let abs = count(&u);
-        for ((c, b), a) in chunk.iter_mut().zip(samples).zip(abs) {
-            // x = |x| or −|x|: (a ⊕ s) − s with s = 0 or −1
-            let s = -i64::from(b[24] & 1);
-            *c = (a ^ s) - s;
+        let mut signs = [0u8; LANES];
+        for (s, b) in signs.iter_mut().zip(samples) {
+            *s = b[24];
         }
+        let x = with_signs(count(&u), signs);
+        chunk.copy_from_slice(&x[..chunk.len()]);
     }
+}
+
+/// `abs[k]` or `−abs[k]`, by bit 0 of `signs[k]`, without a branch: `(a ⊕ s) − s`
+/// with `s` = 0 or −1. Not inlined, so `scripts/dgauss_branches.py` can check it.
+#[inline(never)]
+fn with_signs(abs: [i64; LANES], signs: [u8; LANES]) -> [i64; LANES] {
+    let mut out = [0i64; LANES];
+    for ((o, a), b) in out.iter_mut().zip(abs).zip(signs) {
+        let s = -i64::from(b & 1);
+        *o = (a ^ s) - s;
+    }
+    out
 }
 
 /// For each lane, the number of thresholds `≤ u`.

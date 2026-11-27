@@ -10,7 +10,7 @@ use rand::Rng;
 
 use crate::cs::{Cs, HidingMerkleCommitment, KAPPA_CS, MU_CS};
 use crate::kahe::{Kahe, KaheParams, KaheScheme, SIGMA};
-use crate::rings::PLAINTEXT_MODULUS;
+use crate::rings::{PLAINTEXT_MODULUS, RHO_MAX};
 use crate::sss::ShamirParams;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
@@ -186,8 +186,11 @@ impl ProtocolParams {
 }
 
 fn aggregate_capacity(kahe: &KaheParams, cs: &crate::cs::CsParams) -> usize {
-    let commitment_cap =
-        (cs.r_bound / cs.beta_cs).min(cs.beta_agg_hvc / chipmunk_code::ZETA) as usize;
+    // The reference parameters are generated for at most `RHO_MAX` clients, and
+    // the bridge of the summed keys back into KAHE's ring relies on it.
+    let commitment_cap = ((cs.r_bound / cs.beta_cs).min(cs.beta_agg_hvc / chipmunk_code::ZETA)
+        as usize)
+        .min(RHO_MAX as usize);
     let t = kahe.t_modulus as f64;
     // Eight-sigma aggregate noise plus the worst-case centered message sum.
     (1..=commitment_cap)

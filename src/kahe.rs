@@ -24,7 +24,7 @@ use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
 };
-use rand::{Rng, SeedableRng};
+use rand::{CryptoRng, Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use rayon::prelude::*;
 
@@ -37,8 +37,8 @@ pub trait KaheScheme {
     type Ciphertext: Clone;
 
     fn setup<R: Rng>(rng: &mut R) -> Self::Params;
-    fn gen<R: Rng>(rng: &mut R, pp: &Self::Params) -> Self::Key;
-    fn enc<R: Rng>(
+    fn gen<R: CryptoRng + Rng>(rng: &mut R, pp: &Self::Params) -> Self::Key;
+    fn enc<R: CryptoRng + Rng>(
         rng: &mut R,
         pp: &Self::Params,
         k: &Self::Key,
@@ -269,13 +269,18 @@ impl KaheScheme for Kahe {
         Self::setup_with_dims(rng, 1, PLAINTEXT_MODULUS)
     }
 
-    fn gen<R: Rng>(rng: &mut R, _pp: &KaheParams) -> KaheKey {
+    fn gen<R: CryptoRng + Rng>(rng: &mut R, _pp: &KaheParams) -> KaheKey {
         KaheKey(dgauss::sample_poly(rng))
     }
 
     /// Encrypt up to `μ` plaintext polys under one key `sk`. For position
     /// `i ∈ [0, μ)`: `c_i = m_i + a_i·sk + t·e_i`, with a fresh `e_i ← D_σ`.
-    fn enc<R: Rng>(rng: &mut R, pp: &KaheParams, k: &KaheKey, m: &Vec<KahePoly>) -> Vec<KahePoly> {
+    fn enc<R: CryptoRng + Rng>(
+        rng: &mut R,
+        pp: &KaheParams,
+        k: &KaheKey,
+        m: &Vec<KahePoly>,
+    ) -> Vec<KahePoly> {
         debug_assert!(m.len() <= pp.mu_kahe);
         let t = pp.t_modulus as i64;
         let sk_ntt = KaheNTTPoly::from(k.inner());

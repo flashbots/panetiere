@@ -6,14 +6,19 @@
 // Entry k - 1 is floor(2^192 * P[|X| < k]) for k = 1, ..., 101, as words [hi, mid, lo].
 // The cut tail P[|X| > 101] is below 2^-165. The statistical distance from
 // D_sigma is 2^-165.2 per sample and 2^-130.9 for the 2^34.4 samples
-// of one round at the reference parameters (budget 2^-128).
+// of one round at the reference parameters. Together with the smoothing loss of the
+// privacy proof at this sigma, 2^-128.24, that is 2^-128.02, within the budget
+// of 2^-128.
 
-/// The width the table is generated for.
+/// The parameter `σ` of the discrete Gaussian the table is generated for, with
+/// probabilities proportional to `exp(−x²/(2σ²))`.
 pub(crate) const SIGMA: f64 = 6.80;
-/// Entries whose high word is below `u64::MAX`; their high words are distinct.
+/// The number of entries whose high word is below `u64::MAX`. Their high words
+/// are distinct.
 pub(crate) const TIER1: usize = 62;
-/// Entries before this one have a middle word below `u64::MAX` (those from
-/// `TIER1` on distinct); from here on, high and middle words are `u64::MAX`.
+/// The index of the first entry whose high and middle words are both `u64::MAX`.
+/// The entries from `TIER1` up to here have high word `u64::MAX` and distinct
+/// middle words below it.
 pub(crate) const TIER2: usize = 89;
 
 pub(crate) const TABLE: [[u64; 3]; 101] = [

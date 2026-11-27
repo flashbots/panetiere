@@ -288,7 +288,9 @@ so they only run in the debug test profile.
 Only the sampler of KAHE keys and errors (`dgauss`) is constant time: it
 compares every sample with its whole table, without branches or memory accesses
 that depend on the sample. The rest of the code makes no such attempt. For
-example, the IBLT accesses memory at positions derived from a client's key, and
+example, a client without a message (cover traffic) skips the encoding and
+finishes earlier, which is visible in when its post arrives; the IBLT encoding
+writes to cells at positions derived from the element's random key; and
 reductions with `%` on secret values compile to divisions.
 
 ## Wire formats

@@ -122,6 +122,19 @@ A file written by `--json` looks as follows. `generated` and `command` are optio
 
 All values are JSON integers (`5.0` is rejected), except `sigma`, which must be a positive multiple of 0.01. Two consistency conditions cannot be expressed in the schema and are checked by the script: σ is a multiple of 0.01, and `chipmunk.tau` is the smallest τ with 2^τ ≥ γ.
 
+## The sampler's table
+
+`dgauss_cdt.py` generates the table of the discrete Gaussian sampler that draws the coefficients of KAHE keys and errors (`src/dgauss.rs`), and writes it to `src/dgauss_table.rs`. It reads σ and the size of one round (ρ, µ, n, λ) from `reference.json`:
+
+```sh
+python3 dgauss_cdt.py            # regenerate src/dgauss_table.rs
+python3 dgauss_cdt.py --check    # fail unless src/dgauss_table.rs is up to date (run in CI)
+```
+
+The table holds the cumulative probabilities of |x| as 192-bit integers, up to the smallest |x| beyond which the remaining probability is negligible for one round. The script computes the sampler's statistical distance from the discrete Gaussian exactly from the table, and fails unless it fits the security budget of 2^−λ per round together with the smoothing loss that σ leaves. It also checks the structure of the table that the sampler's kernels rely on. The table's header and the script's output state σ, the table's length and the distances.
+
+Regenerate the table whenever `reference.json` changes σ, ρ, µ, n or λ. Its length depends on the round size, and the sampler is only correct for the σ it was generated for. `--check` in CI catches a table that is out of date.
+
 ## Verifying parameters used elsewhere
 
 To check whether parameters used somewhere else (another implementation, another paper, a configuration file) are covered by the paper's theorems, write them as a parameter file and run `--check-only`. For a configuration of this implementation, start from `reference.json` as described above. The steps below are written so that an agent can follow them as well.

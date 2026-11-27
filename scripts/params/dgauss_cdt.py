@@ -19,14 +19,20 @@
 #
 # The statistical distance between the sampler's output and D_sigma equals the one
 # between the two laws of |x|, since both are symmetric and the sign is uniform.  It is
-# computed exactly from the table (up to the working precision, see PREC) and must fit
-# the paper's budget: the security proofs lose 2^-lambda to statistical terms, and the
-# sampler adds at most (number of samples in one round) * (distance per sample).  One
-# round at the reference parameters has rho clients, each sampling a key and mu error
-# polynomials of n coefficients, so rho (mu + 1) n samples.  K is the smallest value
-# with tail mass P[|X| > K] < 2^-TAIL_BITS, with TAIL_BITS chosen so that the tail alone
-# uses at most a quarter of the budget, and B = 192 makes the rounding of the thresholds
-# negligible next to it.
+# computed exactly from the table (up to the working precision, see PREC).  Over one
+# round at the reference parameters (rho clients, each sampling a key and mu error
+# polynomials of n coefficients, so rho (mu + 1) n samples), it adds up to at most
+# (number of samples) * (distance per sample).
+#
+# The budget: the proof of addition privacy loses 2(rho - 1)(mu + 1) eps to the
+# smoothing parameter eta_eps, and generate_params.py chooses sigma so that this is at
+# most 2^-lambda.  Since sigma is rounded up to a multiple of 1/100, the loss at the
+# actual sigma is smaller, and the sampler's distance per round has to fit into what is
+# left: smoothing loss + sampler distance <= 2^-lambda.  The script checks that.
+#
+# K is the smallest value with tail mass P[|X| > K] < 2^-tail_bits, with tail_bits
+# chosen so that the tail costs at most 2^-(lambda + 2) per round, and B = 192 makes
+# the rounding of the thresholds negligible next to it.
 #
 # The kernel in src/dgauss.rs compares the B = 192-bit numbers as three 64-bit words
 # (hi, mid, lo).  It relies on the structure checked in tiers() below: the first
@@ -40,11 +46,11 @@ import math
 import os
 import sys
 
-from mpmath import mp, mpf, exp, floor, log
+from mpmath import mp, mpf, exp, floor, log, pi
 
 B = 192                 # bits per threshold
 PREC = 1000             # working precision in bits; errors are far below 2^-(PREC - B - 64)
-SUM_RANGE = 2000        # sum the Gaussian weights over |x| <= SUM_RANGE (rest < 2^-80000 at sigma < 10)
+SUM_RANGE = 2000        # sum the Gaussian weights over |x| <= SUM_RANGE (the rest is below 2^-28000 for sigma < 10)
 MAX = 2 ** 64 - 1
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -75,6 +81,15 @@ def law_of_abs(sigma):
   return [w[0] / total] + [2 * x / total for x in w[1:]]
 
 
+def smoothing_loss(sigma, ref):
+  """The privacy proof's loss 2(rho - 1)(mu + 1) eps for the smallest eps that sigma
+  allows, by the bound generate_params.py uses (kahe_sigma_100):
+  sigma >= (2/sqrt(pi)) eta_eps(Z^n) with eta_eps(Z^n) <= sqrt(ln(2n(1 + 1/eps))/pi),
+  so 1/eps <= exp(pi^2 sigma^2 / 4) / (2n) - 1."""
+  inv_eps = exp(pi ** 2 * sigma ** 2 / 4) / (2 * ref["n"]) - 1
+  return 2 * (ref["rho"] - 1) * (ref["mu"] + 1) / inv_eps
+
+
 def build(ref):
   mp.prec = PREC
   sigma = mpf(ref["sigma_100"]) / 100
@@ -84,19 +99,17 @@ def build(ref):
   p = law_of_abs(sigma)
 
   thresholds = []
-  cum = mpf(0)
-  k = 0
-  while True:
-    cum += p[k]
-    k += 1
-    if 1 - cum < mpf(2) ** -tail_bits:
-      break
+  cum = p[0]                       # P[|X| < 1]
+  k = 1
+  while 1 - cum >= mpf(2) ** -tail_bits:
     x = cum * mpf(2) ** B
     t = int(floor(x))
     # floor() must be exact: x may not be within 2^-64 of an integer
     frac = x - t
     assert mpf(2) ** -64 < frac < 1 - mpf(2) ** -64, f"threshold {k} too close to an integer"
     thresholds.append(t)
+    cum += p[k]                    # P[|X| < k + 1]
+    k += 1
   K = len(thresholds)
 
   # the sampler's law of |x|
@@ -104,7 +117,11 @@ def build(ref):
   q = [mpf(bounds[i + 1] - bounds[i]) / mpf(2) ** B for i in range(K + 1)]
   sd = (sum(abs(q[i] - p[i]) for i in range(K + 1)) + sum(p[K + 1:])) / 2
   sd_round = sd * samples
-  assert sd_round <= mpf(2) ** -ref["secpar"], "the sampler does not fit the budget"
+  smoothing = smoothing_loss(sigma, ref)
+  total = smoothing + sd_round
+  assert total <= mpf(2) ** -ref["secpar"], (
+    f"smoothing loss 2^{float(log(smoothing, 2)):.2f} + sampler 2^{float(log(sd_round, 2)):.2f} "
+    f"exceeds 2^-{ref['secpar']}")
   return {
     "sigma_100": ref["sigma_100"],
     "thresholds": thresholds,
@@ -112,16 +129,21 @@ def build(ref):
     "log2_sd": float(log(sd, 2)),
     "log2_samples": log_samples,
     "log2_sd_round": float(log(sd_round, 2)),
+    "log2_smoothing": float(log(smoothing, 2)),
+    "log2_total": float(log(total, 2)),
     "secpar": ref["secpar"],
   }
 
 
 def tiers(thresholds):
-  """(K0, K1) with the structure the kernel relies on (see the header)."""
+  """The table as words, and (K0, K1) with the structure the kernel relies on (see
+  the header)."""
   w = [((t >> 128) & MAX, (t >> 64) & MAX, t & MAX) for t in thresholds]
   assert all(a < b for a, b in zip(thresholds, thresholds[1:])), "not strictly increasing"
-  k0 = next(i for i, x in enumerate(w) if x[0] == MAX)
-  k1 = next(i for i, x in enumerate(w) if x[0] == MAX and x[1] == MAX)
+  k0 = next((i for i, x in enumerate(w) if x[0] == MAX), None)
+  k1 = next((i for i, x in enumerate(w) if x[0] == MAX and x[1] == MAX), None)
+  assert k0 is not None and k1 is not None, (
+    "the table has no entries with high (and middle) word 2^64 - 1; the kernels need all three tiers")
   assert all(x[0] == MAX for x in w[k0:]) and all(x[1] == MAX for x in w[k1:])
   assert all(x[0] < MAX for x in w[:k0]) and all(x[1] < MAX for x in w[k0:k1])
   assert len({x[0] for x in w[:k0]}) == k0, "high words of tier 1 not distinct"
@@ -129,8 +151,7 @@ def tiers(thresholds):
   return w, k0, k1
 
 
-def render(t):
-  w, k0, k1 = tiers(t["thresholds"])
+def render(t, w, k0, k1):
   k = len(w)
   sigma = t["sigma_100"] / 100
   lines = [
@@ -142,14 +163,19 @@ def render(t):
     f"// Entry k - 1 is floor(2^{B} * P[|X| < k]) for k = 1, ..., {k}, as words [hi, mid, lo].",
     f"// The cut tail P[|X| > {k}] is below 2^-{t['tail_bits']}. The statistical distance from",
     f"// D_sigma is 2^{t['log2_sd']:.1f} per sample and 2^{t['log2_sd_round']:.1f} for the 2^{t['log2_samples']:.1f} samples",
-    f"// of one round at the reference parameters (budget 2^-{t['secpar']}).",
+    "// of one round at the reference parameters. Together with the smoothing loss of the",
+    f"// privacy proof at this sigma, 2^{t['log2_smoothing']:.2f}, that is 2^{t['log2_total']:.2f}, within the budget",
+    f"// of 2^-{t['secpar']}.",
     "",
-    "/// The width the table is generated for.",
+    "/// The parameter `σ` of the discrete Gaussian the table is generated for, with",
+    "/// probabilities proportional to `exp(−x²/(2σ²))`.",
     f"pub(crate) const SIGMA: f64 = {sigma:.2f};",
-    "/// Entries whose high word is below `u64::MAX`; their high words are distinct.",
+    "/// The number of entries whose high word is below `u64::MAX`. Their high words",
+    "/// are distinct.",
     f"pub(crate) const TIER1: usize = {k0};",
-    "/// Entries before this one have a middle word below `u64::MAX` (those from",
-    "/// `TIER1` on distinct); from here on, high and middle words are `u64::MAX`.",
+    "/// The index of the first entry whose high and middle words are both `u64::MAX`.",
+    "/// The entries from `TIER1` up to here have high word `u64::MAX` and distinct",
+    "/// middle words below it.",
     f"pub(crate) const TIER2: usize = {k1};",
     "",
     f"pub(crate) const TABLE: [[u64; 3]; {k}] = [",
@@ -168,10 +194,11 @@ def main():
   args = ap.parse_args()
 
   t = build(read_reference(args.reference))
-  text = render(t)
   w, k0, k1 = tiers(t["thresholds"])
+  text = render(t, w, k0, k1)
   summary = (f"sigma = {t['sigma_100'] / 100:.2f}: {len(w)} entries (tiers {k0}, {k1 - k0}, {len(w) - k1}), "
-             f"SD 2^{t['log2_sd']:.1f} per sample, 2^{t['log2_sd_round']:.1f} per round")
+             f"SD 2^{t['log2_sd']:.1f} per sample, 2^{t['log2_sd_round']:.1f} per round; "
+             f"with the smoothing loss 2^{t['log2_smoothing']:.2f}: 2^{t['log2_total']:.2f} <= 2^-{t['secpar']}")
   if args.check:
     with open(args.out) as f:
       if f.read() != text:

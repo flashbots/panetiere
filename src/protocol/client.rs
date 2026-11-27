@@ -64,12 +64,12 @@ pub(crate) fn seal_openings<R: CryptoRng + Rng>(
 }
 
 /// Sample a fresh KAHE secret key.
-pub(crate) fn kahe_keygen<R: Rng>(rng: &mut R, pp: &ProtocolParams) -> KaheKey {
+pub(crate) fn kahe_keygen<R: CryptoRng + Rng>(rng: &mut R, pp: &ProtocolParams) -> KaheKey {
     Kahe::gen(rng, &pp.kahe)
 }
 
 /// Encrypt `message` under `key`.
-pub(crate) fn kahe_encrypt<R: Rng>(
+pub(crate) fn kahe_encrypt<R: CryptoRng + Rng>(
     rng: &mut R,
     pp: &ProtocolParams,
     key: &KaheKey,
