@@ -29,17 +29,7 @@
 //! the recipient, and decodes the recipient's plaintext without a count check,
 //! since the API has no check for |X| ≤ |I| with cover traffic.
 //!
-//! Environment (all optional):
-//!   PAPER_ENCODINGS  "ng,iblt"          encodings to run
-//!   PAPER_CLIENTS    "100,300,300x100"  client counts: ρ, or ρxC for ρ clients of
-//!                                       which C send and ρ − C send cover
-//!   PAPER_SERVERS    "8,16,32"          server counts γ
-//!   PAPER_MSG_BYTES  "4096,16384"       message sizes
-//!   PAPER_REPS       5                  timed repetitions per role (odd, so the
-//!                                       median is a measured value)
-//!   PAPER_SEED       0                  seed, hashed into every cell's inputs
-//!   PAPER_CSV        paper_bench.csv    output file
-//!   RAYON_NUM_THREADS                   threads (recorded in the output)
+//! The settings are environment variables, documented in TESTING.md.
 
 use std::env::VarError;
 use std::fmt::Write as _;

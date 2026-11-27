@@ -97,3 +97,33 @@ runner = "qemu-riscv64 -L /usr/riscv64-linux-gnu"
 ```sh
 RUSTFLAGS="" cargo test --target riscv64gc-unknown-linux-gnu
 ```
+
+## Paper benchmark
+
+`bench/` is a separate package in the workspace, `paper_bench`. It measures the compute time of each role at the paper's parameters, through the public API only. For each combination of encoding, number of clients, number of servers and message size, it times one client, one server and the recipient, from the bytes each receives to the bytes it sends, and reports the exact length of every message.
+
+```sh
+cargo build --release -p paper_bench
+RAYON_NUM_THREADS=8 taskset -c 0-7 target/release/paper_bench
+```
+
+It prints one table per setting and rewrites the CSV file after each one, so a run that is stopped early keeps what it measured. Both start with a line that records the revision, compiler, CPU, the CPUs the process may use, threads, repetitions and seed. Pinning with `taskset` is optional; it keeps runs comparable.
+
+The settings are environment variables, all optional:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PAPER_ENCODINGS` | `ng,iblt` | multiset encodings |
+| `PAPER_CLIENTS` | `100,300,300x100` | client counts: `ρ`, or `ρxC` for ρ clients of which C send a message and ρ − C send cover traffic |
+| `PAPER_SERVERS` | `8,16,32` | server counts γ |
+| `PAPER_MSG_BYTES` | `4096,16384` | message sizes in bytes |
+| `PAPER_REPS` | `5` | timed repetitions per role; odd, so the median is a measured value |
+| `PAPER_SEED` | `0` | seed, hashed into every setting's inputs |
+| `PAPER_CSV` | `paper_bench.csv` | output file |
+| `RAYON_NUM_THREADS` | all CPUs | threads |
+
+The default grid is the paper's, 36 settings, and takes about 5 minutes on a laptop. For a single setting:
+
+```sh
+PAPER_ENCODINGS=ng PAPER_CLIENTS=100 PAPER_SERVERS=8 PAPER_MSG_BYTES=4096 target/release/paper_bench
+```
