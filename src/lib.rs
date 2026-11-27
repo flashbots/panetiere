@@ -12,11 +12,11 @@ mod e2e;
 pub mod hvc_stream;
 #[doc(hidden)]
 pub mod hvc_sum;
+pub(crate) mod iblt;
 mod iblt_shape;
 pub(crate) mod kahe;
-pub(crate) mod mse;
+pub(crate) mod ng;
 pub mod pke;
-pub(crate) mod prony;
 pub mod protocol;
 #[cfg(test)]
 mod reference_params;
