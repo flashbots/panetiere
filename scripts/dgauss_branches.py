@@ -35,8 +35,11 @@ import subprocess
 import sys
 
 TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
-# The mangled name of a function in dgauss: _ZN 9panetiere 6dgauss <len><name> 17h<hash> E
-FUNCTION = re.compile(r"^(_ZN9panetiere6dgauss(\d+)(\w+?)17h[0-9a-f]{16}E):")
+# The mangled name of a function in dgauss, in the legacy scheme
+#   _ZN 9panetiere 6dgauss <len><name> 17h<hash> E
+# or in the v0 scheme (which Rust 1.100 uses)
+#   _RNvNtCs <crate hash> _ 9panetiere 6dgauss <len><name>
+FUNCTION = re.compile(r"^((?:_ZN|_RNvNtCs\w+?_)9panetiere6dgauss(\d+)(\w+?)(?:17h[0-9a-f]{16}E)?):")
 ROOTS = {"x86_64": {"count", "count_avx2", "with_signs"}, "aarch64": {"count", "with_signs"}}
 
 ARCH = {
@@ -124,14 +127,20 @@ def main():
     if arch not in ARCH:
       sys.exit(f"no rules for {arch}")
     rules = ARCH[arch]
-    deps = os.path.join(target_dir, target, "release", "deps")
+    release = os.path.join(target_dir, target, "release")
     # Rebuild the library, so that the assembly is current: cargo only writes it when
     # it compiles, and doesn't compile what it considers up to date.
     subprocess.run(["cargo", "clean", "--quiet", "-p", "panetiere", "--release", "--target", target,
                     "--target-dir", target_dir], cwd=root, env=env, check=True)
     subprocess.run(["cargo", "rustc", "--quiet", "-p", "panetiere", "--release", "--lib", "--target", target,
                     "--target-dir", target_dir, "--", "--emit", "asm"], cwd=root, env=env, check=True)
-    [path] = glob.glob(os.path.join(deps, "panetiere-*.s"))
+    # Where cargo writes the assembly depends on its version and on the layout of the
+    # target directory (release/deps or release/build/panetiere/<hash>/out), so take
+    # the newest one anywhere below release.
+    found = glob.glob(os.path.join(release, "**", "panetiere-*.s"), recursive=True)
+    if not found:
+      sys.exit(f"no assembly for panetiere found below {release}")
+    path = max(found, key=os.path.getmtime)
     print(target)
     with open(path) as f:
       funcs = functions(f.read(), rules["comment"])
