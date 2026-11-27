@@ -6,6 +6,7 @@ pub mod bulletin;
 pub mod channel;
 mod chunking;
 pub(crate) mod cs;
+pub(crate) mod dgauss;
 #[cfg(test)]
 mod e2e;
 #[doc(hidden)]

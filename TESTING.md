@@ -17,7 +17,15 @@ RAYON_NUM_THREADS=8 cargo test -j 8
 KAHE runs on a single 64-bit NTT over its prime modulus; the CS auxiliary
 domain uses a two-prime RNS parameter set from `src/rings.rs`, whose 32-bit NTT
 channels dispatch to scalar, AVX2, or NEON. CS and NG retain their own
-field arithmetic.
+field arithmetic. The discrete Gaussian sampler (`src/dgauss.rs`) has an AVX2
+and a scalar kernel; its tests compare both with a plain comparison at every
+threshold of its table. Whether the compiled kernels are free of branches on
+the sample depends on the compiler and the target, so
+`python3 scripts/dgauss_branches.py` checks the assembly for x86-64 and
+aarch64. CI runs it with the latest stable toolchain; locally, it needs both
+Rust targets installed. If it fails, read what it reports: it is a heuristic
+over the assembly, and a new compiler may also produce harmless branches it
+doesn't recognize.
 
 The end-to-end tests in `src/e2e/` are the executable spec: `end_to_end.rs` (canonical round,
 *t*-of-*n*, replay/tamper/norm rejection, anonymity floor, thread

@@ -9,7 +9,6 @@ use crate::chunking;
 pub use crate::iblt::IbltError;
 use crate::iblt::{self, IbltEncoding, IbltParams};
 use crate::iblt_shape::iblt_shape;
-use crate::kahe::{SIGMA_E_DEFAULT, SIGMA_S_DEFAULT};
 pub use crate::ng::NgError;
 use crate::ng::{NgEncoding, NgParams, NG_OMEGA};
 use crate::protocol::{ProtocolParams, SessionId};
@@ -233,8 +232,6 @@ impl ChannelParams {
             rng,
             n_servers,
             self.n_polys(),
-            SIGMA_S_DEFAULT,
-            SIGMA_E_DEFAULT,
             self.plaintext_modulus(),
         )
     }
