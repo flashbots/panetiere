@@ -285,7 +285,7 @@ impl From<&KaheNTTPoly> for KahePoly {
         let mut coeffs = poly.coeffs;
         ntt64::inv_ntt(kahe_ring(), &mut coeffs);
         Self {
-            coeffs: coeffs.map(|x| center_i64(x as i64, KAHE_MODULUS)),
+            coeffs: coeffs.map(|x| center_lifted_i64(x as i64, KAHE_MODULUS)),
         }
     }
 }
