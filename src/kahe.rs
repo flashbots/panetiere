@@ -15,9 +15,10 @@
 //! - `sk ← D_{σ_s}` — a single discrete-Gaussian ring element (σ_s = 6.80).
 //! - `e ← D_{σ_e}^μ` — discrete Gaussian fresh error (single `D_σ`, σ_e = 6.80).
 //! - `t_modulus` — plaintext modulus. Plaintext lives in `R_t^μ` with centered
-//!   representatives in `[-t/2, t/2)`. Aggregate decryption returns `Σm mod t`.
+//!   representatives in `[−(t−1)/2, (t−1)/2]`. Aggregate decryption returns
+//!   `Σm mod t`.
 
-use crate::rings::{center_half_open_i64, center_i64, MU_MAX, PLAINTEXT_MODULUS};
+use crate::rings::{center_i64, MU_MAX, PLAINTEXT_MODULUS};
 use crate::{
     pointwise_dot_kahe, CsPoly, KaheNTTPoly, KahePoly, CS_MODULUS_OVER_TWO, KAHE_MODULUS_OVER_TWO,
     N,
@@ -156,28 +157,19 @@ fn scale_poly(poly: &KahePoly, scale: i64) -> KahePoly {
         *out = ((c as i128) * (scale as i128) % q) as i64;
     }
     let mut p = KahePoly::from_coeffs(coeffs);
-    p.normalize();
+    p.center();
     p
 }
 
-/// Reduce one (centered) integer coefficient mod `t` to centered range
-/// `[-t/2, t/2)`.
-fn reduce_centered(x: i64, t: i64) -> i64 {
-    center_half_open_i64(x, t)
-}
-
-/// Reduce a polynomial coefficient-wise mod `t` (centered).
-///
-/// Crucially uses `normalize()` (centered `[-q/2, q/2]`) and not `lift()`
-/// (which puts coefficients in `[0, q)` and would skew the mod-t residue
-/// whenever `q ≢ 0 (mod t)`).
-fn poly_mod_t(poly: &KahePoly, t: u64) -> KahePoly {
+/// Crucially centers mod `q` first and doesn't lift into `[0, q)`, which
+/// would skew the mod-t residue whenever `q ≢ 0 (mod t)`.
+pub(crate) fn poly_mod_t(poly: &KahePoly, t: u64) -> KahePoly {
     let mut p = *poly;
-    p.normalize();
+    p.center();
     let t_i = t as i64;
     let mut coeffs = [0i64; N];
     for (out, &c) in coeffs.iter_mut().zip(p.coeffs().iter()) {
-        *out = reduce_centered(c, t_i);
+        *out = center_i64(c, t_i);
     }
     KahePoly::from_coeffs(coeffs)
 }
@@ -192,10 +184,10 @@ fn poly_mod_t(poly: &KahePoly, t: u64) -> KahePoly {
 /// Gaussian keys (`‖Σ sk‖_∞ ≪ q_cs/2` at any realistic n_clients).
 pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
     let mut q = *p;
-    q.normalize();
+    q.center();
     debug_assert!(
         q.coeffs().iter().all(|&c| c.abs() <= CS_MODULUS_OVER_TWO),
-        "lift_cs_to_kahe: input not centered after normalize()"
+        "lift_cs_to_kahe: input not centered after center()"
     );
     let coeffs: [i64; N] = core::array::from_fn(|i| q.coeffs()[i] as i64);
     KahePoly::from_signed_coeffs(&coeffs)
@@ -207,7 +199,7 @@ pub fn lift_cs_to_kahe(p: &CsPoly) -> KahePoly {
 /// sharing, which operates over `R_{q_cs}`.
 pub fn kahe_to_cs_centered(p: &KahePoly) -> CsPoly {
     let mut q = *p;
-    q.normalize();
+    q.center();
     debug_assert!(
         q.coeffs()
             .iter()
@@ -357,7 +349,6 @@ mod tests {
     use rand::SeedableRng;
     use rand_chacha::ChaCha20Rng;
 
-    /// Random message with coefficients centered in `[-t/2, t/2)`.
     fn rand_message_poly<R: Rng>(rng: &mut R, t: u64) -> KahePoly {
         let half = (t / 2) as i64;
         let mut coeffs = [0i64; N];
@@ -378,6 +369,21 @@ mod tests {
         let c = Kahe::enc(&mut rng, &pp, &k, &m);
         let agg = Kahe::agg_key(std::slice::from_ref(&k));
         assert_eq!(Kahe::dec(&pp, &c, &agg), m);
+    }
+
+    #[test]
+    fn round_trip_at_the_ends_of_the_centered_range() {
+        let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
+        let pp = Kahe::setup(&mut rng);
+        let k = Kahe::gen(&mut rng, &pp);
+        let h = (pp.t_modulus as i64 - 1) / 2;
+        let mut coeffs = [0i64; N];
+        coeffs[..4].copy_from_slice(&[h, -h, h - 1, -h + 1]);
+        let m = vec![KahePoly::from_coeffs(coeffs)];
+        let c = Kahe::enc(&mut rng, &pp, &k, &m);
+        let agg = Kahe::agg_key(std::slice::from_ref(&k));
+        let got = Kahe::dec(&pp, &c, &agg);
+        assert_eq!(got[0].coeffs()[..4], [h, -h, h - 1, -h + 1]);
     }
 
     #[test]

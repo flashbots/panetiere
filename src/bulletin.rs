@@ -204,7 +204,7 @@ impl PostSum {
             .into_iter()
             .map(|coeffs| {
                 let mut p = KahePoly::from_coeffs(coeffs);
-                p.normalize();
+                p.center();
                 p
             })
             .collect();

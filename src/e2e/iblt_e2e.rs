@@ -329,7 +329,7 @@ fn zero_payload_insert_is_not_cover() {
     // cover() leaves the matrices empty: nothing to peel.
     assert!(IbltEncoding::cover(&iblt_params).iter().all(|p| {
         let mut q = *p;
-        q.normalize();
+        q.center();
         q.coeffs().iter().all(|&c| c == 0)
     }));
 }
