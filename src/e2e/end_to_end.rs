@@ -2,6 +2,7 @@
 
 use crate::bulletin::ClientBulletinEntry;
 use crate::cs::Commitment;
+use crate::kahe::poly_mod_t;
 use crate::pke;
 use crate::protocol::client::{run_client_round, ClientRound};
 use crate::protocol::server::{run_server_round, unseal_opening, ServerInbox, ServerRoundError};
@@ -105,29 +106,13 @@ fn full_round_is_thread_count_invariant() {
     assert_eq!(one, many);
 }
 
-/// Sample a polynomial with coefficients centered in `[-t/2, t/2)` —
-/// matches the KAHE plaintext space `R_t`.
+/// Sample a polynomial with centered coefficients in `[−(t−1)/2, (t−1)/2]`,
+/// the KAHE plaintext space `R_t`.
 fn rand_message_poly<R: Rng>(rng: &mut R, t: u64) -> KahePoly {
     let half = t as i64 / 2;
     let mut coeffs = [0i64; N];
     for c in coeffs.iter_mut() {
         *c = rng.gen_range(0..t) as i64 - half;
-    }
-    KahePoly::from_coeffs(coeffs)
-}
-
-/// Reduce each coefficient of `poly` mod `t` into centered range — used to
-/// compute the expected aggregate decryption (`Σm mod t`). Uses `normalize`
-/// (centered `[-q/2, q/2]`) so the mod-t residue isn't skewed by `q mod t`.
-fn reduce_centered_mod_t(poly: KahePoly, t: u64) -> KahePoly {
-    let mut p = poly;
-    p.normalize();
-    let t_i = t as i64;
-    let half = t_i / 2;
-    let mut coeffs = [0i64; N];
-    for (out, &c) in coeffs.iter_mut().zip(p.coeffs().iter()) {
-        let r = c.rem_euclid(t_i);
-        *out = if r >= half { r - t_i } else { r };
     }
     KahePoly::from_coeffs(coeffs)
 }
@@ -186,10 +171,7 @@ fn client_round_accepts_message_after_offline_work() {
         &outputs,
     )
     .unwrap();
-    assert_eq!(
-        recovered,
-        vec![reduce_centered_mod_t(message, pp.kahe.t_modulus)]
-    );
+    assert_eq!(recovered, vec![poly_mod_t(&message, pp.kahe.t_modulus)]);
 }
 
 fn run<R: rand::Rng + rand::CryptoRng>(
@@ -247,8 +229,8 @@ fn run<R: rand::Rng + rand::CryptoRng>(
             .expect("verify failed");
     assert_eq!(recovered.len(), pp.kahe.mu_kahe);
 
-    let expected = reduce_centered_mod_t(
-        messages
+    let expected = poly_mod_t(
+        &messages
             .iter()
             .copied()
             .fold(KahePoly::default(), |a, x| a + x),
@@ -627,8 +609,8 @@ fn recovers_from_t_of_n_servers() {
         .map(|inb| run_server_round(&pp, inb, &canonical, &commitments).expect("missing client"))
         .collect();
 
-    let expected = reduce_centered_mod_t(
-        messages
+    let expected = poly_mod_t(
+        &messages
             .iter()
             .copied()
             .fold(KahePoly::default(), |a, x| a + x),

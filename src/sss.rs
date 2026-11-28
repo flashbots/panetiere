@@ -1,6 +1,7 @@
 //! Secret sharing.
 
-use crate::{CsPoly, CS_MODULUS, CS_MODULUS_OVER_TWO, N};
+use crate::rings::center_i64;
+use crate::{CsPoly, CS_MODULUS, N};
 use rand::Rng;
 
 /// Shamir t-of-n secret sharing over `R_q`.
@@ -54,7 +55,7 @@ impl ShamirSharing {
                     for (c, &p) in coeffs.iter().zip(&powers) {
                         acc += c.coeffs()[k] as i64 * p;
                     }
-                    *value = reduce(acc);
+                    *value = center_i64(acc, CS_MODULUS as i64) as i32;
                 }
                 CsPoly::from_coeffs(out)
             })
@@ -72,7 +73,7 @@ impl ShamirSharing {
         let xs: Vec<i32> = samples
             .iter()
             .take(t)
-            .map(|(idx, _)| reduce(*idx as i64 + 1))
+            .map(|(idx, _)| center_i64(*idx as i64 + 1, CS_MODULUS as i64) as i32)
             .collect();
         // Nonzero, pairwise-distinct points mod q ⇒ Lagrange denominators are units.
         for i in 0..t {
@@ -108,32 +109,25 @@ impl ShamirSharing {
                 *a += c as i64 * weight;
             }
         }
-        Ok(CsPoly::from_coeffs(acc.map(reduce)))
+        Ok(CsPoly::from_coeffs(
+            acc.map(|x| center_i64(x, CS_MODULUS as i64) as i32),
+        ))
     }
-}
-
-#[inline]
-fn reduce(x: i64) -> i32 {
-    let mut r = x.rem_euclid(CS_MODULUS as i64) as i32;
-    if r > CS_MODULUS_OVER_TWO {
-        r -= CS_MODULUS;
-    }
-    r
 }
 
 #[inline]
 fn mul_q(a: i32, b: i32) -> i32 {
-    reduce(a as i64 * b as i64)
+    center_i64(a as i64 * b as i64, CS_MODULUS as i64) as i32
 }
 
 #[inline]
 fn sub_q(a: i32, b: i32) -> i32 {
-    reduce(a as i64 - b as i64)
+    center_i64(a as i64 - b as i64, CS_MODULUS as i64) as i32
 }
 
 fn pow_q(base: i32, mut exp: i32) -> i32 {
     let mut result = 1i32;
-    let mut b = reduce(base as i64);
+    let mut b = center_i64(base as i64, CS_MODULUS as i64) as i32;
     while exp > 0 {
         if exp & 1 == 1 {
             result = mul_q(result, b);
@@ -146,7 +140,10 @@ fn pow_q(base: i32, mut exp: i32) -> i32 {
 
 #[inline]
 fn inv_q(x: i32) -> i32 {
-    debug_assert!(reduce(x as i64) != 0, "inv of zero");
+    debug_assert!(
+        center_i64(x as i64, CS_MODULUS as i64) as i32 != 0,
+        "inv of zero"
+    );
     pow_q(x, CS_MODULUS - 2)
 }
 

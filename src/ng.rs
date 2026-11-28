@@ -38,7 +38,7 @@
 //! Newton's identities divide by `1..C`, so the characteristic `t` must exceed
 //! the capacity.
 
-use crate::rings::{center_canonical_half_open_i64, PLAINTEXT_MODULUS};
+use crate::rings::{center_lifted_i64, lift_i64, PLAINTEXT_MODULUS};
 use crate::{KahePoly, N};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -333,18 +333,6 @@ impl Ext {
             b: rng.gen_range(0..self.f.p),
         }
     }
-}
-
-/// Centered representative, matching `kahe::reduce_centered` so that
-/// pack → encrypt → decrypt → unpack is the identity on `F_p`.
-#[inline]
-fn center(x: u64, p: u64) -> i64 {
-    center_canonical_half_open_i64(x as i64, p as i64)
-}
-
-#[inline]
-fn canon(x: i64, p: u64) -> u64 {
-    x.rem_euclid(p as i64) as u64
 }
 
 // ---------------------------------------------------------------
@@ -891,8 +879,8 @@ impl NgEncoding {
         let xs: Vec<[u64; 3]> = payload
             .chunks(NG_OMEGA)
             .map(|s| {
-                let xa = canon(s[0], p);
-                let xb = s.get(1).map_or(0, |&y| canon(y, p));
+                let xa = lift_i64(s[0], p as i64) as u64;
+                let xb = s.get(1).map_or(0, |&y| lift_i64(y, p as i64) as u64);
                 [xa, xb, f.mul(NONRESIDUE, xb)]
             })
             .collect();
@@ -924,8 +912,8 @@ impl NgEncoding {
                     .zip(start..end)
                 {
                     let x = element(e);
-                    slot[0] = center(x.a, p);
-                    slot[1] = center(x.b, p);
+                    slot[0] = center_lifted_i64(x.a as i64, p as i64);
+                    slot[1] = center_lifted_i64(x.b as i64, p as i64);
                 }
                 KahePoly::from_coeffs(coeffs)
             })
@@ -1103,7 +1091,7 @@ impl NgEncoding {
             .par_iter()
             .map(|poly| {
                 let mut q = *poly;
-                q.normalize();
+                q.center();
                 *q.coeffs()
             })
             .collect::<Vec<_>>()
@@ -1115,8 +1103,8 @@ impl NgEncoding {
             .0
             .iter()
             .map(|s| F2 {
-                a: canon(s[0], p),
-                b: canon(s[1], p),
+                a: lift_i64(s[0], p as i64) as u64,
+                b: lift_i64(s[1], p as i64) as u64,
             })
             .collect();
         v.drain(..NG_OMEGA * c);
@@ -1131,8 +1119,8 @@ impl NgEncoding {
     fn cell(&self, idx: usize) -> F2 {
         let p = self.params.p;
         F2 {
-            a: canon(self.v[NG_OMEGA * idx], p),
-            b: canon(self.v[NG_OMEGA * idx + 1], p),
+            a: lift_i64(self.v[NG_OMEGA * idx], p as i64) as u64,
+            b: lift_i64(self.v[NG_OMEGA * idx + 1], p as i64) as u64,
         }
     }
 }

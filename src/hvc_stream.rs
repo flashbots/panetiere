@@ -5,7 +5,7 @@ use negacyclic_rings::ntt32::{self, Ring32};
 use negacyclic_rings::params::{find_psi32, generate_ring32};
 use rand::Rng;
 
-use crate::rings::center_canonical_i64;
+use crate::rings::center_lifted_i64;
 use crate::N;
 
 fn ring() -> &'static Ring32<N> {
@@ -93,7 +93,7 @@ impl StreamingHvcDot {
         ntt32::inv_ntt(ring(), &mut scratch);
         let mut output = [0i32; N];
         for (coefficient, &value) in output.iter_mut().zip(scratch.iter()) {
-            *coefficient = center_canonical_i64(value as i64, HVC_MODULUS as i64) as i32;
+            *coefficient = center_lifted_i64(value as i64, HVC_MODULUS as i64) as i32;
         }
         HVCPoly::from_coeffs(output)
     }

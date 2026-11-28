@@ -14,10 +14,8 @@ use aes::cipher::{BlockEncrypt as _, KeyInit as _};
 use aes::Aes128;
 use rand::Rng;
 
-use crate::rings::PLAINTEXT_MODULUS;
+use crate::rings::{center_i64, center_lifted_i64, lift_i64, PLAINTEXT_MODULUS};
 
-const T: i64 = PLAINTEXT_MODULUS as i64;
-const T_OVER_TWO: i64 = T / 2;
 /// Number of base-`t` limbs for `r`: fixed at 2. `r ∈ Z_{t^2}`.
 pub const K_LIMBS: usize = 2;
 /// AES-128 key length for the position PRF.
@@ -137,21 +135,6 @@ pub enum IbltError {
     PayloadArity,
 }
 
-#[inline]
-fn reduce(x: i64) -> i64 {
-    let mut r = x.rem_euclid(T);
-    if r > T_OVER_TWO {
-        r -= T;
-    }
-    r
-}
-
-/// Canonical unsigned rep `[0, t)` from centered `[-t/2, t/2]`.
-#[inline]
-fn to_canonical(x: i64) -> u128 {
-    x.rem_euclid(T) as u128
-}
-
 /// The position PRF with its key schedule expanded once, so the `γ` lookups
 /// of an insertion or a peel share it.
 fn prf_cipher(key: &[u8; PRF_KEY_BYTES]) -> Aes128 {
@@ -205,20 +188,27 @@ impl IbltEncoding {
         let mut limbs = [0i64; K_LIMBS];
         let mut acc = r;
         for limb in limbs.iter_mut() {
-            *limb = reduce((acc % t) as i64);
+            *limb = center_lifted_i64((acc % t) as i64, PLAINTEXT_MODULUS as i64);
             acc /= t;
         }
-        let payload_reduced: Vec<i64> = payload.iter().map(|&x| reduce(x)).collect();
+        let payload_reduced: Vec<i64> = payload
+            .iter()
+            .map(|&x| center_i64(x, PLAINTEXT_MODULUS as i64))
+            .collect();
         let cipher = prf_cipher(&self.params.prf_key);
         for row in 0..self.params.gamma {
             let col = prf_bucket(&cipher, row, r, self.params.delta);
             let idx = self.idx(row, col);
-            self.c[idx] = reduce(self.c[idx] + 1);
+            self.c[idx] = center_i64(self.c[idx] + 1, PLAINTEXT_MODULUS as i64);
             for ell in 0..K_LIMBS {
-                self.k[ell][idx] = reduce(self.k[ell][idx] + limbs[ell]);
+                self.k[ell][idx] =
+                    center_i64(self.k[ell][idx] + limbs[ell], PLAINTEXT_MODULUS as i64);
             }
             for s in 0..self.params.payload_symbols {
-                self.v[s][idx] = reduce(self.v[s][idx] + payload_reduced[s]);
+                self.v[s][idx] = center_i64(
+                    self.v[s][idx] + payload_reduced[s],
+                    PLAINTEXT_MODULUS as i64,
+                );
             }
         }
     }
@@ -252,7 +242,7 @@ impl IbltEncoding {
             for ell in 0..K_LIMBS {
                 let signed = k[ell][idx];
                 limb_signed[ell] = signed;
-                r_star += to_canonical(signed) * place;
+                r_star += lift_i64(signed, PLAINTEXT_MODULUS as i64) as u128 * place;
                 place *= t_u128;
             }
             // the paper's two guards: an honest sum never trips them, and a
@@ -266,16 +256,22 @@ impl IbltEncoding {
             for s in 0..self.params.payload_symbols {
                 x_star_buf[s] = v[s][idx];
             }
-            emitted.push(x_star_buf.iter().map(|&x| to_canonical(x) as i64).collect());
+            emitted.push(
+                x_star_buf
+                    .iter()
+                    .map(|&x| lift_i64(x, PLAINTEXT_MODULUS as i64))
+                    .collect(),
+            );
             for i in 0..self.params.gamma {
                 let j = prf_bucket(&cipher, i, r_star, self.params.delta);
                 let cell = i * self.params.delta + j;
-                c[cell] = reduce(c[cell] - 1);
+                c[cell] = center_i64(c[cell] - 1, PLAINTEXT_MODULUS as i64);
                 for ell in 0..K_LIMBS {
-                    k[ell][cell] = reduce(k[ell][cell] - limb_signed[ell]);
+                    k[ell][cell] =
+                        center_i64(k[ell][cell] - limb_signed[ell], PLAINTEXT_MODULUS as i64);
                 }
                 for s in 0..self.params.payload_symbols {
-                    v[s][cell] = reduce(v[s][cell] - x_star_buf[s]);
+                    v[s][cell] = center_i64(v[s][cell] - x_star_buf[s], PLAINTEXT_MODULUS as i64);
                 }
                 if c[cell] == 1 {
                     queue.push((i, j));
@@ -342,7 +338,7 @@ impl IbltEncoding {
         let mut flat: Vec<i64> = Vec::with_capacity(polys.len() * N);
         for p in polys {
             let mut q = *p;
-            q.normalize();
+            q.center();
             flat.extend_from_slice(q.coeffs());
         }
 
@@ -388,7 +384,7 @@ mod tests {
         for limb in enc.k.iter_mut() {
             for cell in limb.iter_mut() {
                 if *cell != 0 {
-                    *cell = reduce(*cell + 1);
+                    *cell = center_i64(*cell + 1, PLAINTEXT_MODULUS as i64);
                 }
             }
         }
@@ -408,13 +404,13 @@ mod tests {
         assert_eq!(enc.decode(), Err(IbltError::OverCapacity));
     }
 
-    /// Decoded symbols are canonical in `[0, t)`, whatever the input's sign.
+    /// Decoded symbols are lifted into `[0, t)`, whatever the input's sign.
     #[test]
-    fn decoded_symbols_are_canonical() {
+    fn decoded_symbols_are_lifted() {
         let mut rng = ChaCha20Rng::from_seed([8u8; 32]);
         let mut enc = IbltEncoding::new(params_for(4, 16, 1, 9));
         enc.insert(&mut rng, &[-1]);
-        assert_eq!(enc.decode(), Ok(vec![vec![T - 1]]));
+        assert_eq!(enc.decode(), Ok(vec![vec![PLAINTEXT_MODULUS as i64 - 1]]));
     }
 
     #[test]

@@ -80,42 +80,31 @@ pub(crate) fn boxed_i64_coeffs() -> Box<[i64; N]> {
     }
 }
 
+/// The representative of `value` modulo `m` in `[0, m)`.
 #[inline]
-fn lift64(a: i64, modulus: i64) -> i64 {
-    a.rem_euclid(modulus)
+pub(crate) fn lift_i64(value: i64, modulus: i64) -> i64 {
+    value.rem_euclid(modulus)
 }
 
+/// The centered representative of a lifted `value ∈ [0, m)` modulo an odd
+/// `m`, in `[−(m−1)/2, (m−1)/2]`. Every modulus here is odd, and every
+/// centered value in the crate is in this range.
 #[inline]
-pub(crate) fn center_canonical_i64(value: i64, modulus: i64) -> i64 {
+pub(crate) fn center_lifted_i64(value: i64, modulus: i64) -> i64 {
+    debug_assert!(modulus % 2 == 1);
     debug_assert!((0..modulus).contains(&value));
     value - (modulus & -((value > modulus / 2) as i64))
 }
 
 #[inline]
 pub(crate) fn center_i64(value: i64, modulus: i64) -> i64 {
-    center_canonical_i64(value.rem_euclid(modulus), modulus)
+    center_lifted_i64(lift_i64(value, modulus), modulus)
 }
 
 #[inline]
 pub(crate) fn center_i32(value: i32, modulus: i32) -> i32 {
     let reduced = value.rem_euclid(modulus);
     reduced - (modulus & -((reduced > modulus / 2) as i32))
-}
-
-#[inline]
-pub(crate) fn center_half_open_i64(value: i64, modulus: i64) -> i64 {
-    center_canonical_half_open_i64(value.rem_euclid(modulus), modulus)
-}
-
-#[inline]
-pub(crate) fn center_canonical_half_open_i64(value: i64, modulus: i64) -> i64 {
-    debug_assert!((0..modulus).contains(&value));
-    value - (modulus & -((value >= modulus / 2) as i64))
-}
-
-#[inline]
-fn normalize64(value: i64, modulus: i64) -> i64 {
-    center_i64(value, modulus)
 }
 
 #[cfg(test)]
@@ -167,7 +156,7 @@ impl PartialEq for KahePoly {
         self.coeffs
             .iter()
             .zip(&other.coeffs)
-            .all(|(&a, &b)| lift64(a, KAHE_MODULUS) == lift64(b, KAHE_MODULUS))
+            .all(|(&a, &b)| lift_i64(a, KAHE_MODULUS) == lift_i64(b, KAHE_MODULUS))
     }
 }
 
@@ -259,9 +248,9 @@ impl KahePoly {
         }
     }
 
-    pub(crate) fn normalize(&mut self) {
+    pub(crate) fn center(&mut self) {
         for coefficient in &mut self.coeffs {
-            *coefficient = normalize64(*coefficient, KAHE_MODULUS);
+            *coefficient = center_i64(*coefficient, KAHE_MODULUS);
         }
     }
 }
@@ -279,7 +268,7 @@ impl Default for KaheNTTPoly {
 
 impl From<&KahePoly> for KaheNTTPoly {
     fn from(poly: &KahePoly) -> Self {
-        let mut coeffs = poly.coeffs.map(|x| lift64(x, KAHE_MODULUS) as u64);
+        let mut coeffs = poly.coeffs.map(|x| lift_i64(x, KAHE_MODULUS) as u64);
         ntt64::ntt(kahe_ring(), &mut coeffs);
         Self { coeffs }
     }
@@ -296,7 +285,7 @@ impl From<&KaheNTTPoly> for KahePoly {
         let mut coeffs = poly.coeffs;
         ntt64::inv_ntt(kahe_ring(), &mut coeffs);
         Self {
-            coeffs: coeffs.map(|x| normalize64(x as i64, KAHE_MODULUS)),
+            coeffs: coeffs.map(|x| center_lifted_i64(x as i64, KAHE_MODULUS)),
         }
     }
 }
@@ -449,8 +438,10 @@ impl CsPoly {
         Self::from_coeffs(arithmetic::rand_mod_p_i32(rng, p))
     }
 
-    pub fn normalize(&mut self) {
-        arithmetic::normalize_assign_i32(&mut self.coeffs, CS_MODULUS);
+    pub fn center(&mut self) {
+        for coefficient in &mut self.coeffs {
+            *coefficient = center_i32(*coefficient, CS_MODULUS);
+        }
     }
 
     pub fn decompose_r_to_hvc(&self) -> [HVCPoly; HVC_WIDTH] {
@@ -494,8 +485,7 @@ impl From<&CsPoly> for CsNTTPoly {
     fn from(poly: &CsPoly) -> Self {
         let ring = cs_aux_rns();
         let mut coeffs = boxed_residues();
-        let mut centered = poly.coeffs;
-        arithmetic::normalize_assign_i32(&mut centered, CS_MODULUS);
+        let centered = poly.coeffs.map(|x| center_i32(x, CS_MODULUS));
         ring.reduce_centered_i32_into(&centered, &mut coeffs);
         ring.forward(&mut coeffs);
         Self { coeffs: *coeffs }
@@ -522,8 +512,7 @@ impl From<&CsNTTPoly> for CsPoly {
         };
         let mut output = Self::default();
         for (coefficient, value) in output.coeffs.iter_mut().zip(exact) {
-            *coefficient =
-                arithmetic::normalize_i32(value.rem_euclid(CS_MODULUS as i64) as i32, CS_MODULUS);
+            *coefficient = center_i64(value, CS_MODULUS as i64) as i32;
         }
         output
     }
@@ -634,27 +623,30 @@ mod tests {
 
     #[test]
     fn centering_matches_rem_euclid() {
-        let m = KAHE_MODULUS;
-        let h = m / 2;
-        for x in [
-            0,
-            1,
-            -1,
-            h,
-            h + 1,
-            -h,
-            -h - 1,
-            m - 1,
-            -(m - 1),
-            m,
-            -m,
-            3 * m + 5,
-            i64::MAX,
-            i64::MIN,
-        ] {
-            let r = x.rem_euclid(m);
-            let expected = if r > h { r - m } else { r };
-            assert_eq!(center_i64(x, m), expected, "x = {x}");
+        for m in [KAHE_MODULUS, PLAINTEXT_MODULUS as i64] {
+            let h = m / 2;
+            for x in [
+                0,
+                1,
+                -1,
+                h,
+                h + 1,
+                -h,
+                -h - 1,
+                m - 1,
+                -(m - 1),
+                m,
+                -m,
+                3 * m + 5,
+                i64::MAX,
+                i64::MIN,
+            ] {
+                let r = x.rem_euclid(m);
+                let expected = if r > h { r - m } else { r };
+                assert_eq!(center_i64(x, m), expected, "x = {x}");
+            }
+            assert_eq!(center_i64(h, m), h);
+            assert_eq!(center_i64(h + 1, m), -h);
         }
         for m in [CS_MODULUS, HVC_MODULUS] {
             let h = m / 2;
